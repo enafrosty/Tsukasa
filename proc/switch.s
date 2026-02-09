@@ -1,7 +1,6 @@
-;
-; switch.s - Switch to user mode via iret.
-; void switch_to_user(uint32_t eip, uint32_t esp, uint32_t eflags);
-;
+# switch.s - Switch to user mode via iret.
+# void switch_to_user(uint32_t eip, uint32_t esp, uint32_t eflags);
+#
 
 .section .text
 .global switch_to_user

@@ -5,10 +5,9 @@
 
 #include "shm.h"
 #include "../mm/pmm.h"
-#include "../mm/paging.h"
+#include "include/paging.h"
 #include "../mm/heap.h"
 #include "../proc/task.h"
-#include "../include/paging.h"
 #include <stddef.h>
 #include <stdint.h>
 

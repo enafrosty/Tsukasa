@@ -1,8 +1,7 @@
-;
-; context.s - Context switch. Saves current stack pointer, loads next.
-; void context_switch(uint32_t *save_esp, uint32_t next_esp);
-; Call with interrupts disabled.
-;
+# context.s - Context switch. Saves current stack pointer, loads next.
+# void context_switch(uint32_t *save_esp, uint32_t next_esp);
+# Call with interrupts disabled.
+#
 
 .section .text
 .global context_switch

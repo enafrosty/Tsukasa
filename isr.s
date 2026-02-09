@@ -1,7 +1,6 @@
-;
-; isr.s - Exception stub handlers. Push vector (and 0 for no error code), then jump to common.
-; CPU exceptions 0-31. Common handler calls idt_handler(vector, error_code) then we iret.
-;
+# isr.s - Exception stub handlers. Push vector (and 0 for no error code), then jump to common.
+# CPU exceptions 0-31. Common handler calls idt_handler(vector, error_code) then we iret.
+#
 
 .section .text
 
@@ -75,6 +74,7 @@ isr_ignore:
     iret
 .size isr_ignore, . - isr_ignore
 
+# IRQ 1 (keyboard) -> vector 33
 .global isr_33
 .type isr_33, @function
 isr_33:

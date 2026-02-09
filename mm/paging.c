@@ -3,7 +3,7 @@
  * Identity-maps kernel region and enables paging.
  */
 
-#include "paging.h"
+#include "include/paging.h"
 #include "pmm.h"
 #include <stddef.h>
 #include <stdint.h>

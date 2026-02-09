@@ -1,7 +1,6 @@
-;
-; syscall_entry.s - int 0x80 syscall entry point.
-; Syscall number in eax, args in ebx, ecx, edx. Return value in eax.
-;
+# syscall_entry.s - int 0x80 syscall entry point.
+# Syscall number in eax, args in ebx, ecx, edx. Return value in eax.
+#
 
 .section .text
 .global isr_128

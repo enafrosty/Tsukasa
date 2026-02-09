@@ -6,6 +6,7 @@
 #include <stddef.h>
 
 extern void context_switch(uint32_t *save_esp, uint32_t next_esp);
+extern void switch_to_user(uint32_t eip, uint32_t esp, uint32_t eflags);
 
 /**
  * Enter the scheduler. Switches to the first ready task and never returns.

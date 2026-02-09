@@ -12,12 +12,11 @@ SECTIONS
 
     _kernel_start = .;
 
-    /* Multiboot header must be in first 8 KiB of the kernel. */
-    .multiboot ALIGN(4) : {
-        *(.multiboot)
-    }
-
+    /* Multiboot header must be in first 8 KiB of the kernel file (GRUB scans first 8KB).
+     * Placing .multiboot inside .text ensures it is the first content of the first
+     * PT_LOAD segment so no .note or other section can push it past 8KB. */
     .text ALIGN(4K) : {
+        *(.multiboot)
         *(.text .text.*)
     }
 

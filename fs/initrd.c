@@ -5,6 +5,7 @@
 #include "initrd.h"
 #include "../include/multiboot.h"
 #include <stddef.h>
+#include <stdint.h>
 
 static const void *initrd_data;
 static size_t initrd_size;

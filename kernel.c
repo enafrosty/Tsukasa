@@ -7,13 +7,12 @@
 #include "idt.h"
 #include "vga.h"
 #include "mm/pmm.h"
-#include "mm/paging.h"
+#include "include/paging.h"
 #include "mm/heap.h"
 #include "proc/task.h"
 #include "proc/scheduler.h"
 #include "include/gdt.h"
 #include "include/multiboot.h"
-#include "include/paging.h"
 #include "drv/fb.h"
 #include "drv/pic.h"
 #include "gfx/blit.h"
@@ -49,6 +48,10 @@ static void run_task(void)
 void kernel_main(uint32_t magic, uint32_t info)
 {
     (void)magic;
+    /* Switch to our page tables first. GRUB (BIOS or UEFI) may leave paging on with
+     * its own tables; any kernel memory access (idt_init, multiboot info) must happen
+     * after we have identity map for 0-4 MiB. */
+    paging_init();
     idt_init();
 
     if (pmm_init((const void *)(uintptr_t)info) != 0) {
@@ -57,8 +60,6 @@ void kernel_main(uint32_t magic, uint32_t info)
         for (;;)
             __asm__ volatile ("hlt");
     }
-
-    paging_init();
     heap_init();
     gdt_init();
     fb_init((const void *)(uintptr_t)info);

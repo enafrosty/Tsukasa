@@ -4,9 +4,9 @@
 CC       = gcc
 ASM      = nasm
 LD       = ld
-CFLAGS   = -m32 -ffreestanding -fno-pie -fno-stack-protector -Wall -Wextra -O2 -I.
+CFLAGS   = -m32 -ffreestanding -fno-pie -fno-stack-protector -Wall -Wextra -O2 -I. -Iinclude
 ASMFLAGS = -f elf32
-LDFLAGS  = -m elf_i386 -T linker.ld -nostdlib
+LDFLAGS  = -m elf_i386 -T linker.ld -nostdlib --build-id=none
 
 KERNEL_BIN = myos.bin
 ISO_IMAGE  = myos.iso
@@ -34,8 +34,12 @@ all: $(KERNEL_BIN)
 $(KERNEL_BIN): $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
 
+# Check multiboot header is in first 8KB (for GRUB). Run after link.
+check-multiboot: $(KERNEL_BIN)
+	@python3 check_multiboot.py $(KERNEL_BIN) 2>/dev/null || python check_multiboot.py $(KERNEL_BIN) || true
+
 # Build bootable ISO using grub-mkrescue.
-iso: $(KERNEL_BIN)
+iso: $(KERNEL_BIN) check-multiboot
 	@mkdir -p $(GRUB_DIR)
 	cp $(KERNEL_BIN) $(BOOT_DIR)/
 	cp grub.cfg $(GRUB_DIR)/

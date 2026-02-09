@@ -16,6 +16,8 @@ static uint32_t next_pid;
 extern void context_switch(uint32_t *save_esp, uint32_t next_esp);
 extern void switch_to_user(uint32_t eip, uint32_t esp, uint32_t eflags);
 
+static void idle_task(void);
+
 void task_init(void)
 {
     current_task = NULL;
