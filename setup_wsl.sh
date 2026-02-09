@@ -25,4 +25,4 @@ grub-mkrescue --version 2>/dev/null || true
 
 echo ""
 echo "[OK] Setup complete. You can now run: make iso"
-echo "     Then load myos.iso in VirtualBox as a new VM (Other -> Other/Unknown)."
+echo "     Then load tsukasa.iso in VirtualBox as a new VM (Other -> Other/Unknown)."

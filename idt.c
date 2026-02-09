@@ -118,25 +118,43 @@ void idt_handler(uint32_t vector, uint32_t error_code)
     /* Disable interrupts and write exception info to VGA row 1. */
     __asm__ volatile ("cli");
 
-    /* "Ex=XX Err=XXXXXXXX" at start of second row. */
-    VGA_BUFFER[80 + 0]  = (VGA_ATTR << 8) | 'E';
-    VGA_BUFFER[80 + 1]  = (VGA_ATTR << 8) | 'x';
-    VGA_BUFFER[80 + 2]  = (VGA_ATTR << 8) | '=';
-    VGA_BUFFER[80 + 3]  = (VGA_ATTR << 8) | hex_char((vector >> 4) & 0xF);
-    VGA_BUFFER[80 + 4]  = (VGA_ATTR << 8) | hex_char(vector & 0xF);
-    VGA_BUFFER[80 + 5]  = (VGA_ATTR << 8) | ' ';
-    VGA_BUFFER[80 + 6]  = (VGA_ATTR << 8) | 'E';
-    VGA_BUFFER[80 + 7]  = (VGA_ATTR << 8) | 'r';
+    /* Read CR2 so we can see the faulting linear address. */
+    uint32_t cr2;
+    __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+
+    /* "KEx=XX Err=XXXXXXXX CR2=XXXXXXXX" at start of second row. */
+    VGA_BUFFER[80 + 0]  = (VGA_ATTR << 8) | 'K';
+    VGA_BUFFER[80 + 1]  = (VGA_ATTR << 8) | 'E';
+    VGA_BUFFER[80 + 2]  = (VGA_ATTR << 8) | 'x';
+    VGA_BUFFER[80 + 3]  = (VGA_ATTR << 8) | '=';
+    VGA_BUFFER[80 + 4]  = (VGA_ATTR << 8) | hex_char((vector >> 4) & 0xF);
+    VGA_BUFFER[80 + 5]  = (VGA_ATTR << 8) | hex_char(vector & 0xF);
+    VGA_BUFFER[80 + 6]  = (VGA_ATTR << 8) | ' ';
+    VGA_BUFFER[80 + 7]  = (VGA_ATTR << 8) | 'E';
     VGA_BUFFER[80 + 8]  = (VGA_ATTR << 8) | 'r';
-    VGA_BUFFER[80 + 9]  = (VGA_ATTR << 8) | '=';
-    VGA_BUFFER[80 + 10] = (VGA_ATTR << 8) | hex_char((error_code >> 28) & 0xF);
-    VGA_BUFFER[80 + 11] = (VGA_ATTR << 8) | hex_char((error_code >> 24) & 0xF);
-    VGA_BUFFER[80 + 12] = (VGA_ATTR << 8) | hex_char((error_code >> 20) & 0xF);
-    VGA_BUFFER[80 + 13] = (VGA_ATTR << 8) | hex_char((error_code >> 16) & 0xF);
-    VGA_BUFFER[80 + 14] = (VGA_ATTR << 8) | hex_char((error_code >> 12) & 0xF);
-    VGA_BUFFER[80 + 15] = (VGA_ATTR << 8) | hex_char((error_code >> 8) & 0xF);
-    VGA_BUFFER[80 + 16] = (VGA_ATTR << 8) | hex_char((error_code >> 4) & 0xF);
-    VGA_BUFFER[80 + 17] = (VGA_ATTR << 8) | hex_char(error_code & 0xF);
+    VGA_BUFFER[80 + 9]  = (VGA_ATTR << 8) | 'r';
+    VGA_BUFFER[80 + 10] = (VGA_ATTR << 8) | '=';
+    VGA_BUFFER[80 + 11] = (VGA_ATTR << 8) | hex_char((error_code >> 28) & 0xF);
+    VGA_BUFFER[80 + 12] = (VGA_ATTR << 8) | hex_char((error_code >> 24) & 0xF);
+    VGA_BUFFER[80 + 13] = (VGA_ATTR << 8) | hex_char((error_code >> 20) & 0xF);
+    VGA_BUFFER[80 + 14] = (VGA_ATTR << 8) | hex_char((error_code >> 16) & 0xF);
+    VGA_BUFFER[80 + 15] = (VGA_ATTR << 8) | hex_char((error_code >> 12) & 0xF);
+    VGA_BUFFER[80 + 16] = (VGA_ATTR << 8) | hex_char((error_code >> 8) & 0xF);
+    VGA_BUFFER[80 + 17] = (VGA_ATTR << 8) | hex_char((error_code >> 4) & 0xF);
+    VGA_BUFFER[80 + 18] = (VGA_ATTR << 8) | hex_char(error_code & 0xF);
+
+    VGA_BUFFER[80 + 20] = (VGA_ATTR << 8) | 'C';
+    VGA_BUFFER[80 + 21] = (VGA_ATTR << 8) | 'R';
+    VGA_BUFFER[80 + 22] = (VGA_ATTR << 8) | '2';
+    VGA_BUFFER[80 + 23] = (VGA_ATTR << 8) | '=';
+    VGA_BUFFER[80 + 24] = (VGA_ATTR << 8) | hex_char((cr2 >> 28) & 0xF);
+    VGA_BUFFER[80 + 25] = (VGA_ATTR << 8) | hex_char((cr2 >> 24) & 0xF);
+    VGA_BUFFER[80 + 26] = (VGA_ATTR << 8) | hex_char((cr2 >> 20) & 0xF);
+    VGA_BUFFER[80 + 27] = (VGA_ATTR << 8) | hex_char((cr2 >> 16) & 0xF);
+    VGA_BUFFER[80 + 28] = (VGA_ATTR << 8) | hex_char((cr2 >> 12) & 0xF);
+    VGA_BUFFER[80 + 29] = (VGA_ATTR << 8) | hex_char((cr2 >> 8) & 0xF);
+    VGA_BUFFER[80 + 30] = (VGA_ATTR << 8) | hex_char((cr2 >> 4) & 0xF);
+    VGA_BUFFER[80 + 31] = (VGA_ATTR << 8) | hex_char(cr2 & 0xF);
 
     for (;;)
         __asm__ volatile ("hlt");

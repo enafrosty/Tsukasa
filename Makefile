@@ -1,5 +1,5 @@
 # Makefile for minimal x86 OS (Multiboot + GRUB).
-# Usage: make iso   -> produces myos.iso
+# Usage: make iso   -> produces tsukasa.iso
 
 CC       = gcc
 ASM      = nasm
@@ -8,8 +8,8 @@ CFLAGS   = -m32 -ffreestanding -fno-pie -fno-stack-protector -Wall -Wextra -O2 -
 ASMFLAGS = -f elf32
 LDFLAGS  = -m elf_i386 -T linker.ld -nostdlib --build-id=none
 
-KERNEL_BIN = myos.bin
-ISO_IMAGE  = myos.iso
+KERNEL_BIN = tsukasa.bin
+ISO_IMAGE  = tsukasa.iso
 ISO_DIR    = iso
 BOOT_DIR   = $(ISO_DIR)/boot
 GRUB_DIR   = $(BOOT_DIR)/grub

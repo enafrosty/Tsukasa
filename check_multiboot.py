@@ -16,7 +16,7 @@ GRUB_SCAN_LIMIT = 8192
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: check_multiboot.py <myos.bin>", file=sys.stderr)
+        print("Usage: check_multiboot.py <tsukasa.bin>", file=sys.stderr)
         sys.exit(1)
     bin_path = sys.argv[1]
     if not os.path.isfile(bin_path):

@@ -1,9 +1,9 @@
-# Create a new VirtualBox VM with BIOS (not UEFI) for MyOS.
+# Create a new VirtualBox VM with BIOS (not UEFI) for Tsukasa.
 # Run from PowerShell. Adjust VM name and paths if needed.
 
 $VBox = "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
-$VMName = "MyOS-BIOS"
-$IsoPath = (Resolve-Path "myos.iso").Path
+$VMName = "Tsukasa-BIOS"
+$IsoPath = (Resolve-Path "tsukasa.iso").Path
 $VMFolder = "C:\Users\frost145\VirtualBox VMs\$VMName"
 
 if (-not (Test-Path $VBox)) {
@@ -11,7 +11,7 @@ if (-not (Test-Path $VBox)) {
     exit 1
 }
 if (-not (Test-Path $IsoPath)) {
-    Write-Error "myos.iso not found. Run 'make iso' first."
+    Write-Error "tsukasa.iso not found. Run 'make iso' first."
     exit 1
 }
 
@@ -23,5 +23,5 @@ if (-not (Test-Path $IsoPath)) {
 & $VBox storagectl $VMName --name "IDE" --add ide --controller PIIX4 --bootable on
 & $VBox storageattach $VMName --storagectl "IDE" --port 1 --device 0 --type dvddrive --medium $IsoPath
 
-Write-Host "VM '$VMName' created with BIOS firmware. Start it from VirtualBox with myos.iso attached."
+Write-Host "VM '$VMName' created with BIOS firmware. Start it from VirtualBox with tsukasa.iso attached."
 Write-Host "In VirtualBox: select $VMName -> Start."
