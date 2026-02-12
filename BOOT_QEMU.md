@@ -1,6 +1,6 @@
 # Booting Tsukasa with QEMU (legacy BIOS by default)
 
-If VirtualBox keeps using UEFI and you cannot change it, use **QEMU** instead. QEMU typically uses **SeaBIOS** (legacy BIOS) by default, so your multiboot kernel should boot without changing any firmware setting.
+If you want to use **QEMU** instead of VirtualBox. QEMU typically uses **SeaBIOS** (legacy BIOS) by default, so your multiboot kernel should boot without changing any firmware setting.
 
 ## Install QEMU (Windows)
 
@@ -26,3 +26,4 @@ qemu-system-i386 -cdrom tsukasa.iso -m 64 -nographic
 ```
 
 (Output goes to the terminal; exit with Ctrl+A then X.)
+
