@@ -57,6 +57,7 @@ extern void isr_31(void);
 extern void isr_128(void);
 extern void isr_ignore(void);
 extern void isr_33(void);
+extern void isr_44(void);
 
 static void (*const isr_stubs[])(void) = {
     isr_0, isr_1, isr_2, isr_3, isr_4, isr_5, isr_6, isr_7,
@@ -95,7 +96,10 @@ void idt_init(void)
     for (i = 32; i < 33; i++)
         set_gate(i, isr_ignore);
     set_gate(33, isr_33);
-    for (i = 34; i < 128; i++)
+    for (i = 34; i < 44; i++)
+        set_gate(i, isr_ignore);
+    set_gate(44, isr_44);
+    for (i = 45; i < 128; i++)
         set_gate(i, isr_ignore);
     set_gate_user(128, isr_128);
     for (i = 129; i < IDT_ENTRIES; i++)

@@ -11,11 +11,13 @@
 #include "drv/fb.h"
 #include "drv/pic.h"
 #include "gfx/blit.h"
-#include "gfx/font.h"
+#include "gfx/win311.h"
 #include "input/event.h"
+#include "fs/vfs.h"
 #include "proc/task.h"
 #include "proc/scheduler.h"
 #include "include/paging.h"
+#include <stddef.h>
 #include <stdint.h>
 
 #define ENABLE_USER_TASK 0
@@ -47,17 +49,21 @@ void kernel_main(uint32_t magic, uint32_t info)
     /* Stage 5: set up our own GDT/TSS (uses stack_top from boot.s). */
     gdt_init();
 
-    /* Stage 6: initialize framebuffer and draw a simple rectangle if available. */
+    /* Stage 6: initialize framebuffer; map it if above 4 MiB, then fill. */
     fb_init((const void *)(uintptr_t)info);
-    if (fb_info.addr && fb_info.bpp == 32) {
-        fb_fill_rect(0, 0, fb_info.width, fb_info.height, rgb(32, 32, 48));
-        fb_fill_rect(100, 100, 200, 150, rgb(64, 64, 128));
-    }
+    if (fb_info.addr && fb_info.width && fb_info.height)
+        paging_map_framebuffer((uintptr_t)fb_info.addr,
+                              (size_t)fb_info.pitch * (size_t)fb_info.height);
+    if (fb_info.addr && fb_info.bpp == 32)
+        fb_fill_rect(0, 0, fb_info.width, fb_info.height, WIN311_DESKTOP);
 
     /* Initialize input/events and remap the PIC so hardware IRQs (keyboard)
        use vectors 32+ instead of clobbering CPU exception vectors like 0x08. */
     event_init();
     pic_init();
+
+    /* Initialize Virtual File System (mounts FAT12 ramdisk if present). */
+    vfs_init((const void *)(uintptr_t)info);
 
     /* Stage 7: basic tasking and scheduler with a single kernel task. */
     task_init();

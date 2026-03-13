@@ -11,3 +11,6 @@ _user_stub_entry:
     movl $0, %eax    /* SYS_YIELD */
     int $0x80
     jmp _user_stub_entry
+
+/* Mark stack non-executable to satisfy linker and avoid deprecation warning. */
+.section .note.GNU-stack,"",@progbits

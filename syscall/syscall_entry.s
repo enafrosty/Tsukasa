@@ -30,3 +30,6 @@ isr_128:
     iret
 
 .size isr_128, . - isr_128
+
+/* Mark stack non-executable to satisfy linker and avoid deprecation warning. */
+.section .note.GNU-stack,"",@progbits

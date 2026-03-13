@@ -83,6 +83,15 @@ isr_33:
     jmp irq_common
 .size isr_33, . - isr_33
 
+# IRQ 12 (PS/2 mouse) -> vector 44
+.global isr_44
+.type isr_44, @function
+isr_44:
+    pushl $0
+    pushl $44
+    jmp irq_common
+.size isr_44, . - isr_44
+
 .global irq_common
 .type irq_common, @function
 irq_common:
