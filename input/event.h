@@ -8,10 +8,14 @@
 #include <stdint.h>
 
 #define EVENT_KEY     0
-#define EVENT_MOUSE  1
+#define EVENT_MOUSE   1
 
-#define KEY_PRESS    1
-#define KEY_RELEASE  0
+#define KEY_PRESS     1
+#define KEY_RELEASE   0
+
+#define MOUSE_MOVE     2
+#define MOUSE_BTN_DOWN 3
+#define MOUSE_BTN_UP   4
 
 #define EVENT_BUF_SIZE 64
 

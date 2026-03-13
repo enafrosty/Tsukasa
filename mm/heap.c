@@ -94,10 +94,16 @@ void *kmalloc(size_t size)
     }
 
     /* No suitable block - try to get more from PMM. */
-    uintptr_t phys = pmm_alloc();
+    /* Request enough contiguous pages to satisfy this allocation,
+       plus some extra to avoid tiny heap fragments. */
+    size_t pages_needed = (total + 4095) / 4096;
+    if (pages_needed < 4) pages_needed = 4;
+
+    uintptr_t phys = pmm_alloc_pages(pages_needed);
     if (phys == 0)
         return NULL;
-    heap_add_region(phys, 4096);
+    
+    heap_add_region(phys, pages_needed * 4096);
     return kmalloc(size);
 }
 
