@@ -72,7 +72,7 @@ make iso
 
 ## Running in QEMU
 
-We strongly recommend **QEMU** for testing, as VirtualBox often defaults to UEFI which is incompatible with this Multiboot v1 legacy-BIOS kernel.
+I strongly recommend **QEMU** for testing, as VirtualBox often defaults to UEFI which is incompatible with this Multiboot v1 legacy-BIOS kernel.
 
 To run the ISO in QEMU with 64MB of RAM (adjust display parameters as needed for your host OS):
 
@@ -94,4 +94,4 @@ qemu-system-i386 -cdrom tsukasa.iso -m 64 -vga std -display sdl
 - Window redraws are exclusively event-driven. A global `event_queue` handles routing `EVENT_MOUSE` and `EVENT_KEY` packets to `wm_handle_mouse` and the active focused Window structure.
 
 ### Context Switching
-- The system currently operates on a single core in a monolithic loop. If adding preemptive multitasking or a scheduler later, ensure that `cli` and `sti` are heavily audited around state mutations, as there are currently no spinlocks protecting global state.
+- The system currently operates on a single core in a monolithic loop. If adding preemptive multitasking or a scheduler later, please ensure that `cli` and `sti` are heavily audited around state mutations, as there are currently no spinlocks protecting global state.
