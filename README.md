@@ -61,11 +61,6 @@ make initrd
 ```
 This generates a 1.44 MB `initrd.img` formatted as FAT12 containing your files.
 
-*(Optional)*: Use `make_wallpaper.py` to generate a lightweight geometric gradient BMP to test the wallpaper engine:
-```bash
-python3 make_wallpaper.py initrd_files/wallpaper.bmp
-```
-
 ### 2. Build the Bootable ISO (`tsukasa.iso`)
 Once the initrd is ready, compile the kernel and package everything into a GRUB2 bootable ISO:
 
