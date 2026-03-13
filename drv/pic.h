@@ -5,13 +5,7 @@
 #ifndef PIC_H
 #define PIC_H
 
-#include <stdint.h>
-
-static inline void outb(uint16_t port, uint8_t val)
-{
-    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-#define PIC_H
+#include "../drv/ps2.h"
 
 /**
  * Initialize PIC: remap IRQs to vectors 32-47, mask all except keyboard.

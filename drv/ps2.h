@@ -5,14 +5,20 @@
 #ifndef PS2_H
 #define PS2_H
 
-#define PS2_DATA  0x60
+#define PS2_DATA   0x60
 #define PS2_STATUS 0x64
+#define PS2_CMD    0x64
 
 static inline unsigned char inb(unsigned short port)
 {
     unsigned char val;
     __asm__ volatile ("inb %1, %0" : "=a"(val) : "Nd"(port));
     return val;
+}
+
+static inline void outb(unsigned short port, unsigned char val)
+{
+    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 
 #endif /* PS2_H */

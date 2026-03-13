@@ -5,6 +5,7 @@
 #ifndef PAGING_H
 #define PAGING_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /** Page size in bytes (must match mm/pmm.h). */
@@ -69,5 +70,15 @@ int paging_map(uintptr_t virt, uintptr_t phys, uint32_t flags);
  * @param virt Virtual address (page-aligned).
  */
 void paging_unmap(uintptr_t virt);
+
+/**
+ * Identity-map a physical range (e.g. framebuffer) so it is accessible with paging on.
+ * Use for framebuffer above 4 MiB. Maps a full 4 MiB region containing phys_base.
+ *
+ * @param phys_base Physical base address of the region (e.g. framebuffer_addr).
+ * @param size      Size in bytes (used only to ensure we map at least one 4 MiB region).
+ * @return 0 on success, -1 if phys_base is in first 4 MiB (already mapped).
+ */
+int paging_map_framebuffer(uintptr_t phys_base, size_t size);
 
 #endif /* PAGING_H */
