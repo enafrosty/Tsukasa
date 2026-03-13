@@ -11,7 +11,7 @@
 #include "drv/fb.h"
 #include "drv/pic.h"
 #include "gfx/blit.h"
-#include "gfx/win311.h"
+#include "gfx/theme.h"
 #include "input/event.h"
 #include "fs/vfs.h"
 #include "proc/task.h"
@@ -55,7 +55,7 @@ void kernel_main(uint32_t magic, uint32_t info)
         paging_map_framebuffer((uintptr_t)fb_info.addr,
                               (size_t)fb_info.pitch * (size_t)fb_info.height);
     if (fb_info.addr && fb_info.bpp == 32)
-        fb_fill_rect(0, 0, fb_info.width, fb_info.height, WIN311_DESKTOP);
+        fb_fill_rect(0, 0, fb_info.width, fb_info.height, THEME_BG_TOP);
 
     /* Initialize input/events and remap the PIC so hardware IRQs (keyboard)
        use vectors 32+ instead of clobbering CPU exception vectors like 0x08. */
