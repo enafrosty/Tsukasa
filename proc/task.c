@@ -6,15 +6,17 @@
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
 #include "../include/paging.h"
-#include "../vga.h"
+#include "../include/spinlock.h"
+#include "../include/kprintf.h"
 #include "../drv/fb.h"
 #include "../gfx/desktop.h"
 #include <stddef.h>
 #include <stdint.h>
 
-static task_t *current_task;
-static task_t *ready_list;
-static uint32_t next_pid;
+static task_t    *current_task;
+static task_t    *ready_list;
+static uint32_t   next_pid;
+static spinlock_t task_lock = SPINLOCK_INIT;
 
 extern void context_switch(uint32_t *save_esp, uint32_t next_esp);
 extern void switch_to_user(uint32_t eip, uint32_t esp, uint32_t eflags);
@@ -46,8 +48,7 @@ void idle_task(void)
 
 void main_kernel_task(void)
 {
-    /* Text banner in VGA. */
-    vga_puts_row(0, "Tsukasa kernel main task");
+    kprintf("[task] main kernel task started\n");
 
     /* If we have a 32bpp framebuffer, run the desktop shell. */
     if (fb_info.addr && fb_info.bpp == 32) {
@@ -82,8 +83,8 @@ task_t *task_create(void (*entry)(void))
 
     /* Set up stack: at top of stack, push entry point so ret jumps there. */
     uint32_t *stack_top = (uint32_t *)(stack_phys + TASK_STACK_SIZE - 4);
-    stack_top[0] = (uint32_t)entry;
-    t->esp = (uint32_t)stack_top;
+    stack_top[0] = (uint32_t)(uintptr_t)entry;
+    t->esp = (uint32_t)(uintptr_t)stack_top;
 
     return t;
 }
@@ -117,7 +118,7 @@ task_t *task_create_user(uint32_t entry_addr, uint32_t stack_addr)
     stack_top[2] = 0x202;   /* eflags with IF=1 */
     stack_top[3] = stack_addr;
     stack_top[4] = 0x23;
-    t->esp = (uint32_t)stack_top;
+    t->esp = (uint32_t)(uintptr_t)stack_top;
 
     return t;
 }
@@ -139,17 +140,20 @@ void task_ready(task_t *t)
     if (!t)
         return;
     t->state = TASK_READY;
+    spin_lock(&task_lock);
     t->next = ready_list;
     ready_list = t;
+    spin_unlock(&task_lock);
 }
 
 task_t *task_next_ready(void)
 {
-    if (!ready_list)
-        return NULL;
+    spin_lock(&task_lock);
+    if (!ready_list) { spin_unlock(&task_lock); return NULL; }
     task_t *t = ready_list;
     ready_list = ready_list->next;
     t->next = NULL;
+    spin_unlock(&task_lock);
     return t;
 }
 

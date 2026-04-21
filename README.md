@@ -1,97 +1,183 @@
-# Project Tsukasa - The Operating System
+# Project Tsukasa - Operating System
 
-Tsukasa is a modern, 32-bit bare-metal desktop operating system built entirely in C and Assembly. It features a custom window manager with a translucent glass aesthetic, a functional FAT12 ramdisk, and a suite of built-in desktop utilities.
-**Note:** This project is built from scratch without the standard C library (`libc`) or standard OS headers.
+Tsukasa is a freestanding hobby operating system written in C and Assembly. It now supports two boot/build paths during migration:
 
-![alt text](https://w0.peakpx.com/wallpaper/235/811/HD-wallpaper-anime-tonikawa-over-the-moon-for-you-tsukasa-yuzaki.jpg)
+- Legacy `i386` path (GRUB + Multiboot v1)
+- New `x86_64` foundation path (Limine)
 
+The project is currently in a phased migration toward a BoredOS-aligned x64 architecture.
 
-## Development Status
-This project is currently in early development. Major components are being implemented. 
+![Tsukasa wallpaper](https://w0.peakpx.com/wallpaper/235/811/HD-wallpaper-anime-tonikawa-over-the-moon-for-you-tsukasa-yuzaki.jpg)
 
+## Migration Status
 
-## Features
+- Phase 0 (baseline audit/documentation): complete
+- Phase 1 (x86_64 platform migration foundation): complete
+- Phase 2+: planned
 
-- **Modern Compositing Window Manager:**
-  - True Z-ordering, focus management, drag-and-drop, and window closing.
-  - Sleek, semi-transparent "dark glass" UI with drop shadows, rounded corners, and macOS-style traffic light window buttons.
-  - Global accent colors configurable at runtime.
-- **Virtual File System (VFS):**
-  - **FAT12 (`/`)**: A fully functional FAT12 driver running off a Multiboot ramdisk module (`initrd.img`). Supports directory enumeration and file reading.
-  - **MemFS (`/tmp/`)**: An in-memory writable filesystem for storing application data during a session.
-- **Desktop Environment & Applications:**
-  - **Desktop Shell**: A functional taskbar with active window pills, start menu, and desktop shortcut icons.
-  - **Settings**: System personalization app to dynamically change the global window accent color and set desktop `.bmp` wallpapers.
-  - **File Manager**: A robust graphical file browser that explores the FAT12 disk, featuring icon grids and double-click execution.
-  - **Notepad**: A text editor capable of reading from the FAT12 disk and saving buffers to the `memfs` tmp directory.
-  - **Calculator & Terminal**: Functional utility applications.
-- **BMP Wallpaper Engine**: Natively parses 24-bit and 32-bit uncompressed BMP files and nearest-neighbor scales them into the framebuffer VRAM natively.
+Reference docs:
 
----
+- `docs/baseline/PHASE_0_EXECUTION_LOG.md`
+- `docs/baseline/COMPATIBILITY_MAP.md`
+- `phase_plans/PHASE_1_X64_FOUNDATION.md`
+- `docs/migration/PHASE_1_EXECUTION_LOG.md`
+- `TSUKASA_BOREDOS_GAP_AND_IMPLEMENTATION_PLAN.md`
 
+## Current Capabilities
 
-## Build Dependencies (WSL / Linux)
+### Desktop and UI
 
-The OS uses a standard i686 GCC cross-compiler toolchain and is designed to be built in Linux or WSL (Windows Subsystem for Linux). 
+- Compositing window manager with Z-order, focus, drag, close controls
+- Desktop shell with taskbar, start menu, icons
+- Built-in apps: Notepad, File Manager, Settings, Calculator, Terminal, About
+- 32bpp framebuffer rendering and BMP wallpaper loading
 
-To install the required tools rapidly on Ubuntu/Debian, run the included setup script:
+### Filesystems and Storage
+
+- FAT12 ramdisk mounted at `/` from `initrd.img`
+- MemFS mounted at `/tmp` for writable volatile files
+- FAT32 ATA disk mounted at `/disk` when present
+
+### Platform and Boot
+
+- Early serial diagnostics on COM1
+- Descriptor tables and interrupt handling operational on x64 BSP
+- Keyboard/mouse IRQ routing via PIC (single-core)
+
+## Boot Architecture Paths
+
+### `ARCH=i386` (legacy path)
+
+- Bootloader: GRUB (Multiboot v1)
+- Entry: `boot.s` -> `kernel_main`
+- Paging model: legacy 32-bit bootstrap paging
+
+### `ARCH=x86_64` (new foundation path)
+
+- Bootloader: Limine
+- Entry: `arch/x86_64/boot/entry.asm` -> `tsukasa_x64_entry` -> `kernel_main_x64`
+- Boot info parser: `arch/x86_64/boot/boot_info.c`
+- New CPU platform code:
+  - `arch/x86_64/cpu/gdt.*`
+  - `arch/x86_64/cpu/idt.*`
+  - `arch/x86_64/cpu/isr.asm`
+- New memory layer:
+  - `mm/vmm_x64.*`
+  - higher-half and HHDM translation helpers
+
+## Build Dependencies (WSL/Linux)
+
+Required tools:
+
+- `build-essential` (`gcc`, `make`, `ld`)
+- `nasm`
+- `xorriso`
+- `dosfstools` (`mkfs.fat`, `mcopy`)
+- `qemu-system-x86_64` and/or `qemu-system-i386`
+- `git` (used to fetch/build Limine artifacts for `ARCH=x86_64`)
+- `grub-mkrescue` (for `ARCH=i386` ISO path)
+
+Setup helper (Ubuntu/Debian):
+
 ```bash
 chmod +x setup_wsl.sh
 ./setup_wsl.sh
 ```
 
-Dependencies include:
-- `build-essential` (gcc, make)
-- `nasm` (for boot and interrupt assembly)
-- `grub-common`, `grub-pc-bin`, `xorriso` (to pack the final bootable ISO)
-- `dosfstools` (for `mformat` and `mcopy` to pack the FAT12 initrd image)
+## Build Instructions
 
----
+Always run `make clean` when switching architectures.
 
-## Building the OS
+## Quick Start (Windows PowerShell + WSL)
 
-The build process is completely automated via the `Makefile`. 
+Run these from PowerShell in the project root:
 
-### 1. Build the FAT12 Ramdisk (`initrd.img`)
-The OS relies on an initial ramdisk for its file system. 
-Place any files you want the OS to read (like a `wallpaper.bmp` or text files) inside the `initrd_files/` directory, then run:
+```powershell
+cd C:\Users\frost145\Projects\tsukasa
+```
+
+Optional tool check in WSL:
+
+```powershell
+wsl bash -lc "which gcc nasm make xorriso qemu-system-x86_64 qemu-system-i386"
+```
+
+Build + run `x86_64` (Limine):
+
+```powershell
+wsl bash -lc "cd /mnt/c/Users/frost145/Projects/tsukasa && make clean && make initrd && make ARCH=x86_64 iso"
+wsl bash -lc "cd /mnt/c/Users/frost145/Projects/tsukasa && qemu-system-x86_64 -cdrom tsukasa.iso -hda disk.img -boot d -m 256 -smp 1 -vga std -serial stdio"
+```
+
+Build + run legacy `i386` (GRUB):
+
+```powershell
+wsl bash -lc "cd /mnt/c/Users/frost145/Projects/tsukasa && make clean && make initrd && make ARCH=i386 iso"
+wsl bash -lc "cd /mnt/c/Users/frost145/Projects/tsukasa && qemu-system-i386 -cdrom tsukasa.iso -hda disk.img -boot d -m 64 -vga std -serial stdio"
+```
+
+### Build initrd
 
 ```bash
 make initrd
 ```
-This generates a 1.44 MB `initrd.img` formatted as FAT12 containing your files.
 
-### 2. Build the Bootable ISO (`tsukasa.iso`)
-Once the initrd is ready, compile the kernel and package everything into a GRUB2 bootable ISO:
+### Build x86_64 (Limine) ISO
 
 ```bash
-make iso
+make clean
+make initrd
+make ARCH=x86_64 iso
 ```
 
----
+Output kernel artifact: `tsukasa_x64.elf`
 
-## Running in QEMU
+### Build i386 (GRUB) ISO
 
-I strongly recommend **QEMU** for testing, as VirtualBox often defaults to UEFI which is incompatible with this Multiboot v1 legacy-BIOS kernel.
-
-To run the ISO in QEMU with 64MB of RAM (adjust display parameters as needed for your host OS):
-
-```powershell
-qemu-system-i386 -cdrom tsukasa.iso -m 64 -vga std -display sdl
+```bash
+make clean
+make initrd
+make ARCH=i386 iso
 ```
 
----
+Output kernel artifact: `tsukasa.bin`
 
-## Kernel Architecture Notes
+## Run in QEMU
 
-### Memory & Paging
-- The kernel boots at the 1 MiB mark.
-- Paging is enabled at boot, identity mapping the first **16 MiB** of physical RAM. You can dynamically allocate up to 16 MiB of contiguous physical memory without worrying about virtual memory page fault mapping.
-- The `kmalloc` memory allocator automatically requests `4KB` pages from the Physical Memory Manager (`PMM`) when the 16KB heap is exhausted.
+### x86_64 path (recommended)
 
-### Input & Events
-- `ps2mouse.c` tracks Mouse packets over IRQ 12. 
-- Window redraws are exclusively event-driven. A global `event_queue` handles routing `EVENT_MOUSE` and `EVENT_KEY` packets to `wm_handle_mouse` and the active focused Window structure.
+```bash
+qemu-system-x86_64 -cdrom tsukasa.iso -hda disk.img -boot d -m 256 -smp 1 -vga std -serial stdio
+```
 
-### Context Switching
-- The system currently operates on a single core in a monolithic loop. If adding preemptive multitasking or a scheduler later, please ensure that `cli` and `sti` are heavily audited around state mutations, as there are currently no spinlocks protecting global state.
+### i386 legacy path
+
+```bash
+qemu-system-i386 -cdrom tsukasa.iso -hda disk.img -boot d -m 64 -vga std -serial stdio
+```
+
+## Validated x64 Phase 1 Milestones
+
+The current x64 path has been validated to:
+
+- boot reliably in QEMU single-core mode
+- emit early serial diagnostics
+- initialize framebuffer
+- initialize PMM/heap from Limine-derived boot info
+- initialize x64 GDT/IDT/TSS and handle exceptions
+- mount FAT12/FAT32 paths and enter desktop loop
+
+## Known Limitations (Current)
+
+- Single-core only on x64 (no SMP scheduler/AP bring-up yet)
+- PIC-based IRQ path retained (APIC/timer preemption deferred to later phase)
+- Full x64 syscall/process ABI expansion is not complete yet
+- Some workflows still require manual testing (GUI interaction regressions)
+
+## Notes for Contributors
+
+- Keep architecture-specific code under clear folder boundaries (`arch/x86_64/*` vs legacy paths).
+- Prefer serial logs for early boot debugging.
+- When changing migration behavior, update:
+  - `docs/migration/PHASE_1_EXECUTION_LOG.md`
+  - `TSUKASA_BOREDOS_GAP_AND_IMPLEMENTATION_PLAN.md`

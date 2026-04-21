@@ -12,11 +12,17 @@
 /** 4 KiB page size. */
 #define PAGE_SIZE 4096
 
-/** Maximum physical memory to track (256 MiB). */
+#ifdef __x86_64__
+/** Maximum physical memory to track on x64 path (64 GiB). */
+#define PMM_MAX_MEM_MB 65536
+#else
+/** Maximum physical memory to track on i386 path (256 MiB). */
 #define PMM_MAX_MEM_MB 256
+#endif
 
 /** Total number of frames. */
-#define PMM_FRAME_COUNT ((PMM_MAX_MEM_MB * 1024 * 1024) / PAGE_SIZE)
+#define PMM_FRAME_COUNT \
+    ((size_t)(((uint64_t)PMM_MAX_MEM_MB * 1024ULL * 1024ULL) / PAGE_SIZE))
 
 /**
  * Initialize the PMM from Multiboot memory map.

@@ -10,6 +10,8 @@
 #include "include/gdt.h"
 #include "drv/fb.h"
 #include "drv/pic.h"
+#include "drv/serial.h"
+#include "drv/rtc.h"
 #include "gfx/blit.h"
 #include "gfx/theme.h"
 #include "input/event.h"
@@ -17,6 +19,7 @@
 #include "proc/task.h"
 #include "proc/scheduler.h"
 #include "include/paging.h"
+#include "include/kprintf.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -31,23 +34,32 @@ void kernel_main(uint32_t magic, uint32_t info)
     (void)magic;
     (void)info;
 
+    /* Stage 1: serial port for debug output (must be first). */
+    serial_init();
+    kprintf("[boot] Tsukasa OS starting...\n");
+
     /* Stage 2: enable our page tables early. */
     paging_init();
+    kprintf("[boot] paging_init done\n");
 
     /* Stage 3: install IDT so exceptions are visible via idt_handler. */
     idt_init();
+    kprintf("[boot] idt_init done\n");
 
     /* Stage 4: initialize physical memory manager and heap. On failure,
        print an error and halt instead of continuing. */
     if (pmm_init((const void *)(uintptr_t)info) != 0) {
+        kprintf("[boot] PMM init failed — halting\n");
         vga_puts_row(0, "Tsukasa: PMM init failed");
         for (;;)
             __asm__ volatile ("hlt");
     }
     heap_init();
+    kprintf("[heap] TLSF pool ready\n");
 
     /* Stage 5: set up our own GDT/TSS (uses stack_top from boot.s). */
     gdt_init();
+    kprintf("[boot] gdt_init done\n");
 
     /* Stage 6: initialize framebuffer; map it if above 4 MiB, then fill. */
     fb_init((const void *)(uintptr_t)info);
@@ -56,6 +68,18 @@ void kernel_main(uint32_t magic, uint32_t info)
                               (size_t)fb_info.pitch * (size_t)fb_info.height);
     if (fb_info.addr && fb_info.bpp == 32)
         fb_fill_rect(0, 0, fb_info.width, fb_info.height, THEME_BG_TOP);
+    kprintf("[boot] framebuffer %ux%u bpp=%u\n",
+            fb_info.width, fb_info.height, fb_info.bpp);
+
+    /* Initialize RTC clock and log current time. */
+    rtc_init();
+    {
+        rtc_time_t now;
+        rtc_read(&now);
+        kprintf("[rtc] %04u-%02u-%02u %02u:%02u:%02u UTC\n",
+                (unsigned)now.year, (unsigned)now.month, (unsigned)now.day,
+                (unsigned)now.hour, (unsigned)now.min,   (unsigned)now.sec);
+    }
 
     /* Initialize input/events and remap the PIC so hardware IRQs (keyboard)
        use vectors 32+ instead of clobbering CPU exception vectors like 0x08. */
