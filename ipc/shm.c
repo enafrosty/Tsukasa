@@ -5,9 +5,7 @@
 
 #include "shm.h"
 #include "../mm/pmm.h"
-#include "include/paging.h"
-#include "../mm/heap.h"
-#include "../proc/task.h"
+#include "../include/spinlock.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -26,6 +24,7 @@ struct shm_region {
 
 static struct shm_region shm_regions[SHM_MAX_REGIONS];
 static int next_shm_id = 1;
+static spinlock_t shm_lock = SPINLOCK_INIT;
 
 static struct shm_region *shm_find(int id)
 {
@@ -55,8 +54,10 @@ int shm_create(size_t size)
     if (phys == 0)
         return -1;
 
+    spin_lock(&shm_lock);
     struct shm_region *r = shm_alloc_slot();
     if (!r) {
+        spin_unlock(&shm_lock);
         pmm_free_pages(phys, page_count);
         return -1;
     }
@@ -68,20 +69,22 @@ int shm_create(size_t size)
     r->ref_count = 1;
     r->attach_count = 0;
     r->in_use = 1;
+    spin_unlock(&shm_lock);
     return r->id;
 }
 
 void *shm_attach(int shm_id)
 {
+    spin_lock(&shm_lock);
     struct shm_region *r = shm_find(shm_id);
-    if (!r)
-        return NULL;
+    if (!r) { spin_unlock(&shm_lock); return NULL; }
 
     /* For now, we use identity mapping - return physical addr as virtual.
      * Proper implementation would map into process address space.
      * Since we don't have per-process page dirs for user yet, this works
      * for kernel tasks. */
     r->attach_count++;
+    spin_unlock(&shm_lock);
     return (void *)r->phys_base;
 }
 
@@ -89,6 +92,7 @@ void shm_detach(void *addr)
 {
     if (!addr)
         return;
+    spin_lock(&shm_lock);
     for (int i = 0; i < SHM_MAX_REGIONS; i++) {
         if (shm_regions[i].in_use &&
             (uintptr_t)addr >= shm_regions[i].phys_base &&
@@ -99,19 +103,22 @@ void shm_detach(void *addr)
             break;
         }
     }
+    spin_unlock(&shm_lock);
 }
 
 int shm_destroy(int shm_id)
 {
+    spin_lock(&shm_lock);
     struct shm_region *r = shm_find(shm_id);
-    if (!r)
-        return -1;
-    if (r->attach_count > 0)
-        return -1;
+    if (!r) { spin_unlock(&shm_lock); return -1; }
+    if (r->attach_count > 0) { spin_unlock(&shm_lock); return -1; }
     r->ref_count--;
-    if (r->ref_count <= 0) {
-        pmm_free_pages(r->phys_base, r->page_count);
-        r->in_use = 0;
-    }
+    int should_free = (r->ref_count <= 0);
+    uintptr_t phys = r->phys_base;
+    size_t pages   = r->page_count;
+    if (should_free) r->in_use = 0;
+    spin_unlock(&shm_lock);
+    if (should_free)
+        pmm_free_pages(phys, pages);
     return 0;
 }
