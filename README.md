@@ -1,128 +1,129 @@
-# Project Tsukasa - Operating System
+# Project Tsukasa - The Operating System
 
-Tsukasa is a freestanding hobby operating system written in C and Assembly. It now supports two boot/build paths during migration:
-
-- Legacy `i386` path (GRUB + Multiboot v1)
-- New `x86_64` foundation path (Limine)
-
-The project is currently in a phased migration toward a BoredOS-aligned x64 architecture.
+Tsukasa is a freestanding hobby operating system written in C and Assembly, built without the standard C library (`libc`).
+It currently supports both a legacy 32-bit boot path and a new 64-bit migration foundation.
 
 ![Tsukasa wallpaper](https://w0.peakpx.com/wallpaper/235/811/HD-wallpaper-anime-tonikawa-over-the-moon-for-you-tsukasa-yuzaki.jpg)
 
-## Migration Status
+## Development Status
 
-- Phase 0 (baseline audit/documentation): complete
-- Phase 1 (x86_64 platform migration foundation): complete
-- Phase 2+: planned
+Tsukasa is in active development.
 
-Reference docs:
+Current state:
+- Stable legacy `i386` path (GRUB + Multiboot v1)
+- New single-core `x86_64` foundation path (Limine)
+- Desktop loop, framebuffer, serial diagnostics, and input IRQ flow operational on x64 BSP
 
-- `docs/baseline/PHASE_0_EXECUTION_LOG.md`
-- `docs/baseline/COMPATIBILITY_MAP.md`
-- `phase_plans/PHASE_1_X64_FOUNDATION.md`
-- `docs/migration/PHASE_1_EXECUTION_LOG.md`
-- `TSUKASA_BOREDOS_GAP_AND_IMPLEMENTATION_PLAN.md`
+## Features
 
-## Current Capabilities
+### Desktop & UI
 
-### Desktop and UI
+- Custom compositing window manager with:
+  - Z-order and focus handling
+  - Drag/move window interactions
+  - Close controls and desktop shell integration
+- Desktop shell with:
+  - Taskbar
+  - Start menu
+  - App icons
+- Built-in apps:
+  - Notepad
+  - File Manager
+  - Settings
+  - Calculator
+  - Terminal
+  - About
+- 32-bit color framebuffer rendering
+- BMP wallpaper loading and scaling
 
-- Compositing window manager with Z-order, focus, drag, close controls
-- Desktop shell with taskbar, start menu, icons
-- Built-in apps: Notepad, File Manager, Settings, Calculator, Terminal, About
-- 32bpp framebuffer rendering and BMP wallpaper loading
+### Filesystems & Storage
 
-### Filesystems and Storage
+- FAT12 ramdisk (`/`) via `initrd.img`
+- MemFS (`/tmp`) for writable volatile files
+- FAT32 ATA disk mount (`/disk`) when detected
 
-- FAT12 ramdisk mounted at `/` from `initrd.img`
-- MemFS mounted at `/tmp` for writable volatile files
-- FAT32 ATA disk mounted at `/disk` when present
+### Platform
 
-### Platform and Boot
+- Early COM1 serial logging for boot diagnostics
+- x64 descriptor setup (GDT/IDT/TSS)
+- Exception handling with usable diagnostics
+- PIC-based IRQ routing for keyboard/mouse on BSP
 
-- Early serial diagnostics on COM1
-- Descriptor tables and interrupt handling operational on x64 BSP
-- Keyboard/mouse IRQ routing via PIC (single-core)
+## Boot Paths
 
-## Boot Architecture Paths
+### `ARCH=i386` (legacy)
 
-### `ARCH=i386` (legacy path)
+- Bootloader: GRUB
+- Protocol: Multiboot v1
+- Kernel artifact: `tsukasa.bin`
 
-- Bootloader: GRUB (Multiboot v1)
-- Entry: `boot.s` -> `kernel_main`
-- Paging model: legacy 32-bit bootstrap paging
-
-### `ARCH=x86_64` (new foundation path)
+### `ARCH=x86_64` (new foundation)
 
 - Bootloader: Limine
-- Entry: `arch/x86_64/boot/entry.asm` -> `tsukasa_x64_entry` -> `kernel_main_x64`
-- Boot info parser: `arch/x86_64/boot/boot_info.c`
-- New CPU platform code:
-  - `arch/x86_64/cpu/gdt.*`
-  - `arch/x86_64/cpu/idt.*`
-  - `arch/x86_64/cpu/isr.asm`
-- New memory layer:
-  - `mm/vmm_x64.*`
-  - higher-half and HHDM translation helpers
+- Kernel artifact: `tsukasa_x64.elf`
+- Includes:
+  - x64 boot entry
+  - Limine boot info parsing (framebuffer/memory map/modules)
+  - x64 CPU descriptor/interrupt setup
+  - Higher-half / HHDM memory groundwork
 
-## Build Dependencies (WSL/Linux)
+## Build Dependencies (WSL / Linux)
 
-Required tools:
-
+Required:
 - `build-essential` (`gcc`, `make`, `ld`)
 - `nasm`
 - `xorriso`
 - `dosfstools` (`mkfs.fat`, `mcopy`)
+- `git`
 - `qemu-system-x86_64` and/or `qemu-system-i386`
-- `git` (used to fetch/build Limine artifacts for `ARCH=x86_64`)
-- `grub-mkrescue` (for `ARCH=i386` ISO path)
+- `grub-mkrescue` (for legacy i386 ISO path)
 
-Setup helper (Ubuntu/Debian):
+Setup helper:
 
 ```bash
 chmod +x setup_wsl.sh
 ./setup_wsl.sh
 ```
 
-## Build Instructions
-
-Always run `make clean` when switching architectures.
-
 ## Quick Start (Windows PowerShell + WSL)
 
-Run these from PowerShell in the project root:
+From PowerShell:
 
 ```powershell
 cd C:\Users\frost145\Projects\tsukasa
 ```
 
-Optional tool check in WSL:
+Optional tool check:
 
 ```powershell
 wsl bash -lc "which gcc nasm make xorriso qemu-system-x86_64 qemu-system-i386"
 ```
 
-Build + run `x86_64` (Limine):
+### Build + Run `x86_64` (Limine)
 
 ```powershell
 wsl bash -lc "cd /mnt/c/Users/frost145/Projects/tsukasa && make clean && make initrd && make ARCH=x86_64 iso"
 wsl bash -lc "cd /mnt/c/Users/frost145/Projects/tsukasa && qemu-system-x86_64 -cdrom tsukasa.iso -hda disk.img -boot d -m 256 -smp 1 -vga std -serial stdio"
 ```
 
-Build + run legacy `i386` (GRUB):
+### Build + Run `i386` (legacy)
 
 ```powershell
 wsl bash -lc "cd /mnt/c/Users/frost145/Projects/tsukasa && make clean && make initrd && make ARCH=i386 iso"
 wsl bash -lc "cd /mnt/c/Users/frost145/Projects/tsukasa && qemu-system-i386 -cdrom tsukasa.iso -hda disk.img -boot d -m 64 -vga std -serial stdio"
 ```
 
-### Build initrd
+## Build Instructions (Manual)
+
+Always run `make clean` when switching architectures.
+
+Build initrd:
 
 ```bash
 make initrd
 ```
 
-### Build x86_64 (Limine) ISO
+Build x64 ISO:
 
 ```bash
 make clean
@@ -130,9 +131,7 @@ make initrd
 make ARCH=x86_64 iso
 ```
 
-Output kernel artifact: `tsukasa_x64.elf`
-
-### Build i386 (GRUB) ISO
+Build i386 ISO:
 
 ```bash
 make clean
@@ -140,44 +139,8 @@ make initrd
 make ARCH=i386 iso
 ```
 
-Output kernel artifact: `tsukasa.bin`
+## Runtime Notes
 
-## Run in QEMU
-
-### x86_64 path (recommended)
-
-```bash
-qemu-system-x86_64 -cdrom tsukasa.iso -hda disk.img -boot d -m 256 -smp 1 -vga std -serial stdio
-```
-
-### i386 legacy path
-
-```bash
-qemu-system-i386 -cdrom tsukasa.iso -hda disk.img -boot d -m 64 -vga std -serial stdio
-```
-
-## Validated x64 Phase 1 Milestones
-
-The current x64 path has been validated to:
-
-- boot reliably in QEMU single-core mode
-- emit early serial diagnostics
-- initialize framebuffer
-- initialize PMM/heap from Limine-derived boot info
-- initialize x64 GDT/IDT/TSS and handle exceptions
-- mount FAT12/FAT32 paths and enter desktop loop
-
-## Known Limitations (Current)
-
-- Single-core only on x64 (no SMP scheduler/AP bring-up yet)
-- PIC-based IRQ path retained (APIC/timer preemption deferred to later phase)
-- Full x64 syscall/process ABI expansion is not complete yet
-- Some workflows still require manual testing (GUI interaction regressions)
-
-## Notes for Contributors
-
-- Keep architecture-specific code under clear folder boundaries (`arch/x86_64/*` vs legacy paths).
-- Prefer serial logs for early boot debugging.
-- When changing migration behavior, update:
-  - `docs/migration/PHASE_1_EXECUTION_LOG.md`
-  - `TSUKASA_BOREDOS_GAP_AND_IMPLEMENTATION_PLAN.md`
+- The x64 path is intentionally single-core in the current foundation stage.
+- Interrupt routing is currently PIC-based; APIC/timer preemption work is future work.
+- If boot debugging is needed, prioritize serial output (`-serial stdio`) in QEMU.
