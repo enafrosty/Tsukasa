@@ -90,8 +90,10 @@ chmod +x setup_wsl.sh
 From PowerShell:
 
 ```powershell
-cd C:\Users\frost145\Projects\tsukasa
+cd <path-to-tsukasa>
 ```
+
+Tip: in WSL, a Windows path like `C:\dev\tsukasa` becomes `/mnt/c/dev/tsukasa`.
 
 Optional tool check:
 
@@ -102,15 +104,15 @@ wsl bash -lc "which gcc nasm make xorriso qemu-system-x86_64 qemu-system-i386"
 ### Build + Run `x86_64` (Limine)
 
 ```powershell
-wsl bash -lc "cd /mnt/c/Users/frost145/Projects/tsukasa && make clean && make initrd && make ARCH=x86_64 iso"
-wsl bash -lc "cd /mnt/c/Users/frost145/Projects/tsukasa && qemu-system-x86_64 -cdrom tsukasa.iso -hda disk.img -boot d -m 256 -smp 1 -vga std -serial stdio"
+wsl bash -lc "cd <wsl-path-to-tsukasa> && make clean && make initrd && make ARCH=x86_64 iso"
+wsl bash -lc "cd <wsl-path-to-tsukasa> && qemu-system-x86_64 -cdrom tsukasa.iso -hda disk.img -boot d -m 256 -smp 1 -vga std -serial stdio"
 ```
 
 ### Build + Run `i386` (legacy)
 
 ```powershell
-wsl bash -lc "cd /mnt/c/Users/frost145/Projects/tsukasa && make clean && make initrd && make ARCH=i386 iso"
-wsl bash -lc "cd /mnt/c/Users/frost145/Projects/tsukasa && qemu-system-i386 -cdrom tsukasa.iso -hda disk.img -boot d -m 64 -vga std -serial stdio"
+wsl bash -lc "cd <wsl-path-to-tsukasa> && make clean && make initrd && make ARCH=i386 iso"
+wsl bash -lc "cd <wsl-path-to-tsukasa> && qemu-system-i386 -cdrom tsukasa.iso -hda disk.img -boot d -m 64 -vga std -serial stdio"
 ```
 
 ## Build Instructions (Manual)
