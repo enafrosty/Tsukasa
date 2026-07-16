@@ -20,6 +20,7 @@ static size_t pmm_total_frames;
 
 /** First frame index (after reserved regions). */
 static size_t pmm_first_usable;
+static size_t pmm_free_frames;
 
 static inline size_t addr_to_frame(uint64_t addr)
 {
@@ -84,6 +85,30 @@ static void refresh_first_usable(void)
     }
 }
 
+static void recompute_free_frames(void)
+{
+    size_t free_count = 0;
+    for (size_t i = 0; i < pmm_total_frames; i++) {
+        if (bitmap_get(i))
+            free_count++;
+    }
+    pmm_free_frames = free_count;
+}
+
+static uint64_t boot_addr_to_phys(const struct tsukasa_boot_info *bi, uint64_t addr)
+{
+    if (!bi)
+        return addr;
+
+    if (bi->hhdm_offset && addr >= bi->hhdm_offset)
+        return addr - bi->hhdm_offset;
+
+    if (addr >= TSUKASA_VA_KERNEL_BASE)
+        return addr - TSUKASA_VA_KERNEL_BASE;
+
+    return addr;
+}
+
 int pmm_init(const void *boot_info)
 {
     const struct multiboot_info *mb = (const struct multiboot_info *)boot_info;
@@ -113,7 +138,27 @@ int pmm_init(const void *boot_info)
         /* Keep low memory reserved. */
         mark_region(0, 0x100000u, false);
 
+        /* Reserve loaded kernel image explicitly on boot-info path. */
+        {
+            uint64_t kstart = boot_addr_to_phys(bi, (uint64_t)(uintptr_t)_kernel_start);
+            uint64_t kend = boot_addr_to_phys(bi, (uint64_t)(uintptr_t)_kernel_end);
+            kend = (kend + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+            mark_region(kstart, kend, false);
+        }
+
+        /* Reserve boot modules explicitly when present. */
+        if (bi->modules && bi->module_count > 0) {
+            for (uint64_t i = 0; i < bi->module_count; i++) {
+                uint64_t mstart = boot_addr_to_phys(bi, bi->modules[i].address);
+                uint64_t mend = mstart + bi->modules[i].size;
+                mstart &= ~(uint64_t)(PAGE_SIZE - 1);
+                mend = (mend + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+                mark_region(mstart, mend, false);
+            }
+        }
+
         refresh_first_usable();
+        recompute_free_frames();
         return 0;
     }
 
@@ -162,6 +207,7 @@ int pmm_init(const void *boot_info)
     }
 
     refresh_first_usable();
+    recompute_free_frames();
     return 0;
 }
 
@@ -187,6 +233,10 @@ uintptr_t pmm_alloc_pages(size_t count)
         if (found) {
             for (size_t i = 0; i < count; i++)
                 bitmap_set(start + i, false);
+            if (pmm_free_frames >= count)
+                pmm_free_frames -= count;
+            else
+                pmm_free_frames = 0;
             return frame_to_addr(start);
         }
     }
@@ -206,9 +256,30 @@ void pmm_free_pages(uintptr_t phys, size_t count)
         return;
 
     size_t start = addr_to_frame((uint64_t)phys);
-    for (size_t i = 0; i < count && (start + i) < pmm_total_frames; i++)
-        bitmap_set(start + i, true);
+    for (size_t i = 0; i < count && (start + i) < pmm_total_frames; i++) {
+        if (!bitmap_get(start + i)) {
+            bitmap_set(start + i, true);
+            pmm_free_frames++;
+        }
+    }
 
     if (start < pmm_first_usable)
         pmm_first_usable = start;
+}
+
+uintptr_t pmm_total_page_count(void)
+{
+    return (uintptr_t)pmm_total_frames;
+}
+
+uintptr_t pmm_used_page_count(void)
+{
+    if (pmm_total_frames < pmm_free_frames)
+        return 0;
+    return (uintptr_t)(pmm_total_frames - pmm_free_frames);
+}
+
+uintptr_t pmm_free_page_count(void)
+{
+    return (uintptr_t)pmm_free_frames;
 }

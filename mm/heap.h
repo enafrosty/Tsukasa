@@ -8,6 +8,12 @@
 
 #include <stddef.h>
 
+typedef struct heap_stats {
+    size_t pool_bytes;
+    size_t allocated_bytes;
+    size_t peak_allocated_bytes;
+} heap_stats_t;
+
 /**
  * Initialize the kernel heap. Must be called after pmm_init and paging_init.
  */
@@ -27,5 +33,10 @@ void *kmalloc(size_t size);
  * @param ptr Pointer returned by kmalloc (NULL is safe).
  */
 void kfree(void *ptr);
+
+/**
+ * Snapshot heap accounting.
+ */
+void heap_get_stats(heap_stats_t *out);
 
 #endif /* HEAP_H */
