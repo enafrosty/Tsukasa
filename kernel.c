@@ -86,7 +86,7 @@ void kernel_main(uint32_t magic, uint32_t info)
     event_init();
     pic_init();
 
-    /* Initialize Virtual File System (mounts FAT12 ramdisk if present). */
+    /* Initialize Virtual File System (bootfs/initrd/memfs root fallback, FAT12 optional). */
     vfs_init((const void *)(uintptr_t)info);
 
     /* Stage 7: basic tasking and scheduler with a single kernel task. */

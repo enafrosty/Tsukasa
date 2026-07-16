@@ -1,5 +1,5 @@
 # syscall_entry.s - int 0x80 syscall entry point.
-# Syscall number in eax, args in ebx, ecx, edx. Return value in eax.
+# Syscall number in eax, args in ebx, ecx, edx, esi, edi. Return value in eax.
 #
 
 .section .text
@@ -14,12 +14,14 @@ isr_128:
     pushl %edi
     pushl %ebp
 
+    pushl %edi
+    pushl %esi
     pushl %edx
     pushl %ecx
     pushl %ebx
     pushl %eax
     call syscall_handler
-    addl $16, %esp
+    addl $24, %esp
 
     popl %ebp
     popl %edi

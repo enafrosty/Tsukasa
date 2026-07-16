@@ -4,6 +4,8 @@
 
 .section .text
 
+.section .note.GNU-stack,"",@progbits
+
 .macro ISR_NOERR num
 .global isr_\num
 .type isr_\num, @function

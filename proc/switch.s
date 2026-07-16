@@ -6,6 +6,8 @@
 .global switch_to_user
 .type switch_to_user, @function
 
+.section .note.GNU-stack,"",@progbits
+
 switch_to_user:
     movl 4(%esp), %eax     /* eip */
     movl 8(%esp), %ecx     /* esp (user stack) */

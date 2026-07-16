@@ -40,6 +40,8 @@ stack_top:
 .global _start
 .type _start, @function
 
+.section .note.GNU-stack,"",@progbits
+
 _start:
     mov $stack_top, %esp
     mov $stack_top, %ebp

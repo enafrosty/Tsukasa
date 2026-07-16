@@ -7,6 +7,8 @@
 .global context_switch
 .type context_switch, @function
 
+.section .note.GNU-stack,"",@progbits
+
 context_switch:
     movl 4(%esp), %eax    /* save_esp (pointer) */
     movl 8(%esp), %ecx    /* next_esp */

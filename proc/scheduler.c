@@ -1,18 +1,35 @@
 /*
- * scheduler.c - Round-robin scheduler.
+ * scheduler.c - Scheduler compatibility layer.
  */
 
+#include "scheduler.h"
+
+#ifdef __x86_64__
+
+#include "process.h"
+
+void scheduler_init(void)
+{
+    process_init();
+}
+
+uint64_t scheduler_tick(uint64_t current_rsp)
+{
+    return process_schedule_tick(current_rsp);
+}
+
+void scheduler_run(void)
+{
+    process_start_scheduler();
+}
+
+#else
+
 #include "task.h"
-#include <stddef.h>
 
 extern void context_switch(uint32_t *save_esp, uint32_t next_esp);
 extern void switch_to_user(uint32_t eip, uint32_t esp, uint32_t eflags);
 
-/**
- * Enter the scheduler. Switches to the first ready task and never returns.
- * Call with interrupts disabled. The bootstrap context is saved and we
- * switch to the first task in the ready queue.
- */
 void scheduler_run(void)
 {
     task_t *next = task_next_ready();
@@ -30,3 +47,6 @@ void scheduler_run(void)
     }
     __builtin_unreachable();
 }
+
+#endif
+
