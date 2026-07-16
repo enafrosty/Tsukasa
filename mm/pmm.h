@@ -63,4 +63,11 @@ void pmm_free(uintptr_t phys);
  */
 void pmm_free_pages(uintptr_t phys, size_t count);
 
+/**
+ * PMM accounting snapshots.
+ */
+uintptr_t pmm_total_page_count(void);
+uintptr_t pmm_used_page_count(void);
+uintptr_t pmm_free_page_count(void);
+
 #endif /* PMM_H */
