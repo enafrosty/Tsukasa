@@ -79,15 +79,9 @@ void ps2mouse_init(void)
     ps2_mouse_write(0xF4);
     ps2_mouse_read();       /* ACK */
 
-    /* Unmask IRQ 12 on the slave PIC (IRQ 12 = slave bit 4). */
-    uint8_t mask = inb(0xA1);
-    mask &= ~(1 << 4);
-    outb(0xA1, mask);
-
-    /* Also make sure IRQ 2 (cascade) is unmasked on master. */
-    mask = inb(0x21);
-    mask &= ~(1 << 2);
-    outb(0x21, mask);
+    /* Keep PIC masks coherent with runtime mask bookkeeping. */
+    pic_unmask_irq(12);
+    pic_unmask_irq(2);
 }
 
 void ps2mouse_handler(void)
@@ -130,23 +124,68 @@ void ps2mouse_handler(void)
             /* Enqueue movement event. */
             if (dx != 0 || dy != 0) {
                 struct input_event ev;
+                ev.event_id = INPUT_EVENT_MOUSE_MOVE;
                 ev.type = EVENT_MOUSE;
                 ev.subtype = MOUSE_MOVE;
                 ev.keycode = buttons;
-                ev.x = (int16_t)cursor_x();
-                ev.y = (int16_t)cursor_y();
+                ev.x = cursor_x();
+                ev.y = cursor_y();
+                ev.wheel_delta = 0;
+                ev.width = 0;
+                ev.height = 0;
+                ev.modifiers = 0;
+                ev.window_id = -1;
                 event_enqueue(&ev);
             }
 
             /* Enqueue button change events. */
             uint8_t changed = buttons ^ mouse_buttons_prev;
-            if (changed) {
+            if (changed & MOUSE_BUTTON_LEFT) {
                 struct input_event ev;
+                int pressed = (buttons & MOUSE_BUTTON_LEFT) != 0;
+                ev.event_id = pressed ? INPUT_EVENT_MOUSE_DOWN : INPUT_EVENT_MOUSE_UP;
                 ev.type = EVENT_MOUSE;
-                ev.subtype = (buttons & changed) ? MOUSE_BTN_DOWN : MOUSE_BTN_UP;
+                ev.subtype = pressed ? MOUSE_BTN_DOWN : MOUSE_BTN_UP;
                 ev.keycode = buttons;
-                ev.x = (int16_t)cursor_x();
-                ev.y = (int16_t)cursor_y();
+                ev.x = cursor_x();
+                ev.y = cursor_y();
+                ev.wheel_delta = 0;
+                ev.width = 0;
+                ev.height = 0;
+                ev.modifiers = MOUSE_BUTTON_LEFT;
+                ev.window_id = -1;
+                event_enqueue(&ev);
+            }
+            if (changed & MOUSE_BUTTON_RIGHT) {
+                struct input_event ev;
+                int pressed = (buttons & MOUSE_BUTTON_RIGHT) != 0;
+                ev.event_id = pressed ? INPUT_EVENT_RIGHT_CLICK : INPUT_EVENT_MOUSE_UP;
+                ev.type = EVENT_MOUSE;
+                ev.subtype = pressed ? MOUSE_BTN_DOWN : MOUSE_BTN_UP;
+                ev.keycode = buttons;
+                ev.x = cursor_x();
+                ev.y = cursor_y();
+                ev.wheel_delta = 0;
+                ev.width = 0;
+                ev.height = 0;
+                ev.modifiers = MOUSE_BUTTON_RIGHT;
+                ev.window_id = -1;
+                event_enqueue(&ev);
+            }
+            if (changed & MOUSE_BUTTON_MIDDLE) {
+                struct input_event ev;
+                int pressed = (buttons & MOUSE_BUTTON_MIDDLE) != 0;
+                ev.event_id = pressed ? INPUT_EVENT_MOUSE_DOWN : INPUT_EVENT_MOUSE_UP;
+                ev.type = EVENT_MOUSE;
+                ev.subtype = pressed ? MOUSE_BTN_DOWN : MOUSE_BTN_UP;
+                ev.keycode = buttons;
+                ev.x = cursor_x();
+                ev.y = cursor_y();
+                ev.wheel_delta = 0;
+                ev.width = 0;
+                ev.height = 0;
+                ev.modifiers = MOUSE_BUTTON_MIDDLE;
+                ev.window_id = -1;
                 event_enqueue(&ev);
             }
             mouse_buttons_prev = buttons;

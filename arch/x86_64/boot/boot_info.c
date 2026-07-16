@@ -56,6 +56,14 @@ static volatile struct limine_kernel_address_request kernel_address_request = {
     .response = NULL,
 };
 
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_smp_request smp_request = {
+    .id = LIMINE_SMP_REQUEST,
+    .revision = 0,
+    .response = NULL,
+    .flags = 0,
+};
+
 __attribute__((used, section(".limine_requests_end")))
 static volatile uint64_t limine_requests_end_marker = 0;
 

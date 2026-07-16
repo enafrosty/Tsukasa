@@ -1,7 +1,16 @@
 /*
- * fat32.h - Minimal FAT32 filesystem driver.
+ * fat32.h - FAT32 filesystem driver.
  * Layered on ata_read_sectors / ata_write_sectors.
  * Mounted at /disk/ in the VFS.
+ *
+ * Supported semantics:
+ *   - Nested directory traversal for normalized absolute paths.
+ *   - Writes overwrite existing files in-place when cluster capacity is enough.
+ *   - Rename supports same-directory 8.3 target names only.
+ * Unsupported:
+ *   - Cross-directory rename.
+ *   - Cluster-chain growth during write.
+ *   - LFN rename.
  */
 
 #ifndef FAT32_H
@@ -52,5 +61,13 @@ int fat32_read_file(const char *path, void *buf, size_t max_bytes);
  * Returns 0 on success, -1 on error.
  */
 int fat32_write_file(const char *path, const void *buf, size_t size);
+
+/**
+ * Rename a file or directory in-place.
+ * Constraints: source/target must stay in the same parent directory and the
+ * target leaf must be a short 8.3 name.
+ * Returns 0 on success, -1 on unsupported or error.
+ */
+int fat32_rename(const char *old_path, const char *new_path);
 
 #endif /* FAT32_H */

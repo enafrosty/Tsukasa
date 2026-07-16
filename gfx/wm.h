@@ -7,6 +7,7 @@
 #define WM_H
 
 #include "blit.h"
+#include "../input/event.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -17,6 +18,8 @@
 #define WM_FLAG_ACTIVE    (1u << 1)
 #define WM_FLAG_DRAGGING  (1u << 2)
 #define WM_FLAG_CLOSABLE  (1u << 3)
+#define WM_FLAG_RESIZABLE (1u << 4)
+#define WM_FLAG_AUTOCLOSE (1u << 5)
 
 /* Must match UI_TITLE_H / UI_BORDER in ui.h */
 #define WM_TITLE_BAR_H    28
@@ -37,6 +40,7 @@ typedef void (*wm_event_fn)(wm_window_t *win, const void *event);
 
 struct wm_window {
     int x, y, w, h;
+    int min_w, min_h;
     char title[WM_TITLE_MAX];
     uint32_t flags;
 
@@ -53,6 +57,13 @@ struct wm_window {
     wm_window_t *prev;
     wm_window_t *next;
 };
+
+typedef struct wm_dirty_rect {
+    int x;
+    int y;
+    int w;
+    int h;
+} wm_dirty_rect_t;
 
 /**
  * Initialize the window manager.
@@ -90,9 +101,47 @@ wm_window_t *wm_find_window_at(int px, int py);
 int wm_handle_mouse(int mx, int my, int buttons, int btn_changed);
 
 /**
+ * Handle a normalized input event.
+ * Returns 1 if WM consumed the event, 0 otherwise.
+ */
+int wm_handle_input(const struct input_event *ev);
+
+/**
  * Redraw the entire desktop: all windows bottom-to-top.
  */
 void wm_redraw_all(void);
+
+/**
+ * Redraw windows intersecting a dirty rectangle.
+ */
+void wm_redraw_region(int x, int y, int w, int h);
+
+/**
+ * Set or clear resize ability for a window.
+ */
+void wm_set_resizable(wm_window_t *win, int resizable);
+
+/**
+ * Update a window title.
+ */
+void wm_set_title(wm_window_t *win, const char *title);
+
+/**
+ * Configure close button behavior.
+ * autoclose=1 keeps legacy behavior (destroy on close click).
+ */
+void wm_set_autoclose(wm_window_t *win, int autoclose);
+
+/**
+ * Mark a screen-space region as dirty.
+ */
+void wm_mark_dirty_rect(int x, int y, int w, int h);
+
+/**
+ * Drain pending dirty regions into caller buffer.
+ * Returns number of rectangles copied.
+ */
+int wm_collect_dirty_regions(wm_dirty_rect_t *out, int max);
 
 /**
  * Get the head (bottom) of the z-order list.

@@ -3,8 +3,10 @@ BITS 64
 section .text
 
 global isr_x64_ignore
+global process_entry_resume
 extern idt_exception_handler_x64
-extern irq_handler
+extern irq_handler_x64
+extern process_entry_trampoline
 
 %macro PUSH_GPRS 0
     push r15
@@ -63,7 +65,23 @@ isr_x64_%1:
     push %1
     PUSH_GPRS
     mov rdi, [rsp + 120]
-    call irq_handler
+    mov rsi, rsp
+    cld
+    mov r15, rsp
+    and rsp, -16
+    sub rsp, 8
+    call irq_handler_x64
+    mov rsp, r15
+    test rax, rax
+    jz %%keep_rsp
+    mov rsp, rax
+%%keep_rsp:
+    ; Ensure no latent NT/TF flag state can poison iretq task/trace semantics.
+    pushfq
+    pop rax
+    and rax, ~((1 << 14) | (1 << 8))
+    push rax
+    popfq
     POP_GPRS
     add rsp, 8
     iretq
@@ -102,8 +120,22 @@ ISR_ERR   29
 ISR_ERR   30
 ISR_NOERR 31
 
+IRQ_STUB 32
 IRQ_STUB 33
+IRQ_STUB 34
+IRQ_STUB 35
+IRQ_STUB 36
+IRQ_STUB 37
+IRQ_STUB 38
+IRQ_STUB 39
+IRQ_STUB 40
+IRQ_STUB 41
+IRQ_STUB 42
+IRQ_STUB 43
 IRQ_STUB 44
+IRQ_STUB 45
+IRQ_STUB 46
+IRQ_STUB 47
 
 isr_exception_common:
     PUSH_GPRS
@@ -111,12 +143,23 @@ isr_exception_common:
     mov rsi, [rsp + 128]
     mov rdx, [rsp + 136]
     cld
+    mov r15, rsp
+    and rsp, -16
+    sub rsp, 8
     call idt_exception_handler_x64
+    mov rsp, r15
     POP_GPRS
     add rsp, 16
     iretq
 
 isr_x64_ignore:
+    iretq
+
+process_entry_resume:
+    push rbp
+    mov rbp, rsp
+    call process_entry_trampoline
+    leave
     iretq
 
 section .note.GNU-stack noalloc noexec nowrite progbits

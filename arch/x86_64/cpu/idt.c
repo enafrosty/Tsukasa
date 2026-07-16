@@ -60,8 +60,22 @@ extern void isr_x64_28(void);
 extern void isr_x64_29(void);
 extern void isr_x64_30(void);
 extern void isr_x64_31(void);
+extern void isr_x64_32(void);
 extern void isr_x64_33(void);
+extern void isr_x64_34(void);
+extern void isr_x64_35(void);
+extern void isr_x64_36(void);
+extern void isr_x64_37(void);
+extern void isr_x64_38(void);
+extern void isr_x64_39(void);
+extern void isr_x64_40(void);
+extern void isr_x64_41(void);
+extern void isr_x64_42(void);
+extern void isr_x64_43(void);
 extern void isr_x64_44(void);
+extern void isr_x64_45(void);
+extern void isr_x64_46(void);
+extern void isr_x64_47(void);
 extern void isr_x64_ignore(void);
 
 static void (*const exception_stubs[32])(void) = {
@@ -74,6 +88,8 @@ static void (*const exception_stubs[32])(void) = {
     isr_x64_24, isr_x64_25, isr_x64_26, isr_x64_27,
     isr_x64_28, isr_x64_29, isr_x64_30, isr_x64_31,
 };
+
+static struct idt_ptr idtp;
 
 static void set_gate(uint8_t vec, void (*handler)(void), uint8_t flags)
 {
@@ -111,7 +127,11 @@ static void draw_exception_banner(uint64_t vector, uint64_t error_code, uint64_t
         fb_draw_string(8, 20, line2, rgb(255, 255, 255), rgb(120, 0, 0));
     }
 
-    vga_puts_row(0, "Tsukasa x64 exception (see serial)");
+    /*
+     * Do not write to legacy VGA text memory on x64 path unless it is
+     * explicitly mapped. Unconditional writes to 0xB8000 can recurse into
+     * page faults while handling an exception.
+     */
 }
 
 void idt_exception_handler_x64(uint64_t vector, uint64_t error_code, uint64_t rip)
@@ -147,11 +167,30 @@ void idt_init_x64(void)
     for (uint32_t i = 32; i < IDT_X64_ENTRIES; i++)
         set_gate((uint8_t)i, isr_x64_ignore, 0x8Eu);
 
+    set_gate(32, isr_x64_32, 0x8Eu);
     set_gate(33, isr_x64_33, 0x8Eu);
+    set_gate(34, isr_x64_34, 0x8Eu);
+    set_gate(35, isr_x64_35, 0x8Eu);
+    set_gate(36, isr_x64_36, 0x8Eu);
+    set_gate(37, isr_x64_37, 0x8Eu);
+    set_gate(38, isr_x64_38, 0x8Eu);
+    set_gate(39, isr_x64_39, 0x8Eu);
+    set_gate(40, isr_x64_40, 0x8Eu);
+    set_gate(41, isr_x64_41, 0x8Eu);
+    set_gate(42, isr_x64_42, 0x8Eu);
+    set_gate(43, isr_x64_43, 0x8Eu);
     set_gate(44, isr_x64_44, 0x8Eu);
+    set_gate(45, isr_x64_45, 0x8Eu);
+    set_gate(46, isr_x64_46, 0x8Eu);
+    set_gate(47, isr_x64_47, 0x8Eu);
 
-    ptr.limit = (uint16_t)(sizeof(idt) - 1);
-    ptr.base = (uint64_t)(uintptr_t)&idt;
+    idtp.limit = (uint16_t)(sizeof(idt) - 1);
+    idtp.base = (uint64_t)(uintptr_t)&idt;
 
-    __asm__ volatile ("lidt %0" : : "m"(ptr));
+    __asm__ volatile ("lidt %0" : : "m"(idtp));
+}
+
+void idt_load(void)
+{
+    __asm__ volatile ("lidt %0" : : "m"(idtp) : "memory");
 }

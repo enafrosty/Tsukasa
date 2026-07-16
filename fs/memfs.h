@@ -42,6 +42,12 @@ size_t memfs_write(int inode, size_t pos, const void *buf, size_t count);
 /** Get size of an inode's data. */
 size_t memfs_size(int inode);
 
+/** Truncate inode data to zero bytes. */
+int memfs_truncate(int inode);
+
+/** Stat by file name. */
+int memfs_stat(const char *name, size_t *size_out);
+
 /** List all valid file names.
  *  @param names  Caller-supplied 2D array (max x MEMFS_MAX_NAME).
  *  @return       Number of names written. */

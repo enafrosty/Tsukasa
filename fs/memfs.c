@@ -108,6 +108,8 @@ size_t memfs_write(int inode, size_t pos, const void *buf, size_t count)
     }
 
     const uint8_t *src = (const uint8_t *)buf;
+    if (count > 0 && !src)
+        return 0;
     for (size_t i = 0; i < count; i++) n->data[pos + i] = src[i];
     if (pos + count > n->size) n->size = pos + count;
     return count;
@@ -130,4 +132,22 @@ int memfs_list(char names[][MEMFS_MAX_NAME], int max)
         }
     }
     return cnt;
+}
+
+int memfs_truncate(int inode)
+{
+    if (inode < 0 || inode >= MEMFS_MAX_FILES || !g_inodes[inode].used)
+        return -1;
+    g_inodes[inode].size = 0;
+    return 0;
+}
+
+int memfs_stat(const char *name, size_t *size_out)
+{
+    int inode = memfs_open(name);
+    if (inode < 0)
+        return -1;
+    if (size_out)
+        *size_out = g_inodes[inode].size;
+    return 0;
 }

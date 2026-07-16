@@ -5,10 +5,12 @@
 #ifndef PIC_H
 #define PIC_H
 
+#include <stdint.h>
+
 #include "../drv/ps2.h"
 
 /**
- * Initialize PIC: remap IRQs to vectors 32-47, mask all except keyboard.
+ * Initialize PIC: remap IRQs to vectors 32-47 and unmask timer/keyboard/cascade.
  */
 void pic_init(void);
 
@@ -18,5 +20,8 @@ void pic_init(void);
  * @param irq IRQ number (0-15).
  */
 void pic_eoi(unsigned int irq);
+
+void pic_mask_irq(uint8_t irq);
+void pic_unmask_irq(uint8_t irq);
 
 #endif /* PIC_H */
