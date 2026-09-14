@@ -1,38 +1,17 @@
-/**
- * @file fb_gfx.h
- * @brief Minimal header-only framebuffer graphics primitives.
+/*
+ * Project Tsukasa — @file fb_gfx.h
  *
- * This header provides a tiny C/C++ API for drawing into a linear
- * framebuffer with an explicit pitch/stride. All row stepping uses
- * the hardware-provided pitch to avoid diagonal tearing when the
- * stride in memory is wider than width * bytes_per_pixel.
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
- * Supported bits-per-pixel values: 8, 16, 24, 32.
- * Colors are passed as opaque 32-bit packed values; you are
- * responsible for packing them to match your pixel format.
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
  *
- * Example usage in your kernel:
- *
- *   #include "fb_gfx.h"
- *
- *   extern void* g_framebuffer;
- *   extern unsigned g_width, g_height, g_pitch, g_bpp;
- *
- *   void kmain(void) {
- *       FbGfxContext ctx = fb_gfx_make_context(
- *           g_framebuffer,
- *           g_width,
- *           g_height,
- *           g_pitch,
- *           g_bpp
- *       );
- *
- *       // Clear screen to black.
- *       fb_gfx_clear_screen(&ctx, 0x00000000u);
- *
- *       // Draw a solid red rectangle (format-dependent).
- *       fb_gfx_draw_rect(&ctx, 10, 10, 100, 50, 0x00FF0000u);
- *   }
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #pragma once
@@ -44,36 +23,16 @@
 extern "C" {
 #endif
 
-/**
- * @brief Framebuffer graphics context.
- *
- * All dimensions are in pixels, except @ref pitch which is in bytes.
- *
- * - framebuffer: Base address of the linear framebuffer.
- * - width, height: Visible resolution in pixels.
- * - pitch: Stride in bytes between the start of two consecutive scanlines.
- *          This must be taken directly from your video mode information
- *          (do not recompute as width * bytes_per_pixel).
- * - bpp: Bits per pixel (8, 16, 24, or 32).
- */
+/* @brief Framebuffer graphics context. */
 typedef struct FbGfxContext {
     uint8_t* framebuffer;
     uint32_t width;
     uint32_t height;
-    uint32_t pitch; /* bytes per scanline */
-    uint32_t bpp;   /* bits per pixel */
+    uint32_t pitch;
+    uint32_t bpp;
 } FbGfxContext;
 
-/**
- * @brief Construct a framebuffer graphics context.
- *
- * @param fb     Base address of the framebuffer.
- * @param width  Visible width in pixels.
- * @param height Visible height in pixels.
- * @param pitch  Stride in bytes between the start of two consecutive scanlines.
- * @param bpp    Bits per pixel (8, 16, 24, or 32).
- * @return Initialized FbGfxContext value.
- */
+/* @brief Construct a framebuffer graphics context. */
 static inline FbGfxContext
 fb_gfx_make_context(void* fb,
                     uint32_t width,
@@ -90,11 +49,7 @@ fb_gfx_make_context(void* fb,
     return ctx;
 }
 
-/**
- * @brief Get bytes per pixel from context.
- *
- * Returns 0 for unsupported @ref bpp values.
- */
+/* @brief Get bytes per pixel from context. Returns 0 for unsupported @ref bpp values. */
 static inline uint32_t
 fb_gfx_bytes_per_pixel(const FbGfxContext* ctx)
 {
@@ -111,13 +66,7 @@ fb_gfx_bytes_per_pixel(const FbGfxContext* ctx)
     }
 }
 
-/**
- * @brief Compute a pointer to pixel (x, y) or NULL if out-of-bounds.
- *
- * Uses the context's @ref pitch for row stepping to avoid diagonal
- * tearing when the framebuffer stride is not exactly
- * width * bytes_per_pixel.
- */
+/* @brief Compute a pointer to pixel (x, y) or NULL if out-of-bounds. */
 static inline uint8_t*
 fb_gfx_pixel_ptr(const FbGfxContext* ctx, uint32_t x, uint32_t y)
 {
@@ -138,16 +87,7 @@ fb_gfx_pixel_ptr(const FbGfxContext* ctx, uint32_t x, uint32_t y)
     return row + (size_t)x * (size_t)bpp_bytes;
 }
 
-/**
- * @brief Write a single pixel at (x, y) with the given color.
- *
- * The @p color value is treated as an opaque packed pixel. For example,
- * in a 32bpp X8R8G8B8 mode on little-endian machines, you can pack it
- * as 0x00RRGGBB. For 24bpp, the least significant three bytes of
- * @p color are written in little-endian order.
- *
- * Out-of-bounds coordinates are ignored.
- */
+/* @brief Write a single pixel at (x, y) with the given color. */
 static inline void
 fb_gfx_put_pixel(const FbGfxContext* ctx, uint32_t x, uint32_t y, uint32_t color)
 {
@@ -162,20 +102,17 @@ fb_gfx_put_pixel(const FbGfxContext* ctx, uint32_t x, uint32_t y, uint32_t color
         break;
     }
     case 16: {
-        /* Write two bytes in little-endian order. */
         p[0] = (uint8_t)(color & 0xFFu);
         p[1] = (uint8_t)((color >> 8) & 0xFFu);
         break;
     }
     case 24: {
-        /* Write three bytes in little-endian order. */
         p[0] = (uint8_t)(color & 0xFFu);
         p[1] = (uint8_t)((color >> 8) & 0xFFu);
         p[2] = (uint8_t)((color >> 16) & 0xFFu);
         break;
     }
     case 32: {
-        /* Write four bytes in little-endian order. */
         p[0] = (uint8_t)(color & 0xFFu);
         p[1] = (uint8_t)((color >> 8) & 0xFFu);
         p[2] = (uint8_t)((color >> 16) & 0xFFu);
@@ -183,22 +120,11 @@ fb_gfx_put_pixel(const FbGfxContext* ctx, uint32_t x, uint32_t y, uint32_t color
         break;
     }
     default:
-        /* Unsupported bpp: nothing written. */
         break;
     }
 }
 
-/**
- * @brief Draw a solid filled rectangle.
- *
- * The rectangle is defined by its top-left corner (@p x, @p y) and its
- * width @p w and height @p h (in pixels). Negative coordinates and
- * rectangles that extend off-screen are clipped against the visible
- * framebuffer area.
- *
- * All row stepping uses @ref pitch so that diagonal tearing does not
- * occur when the memory stride differs from width * bytes_per_pixel.
- */
+/* @brief Draw a solid filled rectangle. */
 static inline void
 fb_gfx_draw_rect(const FbGfxContext* ctx,
                  int32_t x,
@@ -274,18 +200,12 @@ fb_gfx_draw_rect(const FbGfxContext* ctx,
             }
             break;
         default:
-            /* Unsupported bpp: nothing drawn on this row. */
             return;
         }
     }
 }
 
-/**
- * @brief Clear the entire framebuffer to a solid color.
- *
- * All row stepping uses @ref pitch so that diagonal tearing does not
- * occur when the memory stride differs from width * bytes_per_pixel.
- */
+/* @brief Clear the entire framebuffer to a solid color. */
 static inline void
 fb_gfx_clear_screen(const FbGfxContext* ctx, uint32_t color)
 {
@@ -334,13 +254,11 @@ fb_gfx_clear_screen(const FbGfxContext* ctx, uint32_t color)
             }
             break;
         default:
-            /* Unsupported bpp: nothing cleared. */
             return;
         }
     }
 }
 
 #ifdef __cplusplus
-} /* extern "C" */
+}
 #endif
-

@@ -1,6 +1,17 @@
 /*
- * wm.h  -  Window manager (z-ordered windows with drag/close/focus).
- *          Extended for modern theming: per-window opacity and accent color.
+ * Project Tsukasa — Window manager (z-ordered windows with drag/close/focus)
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #ifndef WM_H
@@ -32,10 +43,10 @@
 struct wm_window;
 typedef struct wm_window wm_window_t;
 
-/** App callback: draw content into window client area. */
+/* App callback: draw content into window client area. */
 typedef void (*wm_draw_fn)(wm_window_t *win);
 
-/** App callback: handle an input event forwarded to this window. */
+/* App callback: handle an input event forwarded to this window. */
 typedef void (*wm_event_fn)(wm_window_t *win, const void *event);
 
 struct wm_window {
@@ -44,16 +55,13 @@ struct wm_window {
     char title[WM_TITLE_MAX];
     uint32_t flags;
 
-    /* Modern theming. */
-    uint8_t  opacity;     /* 0..255, default 245 (near-opaque)            */
-    uint32_t accent;      /* per-window accent color (0 = use global)      */
+    uint8_t  opacity;
+    uint32_t accent;
 
-    /* Application callbacks. */
     wm_draw_fn   draw_content;
     wm_event_fn  handle_event;
     void         *app_data;
 
-    /* Z-order doubly-linked list (head = bottom, tail = top). */
     wm_window_t *prev;
     wm_window_t *next;
 };
@@ -65,97 +73,53 @@ typedef struct wm_dirty_rect {
     int h;
 } wm_dirty_rect_t;
 
-/**
- * Initialize the window manager.
- */
 void wm_init(void);
 
-/**
- * Create a new window and add it to the top of the z-order.
- * @return Pointer to the window, or NULL on failure.
- */
+/* Create a new window and add it to the top of the z-order. @return Pointer to the window, or NULL on failure. */
 wm_window_t *wm_create_window(int x, int y, int w, int h, const char *title,
                                wm_draw_fn draw_fn, wm_event_fn event_fn,
                                void *app_data);
 
-/**
- * Destroy a window and remove it from the z-order.
- */
+/* Destroy a window and remove it from the z-order. */
 void wm_destroy_window(wm_window_t *win);
 
-/**
- * Bring a window to the top of the z-order and set it active.
- */
+/* Bring a window to the top of the z-order and set it active. */
 void wm_bring_to_front(wm_window_t *win);
 
-/**
- * Find the topmost window containing point (px, py).
- * @return Window pointer, or NULL if no window is under the point.
- */
+/* Find the topmost window containing point (px, py). @return Window pointer, or NULL if no window is under... */
 wm_window_t *wm_find_window_at(int px, int py);
 
-/**
- * Handle a mouse event at (mx, my) with button state.
- * Returns 1 if a window was affected, 0 otherwise.
- */
+/* Handle a mouse event at (mx, my) with button state. Returns 1 if a window was affected, 0 otherwise. */
 int wm_handle_mouse(int mx, int my, int buttons, int btn_changed);
 
-/**
- * Handle a normalized input event.
- * Returns 1 if WM consumed the event, 0 otherwise.
- */
-int wm_handle_input(const struct input_event *ev);
+/* Handle a normalized input event. Returns 1 if WM consumed the event, 0 otherwise. */
+int wm_handle_input(const struct gui_event *ev);
 
-/**
- * Redraw the entire desktop: all windows bottom-to-top.
- */
 void wm_redraw_all(void);
 
-/**
- * Redraw windows intersecting a dirty rectangle.
- */
 void wm_redraw_region(int x, int y, int w, int h);
 
-/**
- * Set or clear resize ability for a window.
- */
 void wm_set_resizable(wm_window_t *win, int resizable);
 
-/**
- * Update a window title.
- */
+/* Update a window title. */
 void wm_set_title(wm_window_t *win, const char *title);
 
-/**
- * Configure close button behavior.
- * autoclose=1 keeps legacy behavior (destroy on close click).
- */
+/* Configure close button behavior. autoclose=1 keeps legacy behavior (destroy on close click). */
 void wm_set_autoclose(wm_window_t *win, int autoclose);
 
-/**
- * Mark a screen-space region as dirty.
- */
+/* Mark a screen-space region as dirty. */
 void wm_mark_dirty_rect(int x, int y, int w, int h);
 
-/**
- * Drain pending dirty regions into caller buffer.
- * Returns number of rectangles copied.
- */
+/* Drain pending dirty regions into caller buffer. Returns number of rectangles copied. */
 int wm_collect_dirty_regions(wm_dirty_rect_t *out, int max);
 
-/**
- * Get the head (bottom) of the z-order list.
- */
+/* Get the head (bottom) of the z-order list. */
 wm_window_t *wm_get_bottom(void);
 
-/**
- * Get the tail (top/active) of the z-order list.
- */
+/* Get the tail (top/active) of the z-order list. */
 wm_window_t *wm_get_top(void);
 
-/**
- * Get the client area coordinates for a window.
- */
+/* Get the client area coordinates for a window. */
 void wm_client_rect(const wm_window_t *win,
                     int *cx, int *cy, int *cw, int *ch);
 

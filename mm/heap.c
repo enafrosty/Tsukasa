@@ -1,10 +1,23 @@
 /*
- * heap.c - Kernel heap backed by TLSF (Two-Level Segregated Fit).
+ * Project Tsukasa — Kernel heap backed by TLSF (Two-Level Segregated Fit)
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "heap.h"
 
 #include "pmm.h"
+#include "slab.h"
 #include "tlsf.h"
 #include "vmm_x64.h"
 #include "../include/kprintf.h"
@@ -23,6 +36,7 @@ typedef struct heap_alloc_header {
 } heap_alloc_header_t;
 
 static tlsf_t *g_heap = NULL;
+/* Hold with IRQs off (irq-save) like the scheduler lock. */
 static spinlock_t g_lock = SPINLOCK_INIT;
 static size_t g_pool_bytes;
 static size_t g_allocated_bytes;
@@ -50,6 +64,7 @@ void *kmalloc(size_t size)
 {
     void *ptr;
     size_t req_size;
+    unsigned long irq_flags;
 
     if (!g_heap || size == 0)
         return NULL;
@@ -58,7 +73,13 @@ void *kmalloc(size_t size)
     if (req_size < size)
         return NULL;
 
-    spin_lock(&g_lock);
+    if (size <= SLAB_MAX_SIZE) {
+        void *sp = slab_kmalloc(size);
+        if (sp)
+            return sp;
+    }
+
+    irq_flags = spin_lock_irqsave(&g_lock);
     ptr = tlsf_malloc(g_heap, req_size);
     if (!ptr) {
         size_t pages = (req_size + 4095u) / 4096u;
@@ -85,18 +106,25 @@ void *kmalloc(size_t size)
         ptr = (void *)(hdr + 1);
     }
 
-    spin_unlock(&g_lock);
+    spin_unlock_irqrestore(&g_lock, irq_flags);
     return ptr;
 }
 
 void kfree(void *ptr)
 {
     heap_alloc_header_t *hdr;
+    unsigned long irq_flags;
 
-    if (!g_heap || !ptr)
+    if (!ptr)
         return;
 
-    spin_lock(&g_lock);
+    if (slab_kfree_if_owned(ptr))
+        return;
+
+    if (!g_heap)
+        return;
+
+    irq_flags = spin_lock_irqsave(&g_lock);
     hdr = ((heap_alloc_header_t *)ptr) - 1;
     if (hdr->magic == HEAP_ALLOC_MAGIC) {
         hdr->magic = 0;
@@ -115,17 +143,27 @@ void kfree(void *ptr)
                     (uint32_t)(hdr->magic & 0xFFFFFFFFu));
         }
     }
-    spin_unlock(&g_lock);
+    spin_unlock_irqrestore(&g_lock, irq_flags);
 }
 
 void heap_get_stats(heap_stats_t *out)
 {
+    unsigned long irq_flags;
+
     if (!out)
         return;
 
-    spin_lock(&g_lock);
+    irq_flags = spin_lock_irqsave(&g_lock);
     out->pool_bytes = g_pool_bytes;
     out->allocated_bytes = g_allocated_bytes;
     out->peak_allocated_bytes = g_peak_allocated_bytes;
-    spin_unlock(&g_lock);
+    spin_unlock_irqrestore(&g_lock, irq_flags);
+
+    {
+        slab_stats_t ss;
+        slab_get_stats(&ss);
+        out->slab_allocs = ss.allocs;
+        out->slab_frees = ss.frees;
+        out->slab_pages = ss.pages;
+    }
 }

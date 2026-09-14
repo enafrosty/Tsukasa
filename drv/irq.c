@@ -1,5 +1,17 @@
 /*
- * irq.c - IRQ handler dispatch.
+ * Project Tsukasa — IRQ handler dispatch
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include <stdint.h>
@@ -13,7 +25,10 @@
 
 #ifdef __x86_64__
 #include "../include/kprintf.h"
+#include "../include/lapic.h"
+#include "../include/smp.h"
 #include "../proc/process.h"
+#include "ioapic.h"
 #endif
 
 typedef struct irq_hook {
@@ -38,6 +53,18 @@ void irq_unregister_handler(uint8_t irq)
         return;
     g_irq_hooks[irq].callback = NULL;
     g_irq_hooks[irq].ctx = NULL;
+}
+
+/* Policy: IOAPIC-delivered interrupts are EOI'd at the LAPIC; the PIC fallback (no ACPI/IOAPIC, or the i386... */
+void irq_ack(unsigned int irq)
+{
+#ifdef __x86_64__
+    if (ioapic_active()) {
+        lapic_eoi();
+        return;
+    }
+#endif
+    pic_eoi(irq);
 }
 
 static int irq_invoke_hook(uint8_t irq)
@@ -93,10 +120,16 @@ uint64_t irq_handler_x64(unsigned int vector, uint64_t context_rsp)
 {
     if (vector == 32) {
         uint64_t next_rsp;
-        pit_irq_tick();
-        (void)irq_invoke_hook(0);
-        pic_eoi(0);
+        uint32_t cpu = smp_this_cpu_id();
+
+        if (cpu == 0) {
+            pit_irq_tick();
+            (void)irq_invoke_hook(0);
+            irq_ack(0);
+        }
         next_rsp = process_schedule_tick(context_rsp);
+        if (cpu == 0 && smp_cpu_count() > 1)
+            lapic_send_ipi_all();
 
         if (!g_irq32_trace_once) {
             g_irq32_trace_once = 1;
@@ -128,9 +161,15 @@ uint64_t irq_handler_x64(unsigned int vector, uint64_t context_rsp)
         return next_rsp;
     }
 
+    if (vector == 65) {
+        /* LAPIC-domain interrupt: EOI goes to the local APIC, not the PIC, and precedes the reschedule to mirror the... */
+        lapic_eoi();
+        return process_schedule_ipi(context_rsp);
+    }
+
     if (vector == 33) {
         if (irq_invoke_hook(1))
-            pic_eoi(1);
+            irq_ack(1);
         else
             ps2kbd_handler();
         return context_rsp;
@@ -138,7 +177,7 @@ uint64_t irq_handler_x64(unsigned int vector, uint64_t context_rsp)
 
     if (vector == 44) {
         if (irq_invoke_hook(12))
-            pic_eoi(12);
+            irq_ack(12);
         else
             ps2mouse_handler();
         return context_rsp;
@@ -147,12 +186,12 @@ uint64_t irq_handler_x64(unsigned int vector, uint64_t context_rsp)
     if (vector >= 34 && vector <= 47) {
         uint8_t irq = (uint8_t)(vector - 32);
         (void)irq_invoke_hook(irq);
-        pic_eoi(irq);
+        irq_ack(irq);
         return context_rsp;
     }
 
     if (vector >= 32 && vector < 48)
-        pic_eoi(vector - 32);
+        irq_ack(vector - 32);
 
     return context_rsp;
 }

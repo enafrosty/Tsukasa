@@ -1,13 +1,17 @@
 /*
- * serial.c - COM1 serial port driver (8N1, 115200 baud).
+ * Project Tsukasa — COM1 serial port driver (8N1, 115200 baud)
  *
- * x86 PC UART register map (base = 0x3F8 = COM1):
- *   +0  THR (write) / RBR (read) / DLL (baud divisor low, DLAB=1)
- *   +1  IER (interrupt enable) / DLH (baud divisor high, DLAB=1)
- *   +2  IIR (read) / FCR (write)
- *   +3  LCR (line control, bit7 = DLAB)
- *   +4  MCR (modem control)
- *   +5  LSR (line status, bit5 = TX empty)
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "../drv/serial.h"
@@ -29,23 +33,17 @@ static inline uint8_t inb(uint16_t port)
 
 void serial_init(void)
 {
-    /* Disable interrupts. */
     outb(COM1_BASE + 1u, 0x00u);
 
-    /* Enable DLAB to set baud divisor. */
     outb(COM1_BASE + 3u, 0x80u);
 
-    /* Divisor = 1 → 115200 baud (clock / 16 / divisor = 1843200/16/1). */
-    outb(COM1_BASE + 0u, 0x01u);   /* DLL */
-    outb(COM1_BASE + 1u, 0x00u);   /* DLH */
+    outb(COM1_BASE + 0u, 0x01u);
+    outb(COM1_BASE + 1u, 0x00u);
 
-    /* 8 data bits, no parity, 1 stop bit, DLAB=0. */
     outb(COM1_BASE + 3u, 0x03u);
 
-    /* Enable FIFO, clear them, 14-byte threshold. */
     outb(COM1_BASE + 2u, 0xC7u);
 
-    /* RTS/DTR active, IRQ disabled. */
     outb(COM1_BASE + 4u, 0x03u);
 }
 

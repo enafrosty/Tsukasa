@@ -1,5 +1,17 @@
 /*
- * process.h - x86_64 process model and preemptive scheduler core.
+ * Project Tsukasa — x86_64 process model and preemptive scheduler core
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #ifndef TSUKASA_PROCESS_H
@@ -23,6 +35,7 @@
 #define PROCESS_PRIORITY_LEVELS 256
 #define PROCESS_DEFAULT_PRIORITY 128
 #define PROCESS_DEFAULT_TIMESLICE 4
+#define PROCESS_CPU_AFFINITY_ANY UINT32_MAX
 
 #define PROCESS_WAIT_WNOHANG   0x1
 
@@ -32,6 +45,9 @@
 #define PROCESS_SIGINT         2
 #define PROCESS_SIGKILL        9
 #define PROCESS_SIGUSR1        10
+#define PROCESS_SIGSEGV        11
+#define PROCESS_SIGTERM        15
+#define PROCESS_SIGSTOP        19
 
 typedef enum process_state {
     PROCESS_CREATED = 0,
@@ -124,6 +140,7 @@ struct process {
     uint32_t uid;
     uint32_t gid;
     uint32_t cpu_id;
+    uint32_t cpu_affinity;
 
     process_state_t state;
     int is_idle;
@@ -192,11 +209,20 @@ void process_init(void);
 process_t *process_current(void);
 int process_current_pid(void);
 int process_get_pgid(int pid);
+uint64_t process_stack_top_aligned(const process_t *p);
 
 process_t *process_spawn_kernel(const char *name, process_entry_t entry);
+
+process_t *process_spawn_kernel_pinned(const char *name, process_entry_t entry,
+                                       uint32_t cpu_id);
+process_t *process_spawn_idle_for_cpu(uint32_t cpu_id);
+
+/* Give the calling process a private user address space (own PML4, kernel higher-half shared). */
+int process_adopt_private_address_space(void);
 int process_exec(int pid, process_entry_t entry, const char *name);
 int process_exit_current(int code);
 void process_exit(int code) __attribute__((noreturn));
+void process_terminate_current(int sig) __attribute__((noreturn));
 
 int process_waitpid(int caller_pid, int target_pid, int options, int *status_out);
 int process_kill(int pid, int sig);
@@ -215,17 +241,31 @@ int process_signal_pending(int pid, uint64_t *pending_out);
 int process_signal_send(int pid, int sig);
 
 uint64_t process_schedule_tick(uint64_t current_rsp);
+uint64_t process_schedule_ipi(uint64_t current_rsp);
+void process_idle_loop_note(void);
 void process_yield(void);
 uint64_t process_ticks(void);
 
 void process_start_scheduler(void) __attribute__((noreturn));
 
+void process_run_phase1_selftests(void);
 void process_run_phase2_selftests(void);
 void process_run_phase3_selftests(void);
 void process_run_phase4_selftests(void);
 void process_run_phase5_selftests(void);
 void process_run_phase7_selftests(void);
 void process_run_phase8_selftests(void);
+void process_run_guide06_selftests(void);
+void process_run_guide10_selftests(void);
+void process_run_guide20_selftests(void);
+
+void process_run_guide15_selftests(void);
+
+void process_run_guide16_selftests(void);
+
+/* process_block_current marks the CALLER blocked (both state fields) without descheduling — the caller... */
+void process_block_current(void);
+int process_wake_blocked(process_t *p);
 void process_dump_memory_state(void);
 int process_snapshot(process_snapshot_t *out, int max);
 int process_get_info(int pid, process_snapshot_t *out);

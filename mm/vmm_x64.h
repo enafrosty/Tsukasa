@@ -1,3 +1,19 @@
+/*
+ * Project Tsukasa — x86_64 Virtual Memory Manager
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
 #ifndef TSUKASA_VMM_X64_H
 #define TSUKASA_VMM_X64_H
 
@@ -19,6 +35,7 @@ void vmm_x64_init(uint64_t hhdm_offset);
 uint64_t vmm_x64_hhdm_offset(void);
 
 uint64_t vmm_get_current_pml4(void);
+uint64_t vmm_get_kernel_pml4(void);
 void vmm_switch_pml4(uint64_t pml4_phys);
 uintptr_t vmm_phys_to_virt(uint64_t phys_addr);
 uint64_t vmm_virt_to_phys(uintptr_t virt_addr);
@@ -47,5 +64,7 @@ int vmm_query_page(uint64_t pml4_phys,
 int vmm_map_page(uintptr_t virt_addr, uint64_t phys_addr, uint64_t flags);
 int vmm_unmap_page(uintptr_t virt_addr);
 int vmm_map_io_region(uint64_t phys_base, size_t size, uintptr_t *virt_base);
+
+int vmm_validate_user_ptr(const void *ptr, size_t len, int need_write);
 
 #endif

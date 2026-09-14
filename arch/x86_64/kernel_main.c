@@ -1,3 +1,19 @@
+/*
+ * Project Tsukasa — x86_64 Kernel Main Entry & Initialization
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -18,17 +34,16 @@
 #include "drv/pic.h"
 #include "drv/pit.h"
 #include "drv/rtc.h"
+#include "drv/ps2mouse.h"
 
 #include "dev/pci.h"
 #include "input/event.h"
 #include "fs/vfs.h"
+#include "ipc/unix_socket.h"
 #include "net/network.h"
 
-#include "gfx/blit.h"
-#include "gfx/theme.h"
-#include "gfx/desktop.h"
-
 #include "loader/exec.h"
+#include "loader/elf64.h"
 #include "proc/process.h"
 #include "tty/tty.h"
 #include "user/apps/registry.h"
@@ -41,17 +56,10 @@ static void halt_forever(void)
         __asm__ volatile ("hlt");
 }
 
-static void desktop_process_entry(void)
-{
-    if (fb_info.addr && fb_info.bpp == 32)
-        desktop_run();
-    process_exit(0);
-}
-
 /*
  * Run network stack initialization after scheduler start.
  * Pre-scheduler boot keeps IRQs disabled, which can stall lwIP timeout-based
- * waits; deferring avoids blocking desktop bring-up.
+ * waits; deferring avoids blocking system bring-up.
  */
 static void network_bootstrap_entry(void)
 {
@@ -123,12 +131,6 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
         if (fb_mapped)
             fb_info.addr = (void *)fb_mapped;
 
-        fb_fill_gradient_v(0, 0,
-                           (int)fb_info.width,
-                           (int)fb_info.height,
-                           THEME_BG_TOP,
-                           THEME_BG_BOT);
-
         kprintf("[boot:x64] framebuffer %ux%u bpp=%u\n",
                 fb_info.width,
                 fb_info.height,
@@ -147,6 +149,8 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     kprintf("[boot:x64] network stack init deferred until scheduler start\n");
 
     vfs_init(boot_info);
+    unix_socket_run_selftests();
+    ps2mouse_init();
 
     kprintf("[boot:x64] process init...\n");
     process_init();
@@ -155,38 +159,40 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     user_apps_register_all();
     kprintf("[boot:x64] userspace app registry ready\n");
 
-    kprintf("[boot:x64] spawn desktop...\n");
-    {
-        process_t *desktop_proc = process_spawn_kernel("desktop", desktop_process_entry);
-        if (!desktop_proc) {
-            kprintf("[boot:x64] WARN: failed to spawn desktop process\n");
-        } else {
-            uint64_t sp_phys = vmm_virt_to_phys((uintptr_t)desktop_proc->kernel_stack);
-            kprintf("[boot:x64] desktop pid=%d stack_phys=0x%08x%08x\n",
-                    (int)desktop_proc->pid,
-                    (uint32_t)(sp_phys >> 32),
-                    (uint32_t)(sp_phys & 0xFFFFFFFFu));
+    kprintf("[boot:x64] handoff to /bin/init (PID 1)...\n");
+    int init_pid = -1;
+    vfs_stat_t st;
+    if (vfs_stat("/bin/init", &st) == 0 && st.type != VFS_TYPE_DIR) {
+        init_pid = elf64_spawn("/bin/init", "/bin/init");
+    } else if (vfs_stat("/init", &st) == 0 && st.type != VFS_TYPE_DIR) {
+        init_pid = elf64_spawn("/init", "/init");
+    } else if (vfs_stat("/sbin/init", &st) == 0 && st.type != VFS_TYPE_DIR) {
+        init_pid = elf64_spawn("/sbin/init", "/sbin/init");
+    }
+
+    if (init_pid < 0) {
+        exec_entry_t init_entry = NULL;
+        if (exec_resolve_builtin("/bin/init", &init_entry) == 0 && init_entry) {
+            process_t *init_proc = process_spawn_kernel("init", init_entry);
+            if (init_proc) {
+                init_pid = (int)init_proc->pid;
+                process_set_cmdline(init_pid, "/bin/init");
+            }
         }
     }
+
+    if (init_pid >= 0) {
+        kprintf("[boot:x64] /bin/init running (pid=%d)\n", init_pid);
+    } else {
+        kprintf("[boot:x64] WARN: failed to spawn /bin/init\n");
+    }
+
     {
         process_t *net_proc = process_spawn_kernel("net-bootstrap", network_bootstrap_entry);
         if (!net_proc)
             kprintf("[boot:x64] WARN: failed to spawn network bootstrap process\n");
     }
-    {
-        exec_entry_t shinit = NULL;
-        if (exec_resolve_builtin("/bin/shinit", &shinit) == 0 && shinit) {
-            if (!process_spawn_kernel("shell-init", shinit))
-                kprintf("[boot:x64] WARN: failed to spawn shell-init\n");
-        }
-    }
-    {
-        exec_entry_t abi_test = NULL;
-        if (exec_resolve_builtin("/bin/abi-test", &abi_test) == 0 && abi_test) {
-            if (!process_spawn_kernel("abi-test", abi_test))
-                kprintf("[boot:x64] WARN: failed to spawn abi-test\n");
-        }
-    }
+    /*
     kprintf("[boot:x64] phase2 selftests spawn...\n");
     process_run_phase2_selftests();
     kprintf("[boot:x64] phase3 selftests spawn...\n");
@@ -199,6 +205,7 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     process_run_phase7_selftests();
     kprintf("[boot:x64] phase8 selftests spawn...\n");
     process_run_phase8_selftests();
+    */
 
     __asm__ volatile ("sti");
     kprintf("[boot:x64] interrupts enabled, preemptive scheduler active\n");

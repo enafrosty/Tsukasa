@@ -1,7 +1,17 @@
 /*
- * calc.c - Simple calculator app.
- * Grid of on-screen buttons for 0-9, +, -, *, /, =, C.
- * Supports basic integer arithmetic via mouse clicks.
+ * Project Tsukasa — Simple calculator app
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "apps.h"
@@ -25,13 +35,12 @@
 struct calc_data {
     int32_t accumulator;
     int32_t current;
-    char    op;          /* '+', '-', '*', '/', or 0 = none */
+    char    op;
     char    display[16];
     int     display_len;
-    int     new_number;  /* 1 = next digit starts a new number */
+    int     new_number;
 };
 
-/* Button layout: 4 columns x 5 rows. */
 static const char *calc_buttons[5][4] = {
     { "C", "+/-", "%", "/" },
     { "7", "8",   "9", "*" },
@@ -79,7 +88,6 @@ static void calc_draw(wm_window_t *win)
 
     fb_fill_rect(cx, cy, cw, ch, (color_t)THEME_WIN_BG);
 
-    /* Display area. */
     int dx = cx + 8;
     int dy = cy + 8;
     int dw = cw - 16;
@@ -89,12 +97,10 @@ static void calc_draw(wm_window_t *win)
     fb_draw_hline(dx, dy + DISPLAY_H - 1, dw, (color_t)THEME_WIN_BORDER);
     fb_draw_vline(dx + dw - 1, dy, DISPLAY_H, (color_t)THEME_WIN_BORDER);
 
-    /* Display text (right-aligned). */
     int text_w = cd->display_len * 8;
     fb_draw_string(dx + dw - text_w - 8, dy + (DISPLAY_H - 8) / 2,
                    cd->display, (color_t)THEME_TEXT, (color_t)rgba(13, 19, 28, 0xFF));
 
-    /* Buttons. */
     int grid_x = cx + 8;
     int grid_y = cy + 8 + DISPLAY_H + 8;
 
@@ -155,7 +161,6 @@ static void calc_handle_char(struct calc_data *cd, char c)
     }
 
     if (c == '+' || c == '-' || c == '*' || c == '/') {
-        /* Apply pending operation first. */
         if (cd->op) {
             switch (cd->op) {
             case '+': cd->accumulator += cd->current; break;
@@ -182,9 +187,8 @@ static void calc_event(wm_window_t *win, const void *event)
     struct calc_data *cd = (struct calc_data *)win->app_data;
     if (!cd || !event) return;
 
-    const struct input_event *ev = (const struct input_event *)event;
+    const struct gui_event *ev = (const struct gui_event *)event;
 
-    /* Handle keyboard numbers. */
     if (ev->type == EVENT_KEY && ev->subtype == KEY_PRESS) {
         char key = (char)(ev->keycode & 0xFF);
         calc_handle_char(cd, key);
@@ -203,14 +207,12 @@ static void calc_event(wm_window_t *win, const void *event)
     int grid_x = cx + 8;
     int grid_y = cy + 8 + DISPLAY_H + 8;
 
-    /* Find which button was clicked. */
     int col = (emx - grid_x) / (BTN_W + BTN_PAD);
     int row = (emy - grid_y) / (BTN_H + BTN_PAD);
 
     if (col < 0 || col >= 4 || row < 0 || row >= 5)
         return;
 
-    /* Check within button bounds (not in padding). */
     int bx = grid_x + col * (BTN_W + BTN_PAD);
     int by = grid_y + row * (BTN_H + BTN_PAD);
     if (emx < bx || emx >= bx + BTN_W ||

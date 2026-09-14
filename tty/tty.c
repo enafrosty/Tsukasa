@@ -1,11 +1,28 @@
 /*
- * tty.c - Minimal tty foreground control and Ctrl+C signalling.
+ * Project Tsukasa — Minimal tty foreground control, Ctrl+C signalling, and the
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "tty.h"
 
+#include "../drv/serial.h"
+#include "../fs/vfs.h"
 #include "../include/spinlock.h"
 #include "../proc/process.h"
+#include "../sys/kconsole.h"
+
+#include <stddef.h>
 
 #define TTY_MAX 8
 
@@ -172,6 +189,37 @@ int tty_kill_foreground(int tty_id, int sig)
     return process_kill_pgid(pgid, sig);
 }
 
+size_t tty_write(int tty_id, const void *buf, size_t count)
+{
+    const char *src = (const char *)buf;
+    int mirror;
+    uint64_t flags;
+
+    if (!src || count == 0)
+        return 0;
+
+    flags = irq_save_disable();
+    spin_lock(&g_tty_lock);
+    if (tty_id < 0)
+        tty_id = g_active_tty;
+    if (tty_id >= TTY_MAX || !g_ttys[tty_id].used) {
+        spin_unlock(&g_tty_lock);
+        irq_restore(flags);
+        return 0;
+    }
+    mirror = (tty_id == g_active_tty) && (vfs_kd_mode() == VFS_KD_TEXT);
+    spin_unlock(&g_tty_lock);
+    irq_restore(flags);
+
+    /* Emit outside g_tty_lock: serial_putc busy-waits on the UART and kconsole_putc takes its own console lock. */
+    for (size_t i = 0; i < count; i++) {
+        serial_putc(src[i]);
+        if (mirror)
+            kconsole_putc(src[i]);
+    }
+    return count;
+}
+
 void tty_handle_scancode(uint8_t scancode, int pressed)
 {
     int active_tty;
@@ -183,7 +231,6 @@ void tty_handle_scancode(uint8_t scancode, int pressed)
     if (!pressed)
         return;
 
-    /* Ctrl+C (set 1: C key make code = 46). */
     if (g_ctrl_down && scancode == 46) {
         active_tty = tty_get_active();
         tty_kill_foreground(active_tty, PROCESS_SIGINT);

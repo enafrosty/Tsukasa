@@ -1,5 +1,17 @@
 /*
- * pic.c - PIC 8259 initialization and EOI.
+ * Project Tsukasa — PIC 8259 initialization and EOI
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "pic.h"
@@ -34,9 +46,15 @@ void pic_init(void)
     outb(PIC2_DATA, 2);
     outb(PIC2_DATA, ICW4_8086);
 
-    /* Unmask IRQ0 (timer), IRQ1 (keyboard), IRQ2 (cascade), IRQ12 (mouse). */
     g_pic1_mask = 0xF8u;
     g_pic2_mask = 0xEFu;
+    pic_write_masks();
+}
+
+void pic_disable(void)
+{
+    g_pic1_mask = 0xFFu;
+    g_pic2_mask = 0xFFu;
     pic_write_masks();
 }
 

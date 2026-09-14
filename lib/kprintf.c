@@ -1,32 +1,51 @@
 /*
- * kprintf.c - Freestanding kernel printf implementation.
- * Outputs via serial_putc (COM1).
+ * Project Tsukasa — Freestanding kernel printf implementation
  *
- * Supported format specifiers:
- *   %d / %i  - signed decimal
- *   %u       - unsigned decimal
- *   %x       - unsigned hex (lowercase)
- *   %X       - unsigned hex (uppercase)
- *   %s       - C string
- *   %c       - character
- *   %%       - literal '%'
- *   Width / zero-padding: e.g. %08x  %5d
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "../include/kprintf.h"
 #include "../drv/serial.h"
+#include "../include/spinlock.h"
 #include <stdint.h>
 #include <stdarg.h>
 #include <stddef.h>
 
-/* ---- low-level output -------------------------------------------------- */
+/* The acquire is a BOUNDED spin, never a hard wait: a panicking core (or a same-core IRQ handler that... */
+static spinlock_t g_kprintf_lock = SPINLOCK_INIT;
+
+static int kprintf_lock_acquire(void)
+{
+    for (uint32_t spins = 0; spins < 4000000u; spins++) {
+        if (spin_trylock(&g_kprintf_lock))
+            return 1;
+        __asm__ volatile ("pause");
+    }
+    return 0;
+}
+
+static void kprintf_lock_release(int owned)
+{
+    if (owned)
+        spin_unlock(&g_kprintf_lock);
+}
+
+/* low-level output */
 
 static void out_char(char c)
 {
     serial_putc(c);
 }
-
-/* ---- integer rendering ------------------------------------------------- */
 
 static const char hex_lower[] = "0123456789abcdef";
 static const char hex_upper[] = "0123456789ABCDEF";
@@ -43,14 +62,11 @@ static int uint_to_buf(char *buf, uint32_t val, uint32_t base, const char *digit
         buf[len++] = digits[val % base];
         val /= base;
     }
-    /* Reverse. */
     for (int i = 0, j = len - 1; i < j; i++, j--) {
         char tmp = buf[i]; buf[i] = buf[j]; buf[j] = tmp;
     }
     return len;
 }
-
-/* ---- core formatter ---------------------------------------------------- */
 
 typedef void (*put_fn)(void *ctx, char c);
 
@@ -91,9 +107,8 @@ static int do_fmt(fmt_ctx_t *f, const char *fmt, va_list ap)
             fmt_putc(f, *fmt++);
             continue;
         }
-        fmt++;  /* skip '%' */
+        fmt++;
 
-        /* Parse flags / width. */
         char pad = ' ';
         int  width = 0;
 
@@ -153,8 +168,6 @@ static int do_fmt(fmt_ctx_t *f, const char *fmt, va_list ap)
     return f->count;
 }
 
-/* ---- serial output context -------------------------------------------- */
-
 static void serial_put(void *ctx, char c)
 {
     (void)ctx;
@@ -164,24 +177,28 @@ static void serial_put(void *ctx, char c)
 int kprintf(const char *fmt, ...)
 {
     fmt_ctx_t f;
+    int owned;
     f.put   = serial_put;
     f.ctx   = NULL;
     f.count = 0;
     va_list ap;
     va_start(ap, fmt);
+    owned = kprintf_lock_acquire();
     int n = do_fmt(&f, fmt, ap);
+    kprintf_lock_release(owned);
     va_end(ap);
     return n;
 }
 
 void kputs(const char *s)
 {
+    int owned;
     if (!s) return;
+    owned = kprintf_lock_acquire();
     while (*s) out_char(*s++);
     out_char('\n');
+    kprintf_lock_release(owned);
 }
-
-/* ---- ksprintf ---------------------------------------------------------- */
 
 typedef struct {
     char  *buf;

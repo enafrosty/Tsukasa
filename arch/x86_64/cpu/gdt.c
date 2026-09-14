@@ -1,8 +1,25 @@
+/*
+ * Project Tsukasa — x86_64 Global Descriptor Table and TSS setup
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
 
 #include "gdt.h"
+#include "include/smp.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm_x64.h"
@@ -96,7 +113,13 @@ static void set_tss_desc(uint32_t index, uint64_t base, uint32_t limit)
 
 void tss_set_rsp0_x64(uint64_t rsp0)
 {
-    tss.rsp0 = rsp0;
+    uint32_t cpu = smp_this_cpu_id();
+    if (cpu == 0) {
+        tss.rsp0 = rsp0;
+    } else if (ap_tss && (cpu - 1) < ap_tss_count) {
+        ap_tss[cpu - 1].rsp0 = rsp0;
+    }
+    __asm__ volatile ("movq %0, %%gs:40" : : "r"(rsp0) : "memory");
 }
 
 void gdt_init_x64(void)
@@ -110,32 +133,18 @@ void gdt_init_x64(void)
     set_seg(0, 0x00u, 0x00u);
     set_seg(1, 0x9Au, 0x20u);
     set_seg(2, 0x92u, 0x00u);
-    set_seg(3, 0xFAu, 0x20u);
-    set_seg(4, 0xF2u, 0x00u);
+    set_seg(3, 0xF2u, 0x00u);
+    set_seg(4, 0xFAu, 0x20u);
     set_tss_desc(5, (uint64_t)(uintptr_t)&tss, (uint32_t)(sizeof(tss) - 1));
 
     gdtp.limit = (uint16_t)((5 * sizeof(struct gdt_entry) + sizeof(struct gdt_tss_desc)) - 1);
     gdtp.base = (uint64_t)(uintptr_t)&gdt;
 
-    __asm__ volatile (
-        "lgdt %0\n"
-        "movw %1, %%ax\n"
-        "mov %%ax, %%ds\n"
-        "mov %%ax, %%es\n"
-        "mov %%ax, %%fs\n"
-        "mov %%ax, %%gs\n"
-        "mov %%ax, %%ss\n"
-        "pushq %2\n"
-        "lea 1f(%%rip), %%rax\n"
-        "pushq %%rax\n"
-        "lretq\n"
-        "1:\n"
-        :
-        : "m"(gdtp), "i"(X64_GDT_KERNEL_DS), "i"(X64_GDT_KERNEL_CS)
-        : "rax", "memory"
-    );
+    gdt_flush();
+    gdt_reload_segments();
 
     {
+        gdt.tss_desc.access = 0x89u;
         uint16_t tss_sel = X64_GDT_TSS;
         __asm__ volatile ("ltr %0" : : "r"(tss_sel) : "memory");
     }
@@ -174,16 +183,41 @@ void gdt_init_ap_tss(uint32_t cpu_count)
 
 void gdt_load_ap_tss(uint32_t cpu_id)
 {
+    struct gdt_tss_desc *desc;
     uint16_t selector;
     if (cpu_id == 0) {
+        desc = &gdt.tss_desc;
         selector = X64_GDT_TSS;
     } else {
-        selector = (uint16_t)((7 + ((cpu_id - 1) * 2)) * sizeof(struct gdt_entry));
+        uint32_t ap_idx = cpu_id - 1;
+        if (ap_idx >= X64_GDT_MAX_APS)
+            return;
+        desc = &gdt.ap_tss_desc[ap_idx];
+        selector = (uint16_t)((7 + (ap_idx * 2)) * sizeof(struct gdt_entry));
     }
+    desc->access = 0x89u;
     __asm__ volatile ("ltr %0" : : "r"(selector) : "memory");
 }
 
 void gdt_flush(void)
 {
     __asm__ volatile ("lgdt %0" : : "m"(gdtp) : "memory");
+}
+
+void gdt_reload_segments(void)
+{
+    __asm__ volatile (
+        "movw %0, %%ax\n"
+        "mov %%ax, %%ds\n"
+        "mov %%ax, %%es\n"
+        "mov %%ax, %%ss\n"
+        "pushq %1\n"
+        "lea 1f(%%rip), %%rax\n"
+        "pushq %%rax\n"
+        "lretq\n"
+        "1:\n"
+        :
+        : "i"(X64_GDT_KERNEL_DS), "i"(X64_GDT_KERNEL_CS)
+        : "rax", "memory"
+    );
 }

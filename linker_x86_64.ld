@@ -9,15 +9,15 @@ SECTIONS
 
     _kernel_start = .;
 
-    .limine_requests_start ALIGN(8) : {
+    .limine_requests_start ALIGN(16) : {
         KEEP(*(.limine_requests_start))
     }
 
-    .limine_requests ALIGN(8) : {
+    .limine_requests ALIGN(16) : {
         KEEP(*(.limine_requests))
     }
 
-    .limine_requests_end ALIGN(8) : {
+    .limine_requests_end ALIGN(16) : {
         KEEP(*(.limine_requests_end))
     }
 

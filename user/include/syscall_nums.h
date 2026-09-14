@@ -1,5 +1,17 @@
 /*
- * syscall_nums.h - User-visible syscall IDs and multiplexer commands.
+ * Project Tsukasa — User-visible syscall IDs and multiplexer commands
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #ifndef SYSCALL_NUMS_H
@@ -12,6 +24,8 @@
 #define SYS_SHM_ATTACH     3
 #define SYS_SHM_DETACH     4
 #define SYS_SHM_DESTROY    5
+#define SYS_SHM_MAP        SYS_SHM_ATTACH
+#define SYS_SHM_UNMAP      SYS_SHM_DETACH
 #define SYS_GUI            6
 #define SYS_FS             7
 #define SYS_SYSTEM         8
@@ -38,6 +52,11 @@
 #define FS_CMD_MMAP        19
 #define FS_CMD_MUNMAP      20
 #define FS_CMD_POLL        21
+#define FS_CMD_MKDIR       22
+#define FS_CMD_UNLINK      23
+#define FS_CMD_RMDIR       24
+#define FS_CMD_RENAME      25
+
 
 #define TSUKASA_O_RDONLY   0x0001
 #define TSUKASA_O_WRONLY   0x0002
@@ -52,6 +71,7 @@
 #define TSUKASA_STAT_TYPE_PIPE 3
 #define TSUKASA_STAT_TYPE_CHAR 4
 #define TSUKASA_STAT_TYPE_BLOCK 5
+#define TSUKASA_STAT_TYPE_SOCKET 6
 
 #define TSUKASA_F_GETFL    1
 #define TSUKASA_F_SETFL    2

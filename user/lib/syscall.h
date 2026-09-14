@@ -1,18 +1,26 @@
 /*
- * syscall.h - User syscall wrapper interface.
+ * Project Tsukasa — User syscall wrapper interface
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #ifndef USER_SYSCALL_H
 #define USER_SYSCALL_H
 
-#include <stddef.h>
-#include <stdint.h>
+#include "user/include/signal.h"
 
-struct tsukasa_sigaction {
-    uintptr_t sa_handler;
-    uint64_t sa_mask;
-    int sa_flags;
-};
+typedef struct sigaction tsukasa_sigaction_t;
+#define tsukasa_sigaction sigaction
 
 struct tsukasa_stat {
     uint64_t size;
@@ -36,12 +44,42 @@ struct tsukasa_mmap_request {
     size_t offset;
 };
 
+struct tsukasa_fb_bitfield {
+    uint32_t offset;
+    uint32_t length;
+    uint32_t msb_right;
+};
+
 struct tsukasa_fb_var_screeninfo {
     uint32_t xres;
     uint32_t yres;
     uint32_t xres_virtual;
     uint32_t yres_virtual;
+    uint32_t xoffset;
+    uint32_t yoffset;
     uint32_t bits_per_pixel;
+    uint32_t grayscale;
+    struct tsukasa_fb_bitfield red;
+    struct tsukasa_fb_bitfield green;
+    struct tsukasa_fb_bitfield blue;
+    struct tsukasa_fb_bitfield transp;
+    uint32_t nonstd;
+    uint32_t activate;
+    uint32_t height;
+    uint32_t width;
+    uint32_t accel_flags;
+    uint32_t pixclock;
+    uint32_t left_margin;
+    uint32_t right_margin;
+    uint32_t upper_margin;
+    uint32_t lower_margin;
+    uint32_t hsync_len;
+    uint32_t vsync_len;
+    uint32_t sync;
+    uint32_t vmode;
+    uint32_t rotate;
+    uint32_t colorspace;
+    uint32_t reserved[4];
 };
 
 struct tsukasa_fb_fix_screeninfo {
@@ -197,7 +235,9 @@ int u_shm_destroy(int id);
 #define tty_kill_fg u_tty_kill_fg
 #define shm_create  u_shm_create
 #define shm_attach  u_shm_attach
+#define shm_map     u_shm_attach
 #define shm_detach  u_shm_detach
+#define shm_unmap   u_shm_detach
 #define shm_destroy u_shm_destroy
 
 int system_mem_stats(struct tsukasa_mem_stats *out);

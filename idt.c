@@ -1,5 +1,17 @@
 /*
- * idt.c - IDT table and initialization. Exception handlers write vector to VGA and halt.
+ * Project Tsukasa — IDT table and initialization. Exception handlers write vector to VGA and halt
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "idt.h"
@@ -10,7 +22,7 @@ struct idt_entry {
     uint16_t offset_lo;
     uint16_t selector;
     uint8_t  zero;
-    uint8_t  type_attr;  /* 0x8E = 32-bit interrupt gate, DPL=0, present */
+    uint8_t  type_attr;
     uint16_t offset_hi;
 } __attribute__((packed));
 
@@ -70,9 +82,9 @@ static void set_gate(unsigned int i, void (*handler)(void))
 {
     uint32_t addr = (uint32_t)handler;
     idt[i].offset_lo = (uint16_t)(addr & 0xFFFF);
-    idt[i].selector  = 0x08;   /* kernel code segment (GRUB GDT) */
+    idt[i].selector  = 0x08;
     idt[i].zero      = 0;
-    idt[i].type_attr = 0x8E;   /* 32-bit interrupt gate, DPL=0, present */
+    idt[i].type_attr = 0x8E;
     idt[i].offset_hi = (uint16_t)((addr >> 16) & 0xFFFF);
 }
 
@@ -82,7 +94,7 @@ static void set_gate_user(unsigned int i, void (*handler)(void))
     idt[i].offset_lo = (uint16_t)(addr & 0xFFFF);
     idt[i].selector  = 0x08;
     idt[i].zero      = 0;
-    idt[i].type_attr = 0xEE;   /* DPL=3 so user can call int 0x80 */
+    idt[i].type_attr = 0xEE;
     idt[i].offset_hi = (uint16_t)((addr >> 16) & 0xFFFF);
 }
 
@@ -119,14 +131,11 @@ static char hex_char(unsigned int n)
 
 void idt_handler(uint32_t vector, uint32_t error_code)
 {
-    /* Disable interrupts and write exception info to VGA row 1. */
     __asm__ volatile ("cli");
 
-    /* Read CR2 so we can see the faulting linear address. */
     uint32_t cr2;
     __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
 
-    /* "KEx=XX Err=XXXXXXXX CR2=XXXXXXXX" at start of second row. */
     VGA_BUFFER[80 + 0]  = (VGA_ATTR << 8) | 'K';
     VGA_BUFFER[80 + 1]  = (VGA_ATTR << 8) | 'E';
     VGA_BUFFER[80 + 2]  = (VGA_ATTR << 8) | 'x';

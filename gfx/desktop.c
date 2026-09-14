@@ -1,5 +1,17 @@
 /*
- * desktop.c - Desktop shell with dirty-region compositing and launcher.
+ * Project Tsukasa — Desktop shell with dirty-region compositing and launcher
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "desktop.h"
@@ -291,8 +303,6 @@ static int save_screenshot_bmp(const char *path)
     return 0;
 }
 
-/* ---- Wallpaper / background ------------------------------------------ */
-
 static void release_wallpaper_cache(void)
 {
     if (wallpaper_pixels) {
@@ -521,8 +531,6 @@ static void draw_desktop_bg_region(int x, int y, int w, int h)
     fill_gradient_region(x, y, w, h);
 }
 
-/* ---- Icons ------------------------------------------------------------ */
-
 static void add_icon(const char *label, int icon_type, app_launcher_fn fn)
 {
     struct desktop_icon *ic;
@@ -594,8 +602,6 @@ static void draw_icons_region(int x, int y, int w, int h)
         draw_icon_item(ic);
     }
 }
-
-/* ---- Taskbar / start menu -------------------------------------------- */
 
 static int start_menu_height(void)
 {
@@ -728,8 +734,6 @@ static void draw_start_menu(void)
                         (color_t)THEME_TEXT, 0x00000000u);
     }
 }
-
-/* ---- Launcher --------------------------------------------------------- */
 
 static int fuzzy_score(const char *query, const char *candidate)
 {
@@ -940,8 +944,6 @@ static void launcher_handle_key(uint32_t keycode)
     }
 }
 
-/* ---- Hit testing ------------------------------------------------------ */
-
 static int hit_icon(int mx, int my)
 {
     for (int i = 0; i < num_icons; i++) {
@@ -974,8 +976,6 @@ static int hit_menu_item(int mx, int my)
     }
 }
 
-/* ---- Redraw ----------------------------------------------------------- */
-
 static void do_full_redraw(void)
 {
     draw_desktop_bg();
@@ -1001,20 +1001,13 @@ static void redraw_dirty_regions(void)
     if (wm_dirty <= 0)
         return;
 
-    /*
-     * Under very bursty input, region stitching can get fragmented.
-     * Falling back to one full redraw keeps visual correctness stable.
-     */
+    /* Under very bursty input, region stitching can get fragmented. */
     if (wm_dirty > (DESKTOP_DIRTY_MAX / 2)) {
         do_full_redraw();
         return;
     }
 
-    /*
-     * Merge dirty rectangles into one repaint region. This avoids ordering
-     * artifacts where later small region redraws can punch visual holes into
-     * overlays or freshly-redrawn windows.
-     */
+    /* Merge dirty rectangles into one repaint region. */
     rx0 = wm_dirty_regions[0].x;
     ry0 = wm_dirty_regions[0].y;
     rx1 = wm_dirty_regions[0].x + wm_dirty_regions[0].w;
@@ -1049,17 +1042,12 @@ static void redraw_dirty_regions(void)
         intersects(rx0, ry0, rw, rh, menu_x, menu_y, MENU_W, start_menu_height()))
         draw_start_menu();
 
-    /*
-     * Launcher draws a full-screen dim layer (except taskbar), so any redraw
-     * on the desktop region must reapply it to remain visually stable.
-     */
+    /* Launcher draws a full-screen dim layer (except taskbar), so any redraw on the desktop region must reapply... */
     if (launcher_open && ry0 < taskbar_y)
         draw_launcher();
 
     cursor_draw();
 }
-
-/* ---- Main loop -------------------------------------------------------- */
 
 void desktop_run(void)
 {
@@ -1105,8 +1093,21 @@ void desktop_run(void)
 
     do_full_redraw();
 
+    int was_graphics = 0;
     for (;;) {
-        struct input_event ev;
+        struct gui_event ev;
+
+        if (vfs_kd_mode() == VFS_KD_GRAPHICS) {
+            struct gui_event drop;
+            while (event_dequeue(&drop)) { }
+            was_graphics = 1;
+            __asm__ volatile ("hlt");
+            continue;
+        }
+        if (was_graphics) {
+            was_graphics = 0;
+            do_full_redraw();
+        }
 
         while (event_dequeue(&ev)) {
             if (ev.event_id == INPUT_EVENT_MOUSE_MOVE ||

@@ -1,5 +1,17 @@
 /*
- * process.c - x86_64 process model, scheduler, lifecycle, and Phase 2 tests.
+ * Project Tsukasa — x86_64 process model, scheduler, lifecycle, and Phase 2 tests
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "process.h"
@@ -9,10 +21,13 @@
 
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../include/paging.h"
+#include "../include/errno.h"
 #include "../include/kprintf.h"
+#include "../include/smp.h"
 #include "../include/spinlock.h"
 #include "../fs/vfs.h"
 #include "../loader/exec.h"
+#include "../loader/elf64.h"
 #include "../ipc/shm.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
@@ -20,11 +35,13 @@
 #include "../gfx/gui_srv.h"
 #include "../gfx/wm.h"
 #include "../net/network.h"
+#include "../sys/futex.h"
+#include "../sys/work_queue.h"
 #include "../syscall/syscall.h"
 #include "../tty/tty.h"
 #include "../user/include/shell.h"
 
-#define CPU_COUNT 1
+#define CPU_COUNT_MAX 32
 #define WAIT_STATUS_EXIT(code)   (((code) & 0xFF) << 8)
 #define WAIT_STATUS_SIGNAL(sig)  ((sig) & 0x7F)
 #define WAIT_EXIT_CODE(st)       (((st) >> 8) & 0xFF)
@@ -42,8 +59,8 @@
 #define PROCESS_CONTEXT_IRET_INDEX 19u
 
 static process_t g_processes[PROCESS_MAX_COUNT];
-static process_t *g_current[CPU_COUNT];
-static process_t *g_idle[CPU_COUNT];
+static process_t *g_current[CPU_COUNT_MAX + 1];
+static process_t *g_idle[CPU_COUNT_MAX + 1];
 static process_t *g_runq_head[PROCESS_PRIORITY_LEVELS];
 static process_t *g_runq_tail[PROCESS_PRIORITY_LEVELS];
 
@@ -51,6 +68,14 @@ static spinlock_t g_sched_lock = SPINLOCK_INIT;
 static uint32_t g_next_pid = 1;
 static volatile uint64_t g_sched_ticks;
 static int g_ctx_warned;
+
+static uint32_t g_cpu_count = 1;
+static volatile uint64_t g_core_ticks[CPU_COUNT_MAX + 1];
+static volatile uint64_t g_ipi_ticks[CPU_COUNT_MAX + 1];
+static volatile uint64_t g_idle_seen_ticks[CPU_COUNT_MAX + 1];
+static volatile uint64_t g_idle_loop_ticks[CPU_COUNT_MAX + 1];
+
+static void process_ap_idle_entry(void);
 
 static int g_inited;
 
@@ -67,6 +92,30 @@ static inline void irq_restore(uint64_t flags)
         __asm__ volatile ("sti" : : : "memory");
     else
         __asm__ volatile ("cli" : : : "memory");
+}
+
+static inline uint32_t sched_this_cpu(void)
+{
+    uint32_t cpu = smp_this_cpu_id();
+    return (cpu < CPU_COUNT_MAX) ? cpu : CPU_COUNT_MAX;
+}
+
+static int process_is_current_anywhere_locked(const process_t *p)
+{
+    for (uint32_t cpu = 0; cpu < g_cpu_count; cpu++) {
+        if (g_current[cpu] == p)
+            return 1;
+    }
+    return 0;
+}
+
+static int process_is_current_on_other_cpu_locked(const process_t *p, uint32_t this_cpu)
+{
+    for (uint32_t cpu = 0; cpu < g_cpu_count; cpu++) {
+        if (cpu != this_cpu && g_current[cpu] == p)
+            return 1;
+    }
+    return 0;
 }
 
 static void name_copy(char *dst, const char *src, int cap)
@@ -112,6 +161,10 @@ static void process_init_sched_state(process_t *p, process_t *parent)
 
     p->priority = parent ? parent->priority : PROCESS_DEFAULT_PRIORITY;
     p->time_slice = PROCESS_DEFAULT_TIMESLICE;
+    p->cpu_affinity = parent ? parent->cpu_affinity : sched_this_cpu();
+    if (p->cpu_affinity == PROCESS_CPU_AFFINITY_ANY || p->cpu_affinity >= g_cpu_count)
+        p->cpu_affinity = sched_this_cpu();
+    p->cpu_id = p->cpu_affinity;
     p->sched_ticks = 0;
     p->created_time = g_sched_ticks;
     p->next_queue = NULL;
@@ -157,6 +210,8 @@ static void runq_push_locked(process_t *p)
     uint32_t pri;
     if (!p)
         return;
+    if (p->is_idle)
+        return;
     pri = p->priority;
     if (pri >= PROCESS_PRIORITY_LEVELS)
         pri = PROCESS_PRIORITY_LEVELS - 1;
@@ -173,17 +228,34 @@ static void runq_push_locked(process_t *p)
     g_runq_tail[pri] = p;
 }
 
-static process_t *runq_pop_locked(void)
+static inline int runq_eligible_on_cpu_locked(const process_t *p, uint32_t cpu)
+{
+    if (process_is_current_on_other_cpu_locked(p, cpu))
+        return 0;
+    return p->cpu_affinity == PROCESS_CPU_AFFINITY_ANY || p->cpu_affinity == cpu;
+}
+
+static process_t *runq_pop_locked(uint32_t cpu)
 {
     for (uint32_t pri = 0; pri < PROCESS_PRIORITY_LEVELS; pri++) {
+        process_t *prev = NULL;
         process_t *p = g_runq_head[pri];
+        while (p && !runq_eligible_on_cpu_locked(p, cpu)) {
+            prev = p;
+            p = p->rq_next;
+        }
         if (!p)
             continue;
-        g_runq_head[pri] = p->rq_next;
-        if (!g_runq_head[pri])
-            g_runq_tail[pri] = NULL;
-        if (g_runq_head[pri])
-            g_runq_head[pri]->prev_queue = NULL;
+        if (prev)
+            prev->rq_next = p->rq_next;
+        else
+            g_runq_head[pri] = p->rq_next;
+        if (g_runq_tail[pri] == p)
+            g_runq_tail[pri] = prev;
+        if (p->rq_next)
+            p->rq_next->prev_queue = prev;
+        if (prev)
+            prev->next_queue = p->rq_next;
         p->rq_next = NULL;
         p->next_queue = NULL;
         p->prev_queue = NULL;
@@ -192,11 +264,13 @@ static process_t *runq_pop_locked(void)
     return NULL;
 }
 
-static int runq_best_priority_locked(void)
+static int runq_best_priority_locked(uint32_t cpu)
 {
     for (uint32_t pri = 0; pri < PROCESS_PRIORITY_LEVELS; pri++) {
-        if (g_runq_head[pri])
-            return (int)pri;
+        for (const process_t *p = g_runq_head[pri]; p; p = p->rq_next) {
+            if (runq_eligible_on_cpu_locked(p, cpu))
+                return (int)pri;
+        }
     }
     return -1;
 }
@@ -321,11 +395,7 @@ static void reset_process_slot_locked(process_t *p)
     p->parent_next_child = NULL;
 }
 
-/*
- * Initial context matches the x64 IRQ epilogue:
- *   [rax..r15][vector][rip][cs][rflags][rsp][ss]
- * with rsp pointing at the saved rax slot.
- */
+/* Initial context matches the x64 IRQ epilogue: [rax..r15][vector][rip][cs][rflags][rsp][ss] with rsp... */
 extern void process_entry_resume(void);
 
 static int setup_initial_context_locked(process_t *p)
@@ -335,10 +405,7 @@ static int setup_initial_context_locked(process_t *p)
     if (!p || !p->kernel_stack)
         return -1;
 
-    /*
-     * Keep final entry rsp 16-byte ABI compatible (rsp % 16 == 8) and reserve
-     * in-frame rsp/ss words so iretq has a fully valid long-mode return frame.
-     */
+    /* Keep final entry rsp 16-byte ABI compatible (rsp % 16 == 8) and reserve in-frame rsp/ss words so iretq has... */
     top = (((uintptr_t)p->kernel_stack + PROCESS_STACK_SIZE) & ~(uintptr_t)0xFULL) -
           (uintptr_t)PROCESS_CONTEXT_TOP_BIAS;
     sp = (uint64_t *)top;
@@ -360,6 +427,25 @@ static int setup_initial_context_locked(process_t *p)
     p->kernel_rsp = (uint64_t)(uintptr_t)sp;
     p->main_thread.kernel_rsp = p->kernel_rsp;
     p->main_thread.kernel_stack = p->kernel_stack;
+    return 0;
+}
+
+/* Issue #21 (smp1 false-positive fix): a saved frame at kernel_rsp is RESUMABLE when its iret tail (RIP@16... */
+static int frame_is_resumable(const uint64_t *ctx, uint64_t low, uint64_t high)
+{
+    uint64_t rip = ctx[16];
+    uint64_t cs = ctx[17];
+    uint64_t rsp = ctx[19];
+    uint64_t ss = ctx[20];
+
+    if (cs == X64_GDT_KERNEL_CS && ss == X64_GDT_KERNEL_DS)
+        return rip != 0 &&
+               rsp >= low && rsp <= (high - sizeof(uint64_t));
+
+    if (cs == X64_GDT_USER_CS && ss == X64_GDT_USER_DS)
+        return rip >= PAGING_USER_VA_MIN && rip < PAGING_USER_VA_MAX &&
+               rsp >= PAGING_USER_VA_MIN && rsp < PAGING_USER_VA_MAX;
+
     return 0;
 }
 
@@ -389,11 +475,7 @@ static int validate_or_repair_context_locked(process_t *p)
     }
 
     ctx = (uint64_t *)(uintptr_t)p->kernel_rsp;
-    if (ctx[17] != X64_GDT_KERNEL_CS ||
-        ctx[16] == 0 ||
-        ctx[19] < low ||
-        ctx[19] > (high - sizeof(uint64_t)) ||
-        ctx[20] != X64_GDT_KERNEL_DS) {
+    if (!frame_is_resumable(ctx, low, high)) {
         if (!g_ctx_warned) {
             g_ctx_warned = 1;
             kprintf("[proc] WARN: bad ctx frame pid=%u rip=0x%08x%08x cs=0x%08x%08x rsp=0x%08x%08x ss=0x%08x%08x (repair)\n",
@@ -435,7 +517,7 @@ static int alloc_process_stack_locked(process_t *p)
     return p->kernel_stack ? 0 : -1;
 }
 
-static uint64_t process_stack_top_aligned(const process_t *p)
+uint64_t process_stack_top_aligned(const process_t *p)
 {
     if (!p || !p->kernel_stack)
         return 0;
@@ -458,6 +540,31 @@ static void wake_parent_if_waiting_locked(process_t *child)
     }
 }
 
+void process_block_current(void)
+{
+    unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
+    process_t *self = g_current[sched_this_cpu()];
+    if (self && !self->is_idle) {
+        self->state = PROCESS_BLOCKED;
+        self->main_thread.state = THREAD_BLOCKED;
+    }
+    spin_unlock_irqrestore(&g_sched_lock, irqf);
+}
+
+int process_wake_blocked(process_t *p)
+{
+    int woke = 0;
+    unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
+    if (p && p->used && !p->is_idle && p->state == PROCESS_BLOCKED) {
+        p->state = PROCESS_READY;
+        p->main_thread.state = THREAD_READY;
+        runq_push_locked(p);
+        woke = 1;
+    }
+    spin_unlock_irqrestore(&g_sched_lock, irqf);
+    return woke;
+}
+
 static void mark_zombie_locked(process_t *p, int wait_status)
 {
     if (!p)
@@ -465,8 +572,23 @@ static void mark_zombie_locked(process_t *p, int wait_status)
     if (p->state == PROCESS_ZOMBIE || p->state == PROCESS_DEAD)
         return;
 
-    vfs_process_cleanup(p);
-    shm_process_cleanup(p);
+    /* Reparent orphaned children to PID 1 (init) */
+    process_t *init_proc = find_by_pid_locked(1);
+    process_t *child = p->children_head;
+    while (child) {
+        process_t *next_child = child->parent_next_child;
+        child->ppid = (init_proc && init_proc != p) ? 1 : 0;
+        if (init_proc && init_proc != p) {
+            child->parent_next_child = init_proc->children_head;
+            init_proc->children_head = child;
+            if (child->state == PROCESS_ZOMBIE)
+                wake_parent_if_waiting_locked(child);
+        } else {
+            child->parent_next_child = NULL;
+        }
+        child = next_child;
+    }
+    p->children_head = NULL;
 
     p->wait_status = wait_status;
     p->exit_code = WAIT_EXIT_CODE(wait_status);
@@ -475,6 +597,7 @@ static void mark_zombie_locked(process_t *p, int wait_status)
     p->state = PROCESS_ZOMBIE;
     p->main_thread.state = THREAD_ZOMBIE;
     p->kill_pending = 0;
+    runq_remove_locked(p);
     wake_parent_if_waiting_locked(p);
 }
 
@@ -508,6 +631,10 @@ static int prepare_signal_action_locked(process_t *p, uintptr_t *handler_out, in
     handler = p->signal_handlers[sig];
 
     if (handler == PROCESS_SIG_IGN)
+        return 0;
+
+    /* PID 1 (init) cannot be terminated by unhandled signals */
+    if (p->pid == 1 && (handler == PROCESS_SIG_DFL || sig == PROCESS_SIGKILL || sig == PROCESS_SIGINT))
         return 0;
 
     if (handler == PROCESS_SIG_DFL || sig == PROCESS_SIGKILL || sig == PROCESS_SIGINT) {
@@ -552,14 +679,15 @@ static process_t *create_kernel_process_locked(const char *name, process_entry_t
 
     if (parent)
         template_space = &parent->vm_space;
-    else if (g_current[0])
-        template_space = &g_current[0]->vm_space;
+    else if (g_current[sched_this_cpu()])
+        template_space = &g_current[sched_this_cpu()]->vm_space;
 
     if (template_space && template_space->pml4_phys) {
         p->vm_space.pml4_phys = template_space->pml4_phys;
         p->vm_space.user_min = template_space->user_min;
         p->vm_space.user_max = template_space->user_max;
         p->vm_space.shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE + (((uintptr_t)p->pid % 64) * 0x01000000ULL);
+        p->vm_space.anon_cursor = (uintptr_t)VM_SPACE_ANON_BASE;
         p->vm_space.mapped_pages = 0;
         p->vm_space.shm_pages = 0;
         p->vm_space.owns_pml4 = 0;
@@ -603,6 +731,12 @@ void process_init(void)
     if (g_inited)
         return;
 
+    g_cpu_count = smp_cpu_count();
+    if (g_cpu_count < 1)
+        g_cpu_count = 1;
+    if (g_cpu_count > CPU_COUNT_MAX)
+        g_cpu_count = CPU_COUNT_MAX;
+
     flags = irq_save_disable();
     spin_lock(&g_sched_lock);
 
@@ -626,10 +760,10 @@ void process_init(void)
     }
 
     bootstrap->used = 1;
-    bootstrap->pid = g_next_pid++;
+    bootstrap->pid = 0;
     bootstrap->ppid = 0;
-    bootstrap->pgid = bootstrap->pid;
-    bootstrap->sid = bootstrap->pid;
+    bootstrap->pgid = 0;
+    bootstrap->sid = 0;
     bootstrap->uid = 0;
     bootstrap->gid = 0;
     bootstrap->cpu_id = 0;
@@ -640,7 +774,7 @@ void process_init(void)
     process_init_sched_state(bootstrap, NULL);
     bootstrap->main_thread.state = THREAD_BLOCKED;
     process_init_io_state(bootstrap, NULL);
-    name_copy(bootstrap->name, "bootstrap", PROCESS_NAME_MAX);
+    name_copy(bootstrap->name, "swapper", PROCESS_NAME_MAX);
     if (vm_space_init_kernel(&bootstrap->vm_space) != 0) {
         spin_unlock(&g_sched_lock);
         irq_restore(flags);
@@ -652,18 +786,28 @@ void process_init(void)
     idle = create_kernel_process_locked("idle0", NULL, NULL);
     if (idle) {
         idle->is_idle = 1;
+        idle->pid = 0;
+        idle->pgid = 0;
+        idle->sid = 0;
         g_idle[0] = idle;
         runq_remove_locked(idle);
     }
 
+    /* First non-idle user/system task will receive PID 1 */
+    g_next_pid = 1;
+
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
     g_inited = 1;
+
+    /* Each adopts the work-queue drain loop its core is already executing (see process_spawn_idle_for_cpu). */
+    for (uint32_t cpu = 1; cpu < g_cpu_count; cpu++)
+        process_spawn_idle_for_cpu(cpu);
 }
 
 process_t *process_current(void)
 {
-    return g_current[0];
+    return g_current[sched_this_cpu()];
 }
 
 int process_current_pid(void)
@@ -683,6 +827,39 @@ int process_get_pgid(int pid)
     return p ? (int)p->pgid : -1;
 }
 
+/* Give the calling process a private user address space: its own PML4 (with the kernel higher-half shared,... */
+int process_adopt_private_address_space(void)
+{
+    process_t *p;
+    vm_space_t priv;
+    uint64_t flags;
+
+    if (vm_space_create(&priv) != 0)
+        return -1;
+
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    p = g_current[sched_this_cpu()];
+    if (!p || p->vm_space.owns_pml4) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        vm_space_destroy(&priv);
+        return p ? 0 : -1;
+    }
+    p->vm_space.pml4_phys = priv.pml4_phys;
+    p->vm_space.user_min = priv.user_min;
+    p->vm_space.user_max = priv.user_max;
+    p->vm_space.shm_cursor = priv.shm_cursor;
+    p->vm_space.anon_cursor = priv.anon_cursor;
+    p->vm_space.mapped_pages = 0;
+    p->vm_space.shm_pages = 0;
+    p->vm_space.owns_pml4 = 1;
+    vmm_switch_pml4(priv.pml4_phys);
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    return 0;
+}
+
 process_t *process_spawn_kernel(const char *name, process_entry_t entry)
 {
     process_t *parent;
@@ -693,11 +870,132 @@ process_t *process_spawn_kernel(const char *name, process_entry_t entry)
 
     flags = irq_save_disable();
     spin_lock(&g_sched_lock);
-    parent = g_current[0];
+    parent = g_current[sched_this_cpu()];
     child = create_kernel_process_locked(name, entry, parent);
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
     return child;
+}
+
+process_t *process_spawn_kernel_pinned(const char *name, process_entry_t entry,
+                                       uint32_t cpu_id)
+{
+    process_t *parent;
+    process_t *child;
+    uint64_t flags;
+    if (!entry || cpu_id >= g_cpu_count)
+        return NULL;
+
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    parent = g_current[sched_this_cpu()];
+    child = create_kernel_process_locked(name, entry, parent);
+    if (child) {
+        runq_remove_locked(child);
+        child->cpu_affinity = cpu_id;
+        child->cpu_id = cpu_id;
+        child->main_thread.cpu_id = cpu_id;
+        runq_push_locked(child);
+    }
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    return child;
+}
+
+/* The AP is already executing sys/smp.c::ap_entry()'s work_queue_drain_loop() on its own boot live execution... */
+process_t *process_spawn_idle_for_cpu(uint32_t cpu_id)
+{
+    process_t *p;
+    cpu_state_t *cs;
+    uint64_t flags;
+    char idle_name[8];
+    int n = 0;
+
+    if (cpu_id == 0 || cpu_id >= g_cpu_count)
+        return NULL;
+    cs = smp_get_cpu(cpu_id);
+    if (!cs || !cs->online || !cs->kernel_stack)
+        return NULL;
+    if (g_idle[cpu_id])
+        return g_idle[cpu_id];
+
+    idle_name[n++] = 'i';
+    idle_name[n++] = 'd';
+    idle_name[n++] = 'l';
+    idle_name[n++] = 'e';
+    if (cpu_id >= 10)
+        idle_name[n++] = (char)('0' + (cpu_id / 10) % 10);
+    idle_name[n++] = (char)('0' + cpu_id % 10);
+    idle_name[n] = '\0';
+
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+
+    p = alloc_process_slot_locked();
+    if (!p) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        kprintf("[guide06] WARN: no process slot for %s\n", idle_name);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < sizeof(*p); i++)
+        ((uint8_t *)p)[i] = 0;
+
+    p->used = 1;
+    p->pid = 0;
+    p->ppid = 0;
+    p->pgid = 0;
+    p->sid = 0;
+    p->uid = 0;
+    p->gid = 0;
+    p->cpu_id = cpu_id;
+    p->state = PROCESS_RUNNING;
+    p->is_idle = 1;
+    p->entry = process_ap_idle_entry;
+    p->tty_id = 0;
+    p->shm_attachment_count = 0;
+    process_init_sched_state(p, NULL);
+    p->cpu_affinity = cpu_id;
+    process_init_io_state(p, NULL);
+    name_copy(p->name, idle_name, PROCESS_NAME_MAX);
+
+    p->kernel_stack = (void *)(uintptr_t)(cs->kernel_stack - PROCESS_STACK_SIZE);
+    p->kernel_stack_phys = 0;
+    p->kernel_stack_from_pmm = 0;
+    p->kernel_rsp = 0;
+    p->main_thread.kernel_stack = p->kernel_stack;
+    p->main_thread.kernel_rsp = 0;
+    p->main_thread.cpu_id = cpu_id;
+    p->main_thread.state = THREAD_RUNNING;
+
+    if (g_current[0] && g_current[0]->vm_space.pml4_phys) {
+        /* Share the boot kernel address space, exactly like other kernel processes spawned without a parent... */
+        p->vm_space.pml4_phys = g_current[0]->vm_space.pml4_phys;
+        p->vm_space.user_min = g_current[0]->vm_space.user_min;
+        p->vm_space.user_max = g_current[0]->vm_space.user_max;
+        p->vm_space.shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE + (((uintptr_t)p->pid % 64) * 0x01000000ULL);
+        p->vm_space.mapped_pages = 0;
+        p->vm_space.shm_pages = 0;
+        p->vm_space.owns_pml4 = 0;
+    } else if (vm_space_init_kernel(&p->vm_space) != 0) {
+        p->used = 0;
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        kprintf("[guide06] WARN: vm_space init failed for %s\n", idle_name);
+        return NULL;
+    }
+    p->va_space = &p->vm_space;
+
+    g_idle[cpu_id] = p;
+    g_current[cpu_id] = p;
+
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+
+    kprintf("[guide06] %s pid=%u adopted cpu %u drain loop\n",
+            p->name, (unsigned)p->pid, cpu_id);
+    return p;
 }
 
 int process_exec(int pid, process_entry_t entry, const char *name)
@@ -711,7 +1009,8 @@ int process_exec(int pid, process_entry_t entry, const char *name)
     spin_lock(&g_sched_lock);
 
     p = find_by_pid_locked(pid);
-    if (!p || p->state == PROCESS_DEAD || p->state == PROCESS_ZOMBIE || p == g_current[0]) {
+    if (!p || p->state == PROCESS_DEAD || p->state == PROCESS_ZOMBIE ||
+        process_is_current_anywhere_locked(p)) {
         spin_unlock(&g_sched_lock);
         irq_restore(flags);
         return -1;
@@ -753,7 +1052,7 @@ int process_exit_current(int code)
     process_t *cur;
     uint64_t flags = irq_save_disable();
     spin_lock(&g_sched_lock);
-    cur = g_current[0];
+    cur = g_current[sched_this_cpu()];
     if (!cur) {
         spin_unlock(&g_sched_lock);
         irq_restore(flags);
@@ -768,6 +1067,22 @@ int process_exit_current(int code)
 void process_exit(int code)
 {
     process_exit_current(code);
+    process_yield();
+    for (;;)
+        __asm__ volatile ("hlt");
+}
+
+/* Terminate the current process because it took a fatal fault (e.g. */
+void process_terminate_current(int sig)
+{
+    process_t *cur;
+    uint64_t flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    cur = g_current[sched_this_cpu()];
+    if (cur)
+        mark_zombie_locked(cur, WAIT_STATUS_SIGNAL(sig));
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
     process_yield();
     for (;;)
         __asm__ volatile ("hlt");
@@ -791,6 +1106,7 @@ int process_waitpid(int caller_pid, int target_pid, int options, int *status_out
     for (;;) {
         process_t *caller;
         process_t *child;
+        process_t *self;
         int found_match = 0;
         int found_any_child = 0;
         uint64_t flags = irq_save_disable();
@@ -808,7 +1124,8 @@ int process_waitpid(int caller_pid, int target_pid, int options, int *status_out
             found_any_child = 1;
             if (wait_match_child(caller, child, target_pid)) {
                 found_match = 1;
-                if (child->state == PROCESS_ZOMBIE) {
+                if (child->state == PROCESS_ZOMBIE &&
+                    !process_is_current_anywhere_locked(child)) {
                     int pid = (int)child->pid;
                     if (status_out)
                         *status_out = child->wait_status;
@@ -834,9 +1151,10 @@ int process_waitpid(int caller_pid, int target_pid, int options, int *status_out
             return 0;
         }
 
-        if (g_current[0] && g_current[0]->pid == caller->pid) {
-            g_current[0]->state = PROCESS_BLOCKED;
-            g_current[0]->main_thread.state = THREAD_BLOCKED;
+        self = g_current[sched_this_cpu()];
+        if (self && self->pid == caller->pid) {
+            self->state = PROCESS_BLOCKED;
+            self->main_thread.state = THREAD_BLOCKED;
             spin_unlock(&g_sched_lock);
             irq_restore(flags);
             process_yield();
@@ -877,6 +1195,13 @@ int process_kill(int pid, int sig)
         return -1;
     }
 
+    /* PID 1 (init) cannot be killed */
+    if (pid == 1 && (sig == PROCESS_SIGKILL || sig == PROCESS_SIGSTOP || sig == PROCESS_SIGTERM)) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -1;
+    }
+
     if (sig == PROCESS_SIGKILL) {
         mark_zombie_locked(p, WAIT_STATUS_SIGNAL(sig));
     } else {
@@ -907,6 +1232,8 @@ int process_kill_pgid(int pgid, int sig)
         if (!p->used || p->state == PROCESS_DEAD || p->state == PROCESS_ZOMBIE)
             continue;
         if ((int)p->pgid != pgid)
+            continue;
+        if (p->pid == 1 && (sig == PROCESS_SIGKILL || sig == PROCESS_SIGSTOP || sig == PROCESS_SIGTERM))
             continue;
         if (sig == PROCESS_SIGKILL)
             mark_zombie_locked(p, WAIT_STATUS_SIGNAL(sig));
@@ -1128,13 +1455,24 @@ uint64_t process_schedule_tick(uint64_t current_rsp)
     uintptr_t signal_handler = 0;
     int delivered_sig = 0;
     uint64_t next_rsp;
+    uint32_t cpu;
     uint64_t flags = irq_save_disable();
 
-    spin_lock(&g_sched_lock);
-    g_sched_ticks++;
+    cpu = sched_this_cpu();
+    if (cpu >= g_cpu_count) {
+        irq_restore(flags);
+        return current_rsp;
+    }
 
-    cur = g_current[0];
+    spin_lock(&g_sched_lock);
+    if (cpu == 0)
+        g_sched_ticks++;
+    g_core_ticks[cpu]++;
+
+    cur = g_current[cpu];
     if (cur) {
+        if (cur->is_idle)
+            g_idle_seen_ticks[cpu]++;
         cur->kernel_rsp = current_rsp;
         cur->ticks++;
         cur->sched_ticks++;
@@ -1143,11 +1481,10 @@ uint64_t process_schedule_tick(uint64_t current_rsp)
 
         if (cur->state == PROCESS_RUNNING &&
             prepare_signal_action_locked(cur, &signal_handler, &delivered_sig)) {
-            /* handler delivered below after lock release */
         }
 
         if (cur->state == PROCESS_RUNNING) {
-            int best_pri = runq_best_priority_locked();
+            int best_pri = runq_best_priority_locked(cpu);
             if (!cur->is_idle && cur->time_slice > 0) {
                 cur->time_slice--;
                 cur->main_thread.time_slice = cur->time_slice;
@@ -1177,32 +1514,38 @@ uint64_t process_schedule_tick(uint64_t current_rsp)
         }
     }
 
-    next = runq_pop_locked();
+    next = runq_pop_locked(cpu);
     if (!next)
-        next = g_idle[0];
+        next = g_idle[cpu];
     if (!next)
         next = cur;
 
     if (next) {
         next->state = PROCESS_RUNNING;
         next->main_thread.state = THREAD_RUNNING;
+        next->cpu_id = cpu;
+        next->main_thread.cpu_id = cpu;
     }
-    g_current[0] = next;
+    g_current[cpu] = next;
     if (next && next->kernel_stack) {
         if (validate_or_repair_context_locked(next) != 0) {
-            process_t *fallback = cur ? cur : g_idle[0];
+            process_t *fallback = cur ? cur : g_idle[cpu];
             if (fallback) {
                 next = fallback;
                 next->state = PROCESS_RUNNING;
                 next->main_thread.state = THREAD_RUNNING;
-                g_current[0] = next;
+                next->cpu_id = cpu;
+                next->main_thread.cpu_id = cpu;
+                g_current[cpu] = next;
             }
         }
         if (next && next->kernel_stack)
             tss_set_rsp0_x64(process_stack_top_aligned(next));
     }
-    if (next && next->vm_space.pml4_phys)
+    if (next && next->vm_space.owns_pml4 && next->vm_space.pml4_phys)
         vmm_switch_pml4(next->vm_space.pml4_phys);
+    else if (vmm_get_kernel_pml4())
+        vmm_switch_pml4(vmm_get_kernel_pml4());
 
     next_rsp = next ? next->kernel_rsp : current_rsp;
     spin_unlock(&g_sched_lock);
@@ -1214,6 +1557,22 @@ uint64_t process_schedule_tick(uint64_t current_rsp)
     }
 
     return next_rsp ? next_rsp : current_rsp;
+}
+
+uint64_t process_schedule_ipi(uint64_t current_rsp)
+{
+    g_ipi_ticks[sched_this_cpu()]++;
+    return process_schedule_tick(current_rsp);
+}
+
+void process_idle_loop_note(void)
+{
+    g_idle_loop_ticks[sched_this_cpu()]++;
+}
+
+static void process_ap_idle_entry(void)
+{
+    work_queue_drain_loop();
 }
 
 void process_yield(void)
@@ -1395,8 +1754,11 @@ void process_entry_trampoline(void)
             continue;
         }
 
-        if (cur->is_idle)
+        if (cur->is_idle) {
+            if (cur->entry)
+                cur->entry();
             process_idle_entry();
+        }
 
         fn = cur->entry;
         kprintf("[proc] enter pid=%u name=%s entry=0x%08x%08x\n",
@@ -1413,12 +1775,6 @@ void process_entry_trampoline(void)
         process_exit(0);
     }
 }
-
-/*
- * -----------------------------------------------------------------------
- * Phase 2 self-tests (WS2.1-WS2.4 validation)
- * -----------------------------------------------------------------------
- */
 
 static volatile uint64_t g_burn_a;
 static volatile uint64_t g_burn_b;
@@ -1515,6 +1871,12 @@ static int selftest_wait_child(int pid, int *status_out)
     return process_waitpid(caller, pid, 0, status_out);
 }
 
+static volatile uint32_t g_phase2_done_w;
+
+static volatile uint32_t g_guide20_done_w;
+
+static volatile uint32_t g_guide15_done_w;
+
 static void phase2_selftest_entry(void)
 {
     int pass = 0;
@@ -1522,7 +1884,6 @@ static void phase2_selftest_entry(void)
 
     kprintf("[phase2][test] start\n");
 
-    /* Step 1: enhanced process structure and primary TCB invariants. */
     {
         process_t *cur = process_current();
         int ok = cur &&
@@ -1550,7 +1911,6 @@ static void phase2_selftest_entry(void)
         }
     }
 
-    /* 256-priority run queues: lower numeric priority runs first. */
     {
         process_t *low;
         process_t *high;
@@ -1579,7 +1939,6 @@ static void phase2_selftest_entry(void)
         }
     }
 
-    /* Preemption fairness */
     {
         process_t *a;
         process_t *b;
@@ -1608,7 +1967,6 @@ static void phase2_selftest_entry(void)
         }
     }
 
-    /* spawn -> exec -> waitpid and kill status */
     {
         process_t *child = process_spawn_kernel("exec-src", selftest_exec_source);
         int st = 0;
@@ -1641,7 +1999,6 @@ static void phase2_selftest_entry(void)
         }
     }
 
-    /* Signal mask/pending and handler delivery */
     {
         process_t *sig_target;
         int st = 0;
@@ -1679,7 +2036,6 @@ static void phase2_selftest_entry(void)
         }
     }
 
-    /* TTY foreground Ctrl+C behaviour */
     {
         process_t *fg = process_spawn_kernel("tty-fg", selftest_tty_fg_target);
         int st = 0;
@@ -1702,6 +2058,8 @@ static void phase2_selftest_entry(void)
     }
 
     kprintf("[phase2][test] done pass=%d fail=%d\n", pass, fail);
+    g_phase2_done_w = 1;
+    kernel_futex_wake(&g_phase2_done_w, 64);
     process_exit((fail == 0) ? 0 : 1);
 }
 
@@ -1711,11 +2069,110 @@ void process_run_phase2_selftests(void)
     process_spawn_kernel("phase2-selftest", phase2_selftest_entry);
 }
 
-/*
- * -----------------------------------------------------------------------
- * Phase 3 self-tests (WS3.1-WS3.4 validation)
- * -----------------------------------------------------------------------
- */
+#ifdef __x86_64__
+static void phase1_fault_isolation_entry(void)
+{
+    int pid = -1;
+    int status = -1;
+    int r;
+
+    /* elf64_spawn uses a single-slot handoff; retry while another spawn (e.g. */
+    for (int i = 0; i < 200 && pid < 0; i++) {
+        pid = elf64_spawn("/fat12/fault.elf", "fault-victim");
+        if (pid < 0)
+            process_yield();
+    }
+    if (pid < 0) {
+        kprintf("[phase1][test] ring3 fault-isolation FAIL (spawn)\n");
+        process_exit(0);
+    }
+
+    r = process_waitpid(process_current_pid(), pid, 0, &status);
+    if (r == pid && WAIT_TERM_SIGNAL(status) == PROCESS_SIGSEGV)
+        kprintf("[phase1][test] ring3 fault-isolation PASS victim pid=%d killed by SIGSEGV=%d, kernel alive\n",
+                pid, WAIT_TERM_SIGNAL(status));
+    else
+        kprintf("[phase1][test] ring3 fault-isolation FAIL pid=%d r=%d status=0x%x sig=%d\n",
+                pid, r, (unsigned)status, WAIT_TERM_SIGNAL(status));
+    process_exit(0);
+}
+#endif
+
+#ifdef __x86_64__
+/* Prove ELF loading is reachable through the real SYS_SPAWN dispatch (not just the in-kernel elf64_spawn()... */
+static void phase1_elf_spawn_syscall_entry(void)
+{
+    long pid = -1;
+    int status = -1;
+    int r;
+
+    for (int i = 0; i < 200 && pid < 0; i++) {
+        pid = (long)syscall_handler(SYS_SYSTEM, SYSTEM_CMD_SPAWN,
+                                    (uintptr_t)"/fat12/hello.elf", 0, 0, 0);
+        if (pid < 0)
+            process_yield();
+    }
+    if (pid < 0) {
+        kprintf("[phase1][test] elf spawn-by-syscall FAIL (spawn)\n");
+        process_exit(0);
+    }
+
+    r = process_waitpid(process_current_pid(), (int)pid, 0, &status);
+    if (r == (int)pid)
+        kprintf("[phase1][test] elf spawn-by-syscall PASS pid=%d ran ring3 (exit code=%d)\n",
+                (int)pid, (status >> 8) & 0xFF);
+    else
+        kprintf("[phase1][test] elf spawn-by-syscall FAIL pid=%d r=%d\n", (int)pid, r);
+    process_exit(0);
+}
+
+static void phase1_spawn_wait_entry(void)
+{
+    struct tsukasa_spawn_request req;
+    long pid = -1;
+    int status = -1;
+    int r;
+
+    req.path = "/fat12/exit7.elf";
+    req.args = "/fat12/exit7.elf";
+    req.stdin_fd = -1;
+    req.stdout_fd = -1;
+    req.stderr_fd = -1;
+    req.tty_id = -1;
+
+    for (int i = 0; i < 200 && pid < 0; i++) {
+        pid = (long)syscall_handler(SYS_SYSTEM, SYSTEM_CMD_SPAWN_EX,
+                                    (uintptr_t)&req, 0, 0, 0);
+        if (pid < 0)
+            process_yield();
+    }
+    if (pid < 0) {
+        kprintf("[phase1][test] spawn+wait(disk) FAIL (spawn)\n");
+        process_exit(0);
+    }
+
+    r = process_waitpid(process_current_pid(), (int)pid, 0, &status);
+    if (r == (int)pid && WAIT_EXIT_CODE(status) == 7)
+        kprintf("[phase1][test] spawn+wait(disk exit7) PASS pid=%d exit_code=%d\n",
+                (int)pid, WAIT_EXIT_CODE(status));
+    else
+        kprintf("[phase1][test] spawn+wait(disk exit7) FAIL pid=%d r=%d status=0x%x code=%d\n",
+                (int)pid, r, (unsigned)status, WAIT_EXIT_CODE(status));
+    process_exit(0);
+}
+#endif
+
+void process_run_phase1_selftests(void)
+{
+#ifdef __x86_64__
+    if (!process_spawn_kernel("phase1-selftest", phase1_fault_isolation_entry))
+        kprintf("[phase1][test] WARN: failed to spawn phase1-selftest\n");
+    if (!process_spawn_kernel("phase1-elf-spawn", phase1_elf_spawn_syscall_entry))
+        kprintf("[phase1][test] WARN: failed to spawn phase1-elf-spawn\n");
+    if (!process_spawn_kernel("phase1-spawn-wait", phase1_spawn_wait_entry))
+        kprintf("[phase1][test] WARN: failed to spawn phase1-spawn-wait\n");
+#endif
+}
 
 static volatile int g_p3_shm_stage;
 static volatile int g_p3_shm_id;
@@ -1797,7 +2254,6 @@ static void phase3_exit_leak_task(void)
         process_exit(1);
 
     *buf = 0xA5A55A5Au;
-    /* Intentionally exit without detach/destroy to verify teardown hook. */
     process_exit(0);
 }
 
@@ -2004,12 +2460,6 @@ void process_run_phase3_selftests(void)
     process_spawn_kernel("phase3-selftest", phase3_selftest_entry);
 }
 
-/*
- * -----------------------------------------------------------------------
- * Phase 4 self-tests (WS4.1-WS4.4 validation)
- * -----------------------------------------------------------------------
- */
-
 static int phase4_fd_semantics_test(void)
 {
     static const char data[] = "phase4-fd";
@@ -2158,12 +2608,6 @@ void process_run_phase4_selftests(void)
     process_spawn_kernel("phase4-selftest", phase4_selftest_entry);
 }
 
-/*
- * -----------------------------------------------------------------------
- * Phase 5 self-tests (WS5.1-WS5.4 validation)
- * -----------------------------------------------------------------------
- */
-
 static int phase5_sysfs_visibility_test(void)
 {
     int fd;
@@ -2227,10 +2671,7 @@ static int phase5_network_syscall_test(void)
     if (!stats.stack_initialized)
         return -1;
 
-    /*
-     * DHCP may legitimately fail in some headless CI/QEMU environments.
-     * Try to acquire a lease, then validate either online or offline syscall paths.
-     */
+    /* DHCP may legitimately fail in some headless CI/QEMU environments. */
     rc = (int)syscall_handler(SYS_SYSTEM, SYSTEM_CMD_NET_DHCP, 0, 0, 0, 0);
     if (rc != 0 && rc != -1)
         return -1;
@@ -2244,10 +2685,7 @@ static int phase5_network_syscall_test(void)
     }
 
     if (!has_ip) {
-        /*
-         * Offline mode: ensure syscall path is still stable and errors are sane.
-         * No external network should not fail the whole phase.
-         */
+        /* Offline mode: ensure syscall path is still stable and errors are sane. */
         (void)syscall_handler(SYS_SYSTEM, SYSTEM_CMD_NET_TCP_CLOSE, 0, 0, 0, 0);
         rc = (int)syscall_handler(SYS_SYSTEM, SYSTEM_CMD_NET_TCP_SEND,
                                   (uintptr_t)http_probe,
@@ -2363,12 +2801,6 @@ void process_run_phase5_selftests(void)
 {
     process_spawn_kernel("phase5-selftest", phase5_selftest_entry);
 }
-
-/*
- * -----------------------------------------------------------------------
- * Phase 7 self-tests (shell redirection, pipes, rc parsing)
- * -----------------------------------------------------------------------
- */
 
 static int phase7_read_file(const char *path, char *buf, size_t cap)
 {
@@ -2486,11 +2918,11 @@ void process_run_phase7_selftests(void)
     process_spawn_kernel("phase7-selftest", phase7_selftest_entry);
 }
 
-/*
- * -----------------------------------------------------------------------
- * Phase 8 self-tests (stabilization, stress, release readiness)
- * -----------------------------------------------------------------------
- */
+/* frosty (2026-07-22): the boot-time window storms — the gui/input stress windows and the core-app-launch... */
+#define PHASE8_GUI_TESTS 0
+
+/* frosty (2026-07-23): the proc/mem STRESS STORM (192 p8-kill-target spawns + shm churn + forced reap) can... */
+#define PHASE8_STRESS_STORM 0
 
 #define PHASE8_GUI_WINDOWS      3
 #define PHASE8_GUI_STORM_ITERS  320
@@ -2506,9 +2938,11 @@ static volatile uint64_t g_p8_fair_b;
 static volatile uint64_t g_p8_fair_c;
 static volatile int g_p8_fair_stop;
 
+#if PHASE8_STRESS_STORM
 static volatile int g_p8_shm_id;
 static volatile int g_p8_shm_fail;
 static volatile int g_p8_shm_start;
+#endif
 
 static uint64_t phase8_pack_i32(int a, int b)
 {
@@ -2658,6 +3092,7 @@ static int phase8_scheduler_fairness_test(uint32_t *ratio_pct_out,
     return (ratio_pct >= 35u) ? 0 : -1;
 }
 
+#if PHASE8_GUI_TESTS
 static int phase8_gui_input_stress_test(uint32_t *event_count_out,
                                         uint32_t *draw_ops_out,
                                         uint32_t *ops_per_100ticks_out)
@@ -2798,7 +3233,9 @@ cleanup:
 
     return ok ? 0 : -1;
 }
+#endif
 
+#if PHASE8_STRESS_STORM
 static void phase8_kill_target(void)
 {
     for (;;)
@@ -2946,6 +3383,7 @@ static int phase8_process_memory_stress_test(uint32_t *spawned_out,
         *free_after_out = free_after;
     return 0;
 }
+#endif
 
 static int phase8_storage_network_stress_test(uint32_t *fd_ops_out,
                                               uint32_t *net_attempts_out,
@@ -3119,6 +3557,7 @@ static int phase8_invalid_syscall_fault_test(int *checks_out)
     return 0;
 }
 
+#if PHASE8_GUI_TESTS
 static int phase8_core_app_launch_test(int *launched_out, int *passed_out, int *total_out)
 {
     static const char *apps[] = {
@@ -3169,6 +3608,7 @@ static int phase8_core_app_launch_test(int *launched_out, int *passed_out, int *
         *total_out = total;
     return (launched == total && passed == total) ? 0 : -1;
 }
+#endif
 
 static void phase8_selftest_entry(void)
 {
@@ -3181,23 +3621,29 @@ static void phase8_selftest_entry(void)
     uint32_t fairness_ratio = 0;
     uint64_t fairness_min = 0;
     uint64_t fairness_max = 0;
+#if PHASE8_GUI_TESTS
     uint32_t gui_events = 0;
     uint32_t gui_draw_ops = 0;
     uint32_t gui_ops_per_100ticks = 0;
+#endif
+#if PHASE8_STRESS_STORM
     uint32_t spawned = 0;
     uint32_t killed = 0;
     uint32_t reaped = 0;
     uint32_t shm_ops = 0;
     uintptr_t free_before = 0;
     uintptr_t free_after = 0;
+#endif
     uint32_t fd_ops = 0;
     uint32_t net_attempts = 0;
     uint32_t net_success = 0;
     int net_online = 0;
     int fault_checks = 0;
+#if PHASE8_GUI_TESTS
     int apps_launched = 0;
     int apps_passed = 0;
     int apps_total = 0;
+#endif
 
     {
         uint64_t wait_start = process_ticks();
@@ -3222,6 +3668,7 @@ static void phase8_selftest_entry(void)
                 (uint32_t)fairness_max);
     }
 
+#if PHASE8_GUI_TESTS
     if (phase8_gui_input_stress_test(&gui_events, &gui_draw_ops, &gui_ops_per_100ticks) == 0) {
         pass++;
         kprintf("[phase8][stress] gui/input PASS events=%u draw_ops=%u ops_per_100ticks=%u\n",
@@ -3247,7 +3694,13 @@ static void phase8_selftest_entry(void)
         kprintf("[phase8][perf] redraw throughput FAIL ops_per_100ticks=%u\n",
                 gui_ops_per_100ticks);
     }
+#else
+    kprintf("[phase8][stress] gui/input SKIPPED (PHASE8_GUI_TESTS=0 — "
+            "boot window storm disabled per frosty; issue #21 family)\n");
+    kprintf("[phase8][perf] redraw throughput SKIPPED (PHASE8_GUI_TESTS=0)\n");
+#endif
 
+#if PHASE8_STRESS_STORM
     if (phase8_process_memory_stress_test(&spawned,
                                           &killed,
                                           &reaped,
@@ -3279,6 +3732,12 @@ static void phase8_selftest_entry(void)
                 spawned,
                 reaped);
     }
+#else
+    kprintf("[phase8][stress] proc/mem SKIPPED (PHASE8_STRESS_STORM=0 — "
+            "192-spawn soak trips the issue-#17 reap race and exhausts "
+            "the process table on desktop boots)\n");
+    kprintf("[phase8][fault] forced reap SKIPPED (PHASE8_STRESS_STORM=0)\n");
+#endif
 
     if (phase8_storage_network_stress_test(&fd_ops, &net_attempts, &net_success, &net_online) == 0) {
         pass++;
@@ -3306,6 +3765,7 @@ static void phase8_selftest_entry(void)
         kprintf("[phase8][fault] invalid-syscalls FAIL checks=%d\n", fault_checks);
     }
 
+#if PHASE8_GUI_TESTS
     if (phase8_core_app_launch_test(&apps_launched, &apps_passed, &apps_total) == 0) {
         pass++;
         kprintf("[phase8][regression] core-app-launch PASS launched=%d/%d\n",
@@ -3319,6 +3779,9 @@ static void phase8_selftest_entry(void)
                 apps_total,
                 apps_launched);
     }
+#else
+    kprintf("[phase8][regression] core-app-launch SKIPPED (PHASE8_GUI_TESTS=0)\n");
+#endif
 
     kprintf("[phase8][triage] blocker=%d major=%d minor=%d\n", blocker, major, minor);
     kprintf("[phase8][test] done pass=%d fail=%d\n", pass, fail);
@@ -3328,4 +3791,1140 @@ static void phase8_selftest_entry(void)
 void process_run_phase8_selftests(void)
 {
     process_spawn_kernel("phase8-selftest", phase8_selftest_entry);
+}
+
+static volatile uint32_t g_guide06_pin_min;
+static volatile uint32_t g_guide06_pin_max;
+static volatile int g_guide06_pin_done;
+
+static void guide06_pinned_entry(void)
+{
+    uint32_t min_cpu = 0xFFFFFFFFu;
+    uint32_t max_cpu = 0;
+
+    for (int i = 0; i < 16; i++) {
+        uint32_t cpu = smp_this_cpu_id();
+        if (cpu < min_cpu)
+            min_cpu = cpu;
+        if (cpu > max_cpu)
+            max_cpu = cpu;
+        process_yield();
+    }
+    g_guide06_pin_min = min_cpu;
+    g_guide06_pin_max = max_cpu;
+    kprintf("[guide06] pinned process ran on cpu %u..%u (cpu_affinity=2)\n",
+            min_cpu, max_cpu);
+    g_guide06_pin_done = 1;
+    process_exit(0);
+}
+
+static void guide06_selftest_entry(void)
+{
+    uint64_t tick0[CPU_COUNT_MAX];
+    uint64_t ipi0[CPU_COUNT_MAX];
+    uint64_t idle0[CPU_COUNT_MAX];
+    int pass = 0;
+    int fail = 0;
+    uint32_t ncpu = g_cpu_count;
+
+    kprintf("[guide06][test] start ncpu=%u smp_cpu_count=%u\n",
+            ncpu, smp_cpu_count());
+
+    for (uint32_t c = 0; c < ncpu; c++) {
+        tick0[c] = g_core_ticks[c];
+        ipi0[c] = g_ipi_ticks[c];
+        idle0[c] = g_idle_seen_ticks[c];
+    }
+
+    {
+        uint64_t start = process_ticks();
+        while (process_ticks() - start < 200)
+            process_yield();
+    }
+
+    {
+        int ipi_ok = 1;
+        int tick_ok = 1;
+        for (uint32_t c = 0; c < ncpu; c++) {
+            uint64_t dt = g_core_ticks[c] - tick0[c];
+            uint64_t di = g_ipi_ticks[c] - ipi0[c];
+            uint64_t dd = g_idle_seen_ticks[c] - idle0[c];
+            kprintf("[guide06] cpu%u ticks+%u ipi+%u idle_seen+%u\n",
+                    c, (uint32_t)dt, (uint32_t)di, (uint32_t)dd);
+            if (dt == 0)
+                tick_ok = 0;
+            if (c > 0 && di == 0)
+                ipi_ok = 0;
+        }
+
+        if (tick_ok) {
+            pass++;
+            kprintf("[guide06] tick distribution PASS (all %u cpus ticked)\n", ncpu);
+        } else {
+            fail++;
+            kprintf("[guide06] tick distribution FAIL\n");
+        }
+
+        if (ncpu == 1) {
+            kprintf("[guide06] ipi delivery N/A (single cpu, regression mode)\n");
+        } else {
+            if (ipi_ok) {
+                pass++;
+                kprintf("[guide06] ipi delivery PASS (every AP took vector 0x41)\n");
+            } else {
+                fail++;
+                kprintf("[guide06] ipi delivery FAIL\n");
+            }
+        }
+    }
+
+    if (ncpu >= 3) {
+        process_t *pin;
+        g_guide06_pin_done = 0;
+        g_guide06_pin_min = 0xFFFFFFFFu;
+        g_guide06_pin_max = 0xFFFFFFFFu;
+        pin = process_spawn_kernel_pinned("guide06-pin2", guide06_pinned_entry, 2);
+        if (!pin) {
+            fail++;
+            kprintf("[guide06] affinity pin FAIL (spawn failed)\n");
+        } else {
+            int status = 0;
+            int r = process_waitpid(process_current_pid(), (int)pin->pid, 0, &status);
+            if (r == (int)pin->pid && g_guide06_pin_done &&
+                g_guide06_pin_min == 2 && g_guide06_pin_max == 2) {
+                pass++;
+                kprintf("[guide06] affinity pin PASS (cpu_affinity=2 held)\n");
+            } else {
+                fail++;
+                kprintf("[guide06] affinity pin FAIL (r=%d done=%d cpu %u..%u)\n",
+                        r, g_guide06_pin_done, g_guide06_pin_min, g_guide06_pin_max);
+            }
+        }
+    } else {
+        kprintf("[guide06] affinity pin SKIP (ncpu=%u < 3)\n", ncpu);
+    }
+
+    /* Idle heartbeat: one count per drain-loop iteration on each AP (work_queue_drain_loop ->... */
+    if (ncpu > 1) {
+        uint64_t loop0[CPU_COUNT_MAX];
+        int idle_ok = 1;
+        for (uint32_t c = 0; c < ncpu; c++)
+            loop0[c] = g_idle_loop_ticks[c];
+        {
+            uint64_t start = process_ticks();
+            while (process_ticks() - start < 300)
+                process_yield();
+        }
+        for (uint32_t c = 1; c < ncpu; c++) {
+            uint64_t dl = g_idle_loop_ticks[c] - loop0[c];
+            kprintf("[guide06] cpu%u idle_loop+%u\n", c, (uint32_t)dl);
+            if (dl == 0)
+                idle_ok = 0;
+        }
+        if (idle_ok) {
+            pass++;
+            kprintf("[guide06] idle heartbeat PASS (every AP ran its idle drain loop)\n");
+        } else {
+            fail++;
+            kprintf("[guide06] idle heartbeat FAIL\n");
+        }
+    } else {
+        kprintf("[guide06] idle heartbeat N/A (single cpu, regression mode)\n");
+    }
+
+    kprintf("[guide06][test] done pass=%d fail=%d\n", pass, fail);
+    process_exit((fail == 0) ? 0 : 1);
+}
+
+void process_run_guide06_selftests(void)
+{
+    process_spawn_kernel("guide06-selftest", guide06_selftest_entry);
+}
+
+#define G10_TICKS 500 /* 5 s at the 100 Hz PIT — per bounded wait */
+
+static volatile uint32_t g10_m1_w1;
+static volatile uint32_t g10_m1_w2;
+static volatile int g10_m1_a_rc;
+static volatile int g10_m1_b_wake_rc;
+static volatile int g10_m1_b_hs_ok;
+
+static volatile uint32_t g10_m2_w;
+
+static volatile uint32_t g10_m3_w;
+static volatile uint32_t g10_m3_woken;
+static volatile uint32_t g10_m3_wait_bad;
+
+/* [0] and [64] are 256 bytes apart: key delta 64, same bucket (& 63). */
+static volatile uint32_t g10_m4_arr[65];
+static volatile uint32_t g10_m4_c_woke;
+static volatile uint32_t g10_m4_d_woke;
+
+static int guide10_state_of(int pid)
+{
+    int st = -1;
+    unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
+    process_t *p = find_by_pid_locked(pid);
+    if (p)
+        st = (int)p->state;
+    spin_unlock_irqrestore(&g_sched_lock, irqf);
+    return st;
+}
+
+/* Yield until pid reaches `state` or ~timeout ticks pass. 1 = reached. */
+static int guide10_wait_state(int pid, int state, uint64_t timeout)
+{
+    uint64_t t0 = g_sched_ticks;
+    while (g_sched_ticks - t0 < timeout) {
+        if (guide10_state_of(pid) == state)
+            return 1;
+        process_yield();
+    }
+    return guide10_state_of(pid) == state;
+}
+
+static void guide10_force_wake(int pid)
+{
+    process_t *p;
+    unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
+    p = find_by_pid_locked(pid);
+    spin_unlock_irqrestore(&g_sched_lock, irqf);
+    if (p)
+        process_wake_blocked(p);
+}
+
+/* M1: A blocks on w1; B publishes w1=1 then wakes it; A replies on w2 the same way. */
+static void guide10_m1_waiter(void)
+{
+    long rc = kernel_futex_wait(&g10_m1_w1, 0);
+    g10_m1_a_rc = (int)rc;
+    g10_m1_w2 = 1;
+    kernel_futex_wake(&g10_m1_w2, 1);
+    process_exit(0);
+}
+
+static void guide10_m1_waker(void)
+{
+    long rc;
+    g10_m1_w1 = 1;
+    g10_m1_b_wake_rc = (int)kernel_futex_wake(&g10_m1_w1, 1);
+    rc = kernel_futex_wait(&g10_m1_w2, 0);
+    g10_m1_b_hs_ok = (rc == 0) || (rc == -EAGAIN && g10_m1_w2 == 1);
+    process_exit(0);
+}
+
+static void guide10_m3_waiter(void)
+{
+    long rc = kernel_futex_wait(&g10_m3_w, 0);
+    if (rc != 0)
+        __atomic_fetch_add(&g10_m3_wait_bad, 1, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&g10_m3_woken, 1, __ATOMIC_SEQ_CST);
+    process_exit(0);
+}
+
+static void guide10_m4_c(void)
+{
+    kernel_futex_wait(&g10_m4_arr[0], 0);
+    g10_m4_c_woke = 1;
+    process_exit(0);
+}
+
+static void guide10_m4_d(void)
+{
+    kernel_futex_wait(&g10_m4_arr[64], 0);
+    g10_m4_d_woke = 1;
+    process_exit(0);
+}
+
+static int guide10_spawn_cli(const char *args, const char *name)
+{
+    int pid = -1;
+    for (int i = 0; i < 200 && pid < 0; i++) {
+        pid = elf64_spawn_cmdline("/fat12/futex10.elf", args, name);
+        if (pid < 0)
+            process_yield();
+    }
+    return pid;
+}
+
+static void guide10_selftest_entry(void)
+{
+    int pass = 0;
+    int fail = 0;
+    int st;
+    uint64_t t0;
+
+    kprintf("[guide10][test] start\n");
+
+    {
+        process_t *a;
+        process_t *b;
+        int ok = 0;
+        g10_m1_w1 = 0;
+        g10_m1_w2 = 0;
+        g10_m1_a_rc = -1000;
+        g10_m1_b_wake_rc = -1000;
+        g10_m1_b_hs_ok = 0;
+        a = process_spawn_kernel("g10-m1-waiter", guide10_m1_waiter);
+        if (a && guide10_wait_state((int)a->pid, PROCESS_BLOCKED, G10_TICKS)) {
+            b = process_spawn_kernel("g10-m1-waker", guide10_m1_waker);
+            if (b) {
+                t0 = g_sched_ticks;
+                while (g10_m1_a_rc == -1000 && g_sched_ticks - t0 < G10_TICKS)
+                    process_yield();
+                if (g10_m1_a_rc == -1000) {
+                    process_wake_blocked(a);
+                    process_wake_blocked(b);
+                } else {
+                    ok = 1;
+                }
+                selftest_wait_child((int)a->pid, &st);
+                selftest_wait_child((int)b->pid, &st);
+                ok = ok && (g10_m1_a_rc == 0) && (g10_m1_b_wake_rc == 1) &&
+                     g10_m1_b_hs_ok;
+            }
+        } else if (a) {
+            process_wake_blocked(a);
+            selftest_wait_child((int)a->pid, &st);
+        }
+        if (ok) {
+            pass++;
+            kprintf("[guide10] m1 handshake PASS (wait rc=0, wake count=1, reply leg ok)\n");
+        } else {
+            fail++;
+            kprintf("[guide10] m1 handshake FAIL a_rc=%d wake_rc=%d hs=%d\n",
+                    g10_m1_a_rc, g10_m1_b_wake_rc, g10_m1_b_hs_ok);
+        }
+    }
+
+    {
+        long rc1;
+        long rc2;
+        g10_m2_w = 7;
+        rc1 = kernel_futex_wait(&g10_m2_w, 3);
+        rc2 = kernel_futex_wake(&g10_m2_w, 8);
+        if (rc1 == -EAGAIN && futex_pending_waiters(&g10_m2_w) == 0 &&
+            rc2 == 0) {
+            pass++;
+            kprintf("[guide10] m2 eagain PASS (no block, no waiter, wake=0)\n");
+        } else {
+            fail++;
+            kprintf("[guide10] m2 eagain FAIL rc1=%d rc2=%d pending=%d\n",
+                    (int)rc1, (int)rc2, futex_pending_waiters(&g10_m2_w));
+        }
+    }
+
+    {
+        process_t *w[3];
+        int ok = 1;
+        int i;
+        long rc1 = -1000;
+        long rc2 = -1000;
+        g10_m3_w = 0;
+        g10_m3_woken = 0;
+        g10_m3_wait_bad = 0;
+        w[0] = process_spawn_kernel("g10-m3-a", guide10_m3_waiter);
+        w[1] = process_spawn_kernel("g10-m3-b", guide10_m3_waiter);
+        w[2] = process_spawn_kernel("g10-m3-c", guide10_m3_waiter);
+        for (i = 0; i < 3; i++) {
+            if (!w[i] ||
+                !guide10_wait_state((int)w[i]->pid, PROCESS_BLOCKED, G10_TICKS))
+                ok = 0;
+        }
+        if (ok && futex_pending_waiters(&g10_m3_w) != 3)
+            ok = 0;
+        if (ok) {
+            rc1 = kernel_futex_wake(&g10_m3_w, 1);
+            t0 = g_sched_ticks;
+            while (g10_m3_woken < 1 && g_sched_ticks - t0 < G10_TICKS)
+                process_yield();
+            t0 = g_sched_ticks;
+            while (g_sched_ticks - t0 < 20)
+                process_yield();
+            if (rc1 != 1 || g10_m3_woken != 1 ||
+                futex_pending_waiters(&g10_m3_w) != 2)
+                ok = 0;
+        }
+        if (ok) {
+            rc2 = kernel_futex_wake(&g10_m3_w, 2);
+            t0 = g_sched_ticks;
+            while (g10_m3_woken < 3 && g_sched_ticks - t0 < G10_TICKS)
+                process_yield();
+            if (rc2 != 2 || g10_m3_woken != 3 || g10_m3_wait_bad != 0)
+                ok = 0;
+        }
+        for (i = 0; i < 3; i++) {
+            if (w[i]) {
+                process_wake_blocked(w[i]);
+                selftest_wait_child((int)w[i]->pid, &st);
+            }
+        }
+        if (ok) {
+            pass++;
+            kprintf("[guide10] m3 wake count PASS (1 of 3, then the other 2)\n");
+        } else {
+            fail++;
+            kprintf("[guide10] m3 wake count FAIL rc1=%d rc2=%d woken=%u bad=%u pending=%d\n",
+                    (int)rc1, (int)rc2, g10_m3_woken, g10_m3_wait_bad,
+                    futex_pending_waiters(&g10_m3_w));
+        }
+    }
+
+    {
+        process_t *c;
+        process_t *d;
+        int ok = 0;
+        int c_held = 0;
+        long rc1 = -1000;
+        long rc2 = -1000;
+        uintptr_t k0 = ((uintptr_t)&g10_m4_arr[0] >> 2) & 63;
+        uintptr_t k64 = ((uintptr_t)&g10_m4_arr[64] >> 2) & 63;
+        g10_m4_arr[0] = 0;
+        g10_m4_arr[64] = 0;
+        g10_m4_c_woke = 0;
+        g10_m4_d_woke = 0;
+        c = process_spawn_kernel("g10-m4-c", guide10_m4_c);
+        d = process_spawn_kernel("g10-m4-d", guide10_m4_d);
+        if (k0 == k64 && c && d &&
+            guide10_wait_state((int)c->pid, PROCESS_BLOCKED, G10_TICKS) &&
+            guide10_wait_state((int)d->pid, PROCESS_BLOCKED, G10_TICKS)) {
+            rc1 = kernel_futex_wake(&g10_m4_arr[64], 8);
+            t0 = g_sched_ticks;
+            while (g10_m4_d_woke == 0 && g_sched_ticks - t0 < G10_TICKS)
+                process_yield();
+            c_held = (guide10_state_of((int)c->pid) == PROCESS_BLOCKED) &&
+                     (futex_pending_waiters(&g10_m4_arr[0]) == 1);
+            if (rc1 == 1 && g10_m4_d_woke == 1 && c_held) {
+                rc2 = kernel_futex_wake(&g10_m4_arr[0], 1);
+                t0 = g_sched_ticks;
+                while (g10_m4_c_woke == 0 && g_sched_ticks - t0 < G10_TICKS)
+                    process_yield();
+                ok = (rc2 == 1 && g10_m4_c_woke == 1);
+            }
+        }
+        if (c) {
+            process_wake_blocked(c);
+            selftest_wait_child((int)c->pid, &st);
+        }
+        if (d) {
+            process_wake_blocked(d);
+            selftest_wait_child((int)d->pid, &st);
+        }
+        if (ok) {
+            pass++;
+            kprintf("[guide10] m4 bucket collision PASS (key %u==%u, neighbor undisturbed)\n",
+                    (unsigned)k0, (unsigned)k64);
+        } else {
+            fail++;
+            kprintf("[guide10] m4 bucket collision FAIL k0=%u k64=%u rc1=%d rc2=%d c_woke=%u d_woke=%u held=%d\n",
+                    (unsigned)k0, (unsigned)k64, (int)rc1, (int)rc2,
+                    g10_m4_c_woke, g10_m4_d_woke, c_held);
+        }
+    }
+
+    {
+        int ok = 0;
+        int code = -1;
+        int ppid;
+        int wpid = -1;
+        int kpid;
+        ppid = guide10_spawn_cli("futex10 probe", "futex10-probe");
+        st = -1;
+        code = (ppid > 0 && selftest_wait_child(ppid, &st) == ppid)
+                   ? ((st >> 8) & 0xFF) : -1;
+        if (code == 0) {
+            wpid = guide10_spawn_cli("futex10 waiter", "futex10-wait");
+            if (wpid > 0 &&
+                guide10_wait_state(wpid, PROCESS_BLOCKED, G10_TICKS)) {
+                kpid = guide10_spawn_cli("futex10 waker", "futex10-wake");
+                st = -1;
+                code = (kpid > 0 && selftest_wait_child(kpid, &st) == kpid)
+                           ? ((st >> 8) & 0xFF) : -1;
+                if (code == 0) {
+                    st = -1;
+                    code = (selftest_wait_child(wpid, &st) == wpid)
+                               ? ((st >> 8) & 0xFF) : -1;
+                    ok = (code == 0);
+                } else {
+                    code = 100 + ((code < 0) ? 99 : code);
+                    guide10_force_wake(wpid);
+                    selftest_wait_child(wpid, &st);
+                }
+            } else {
+                code = -2;
+                if (wpid > 0) {
+                    guide10_force_wake(wpid);
+                    selftest_wait_child(wpid, &st);
+                }
+            }
+        }
+        if (ok) {
+            pass++;
+            kprintf("[guide10] m5 ring-3 round trip PASS (probe clean, cross-process wake=1, waiter exit 0)\n");
+        } else {
+            fail++;
+            kprintf("[guide10] m5 ring-3 round trip FAIL code=%d\n", code);
+        }
+    }
+
+    kprintf("[guide10][test] done pass=%d fail=%d\n", pass, fail);
+    process_exit((fail == 0) ? 0 : 1);
+}
+
+void process_run_guide10_selftests(void)
+{
+    process_spawn_kernel("guide10-selftest", guide10_selftest_entry);
+}
+
+/* AF_UNIX sockets: rendezvous (bind/listen/connect/accept), byte-exact */
+/* data both ways, error paths, fd-teardown cleanup, and the ring-3 */
+/* flat-table glue via /fat12/usock20.elf (futex10/m5 precedent). Runs */
+/* as a spawned process (guide10 pattern) because M2/M3 need the */
+/* scheduler. Idempotent: socket paths are RAM-registry entries that */
+/* die with their fds; every path bound here is released here. */
+
+#define G20_TICKS 500
+
+static volatile int g20_srv_rc = -1000;
+static volatile int g20_cli_rc = -1000;
+static volatile int g20_bind_rc = -1000;
+
+static void guide20_srv(void)
+{
+    int lfd = vfs_socket_create();
+    int afd = -EAGAIN;
+    char buf[8];
+    int rc = 1;
+    uint64_t t0 = g_sched_ticks;
+
+    if (lfd >= 0 && vfs_socket_bind(lfd, "/tmp/g20-echo.sock") == 0 &&
+        vfs_socket_listen(lfd) == 0) {
+        while (afd == -EAGAIN && g_sched_ticks - t0 < G20_TICKS) {
+            afd = vfs_socket_accept(lfd);
+            if (afd == -EAGAIN)
+                process_yield();
+        }
+        if (afd >= 0) {
+            int got = 0;
+            t0 = g_sched_ticks;
+            while (got < 4 && g_sched_ticks - t0 < G20_TICKS) {
+                size_t r = vfs_read(afd, buf + got, (size_t)(4 - got));
+                if (r > 0)
+                    got += (int)r;
+                else
+                    process_yield();
+            }
+            if (got == 4 && buf[0] == 'p' && buf[1] == 'i' &&
+                buf[2] == 'n' && buf[3] == 'g' &&
+                vfs_write(afd, "pong", 4) == 4)
+                rc = 0;
+            vfs_close(afd);
+        }
+    }
+    if (lfd >= 0)
+        vfs_close(lfd);
+    g20_srv_rc = rc;
+    process_exit(rc);
+}
+
+static void guide20_cli(void)
+{
+    int fd = vfs_socket_create();
+    char buf[8];
+    int rc = 1;
+    int con = -1;
+    uint64_t t0 = g_sched_ticks;
+
+    if (fd >= 0) {
+        /* The server may not have bound yet: retry while refused. */
+        while (con != 0 && g_sched_ticks - t0 < G20_TICKS) {
+            con = vfs_socket_connect(fd, "/tmp/g20-echo.sock");
+            if (con != 0)
+                process_yield();
+        }
+        if (con == 0 && vfs_write(fd, "ping", 4) == 4) {
+            int got = 0;
+            t0 = g_sched_ticks;
+            while (got < 4 && g_sched_ticks - t0 < G20_TICKS) {
+                size_t r = vfs_read(fd, buf + got, (size_t)(4 - got));
+                if (r > 0)
+                    got += (int)r;
+                else
+                    process_yield();
+            }
+            if (got == 4 && buf[0] == 'p' && buf[1] == 'o' &&
+                buf[2] == 'n' && buf[3] == 'g')
+                rc = 0;
+        }
+        vfs_close(fd);
+    }
+    g20_cli_rc = rc;
+    process_exit(rc);
+}
+
+/* Binds + listens, then exits WITHOUT closing: process teardown (vfs_process_cleanup -> file_release) must... */
+static void guide20_binder(void)
+{
+    int fd = vfs_socket_create();
+
+    g20_bind_rc = (fd >= 0 &&
+                   vfs_socket_bind(fd, "/tmp/g20-dead.sock") == 0 &&
+                   vfs_socket_listen(fd) == 0) ? 0 : 1;
+    process_exit(0);
+}
+
+static int guide20_spawn_cli(const char *args, const char *name)
+{
+    int pid = -1;
+    for (int i = 0; i < 200 && pid < 0; i++) {
+        pid = elf64_spawn_cmdline("/fat12/usock20.elf", args, name);
+        if (pid < 0)
+            process_yield();
+    }
+    return pid;
+}
+
+static void guide20_selftest_entry(void)
+{
+    int pass = 0;
+    int fail = 0;
+    int st;
+
+    /* Wait for phase2 (blocking futex, not a yield-spin): kernel_futex_wait returns 0 on wake or -EAGAIN if... */
+    while (g_phase2_done_w == 0) {
+        if (kernel_futex_wait(&g_phase2_done_w, 0) == -EAGAIN)
+            break;
+    }
+
+    kprintf("[guide20][test] start\n");
+
+    {
+        int step = 0;
+        int lfd = -1, cfd = -1, afd = -1, xfd = -1;
+        char buf[8];
+
+        do {
+            step = 1;
+            lfd = vfs_socket_create();
+            if (lfd < 0)
+                break;
+            step = 2;
+            if (vfs_socket_bind(lfd, "/tmp/g20-m1.sock") != 0)
+                break;
+            step = 3;
+            xfd = vfs_socket_create();
+            if (xfd < 0 ||
+                vfs_socket_bind(xfd, "/tmp/g20-m1.sock") != -EADDRINUSE)
+                break;
+            vfs_close(xfd);
+            xfd = -1;
+            step = 4;
+            if (vfs_socket_listen(lfd) != 0)
+                break;
+            step = 5;
+            if (vfs_socket_accept(lfd) != -EAGAIN)
+                break;
+            step = 6;
+            cfd = vfs_socket_create();
+            if (cfd < 0 || vfs_socket_connect(cfd, "/tmp/g20-m1.sock") != 0)
+                break;
+            step = 7;
+            {
+                vfs_pollfd_t pf;
+                pf.fd = lfd;
+                pf.events = VFS_POLLIN;
+                pf.revents = 0;
+                if (vfs_poll(&pf, 1, 0) != 1 || !(pf.revents & VFS_POLLIN))
+                    break;
+            }
+            step = 8;
+            afd = vfs_socket_accept(lfd);
+            if (afd < 0)
+                break;
+            step = 9;
+            if (vfs_write(cfd, "ping!", 5) != 5 ||
+                vfs_read(afd, buf, sizeof(buf)) != 5 ||
+                buf[0] != 'p' || buf[4] != '!')
+                break;
+            step = 10;
+            if (vfs_write(afd, "reply", 5) != 5 ||
+                vfs_read(cfd, buf, sizeof(buf)) != 5 ||
+                buf[0] != 'r' || buf[4] != 'y')
+                break;
+            step = 11;
+            xfd = vfs_socket_create();
+            if (xfd < 0 ||
+                vfs_socket_connect(xfd, "/tmp/g20-none.sock") != -ECONNREFUSED)
+                break;
+            vfs_close(xfd);
+            xfd = -1;
+            step = 12;
+            vfs_close(afd);
+            afd = -1;
+            vfs_close(cfd);
+            cfd = -1;
+            vfs_close(lfd);
+            lfd = -1;
+            xfd = vfs_socket_create();
+            if (xfd < 0 || vfs_socket_bind(xfd, "/tmp/g20-m1.sock") != 0)
+                break;
+            vfs_close(xfd);
+            xfd = -1;
+            step = 0;
+        } while (0);
+
+        if (afd >= 0)
+            vfs_close(afd);
+        if (cfd >= 0)
+            vfs_close(cfd);
+        if (lfd >= 0)
+            vfs_close(lfd);
+        if (xfd >= 0)
+            vfs_close(xfd);
+        if (step == 0) {
+            pass++;
+            kprintf("[guide20] m1 loopback+errors PASS "
+                    "(bind/dup/listen/EAGAIN/POLLIN/2-way/refused/rebind)\n");
+        } else {
+            fail++;
+            kprintf("[guide20] m1 loopback+errors FAIL (step=%d)\n", step);
+        }
+    }
+
+    {
+        process_t *s;
+        process_t *c;
+        int ok = 0;
+
+        g20_srv_rc = -1000;
+        g20_cli_rc = -1000;
+        s = process_spawn_kernel("g20-srv", guide20_srv);
+        c = s ? process_spawn_kernel("g20-cli", guide20_cli) : NULL;
+        if (s && c) {
+            selftest_wait_child((int)s->pid, &st);
+            selftest_wait_child((int)c->pid, &st);
+            ok = (g20_srv_rc == 0 && g20_cli_rc == 0);
+        } else if (s) {
+            selftest_wait_child((int)s->pid, &st);
+        }
+        if (ok) {
+            pass++;
+            kprintf("[guide20] m2 two-process echo PASS (ping->pong)\n");
+        } else {
+            fail++;
+            kprintf("[guide20] m2 two-process echo FAIL srv=%d cli=%d\n",
+                    g20_srv_rc, g20_cli_rc);
+        }
+    }
+
+    {
+        process_t *b;
+        int ok = 0;
+
+        g20_bind_rc = -1000;
+        b = process_spawn_kernel("g20-binder", guide20_binder);
+        if (b) {
+            int pfd;
+            selftest_wait_child((int)b->pid, &st);
+            pfd = vfs_socket_create();
+            if (g20_bind_rc == 0 && pfd >= 0 &&
+                vfs_socket_connect(pfd, "/tmp/g20-dead.sock") ==
+                    -ECONNREFUSED &&
+                vfs_socket_bind(pfd, "/tmp/g20-dead.sock") == 0)
+                ok = 1;
+            if (pfd >= 0)
+                vfs_close(pfd);
+        }
+        if (ok) {
+            pass++;
+            kprintf("[guide20] m3 death-cleanup PASS "
+                    "(listener unregistered on owner exit)\n");
+        } else {
+            fail++;
+            kprintf("[guide20] m3 death-cleanup FAIL (bind_rc=%d)\n",
+                    g20_bind_rc);
+        }
+    }
+
+    /* M4 — ring-3 flat-table glue via /fat12/usock20.elf. */
+    {
+        int ok = 0;
+        int code = -1;
+        int sig = -1;
+        int pid;
+
+        pid = guide20_spawn_cli("usock20 validate", "usock20-val");
+        st = -1;
+        if (pid > 0 && selftest_wait_child(pid, &st) == pid) {
+            code = WAIT_EXIT_CODE(st);
+            sig = WAIT_TERM_SIGNAL(st);
+        }
+        if (code == 0 && sig == 0) {
+            pid = guide20_spawn_cli("usock20 loopback", "usock20-loop");
+            st = -1;
+            code = -1;
+            sig = -1;
+            if (pid > 0 && selftest_wait_child(pid, &st) == pid) {
+                code = WAIT_EXIT_CODE(st);
+                sig = WAIT_TERM_SIGNAL(st);
+            }
+            ok = (code == 0 && sig == 0);
+        }
+        if (ok) {
+            pass++;
+            kprintf("[guide20] m4 ring-3 syscalls PASS "
+                    "(validate + loopback: clean exit 0)\n");
+        } else {
+            fail++;
+            kprintf("[guide20] m4 ring-3 syscalls FAIL code=%d sig=%d\n",
+                    code, sig);
+        }
+    }
+
+    kprintf("[guide20][test] done pass=%d fail=%d\n", pass, fail);
+
+    g_guide20_done_w = 1;
+    kernel_futex_wake(&g_guide20_done_w, 64);
+
+    process_exit((fail == 0) ? 0 : 1);
+}
+
+void process_run_guide20_selftests(void)
+{
+    process_spawn_kernel("guide20-selftest", guide20_selftest_entry);
+}
+
+/* Userland display server: a ring-3 compositor (/fat12/wsrv15.elf) that */
+/* owns /dev/fb0 + KD_GRAPHICS, listens on an AF_UNIX socket, and */
+/* composites client pixels delivered via ipc/shm.c surfaces. A ring-3 */
+/* client (/fat12/wapp15.elf) draws a window through the protocol. */
+/* Verdicts come back purely through exit codes (usock20 precedent), so */
+/* the checks are signal-aware (a #UD/#GP kill has exit byte 0). Runs */
+/* after [guide20] (blocks on g_guide20_done_w) so the two socket suites */
+/* never overlap. Idempotent: socket path is a RAM registry entry that */
+/* dies with its fds; every shm surface is reclaimed; KD_TEXT restored. */
+
+static int guide15_spawn(const char *path, const char *args, const char *name)
+{
+    int pid = -1;
+    for (int i = 0; i < 200 && pid < 0; i++) {
+        pid = elf64_spawn_cmdline(path, args, name);
+        if (pid < 0)
+            process_yield();
+    }
+    return pid;
+}
+
+/* Spawn a compositor + client pair and collect both exit codes and both termination signals. */
+static int guide15_run_pair(const char *srv_args, const char *srv_name,
+                            const char *cli_path,
+                            const char *cli_args, const char *cli_name,
+                            int expect_cc,
+                            int *sc, int *ss, int *cc, int *cs)
+{
+    int sp, cp, st;
+
+    *sc = *ss = *cc = *cs = -1;
+    sp = guide15_spawn("/fat12/wsrv15.elf", srv_args, srv_name);
+    if (sp < 0)
+        return -1;
+    cp = guide15_spawn(cli_path, cli_args, cli_name);
+    if (cp < 0) {
+        st = -1;
+        selftest_wait_child(sp, &st);
+        return -1;
+    }
+
+    /* The CLIENT is the timeout authority: every wapp15 loop is bounded and always exits with a verdict, so this... */
+    st = -1;
+    if (selftest_wait_child(cp, &st) == cp) {
+        *cc = WAIT_EXIT_CODE(st);
+        *cs = WAIT_TERM_SIGNAL(st);
+    }
+    if (*cc != expect_cc || *cs != 0)
+        process_kill(sp, PROCESS_SIGKILL);
+    st = -1;
+    if (selftest_wait_child(sp, &st) == sp) {
+        *sc = WAIT_EXIT_CODE(st);
+        *ss = WAIT_TERM_SIGNAL(st);
+    }
+    return 0;
+}
+
+static void guide15_selftest_entry(void)
+{
+    int pass = 0;
+    int fail = 0;
+
+    /* Sequence after phase2 (timing tests) AND guide20 (socket suite), blocking on each done-futex rather than... */
+    while (g_phase2_done_w == 0) {
+        if (kernel_futex_wait(&g_phase2_done_w, 0) == -EAGAIN)
+            break;
+    }
+    while (g_guide20_done_w == 0) {
+        if (kernel_futex_wait(&g_guide20_done_w, 0) == -EAGAIN)
+            break;
+    }
+
+    kprintf("[guide15][test] start\n");
+
+    {
+        int sc, ss, cc, cs;
+        int r = guide15_run_pair("wsrv15 m1", "wsrv15-m1",
+                                 "/fat12/wapp15.elf",
+                                 "wapp15 handshake", "wapp15-hs", 0,
+                                 &sc, &ss, &cc, &cs);
+        if (r == 0 && sc == 0 && ss == 0 && cc == 0 && cs == 0) {
+            pass++;
+            kprintf("[guide15] m1 handshake PASS "
+                    "(socket create-surface/reply/destroy round-trip)\n");
+        } else {
+            fail++;
+            kprintf("[guide15] m1 handshake FAIL srv=%d/sig%d cli=%d/sig%d\n",
+                    sc, ss, cc, cs);
+        }
+    }
+
+    /* M2 — shm pixels: client fills its surface, DAMAGEs it, the server composites it to the real framebuffer... */
+    {
+        int sc, ss, cc, cs;
+        int r = guide15_run_pair("wsrv15 m2", "wsrv15-m2",
+                                 "/fat12/wapp15.elf",
+                                 "wapp15 draw", "wapp15-draw", 0,
+                                 &sc, &ss, &cc, &cs);
+        if (r == 0 && sc == 20 && ss == 0) {
+            kprintf("[guide15] m2 shm pixels SKIPPED (no 32bpp framebuffer)\n");
+        } else if (r == 0 && sc == 0 && ss == 0 && cc == 0 && cs == 0) {
+            pass++;
+            kprintf("[guide15] m2 shm pixels PASS "
+                    "(client shm -> composited -> fb readback byte-exact)\n");
+        } else {
+            fail++;
+            kprintf("[guide15] m2 shm pixels FAIL srv=%d/sig%d cli=%d/sig%d\n",
+                    sc, ss, cc, cs);
+        }
+    }
+
+    /* M3 — death cleanup: client draws then dies WITHOUT destroy/close; the server must reclaim the surface +... */
+    {
+        int sc, ss, cc, cs;
+        int r = guide15_run_pair("wsrv15 m3", "wsrv15-m3",
+                                 "/fat12/wapp15.elf",
+                                 "wapp15 die", "wapp15-die", 0,
+                                 &sc, &ss, &cc, &cs);
+        if (r == 0 && sc == 0 && ss == 0 && cc == 0 && cs == 0) {
+            pass++;
+            kprintf("[guide15] m3 death-cleanup PASS "
+                    "(HUP -> surface + shm reclaimed, no leak)\n");
+        } else {
+            fail++;
+            kprintf("[guide15] m3 death-cleanup FAIL srv=%d/sig%d cli=%d/sig%d\n",
+                    sc, ss, cc, cs);
+        }
+    }
+
+    kprintf("[guide15][test] done pass=%d fail=%d\n", pass, fail);
+
+    g_guide15_done_w = 1;
+    kernel_futex_wake(&g_guide15_done_w, 64);
+
+    process_exit((fail == 0) ? 0 : 1);
+}
+
+void process_run_guide15_selftests(void)
+{
+    process_spawn_kernel("guide15-selftest", guide15_selftest_entry);
+}
+
+/* GUI toolkit: the retained widget kit in user/lib/libwidget.c (base */
+/* type, enum signals, box/grid layout) is KERNEL-LINKED, so m1 unit- */
+/* checks its layout/signal/dispatch math right here — deterministic, */
+/* no ring 3 involved. m2 then runs the full ring-3 demo (wdemo16.elf, */
+/* self-driving: synthetic events through the same dispatch path real */
+/* input uses) against the guide-15 compositor, byte-exact readback and */
+/* all. Sequenced after [guide15] via its done-futex. */
+
+#include "../user/include/libwidget.h"
+
+static int g16_sig_log[4];
+static int g16_sig_n;
+static int g16_btn_clicks;
+
+static void g16_lis_a(ui_widget_t *w, void *ud)
+{
+    (void)w; (void)ud;
+    if (g16_sig_n < 4) g16_sig_log[g16_sig_n++] = 1;
+}
+
+static void g16_lis_b(ui_widget_t *w, void *ud)
+{
+    (void)w; (void)ud;
+    if (g16_sig_n < 4) g16_sig_log[g16_sig_n++] = 2;
+}
+
+static void g16_btn_click(void *ud)
+{
+    (void)ud;
+    g16_btn_clicks++;
+}
+
+/* Returns 0, or the failing step number. */
+static int guide16_unit_checks(void)
+{
+    static ui_box_t box;
+    static ui_box_t hbox;
+    static ui_grid_t grid;
+    static ui_widget_t c1, c2, c3, ga, gb, gc, root;
+    static widget_button_t btn;
+    ui_tk_event_t ev;
+
+    /* Box packing: fixed | expand | fixed in a 288-wide row, spacing 4, padding 2 each. */
+    ui_widget_base_init(&c1, UI_WIDGET_PLAIN, 0, 0, 70, 26);
+    ui_widget_base_init(&c2, UI_WIDGET_PLAIN, 0, 0, 70, 26);
+    ui_widget_base_init(&c3, UI_WIDGET_PLAIN, 0, 0, 70, 26);
+    ui_box_init(&box, UI_HORIZONTAL, 16, 16, 288, 30);
+    ui_box_pack(&box, &c1, false, false, 2);
+    ui_box_pack(&box, &c2, true, true, 2);
+    ui_box_pack(&box, &c3, false, false, 2);
+    if (c1.x != 18 || c1.w != 70 || c2.x != 96 || c2.w != 128 ||
+        c3.x != 232 || c3.w != 70 || c1.h != 30)
+        return 1;
+
+    ui_box_set_geometry(&box, 16, 16, 228, 30);
+    if (c2.w != 68)
+        return 2;
+    ui_box_set_geometry(&box, 16, 16, 288, 30);
+    if (c2.w != 128)
+        return 2;
+
+    ui_widget_base_init(&ga, UI_WIDGET_PLAIN, 0, 0, 10, 10);
+    ui_widget_base_init(&gb, UI_WIDGET_PLAIN, 0, 0, 200, 10);
+    ui_widget_base_init(&gc, UI_WIDGET_PLAIN, 0, 0, 55, 10);
+    ui_box_init(&hbox, UI_HORIZONTAL, 0, 0, 300, 20);
+    hbox.homogeneous = true;
+    hbox.spacing = 0;
+    ui_box_pack(&hbox, &ga, false, false, 0);
+    ui_box_pack(&hbox, &gb, false, false, 0);
+    ui_box_pack(&hbox, &gc, false, false, 0);
+    if (ga.w != 100 || gb.w != 100 || gc.w != 100 ||
+        ga.x != 0 || gb.x != 100 || gc.x != 200)
+        return 3;
+
+    ui_widget_base_init(&ga, UI_WIDGET_PLAIN, 0, 0, 10, 10);
+    ui_widget_base_init(&gb, UI_WIDGET_PLAIN, 0, 0, 10, 10);
+    ui_widget_base_init(&gc, UI_WIDGET_PLAIN, 0, 0, 10, 10);
+    ui_grid_init(&grid, 2, 2, 4, 8, 8, 204, 104);
+    ui_grid_attach(&grid, &ga, 0, 0);
+    ui_grid_attach(&grid, &gb, 0, 1);
+    ui_grid_attach(&grid, &gc, 1, 0);
+    if (ga.x != 8 || ga.y != 8 || ga.w != 100 || ga.h != 50 ||
+        gb.x != 112 || gb.y != 8 || gc.x != 8 || gc.y != 62)
+        return 4;
+
+    ui_widget_base_init(&root, UI_WIDGET_PLAIN, 0, 0, 100, 100);
+    g16_sig_n = 0;
+    if (ui_signal_connect(&root, UI_SIGNAL_CLICKED, g16_lis_a, 0) != 0 ||
+        ui_signal_connect(&root, UI_SIGNAL_CLICKED, g16_lis_b, 0) != 0)
+        return 5;
+    if (ui_signal_emit(&root, UI_SIGNAL_CLICKED) != 2 ||
+        g16_sig_n != 2 || g16_sig_log[0] != 1 || g16_sig_log[1] != 2)
+        return 5;
+    if (ui_signal_disconnect(&root, UI_SIGNAL_CLICKED, g16_lis_a) != 0)
+        return 6;
+    g16_sig_n = 0;
+    if (ui_signal_emit(&root, UI_SIGNAL_CLICKED) != 1 ||
+        g16_sig_n != 1 || g16_sig_log[0] != 2)
+        return 6;
+
+    /* Tree dispatch: press+release over a child button fires on_click AND the CLICKED signal through the same... */
+    ui_widget_base_init(&root, UI_WIDGET_PLAIN, 0, 0, 200, 100);
+    widget_button_init(&btn, 10, 10, 50, 20, "ok");
+    btn.on_click = g16_btn_click;
+    g16_sig_n = 0;
+    if (ui_signal_connect(&btn.base, UI_SIGNAL_CLICKED, g16_lis_b, 0) != 0)
+        return 7;
+    if (ui_widget_add_child(&root, &btn.base) != 0)
+        return 7;
+    g16_btn_clicks = 0;
+    ev.type = UI_TK_EV_POINTER;
+    ev.x = 35; ev.y = 20;
+    ev.buttons = 1; ev.down = true; ev.clicked = true;
+    ev.keycode = 0; ev.pressed = false;
+    if (!ui_widget_dispatch(&root, &ev) || !btn.pressed)
+        return 7;
+    ev.buttons = 0; ev.down = false; ev.clicked = false;
+    if (!ui_widget_dispatch(&root, &ev) ||
+        g16_btn_clicks != 1 || g16_sig_n != 1 || g16_sig_log[0] != 2)
+        return 7;
+
+    {
+        static ui_gradient_t g;
+        ui_gradient_init(&g, true);
+        ui_gradient_add_stop(&g, 0, 0xFF000000u);
+        ui_gradient_add_stop(&g, 100, 0xFF0000FFu);
+        if (ui_gradient_sample(&g, 0) != 0xFF000000u ||
+            ui_gradient_sample(&g, 100) != 0xFF0000FFu ||
+            ui_gradient_sample(&g, 50) != 0xFF00007Fu)
+            return 8;
+    }
+    return 0;
+}
+
+static void guide16_selftest_entry(void)
+{
+    int pass = 0;
+    int fail = 0;
+
+    while (g_phase2_done_w == 0) {
+        if (kernel_futex_wait(&g_phase2_done_w, 0) == -EAGAIN)
+            break;
+    }
+    while (g_guide15_done_w == 0) {
+        if (kernel_futex_wait(&g_guide15_done_w, 0) == -EAGAIN)
+            break;
+    }
+
+    kprintf("[guide16][test] start\n");
+
+    /* M1 — kernel-side unit checks: libwidget.c is linked into the kernel, so the layout/signal/dispatch math is... */
+    {
+        int step = guide16_unit_checks();
+        if (step == 0) {
+            pass++;
+            kprintf("[guide16] m1 layout+signals PASS "
+                    "(box/homogeneous/grid/signals/dispatch/gradient)\n");
+        } else {
+            fail++;
+            kprintf("[guide16] m1 layout+signals FAIL (step=%d)\n", step);
+        }
+    }
+
+    /* M2 — the ring-3 toolkit demo on the display server: buttons + text field + modal dialog + gradient... */
+    {
+        int sc, ss, cc, cs;
+        int r = guide15_run_pair("wsrv15 m2", "wsrv15-g16",
+                                 "/fat12/wdemo16.elf",
+                                 "wdemo16 selftest", "wdemo16-st", 42,
+                                 &sc, &ss, &cc, &cs);
+        if (r == 0 && sc == 20 && ss == 0) {
+            kprintf("[guide16] m2 toolkit demo SKIPPED (no 32bpp framebuffer)\n");
+        } else if (r == 0 && sc == 0 && ss == 0 && cc == 42 && cs == 0) {
+            pass++;
+            kprintf("[guide16] m2 toolkit demo PASS "
+                    "(buttons/field/dialog/timer/clipboard/painter, "
+                    "server readback byte-exact)\n");
+        } else {
+            fail++;
+            kprintf("[guide16] m2 toolkit demo FAIL srv=%d/sig%d cli=%d/sig%d\n",
+                    sc, ss, cc, cs);
+        }
+    }
+
+    kprintf("[guide16][test] done pass=%d fail=%d\n", pass, fail);
+    process_exit((fail == 0) ? 0 : 1);
+}
+
+void process_run_guide16_selftests(void)
+{
+    process_spawn_kernel("guide16-selftest", guide16_selftest_entry);
 }

@@ -1,13 +1,17 @@
 /*
- * sysfs.c - Read-only system pseudo filesystem.
+ * Project Tsukasa — Read-only system pseudo filesystem
  *
- * Layout:
- *   /sys/memory
- *   /sys/devices/summary
- *   /sys/devices/pci
- *   /sys/mounts
- *   /sys/net/status
- *   /sys/net/stats
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "sysfs.h"
@@ -256,6 +260,13 @@ static int build_memory(out_buf_t *ob)
     if (out_append_u64(ob, hs.allocated_bytes) != 0) return -1;
     if (out_append_str(ob, "\nheap_peak_bytes: ") != 0) return -1;
     if (out_append_u64(ob, hs.peak_allocated_bytes) != 0) return -1;
+
+    if (out_append_str(ob, "\nslab_allocs: ") != 0) return -1;
+    if (out_append_u64(ob, hs.slab_allocs) != 0) return -1;
+    if (out_append_str(ob, "\nslab_frees: ") != 0) return -1;
+    if (out_append_u64(ob, hs.slab_frees) != 0) return -1;
+    if (out_append_str(ob, "\nslab_pages: ") != 0) return -1;
+    if (out_append_u64(ob, hs.slab_pages) != 0) return -1;
 
     if (out_append_str(ob, "\nprocess_count: ") != 0) return -1;
     if (out_append_u64(ob, pc) != 0) return -1;

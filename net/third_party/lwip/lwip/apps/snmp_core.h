@@ -151,7 +151,6 @@ union snmp_variant_value
 #endif
 };
 
-
 /**
 SNMP MIB node types
  tree node is the only node the stack can process in order to walk the tree,
@@ -220,7 +219,6 @@ struct snmp_node_instance
   /** see reference (if reference is a pointer, the length of underlying data may be stored here or anything else) */
   u32_t reference_len;
 };
-
 
 /** SNMP tree node */
 struct snmp_tree_node

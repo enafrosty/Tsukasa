@@ -1,3 +1,19 @@
+;
+; Project Tsukasa — x86_64 Interrupt and Exception Service Routine stubs
+;
+; Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+;
+; Project Tsukasa was created and is maintained by frosty (@enafrosty).
+; This program is free software: you can redistribute it and/or modify it
+; under the terms of the GNU General Public License as published by the
+; Free Software Foundation, either version 3 of the License, or (at your
+; option) any later version. See the top-level LICENSE file.
+;
+; This program is distributed in the hope that it will be useful, but
+; WITHOUT ANY WARRANTY; without even the implied warranty of
+; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+;
+
 BITS 64
 
 section .text
@@ -64,6 +80,10 @@ global isr_x64_%1
 isr_x64_%1:
     push %1
     PUSH_GPRS
+    test qword [rsp + 136], 3
+    jz %%from_kernel
+    swapgs
+%%from_kernel:
     mov rdi, [rsp + 120]
     mov rsi, rsp
     cld
@@ -82,6 +102,10 @@ isr_x64_%1:
     and rax, ~((1 << 14) | (1 << 8))
     push rax
     popfq
+    test qword [rsp + 136], 3
+    jz %%skip_swap
+    swapgs
+%%skip_swap:
     POP_GPRS
     add rsp, 8
     iretq
@@ -136,18 +160,30 @@ IRQ_STUB 44
 IRQ_STUB 45
 IRQ_STUB 46
 IRQ_STUB 47
+IRQ_STUB 65
 
 isr_exception_common:
     PUSH_GPRS
+    test qword [rsp + 144], 3
+    jz .from_kernel
+    swapgs
+.from_kernel:
     mov rdi, [rsp + 120]
     mov rsi, [rsp + 128]
     mov rdx, [rsp + 136]
+    mov rcx, [rsp + 144]
+    mov r8,  [rsp + 160]
+    mov r9,  [rsp + 168]
     cld
     mov r15, rsp
     and rsp, -16
     sub rsp, 8
     call idt_exception_handler_x64
     mov rsp, r15
+    test qword [rsp + 144], 3
+    jz .skip_swap
+    swapgs
+.skip_swap:
     POP_GPRS
     add rsp, 16
     iretq

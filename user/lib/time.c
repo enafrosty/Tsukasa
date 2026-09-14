@@ -1,7 +1,24 @@
-#include "../include/time.h"
+/*
+ * Project Tsukasa — include "../include/time.h"
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
 
-#include "../lib/syscall.h"
-#include "../include/string.h"
+#include <stddef.h>
+#include <stdint.h>
+#include "user/include/time.h"
+#include "user/include/string.h"
+#include "user/lib/syscall.h"
 
 static int is_leap(int year)
 {
@@ -96,7 +113,7 @@ struct tm *gmtime_r(const time_t *timer, struct tm *result)
     result->tm_mon = month - 1;
     result->tm_year = year - 1900;
     result->tm_yday = yday;
-    result->tm_wday = (int)((*timer / 86400 + 4) % 7); /* 1970-01-01 = Thu */
+    result->tm_wday = (int)((*timer / 86400 + 4) % 7);
     result->tm_isdst = 0;
     return result;
 }
@@ -185,4 +202,39 @@ size_t strftime(char *s, size_t max, const char *fmt, const struct tm *tm)
         }
     }
     return oi;
+}
+
+#ifdef TSUKASA_USERLIB_KERNEL
+extern long syscall_dispatch(long nr, long a1, long a2, long a3, long a4, long a5, long a6);
+#endif
+
+int nanosleep(const struct timespec *req, struct timespec *rem)
+{
+    (void)rem;
+    if (!req)
+        return -1;
+    long ms = (long)req->tv_sec * 1000 + req->tv_nsec / 1000000;
+    if (ms < 0)
+        ms = 0;
+#ifdef TSUKASA_USERLIB_KERNEL
+    return (int)syscall_dispatch(35, ms, 0, 0, 0, 0, 0);
+#else
+    return 0;
+#endif
+}
+
+unsigned int sleep(unsigned int seconds)
+{
+    struct timespec req = { .tv_sec = (time_t)seconds, .tv_nsec = 0 };
+    nanosleep(&req, NULL);
+    return 0;
+}
+
+int usleep(unsigned long usec)
+{
+    struct timespec req = {
+        .tv_sec = (time_t)(usec / 1000000),
+        .tv_nsec = (long)((usec % 1000000) * 1000)
+    };
+    return nanosleep(&req, NULL);
 }

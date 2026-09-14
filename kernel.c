@@ -1,6 +1,17 @@
 /*
- * kernel.c - temporary minimal kernel to debug boot.
- * Just writes a message to VGA text mode and halts.
+ * Project Tsukasa — temporary minimal kernel to debug boot
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "vga.h"
@@ -34,20 +45,15 @@ void kernel_main(uint32_t magic, uint32_t info)
     (void)magic;
     (void)info;
 
-    /* Stage 1: serial port for debug output (must be first). */
     serial_init();
     kprintf("[boot] Tsukasa OS starting...\n");
 
-    /* Stage 2: enable our page tables early. */
     paging_init();
     kprintf("[boot] paging_init done\n");
 
-    /* Stage 3: install IDT so exceptions are visible via idt_handler. */
     idt_init();
     kprintf("[boot] idt_init done\n");
 
-    /* Stage 4: initialize physical memory manager and heap. On failure,
-       print an error and halt instead of continuing. */
     if (pmm_init((const void *)(uintptr_t)info) != 0) {
         kprintf("[boot] PMM init failed — halting\n");
         vga_puts_row(0, "Tsukasa: PMM init failed");
@@ -57,11 +63,9 @@ void kernel_main(uint32_t magic, uint32_t info)
     heap_init();
     kprintf("[heap] TLSF pool ready\n");
 
-    /* Stage 5: set up our own GDT/TSS (uses stack_top from boot.s). */
     gdt_init();
     kprintf("[boot] gdt_init done\n");
 
-    /* Stage 6: initialize framebuffer; map it if above 4 MiB, then fill. */
     fb_init((const void *)(uintptr_t)info);
     if (fb_info.addr && fb_info.width && fb_info.height)
         paging_map_framebuffer((uintptr_t)fb_info.addr,
@@ -71,7 +75,6 @@ void kernel_main(uint32_t magic, uint32_t info)
     kprintf("[boot] framebuffer %ux%u bpp=%u\n",
             fb_info.width, fb_info.height, fb_info.bpp);
 
-    /* Initialize RTC clock and log current time. */
     rtc_init();
     {
         rtc_time_t now;
@@ -81,15 +84,12 @@ void kernel_main(uint32_t magic, uint32_t info)
                 (unsigned)now.hour, (unsigned)now.min,   (unsigned)now.sec);
     }
 
-    /* Initialize input/events and remap the PIC so hardware IRQs (keyboard)
-       use vectors 32+ instead of clobbering CPU exception vectors like 0x08. */
+    /* Initialize input/events and remap the PIC so hardware IRQs (keyboard) use vectors 32+ instead of... */
     event_init();
     pic_init();
 
-    /* Initialize Virtual File System (bootfs/initrd/memfs root fallback, FAT12 optional). */
     vfs_init((const void *)(uintptr_t)info);
 
-    /* Stage 7: basic tasking and scheduler with a single kernel task. */
     task_init();
 
     extern void main_kernel_task(void);
@@ -97,9 +97,7 @@ void kernel_main(uint32_t magic, uint32_t info)
     if (main_task)
         task_ready(main_task);
 
-    /* Stage 8: (optionally) create a user-mode task using the user stub. */
 #if ENABLE_USER_TASK
-    /* Mark user stub and stack pages as user-accessible. */
     paging_map((uintptr_t)_user_stub_start, (uintptr_t)_user_stub_start,
                PTE_PRESENT | PTE_USER);
     paging_map((uintptr_t)_user_stack_top - 4096, (uintptr_t)_user_stack_top - 4096,

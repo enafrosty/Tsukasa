@@ -1,9 +1,17 @@
 /*
- * rtc.c - CMOS Real-Time Clock driver.
+ * Project Tsukasa — CMOS Real-Time Clock driver
  *
- * Reads via CMOS ports 0x70 (index write) / 0x71 (data read).
- * Handles BCD encoding and the "Update In Progress" flag.
- * Supports century register (register 0x32) if the BIOS sets it.
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "../drv/rtc.h"
@@ -55,17 +63,15 @@ static uint8_t bcd2bin(uint8_t bcd)
 
 static rtc_time_t g_cached;
 
-/** Read until two consecutive identical reads — avoids mid-update glitches. */
+/* Read until two consecutive identical reads — avoids mid-update glitches. */
 static void rtc_read_raw(rtc_time_t *t)
 {
     rtc_time_t prev;
     uint8_t status_b;
 
-    /* Wait for any update-in-progress to clear. */
     while (rtc_updating())
         __asm__ volatile ("pause");
 
-    /* First read. */
     prev.sec   = cmos_read(CMOS_SEC);
     prev.min   = cmos_read(CMOS_MIN);
     prev.hour  = cmos_read(CMOS_HOUR);
@@ -73,7 +79,6 @@ static void rtc_read_raw(rtc_time_t *t)
     prev.month = cmos_read(CMOS_MONTH);
     prev.year  = cmos_read(CMOS_YEAR);
 
-    /* Repeat until stable. */
     do {
         *t = prev;
         while (rtc_updating())
@@ -90,7 +95,6 @@ static void rtc_read_raw(rtc_time_t *t)
 
     status_b = cmos_read(CMOS_STATUS_B);
 
-    /* If bit 2 of Status B is clear, values are BCD-encoded. */
     if (!(status_b & 0x04u)) {
         t->sec   = bcd2bin(t->sec);
         t->min   = bcd2bin(t->min);
@@ -100,19 +104,16 @@ static void rtc_read_raw(rtc_time_t *t)
         t->year  = bcd2bin((uint8_t)t->year);
     }
 
-    /* Convert 12-h to 24-h if needed. */
     if (!(status_b & 0x02u) && (t->hour & 0x80u)) {
         t->hour = (uint8_t)(((t->hour & 0x7Fu) % 12u) + 12u);
     }
 
-    /* Determine full year. */
     uint8_t century = cmos_read(CMOS_CENTURY);
     uint16_t full_year;
     if (century != 0 && century != 0xFF) {
         uint8_t c = (status_b & 0x04u) ? century : bcd2bin(century);
         full_year = (uint16_t)(c * 100u + t->year);
     } else {
-        /* BIOS doesn't expose century — assume 2000s. */
         full_year = (uint16_t)(((uint16_t)t->year < 70u) ?
                                2000u + t->year : 1900u + t->year);
     }

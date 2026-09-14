@@ -1,7 +1,17 @@
 /*
- * terminal.c - Minimal terminal/shell app.
- * Built-in commands: help, ver, cls, echo <text>.
- * Shows a command prompt and scrollable output.
+ * Project Tsukasa — Minimal terminal/shell app
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "apps.h"
@@ -25,8 +35,6 @@ struct term_data {
     char   cmd[TERM_CMD_SIZE];
     int    cmd_len;
 };
-
-/* ---- string helpers ---- */
 
 static int kstrcmp(const char *a, const char *b)
 {
@@ -53,12 +61,10 @@ static void term_append(struct term_data *td, const char *str)
 
 static void term_execute(struct term_data *td)
 {
-    /* Trim command. */
     char *cmd = td->cmd;
     while (*cmd == ' ') cmd++;
 
     if (cmd[0] == '\0') {
-        /* Empty command. */
     } else if (kstrcmp(cmd, "help") == 0) {
         term_append(td, "Available commands:\n");
         term_append(td, "  help  - Show this help\n");
@@ -79,11 +85,9 @@ static void term_execute(struct term_data *td)
         term_append(td, "\n");
     }
 
-    /* Reset command buffer. */
     td->cmd_len = 0;
     td->cmd[0] = '\0';
 
-    /* Print prompt. */
     term_append(td, "C:\\> ");
 }
 
@@ -95,18 +99,15 @@ static void term_draw(wm_window_t *win)
     int cx, cy, cw, ch;
     wm_client_rect(win, &cx, &cy, &cw, &ch);
 
-    /* Black background, green text (classic terminal). */
     color_t bg = rgb(0, 0, 0);
     color_t fg = rgb(0, 255, 0);
 
     fb_fill_rect(cx, cy, cw, ch, bg);
 
-    /* Draw output buffer with scrolling (show last N lines). */
     int x = cx + 4;
     int y = cy + 4;
     int max_y = cy + ch - 4;
 
-    /* Count how many lines in the output. */
     int total_lines = 1;
     for (int i = 0; i < td->out_len; i++)
         if (td->output[i] == '\n') total_lines++;
@@ -141,7 +142,6 @@ static void term_draw(wm_window_t *win)
         x += 8;
     }
 
-    /* Draw current command being typed. */
     for (int i = 0; i < td->cmd_len; i++) {
         if (x + 8 > cx + cw - 4) {
             y += TERM_LINE_H;
@@ -152,7 +152,6 @@ static void term_draw(wm_window_t *win)
         x += 8;
     }
 
-    /* Cursor. */
     if (y + 8 <= max_y)
         fb_draw_char(x, y, '_', fg, bg);
 }
@@ -162,7 +161,7 @@ static void term_event(wm_window_t *win, const void *event)
     struct term_data *td = (struct term_data *)win->app_data;
     if (!td) return;
 
-    const struct input_event *ev = (const struct input_event *)event;
+    const struct gui_event *ev = (const struct gui_event *)event;
     if (ev->type != EVENT_KEY || ev->subtype != KEY_PRESS)
         return;
 
@@ -175,7 +174,6 @@ static void term_event(wm_window_t *win, const void *event)
     }
 
     if (key == '\n' || key == '\r') {
-        /* Echo command to output. */
         term_append(td, td->cmd);
         term_append(td, "\n");
         term_execute(td);

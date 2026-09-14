@@ -4,12 +4,25 @@
 #   make ARCH=i386 iso      -> legacy GRUB/Multiboot i386 image
 #   make ARCH=x86_64 iso    -> Limine x86_64 image
 
-ARCH ?= i386
+ARCH ?= x86_64
 
+# Toolchains:
+#   make TOOLCHAIN=llvm  (default) -> clang/ld.lld targeting bare-metal ELF
+#                                     (works natively on Windows via MSYS2)
+#   make TOOLCHAIN=gcc             -> host gcc/ld cross-capable of ELF (WSL/Linux)
+TOOLCHAIN ?= llvm
+
+ifeq ($(TOOLCHAIN),llvm)
+CLANG_TARGET = $(if $(filter x86_64,$(ARCH)),x86_64-unknown-elf,i386-unknown-elf)
+CC = clang --target=$(CLANG_TARGET)
+LD = ld.lld
+else
 CC = gcc
-ASM = nasm
 LD = ld
-MAKE = make
+endif
+
+ASM = nasm
+MAKE ?= $(MAKE)
 
 ISO_IMAGE = tsukasa.iso
 ISO_DIR = iso
@@ -27,12 +40,13 @@ LIMINE_BRANCH = v8.x-binary
 ARCH_MARKER = .last_build_arch
 
 COMMON_OBJS = vga.o \
-    mm/pmm.o mm/heap.o mm/tlsf.o mm/vmm_x64.o mm/vm_space.o \
+    mm/pmm.o mm/heap.o mm/slab.o mm/tlsf.o mm/vmm_x64.o mm/vm_space.o \
     drv/fb.o drv/pic.o drv/pit.o drv/ps2kbd.o drv/irq.o drv/ps2mouse.o \
-    drv/serial.o drv/ata.o drv/rtc.o \
-    input/event.o \
-    fs/vfs.o fs/initrd.o fs/fat12.o fs/fat32.o fs/memfs.o fs/procfs.o fs/sysfs.o fs/bootfs.o \
-    loader/elf.o loader/exec.o \
+    drv/serial.o drv/ata.o drv/blockdev.o drv/diskmgr.o drv/rtc.o \
+    input/event.o drv/input_dev.o \
+    fs/vfs.o fs/devfs.o fs/initrd.o fs/fat12.o fs/fat32.o fs/mkfs_fat32.o fs/memfs.o fs/procfs.o fs/sysfs.o fs/bootfs.o \
+    fs/tar.o fs/tar_testdata.o \
+    loader/elf.o loader/exec.o loader/elf64.o \
     lib/kprintf.o lib/kutils.o lib/compiler_rt.o \
     gfx/blit.o gfx/font.o gfx/font_8x8.o \
     gfx/ui.o gfx/bmp.o \
@@ -69,6 +83,9 @@ X64_NET_OBJS = dev/pci.o \
     net/third_party/lwip/core/ipv4/ip4_frag.o \
     net/third_party/lwip/netif/ethernet.o
 
+# x64-only storage drivers (PCI-based; i386 keeps ATA PIO only).
+X64_STORAGE_OBJS =
+
 ifeq ($(ARCH),x86_64)
 KERNEL_BIN = tsukasa_x64.elf
 CFLAGS = -m64 -mcmodel=kernel -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
@@ -82,13 +99,16 @@ OBJS = arch/x86_64/boot/entry.o \
        arch/x86_64/boot/boot_info.o \
        arch/x86_64/kernel_main.o \
        arch/x86_64/cpu/gdt.o arch/x86_64/cpu/idt.o arch/x86_64/cpu/isr.o \
-       drv/lapic.o sys/smp.o \
+       arch/x86_64/cpu/syscall_entry.o arch/x86_64/cpu/syscall_init.o \
+       drv/acpi.o drv/ioapic.o drv/lapic.o sys/smp.o sys/wait_queue.o sys/work_queue.o \
+       sys/futex.o sys/installer.o \
+       sys/panic.o sys/kconsole.o \
        proc/process.o proc/scheduler.o proc/signal.o \
        tty/tty.o \
-       syscall/syscall.o \
-       ipc/shm.o \
+       syscall/syscall.o syscall/syscall_table.o \
+       ipc/shm.o ipc/unix_socket.o \
        $(USER_LIB_OBJS) $(USER_APP_OBJS) \
-       $(COMMON_OBJS) $(X64_NET_OBJS)
+       $(COMMON_OBJS) $(X64_NET_OBJS) $(X64_STORAGE_OBJS)
 ISO_TARGET = iso-x86_64
 else
 KERNEL_BIN = tsukasa.bin
@@ -100,12 +120,12 @@ OBJS = boot.o isr.o idt.o kernel.o \
        mm/paging.o \
        proc/task.o proc/scheduler.o proc/context.o proc/switch.o \
        syscall/syscall.o syscall/syscall_entry.o \
-       ipc/shm.o user/user_stub.o \
+       ipc/shm.o ipc/unix_socket.o user/user_stub.o \
        $(COMMON_OBJS)
 ISO_TARGET = iso-i386
 endif
 
-.PHONY: all iso initrd clean check-multiboot iso-i386 iso-x86_64 limine-artifacts arch-guard
+.PHONY: all iso initrd clean check-multiboot iso-i386 iso-x86_64 limine-artifacts arch-guard sdk apps vanilla coreutils disktools ports
 
 all: arch-guard $(KERNEL_BIN)
 
@@ -133,14 +153,208 @@ arch-guard:
 $(KERNEL_BIN): arch-guard $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
 
-$(INITRD_IMG):
+$(INITRD_FILES)/hello.elf: user_elf/hello64.asm
 	@mkdir -p $(INITRD_FILES)
-	dd if=/dev/zero of=$(INITRD_IMG) bs=1024 count=2880
-	mkfs.fat -F 12 $(INITRD_IMG)
+	nasm -f elf64 -o user_elf/hello64.o user_elf/hello64.asm
+	ld.lld -m elf_x86_64 -e _start --image-base=0x400000 -o $@ user_elf/hello64.o
+
+$(INITRD_FILES)/hello_sc.elf: user_elf/hello_syscall64.asm
+	@mkdir -p $(INITRD_FILES)
+	nasm -f elf64 -o user_elf/hello_syscall64.o user_elf/hello_syscall64.asm
+	ld.lld -m elf_x86_64 -e _start --image-base=0x400000 -o $@ user_elf/hello_syscall64.o
+
+$(INITRD_FILES)/fault.elf: user_elf/fault64.asm
+	@mkdir -p $(INITRD_FILES)
+	nasm -f elf64 -o user_elf/fault64.o user_elf/fault64.asm
+	ld.lld -m elf_x86_64 -e _start --image-base=0x400000 -o $@ user_elf/fault64.o
+
+$(INITRD_FILES)/exit7.elf: user_elf/exit7.asm
+	@mkdir -p $(INITRD_FILES)
+	nasm -f elf64 -o user_elf/exit7.o user_elf/exit7.asm
+	ld.lld -m elf_x86_64 -e _start --image-base=0x400000 -o $@ user_elf/exit7.o
+
+# ---- Guide 05 (PR A): user SDK (crt0 + syscall stubs) & standalone apps ----
+# Cross toolchain: clang + ld.lld targeting bare ELF64 — the same LLVM tools
+# the TOOLCHAIN=llvm kernel path and the user_elf test binaries already use
+# (works on Linux and MSYS2 alike; no from-source binutils/gcc build).
+# App code is NOT kernel code: no -mcmodel=kernel, no -DTSUKASA_USERLIB_KERNEL.
+# -mno-red-zone is kept for now only because signal delivery's user-stack
+# frame has not been audited for red-zone safety — TODO(verify), then drop.
+# NOTE: initrd binaries MUST fit FAT12 8.3 names — the in-kernel fat12
+# driver has no long-filename (LFN) support, so mcopy's mangled short name
+# (HELLO_~1.ELF) would be unfindable by path. Hence hellosdk.elf (8+3),
+# matching the existing hello_sc/fault/exit7 convention.
+SDK_DIR    = sdk
+SDK_CC     = clang --target=x86_64-unknown-elf
+# -mno-mmx/-mno-sse/-mno-sse2: the kernel never enables ring-3 SSE state
+# (CR4.OSFXSR stays clear; the kernel itself builds -mno-sse), so any
+# compiler-vectorized SSE in an SDK app raises #UD (Invalid Opcode) at run
+# time. Found by the guide-20 gate: clang -O2 emitted movaps/movups for
+# usock20's sockaddr_un stores; stdio_lite.c carried 8 latent xmm hits too.
+SDK_CFLAGS = -ffreestanding -fno-pie -fno-stack-protector -mno-red-zone \
+             -mno-mmx -mno-sse -mno-sse2 \
+             -O2 -Wall -Wextra -Iuser/crt
+SDK_OBJS   = user/crt/crt0.o user/crt/syscalls.o user/crt/stdio_lite.o
+
+user/crt/crt0.o: user/crt/crt0.asm
+	nasm -f elf64 -o $@ $<
+
+user/crt/syscalls.o: user/crt/syscalls.c user/crt/tsukasa_sdk.h
+	$(SDK_CC) $(SDK_CFLAGS) -c -o $@ $<
+
+user/crt/stdio_lite.o: user/crt/stdio_lite.c user/crt/tsukasa_sdk.h
+	$(SDK_CC) $(SDK_CFLAGS) -c -o $@ $<
+
+# Migrated CLI tools (guide 05 PR B): built against the SDK, staged onto the
+# initrd with FAT12 8.3 names. Explicit rules for the five pre-existing test
+# ELFs above take precedence over this pattern (standard make semantics).
+$(INITRD_FILES)/%.elf: user/cli/%.c $(SDK_OBJS) user/crt/tsukasa_app.ld
+	@mkdir -p $(INITRD_FILES)
+	$(SDK_CC) $(SDK_CFLAGS) -c -o user/cli/$*.o $<
+	ld.lld -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
+	    -o $@ user/crt/crt0.o user/cli/$*.o user/crt/syscalls.o user/crt/stdio_lite.o
+
+$(INITRD_FILES)/hellosdk.elf: user/examples/hello.c $(SDK_OBJS) user/crt/tsukasa_app.ld
+	@mkdir -p $(INITRD_FILES)
+	$(SDK_CC) $(SDK_CFLAGS) -c -o user/examples/hello.o user/examples/hello.c
+	ld.lld -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
+	    -o $@ user/crt/crt0.o user/examples/hello.o user/crt/syscalls.o
+
+# ---- Guide 16: SDK toolkit (tk_*) + dual-compiled widget kit ----
+# libwidget.c and font_8x8.c ALSO build into the kernel; the .sdk.o suffix
+# keeps the two object flavors from colliding in one directory.
+TK_OBJS = user/tk/tk_client.sdk.o user/tk/tk_painter.sdk.o user/tk/tk_app.sdk.o \
+          user/lib/libwidget.sdk.o gfx/font_8x8.sdk.o
+
+user/tk/%.sdk.o: user/tk/%.c user/crt/tsukasa_sdk.h
+	$(SDK_CC) $(SDK_CFLAGS) -c -o $@ $<
+
+user/lib/libwidget.sdk.o: user/lib/libwidget.c user/include/libwidget.h
+	$(SDK_CC) $(SDK_CFLAGS) -c -o $@ $<
+
+gfx/font_8x8.sdk.o: gfx/font_8x8.c gfx/font_8x8.h
+	$(SDK_CC) $(SDK_CFLAGS) -c -o $@ $<
+
+$(INITRD_FILES)/wdemo16.elf: user/cli/wdemo16.c $(SDK_OBJS) $(TK_OBJS) user/crt/tsukasa_app.ld
+	@mkdir -p $(INITRD_FILES)
+	$(SDK_CC) $(SDK_CFLAGS) -c -o user/cli/wdemo16.o $<
+	ld.lld -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
+	    -o $@ user/crt/crt0.o user/cli/wdemo16.o $(TK_OBJS) user/crt/syscalls.o user/crt/stdio_lite.o
+
+vanilla:
+	$(MAKE) -C vanilla all
+
+$(INITRD_FILES)/VSRV.ELF: vanilla
+	@mkdir -p $(INITRD_FILES)
+	cp vanilla/bin/vanilla_srv.elf $@
+
+$(INITRD_FILES)/TESTIPC.ELF: vanilla
+	@mkdir -p $(INITRD_FILES)
+	cp vanilla/bin/test_ipc.elf $@
+
+$(INITRD_FILES)/TESTCOMP.ELF: vanilla
+	@mkdir -p $(INITRD_FILES)
+	cp vanilla/bin/test_compositor.elf $@
+
+$(INITRD_FILES)/TESTTYPO.ELF: vanilla
+	@mkdir -p $(INITRD_FILES)
+	cp vanilla/bin/test_typography.elf $@
+
+$(INITRD_FILES)/TESTSHELL.ELF: vanilla
+	@mkdir -p $(INITRD_FILES)
+	cp vanilla/bin/test_shell.elf $@
+
+$(INITRD_FILES)/TERMINAL.ELF: vanilla
+	@mkdir -p $(INITRD_FILES)
+	cp vanilla/bin/terminal.elf $@
+
+$(INITRD_FILES)/NOTEPAD.ELF: vanilla
+	@mkdir -p $(INITRD_FILES)
+	cp vanilla/bin/notepad.elf $@
+
+$(INITRD_FILES)/CALC.ELF: vanilla
+	@mkdir -p $(INITRD_FILES)
+	cp vanilla/bin/calc.elf $@
+
+$(INITRD_FILES)/FILEMGR.ELF: vanilla
+	@mkdir -p $(INITRD_FILES)
+	cp vanilla/bin/filemgr.elf $@
+
+$(INITRD_FILES)/SETTINGS.ELF: vanilla
+	@mkdir -p $(INITRD_FILES)
+	cp vanilla/bin/settings.elf $@
+
+$(INITRD_FILES)/TASKMGR.ELF: vanilla
+	@mkdir -p $(INITRD_FILES)
+	cp vanilla/bin/taskmgr.elf $@
+
+coreutils:
+	$(MAKE) -C tsukasa-coreutils all
+
+$(INITRD_FILES)/TSH.ELF: coreutils
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-coreutils/bin/tsh.elf $@
+
+disktools:
+	$(MAKE) -C tsukasa-disktools all
+
+$(INITRD_FILES)/FDISK.ELF: disktools
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-disktools/bin/fdisk.elf $@
+
+$(INITRD_FILES)/MKFSFAT.ELF: disktools
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-disktools/bin/mkfs.fat32.elf $@
+
+$(INITRD_FILES)/MKFSEXT2.ELF: disktools
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-disktools/bin/mkfs.ext2.elf $@
+
+$(INITRD_FILES)/INSTALL.ELF: disktools
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-disktools/bin/installer.elf $@
+ 
+ports:
+	$(MAKE) -C tsukasa-ports all
+
+$(INITRD_FILES)/DOOM.ELF: ports
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-ports/staging/bin/doomgeneric.elf $@
+
+$(INITRD_FILES)/DOOM1.WAD: ports
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-ports/staging/usr/share/doom/doom1.wad $@
+
+$(INITRD_FILES)/TCC.ELF: ports
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-ports/staging/bin/tcc.elf $@
+
+$(INITRD_FILES)/LUA.ELF: ports
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-ports/staging/bin/lua.elf $@
+
+$(INITRD_FILES)/LUAC.ELF: ports
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-ports/staging/bin/luac.elf $@
+
+apps: $(INITRD_FILES)/hellosdk.elf $(INITRD_FILES)/echo.elf $(INITRD_FILES)/cat.elf $(INITRD_FILES)/argvchk.elf $(INITRD_FILES)/futex10.elf $(INITRD_FILES)/usock20.elf $(INITRD_FILES)/wsrv15.elf $(INITRD_FILES)/wapp15.elf $(INITRD_FILES)/wdemo16.elf $(INITRD_FILES)/VSRV.ELF $(INITRD_FILES)/TESTIPC.ELF $(INITRD_FILES)/TESTCOMP.ELF $(INITRD_FILES)/TESTTYPO.ELF $(INITRD_FILES)/TESTSHELL.ELF $(INITRD_FILES)/TERMINAL.ELF $(INITRD_FILES)/NOTEPAD.ELF $(INITRD_FILES)/CALC.ELF $(INITRD_FILES)/FILEMGR.ELF $(INITRD_FILES)/SETTINGS.ELF $(INITRD_FILES)/TASKMGR.ELF $(INITRD_FILES)/TSH.ELF $(INITRD_FILES)/FDISK.ELF $(INITRD_FILES)/MKFSFAT.ELF $(INITRD_FILES)/MKFSEXT2.ELF $(INITRD_FILES)/INSTALL.ELF $(INITRD_FILES)/DOOM.ELF $(INITRD_FILES)/DOOM1.WAD $(INITRD_FILES)/TCC.ELF $(INITRD_FILES)/LUA.ELF $(INITRD_FILES)/LUAC.ELF
+
+sdk: $(SDK_OBJS) user/crt/tsukasa_app.ld user/crt/tsukasa_sdk.h
+	@mkdir -p $(SDK_DIR)/include $(SDK_DIR)/lib $(SDK_DIR)/crt
+	cp user/crt/tsukasa_sdk.h $(SDK_DIR)/include/
+	cp user/crt/crt0.o user/crt/tsukasa_app.ld $(SDK_DIR)/crt/
+	cp user/crt/syscalls.o $(SDK_DIR)/lib/
+	@echo "[OK] SDK staged in $(SDK_DIR)/ (crt0.o, tsukasa_app.ld, syscalls.o, tsukasa_sdk.h)."
+
+$(INITRD_IMG): $(INITRD_FILES)/hello.elf $(INITRD_FILES)/hello_sc.elf $(INITRD_FILES)/fault.elf $(INITRD_FILES)/exit7.elf $(INITRD_FILES)/hellosdk.elf $(INITRD_FILES)/echo.elf $(INITRD_FILES)/cat.elf $(INITRD_FILES)/argvchk.elf $(INITRD_FILES)/futex10.elf $(INITRD_FILES)/usock20.elf $(INITRD_FILES)/wsrv15.elf $(INITRD_FILES)/wapp15.elf $(INITRD_FILES)/wdemo16.elf $(INITRD_FILES)/VSRV.ELF $(INITRD_FILES)/TESTIPC.ELF $(INITRD_FILES)/TESTCOMP.ELF $(INITRD_FILES)/TESTTYPO.ELF $(INITRD_FILES)/TESTSHELL.ELF $(INITRD_FILES)/TERMINAL.ELF $(INITRD_FILES)/NOTEPAD.ELF $(INITRD_FILES)/CALC.ELF $(INITRD_FILES)/FILEMGR.ELF $(INITRD_FILES)/SETTINGS.ELF $(INITRD_FILES)/TASKMGR.ELF $(INITRD_FILES)/TSH.ELF $(INITRD_FILES)/FDISK.ELF $(INITRD_FILES)/MKFSFAT.ELF $(INITRD_FILES)/MKFSEXT2.ELF $(INITRD_FILES)/INSTALL.ELF $(INITRD_FILES)/DOOM.ELF $(INITRD_FILES)/DOOM1.WAD $(INITRD_FILES)/TCC.ELF $(INITRD_FILES)/LUA.ELF $(INITRD_FILES)/LUAC.ELF
+
+	@mkdir -p $(INITRD_FILES)
+	dd if=/dev/zero of=$(INITRD_IMG) bs=1024 count=16384
+	mkfs.fat -F 12 -s 16 $(INITRD_IMG)
 	@if [ -n "$$(ls -A $(INITRD_FILES) 2>/dev/null)" ]; then \
 	    mcopy -i $(INITRD_IMG) $(INITRD_FILES)/* ::; \
 	fi
-	@echo "[OK] $(INITRD_IMG) ready (FAT12, 1.44 MB)."
+	@echo "[OK] $(INITRD_IMG) ready (FAT12, 16 MB)."
 
 initrd: $(INITRD_IMG)
 
@@ -171,9 +385,24 @@ $(LIMINE_DIR)/limine:
 
 limine-artifacts: $(LIMINE_DIR)/limine
 
-iso-x86_64: $(KERNEL_BIN) limine-artifacts
+# Guide 13: capture Limine's BIOS stage1+2 from a template image so the
+# in-OS installer can replay them onto a target disk. bios-install puts
+# stage 1 in the MBR boot code and stage 2 in the post-MBR gap; both are
+# position-fixed within sectors 0..2047 and independent of partition
+# CONTENT, so the capture is deterministic for a given Limine release.
+bootblob.bin: limine-artifacts
+	dd if=/dev/zero of=.bootblob-template.img bs=512 count=8192 2>/dev/null
+	printf '\200\000\002\000\014\377\377\377\000\010\000\000\000\030\000\000' | \
+	    dd of=.bootblob-template.img bs=1 seek=446 conv=notrunc 2>/dev/null
+	printf '\125\252' | dd of=.bootblob-template.img bs=1 seek=510 conv=notrunc 2>/dev/null
+	$(LIMINE_DIR)/limine bios-install .bootblob-template.img
+	dd if=.bootblob-template.img of=$@ bs=512 count=2048 2>/dev/null
+	rm -f .bootblob-template.img
+
+iso-x86_64: $(KERNEL_BIN) limine-artifacts bootblob.bin $(INITRD_IMG)
 	@mkdir -p $(BOOT_DIR) $(LIMINE_BOOT_DIR) $(EFI_BOOT_DIR)
 	cp $(KERNEL_BIN) $(BOOT_DIR)/tsukasa_x64.elf
+	cp bootblob.bin $(BOOT_DIR)/
 	cp limine.conf $(ISO_DIR)/
 	@if [ -f $(INITRD_IMG) ]; then \
 	    cp $(INITRD_IMG) $(BOOT_DIR)/; \
@@ -195,7 +424,17 @@ iso-x86_64: $(KERNEL_BIN) limine-artifacts
 	$(LIMINE_DIR)/limine bios-install $(ISO_IMAGE)
 	@echo "[OK] $(ISO_IMAGE) ready (x86_64/Limine)."
 
+qemu run: iso-x86_64
+	@if [ ! -f disk.img ]; then \
+	    echo "[*] Creating 64MB disk.img..."; \
+	    qemu-img create -f raw disk.img 64M 2>/dev/null || dd if=/dev/zero of=disk.img bs=1M count=64 2>/dev/null; \
+	fi
+	qemu-system-x86_64 -cdrom $(ISO_IMAGE) -hda disk.img -boot d -m 256 -smp 2 -vga std -serial stdio -netdev user,id=u1 -device e1000,netdev=u1
+
+
 clean:
 	find . -name '*.o' -delete
 	rm -f tsukasa.bin tsukasa_x64.elf $(ISO_IMAGE) $(INITRD_IMG) $(ARCH_MARKER)
-	rm -rf $(ISO_DIR)
+	rm -rf $(ISO_DIR) $(SDK_DIR) $(INITRD_FILES)
+	$(MAKE) -C vanilla clean
+	$(MAKE) -C tsukasa-disktools clean

@@ -1,8 +1,17 @@
 /*
- * bmp.c  -  BMP parser: 24-bit and 32-bit uncompressed, bottom-up rows.
+ * Project Tsukasa — BMP parser: 24-bit and 32-bit uncompressed, bottom-up rows
  *
- * Uses VFS for file I/O and kmalloc for scratch buffers.
- * No libc, no floats — pure integer arithmetic throughout.
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "bmp.h"
@@ -12,7 +21,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* ---- BMP on-disk structures (packed, little-endian) ------------------- */
+/* BMP on-disk structures (packed, little-endian) */
 
 /* We parse fields by offset to avoid alignment padding issues. */
 static inline uint16_t u16le(const uint8_t *p)
@@ -34,25 +43,18 @@ static inline int32_t s32le(const uint8_t *p)
 #define BI_RGB           0
 #define BI_BITFIELDS     3
 
-/* ---- Internal helpers ------------------------------------------------- */
-
 /* Integer division that rounds to nearest (for scaling). */
 static inline int scale_coord(int src, int src_max, int dst_max)
 {
-    /* src_pos in destination coords → source pixel index */
     return (int)((uint32_t)src * (uint32_t)src_max / (uint32_t)dst_max);
 }
 
-/*
- * Read the whole file into a kmalloc'd buffer.
- * Returns pointer (caller must kfree) and sets *fsize, or NULL on failure.
- */
+/* Read the whole file into a kmalloc'd buffer. Returns pointer (caller must kfree) and sets *fsize, or NULL... */
 static uint8_t *read_vfs_file(const char *path, size_t *fsize)
 {
     int fd = vfs_open(path);
     if (fd < 0) return NULL;
 
-    /* Seek to end to get size. */
     size_t sz = vfs_seek(fd, 0, VFS_SEEK_END);
     if (sz == (size_t)-1 || sz == 0) { vfs_close(fd); return NULL; }
 
@@ -70,23 +72,17 @@ static uint8_t *read_vfs_file(const char *path, size_t *fsize)
     return buf;
 }
 
-/*
- * Parse the header and decode all pixels into an ARGB buffer.
- * Returns kmalloc'd pixel array (w*h uint32_t, top-to-bottom),
- * or NULL on format errors.
- */
+/* Parse the header and decode all pixels into an ARGB buffer. */
 static uint32_t *bmp_decode(const uint8_t *data, size_t size,
                              int *out_w, int *out_h)
 {
     if (size < BFH_SIZE + 4) return NULL;
 
-    /* Check magic 'BM'. */
     if (data[0] != 'B' || data[1] != 'M') return NULL;
 
     uint32_t pixel_offset = u32le(data + 10);
     if (pixel_offset >= size) return NULL;
 
-    /* Info header starts at offset 14. */
     const uint8_t *bih = data + BFH_SIZE;
     uint32_t bih_size  = u32le(bih + 0);
     if (BFH_SIZE + bih_size > size) return NULL;
@@ -105,7 +101,6 @@ static uint32_t *bmp_decode(const uint8_t *data, size_t size,
     int img_w = bmp_w;
     int img_h = bottom_up ? (int)bmp_h : -(int)bmp_h;
 
-    /* Row stride: each row is padded to a 4-byte boundary. */
     int bytes_per_px = (int)(bpp / 8u);
     int row_stride   = (img_w * bytes_per_px + 3) & ~3;
 
@@ -116,7 +111,6 @@ static uint32_t *bmp_decode(const uint8_t *data, size_t size,
     if (!pixels) return NULL;
 
     for (int row = 0; row < img_h; row++) {
-        /* BMP rows are stored bottom-up when bmp_h > 0. */
         int bmp_row = bottom_up ? (img_h - 1 - row) : row;
         const uint8_t *src = data + pixel_offset + (size_t)bmp_row * (size_t)row_stride;
 
@@ -135,8 +129,6 @@ static uint32_t *bmp_decode(const uint8_t *data, size_t size,
     return pixels;
 }
 
-/* ---- Public API ------------------------------------------------------- */
-
 int bmp_draw_wallpaper(const char *vfs_path)
 {
     size_t fsize = 0;
@@ -151,7 +143,6 @@ int bmp_draw_wallpaper(const char *vfs_path)
     int sw = (int)fb_info.width;
     int sh = (int)fb_info.height;
 
-    /* Nearest-neighbor scale: for each destination pixel, look up source. */
     for (int y = 0; y < sh; y++) {
         int src_y = scale_coord(y, bh, sh);
         if (src_y >= bh) src_y = bh - 1;
@@ -162,7 +153,6 @@ int bmp_draw_wallpaper(const char *vfs_path)
             int src_x = scale_coord(x, bw, sw);
             if (src_x >= bw) src_x = bw - 1;
             uint32_t px = pixels[src_y * bw + src_x];
-            /* Force opaque for framebuffer write. */
             fb_row[x] = px | 0xFF000000u;
         }
     }

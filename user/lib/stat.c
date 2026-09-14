@@ -1,7 +1,24 @@
-#include "../include/sys/stat.h"
+/*
+ * Project Tsukasa — include "../include/sys/stat.h"
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
 
-#include "../lib/syscall.h"
-#include "../include/syscall_nums.h"
+#include <stddef.h>
+#include <stdint.h>
+#include "user/include/sys/stat.h"
+#include "user/lib/syscall.h"
+#include "user/include/syscall_nums.h"
 
 static mode_t map_mode(const struct tsukasa_stat *in)
 {
@@ -14,6 +31,8 @@ static mode_t map_mode(const struct tsukasa_stat *in)
         mode |= S_IFCHR;
     else if (in->type == TSUKASA_STAT_TYPE_PIPE)
         mode |= S_IFIFO;
+    else if (in->type == TSUKASA_STAT_TYPE_SOCKET)
+        mode |= S_IFSOCK;
     else
         mode |= S_IFREG;
 
