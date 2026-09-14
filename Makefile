@@ -173,24 +173,10 @@ $(INITRD_FILES)/exit7.elf: user_elf/exit7.asm
 	nasm -f elf64 -o user_elf/exit7.o user_elf/exit7.asm
 	ld.lld -m elf_x86_64 -e _start --image-base=0x400000 -o $@ user_elf/exit7.o
 
-# ---- Guide 05 (PR A): user SDK (crt0 + syscall stubs) & standalone apps ----
-# Cross toolchain: clang + ld.lld targeting bare ELF64 — the same LLVM tools
-# the TOOLCHAIN=llvm kernel path and the user_elf test binaries already use
-# (works on Linux and MSYS2 alike; no from-source binutils/gcc build).
-# App code is NOT kernel code: no -mcmodel=kernel, no -DTSUKASA_USERLIB_KERNEL.
-# -mno-red-zone is kept for now only because signal delivery's user-stack
-# frame has not been audited for red-zone safety — TODO(verify), then drop.
-# NOTE: initrd binaries MUST fit FAT12 8.3 names — the in-kernel fat12
-# driver has no long-filename (LFN) support, so mcopy's mangled short name
-# (HELLO_~1.ELF) would be unfindable by path. Hence hellosdk.elf (8+3),
-# matching the existing hello_sc/fault/exit7 convention.
+
 SDK_DIR    = sdk
 SDK_CC     = clang --target=x86_64-unknown-elf
-# -mno-mmx/-mno-sse/-mno-sse2: the kernel never enables ring-3 SSE state
-# (CR4.OSFXSR stays clear; the kernel itself builds -mno-sse), so any
-# compiler-vectorized SSE in an SDK app raises #UD (Invalid Opcode) at run
-# time. Found by the guide-20 gate: clang -O2 emitted movaps/movups for
-# usock20's sockaddr_un stores; stdio_lite.c carried 8 latent xmm hits too.
+
 SDK_CFLAGS = -ffreestanding -fno-pie -fno-stack-protector -mno-red-zone \
              -mno-mmx -mno-sse -mno-sse2 \
              -O2 -Wall -Wextra -Iuser/crt
@@ -205,9 +191,7 @@ user/crt/syscalls.o: user/crt/syscalls.c user/crt/tsukasa_sdk.h
 user/crt/stdio_lite.o: user/crt/stdio_lite.c user/crt/tsukasa_sdk.h
 	$(SDK_CC) $(SDK_CFLAGS) -c -o $@ $<
 
-# Migrated CLI tools (guide 05 PR B): built against the SDK, staged onto the
-# initrd with FAT12 8.3 names. Explicit rules for the five pre-existing test
-# ELFs above take precedence over this pattern (standard make semantics).
+
 $(INITRD_FILES)/%.elf: user/cli/%.c $(SDK_OBJS) user/crt/tsukasa_app.ld
 	@mkdir -p $(INITRD_FILES)
 	$(SDK_CC) $(SDK_CFLAGS) -c -o user/cli/$*.o $<
@@ -220,9 +204,6 @@ $(INITRD_FILES)/hellosdk.elf: user/examples/hello.c $(SDK_OBJS) user/crt/tsukasa
 	ld.lld -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
 	    -o $@ user/crt/crt0.o user/examples/hello.o user/crt/syscalls.o
 
-# ---- Guide 16: SDK toolkit (tk_*) + dual-compiled widget kit ----
-# libwidget.c and font_8x8.c ALSO build into the kernel; the .sdk.o suffix
-# keeps the two object flavors from colliding in one directory.
 TK_OBJS = user/tk/tk_client.sdk.o user/tk/tk_painter.sdk.o user/tk/tk_app.sdk.o \
           user/lib/libwidget.sdk.o gfx/font_8x8.sdk.o
 
@@ -385,11 +366,6 @@ $(LIMINE_DIR)/limine:
 
 limine-artifacts: $(LIMINE_DIR)/limine
 
-# Guide 13: capture Limine's BIOS stage1+2 from a template image so the
-# in-OS installer can replay them onto a target disk. bios-install puts
-# stage 1 in the MBR boot code and stage 2 in the post-MBR gap; both are
-# position-fixed within sectors 0..2047 and independent of partition
-# CONTENT, so the capture is deterministic for a given Limine release.
 bootblob.bin: limine-artifacts
 	dd if=/dev/zero of=.bootblob-template.img bs=512 count=8192 2>/dev/null
 	printf '\200\000\002\000\014\377\377\377\000\010\000\000\000\030\000\000' | \
