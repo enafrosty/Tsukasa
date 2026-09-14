@@ -1,5 +1,5 @@
 /*
- * Project Tsukasa — Simple x86 spinlock using atomic xchg
+ * Project Tsukasa - Spinlock Synchronization Primitives
  *
  * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
@@ -23,7 +23,7 @@ typedef volatile uint32_t spinlock_t;
 
 #define SPINLOCK_INIT  0u
 
-/* Atomically test-and-set the lock. Returns the old value: 0 = lock acquired, 1 = already held. */
+/* Atomically test and set lock. Returns 0 if acquired, non-zero if held. */
 static inline uint32_t _spin_xchg(spinlock_t *lock, uint32_t val)
 {
     __asm__ volatile (
@@ -35,44 +35,74 @@ static inline uint32_t _spin_xchg(spinlock_t *lock, uint32_t val)
     return val;
 }
 
-/* Acquire the spinlock (busy-waits until acquired). */
+/* Busy-wait until spinlock is acquired. */
 static inline void spin_lock(spinlock_t *lock)
 {
     while (_spin_xchg(lock, 1u) != 0u)
         __asm__ volatile ("pause");
 }
 
-/* Release the spinlock. */
+/* Release spinlock with compiler memory barrier. */
 static inline void spin_unlock(spinlock_t *lock)
 {
     __asm__ volatile ("" ::: "memory");
     *lock = 0u;
 }
 
-/* Try to acquire the lock without blocking. Returns 1 if acquired, 0 if already held. */
+/* Non-blocking lock attempt. Returns 1 if acquired, 0 if held. */
 static inline int spin_trylock(spinlock_t *lock)
 {
     return (_spin_xchg(lock, 1u) == 0u) ? 1 : 0;
 }
 
+/* Save RFLAGS, disable interrupts, and acquire spinlock. */
 static inline unsigned long spin_lock_irqsave(spinlock_t *lock)
 {
     unsigned long flags;
 #ifdef __x86_64__
-    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+    __asm__ volatile (
+        "pushfq\n\t"
+        "popq %0\n\t"
+        "cli"
+        : "=r"(flags)
+        :
+        : "memory"
+    );
 #else
-    __asm__ volatile ("pushfl; popl %0; cli" : "=r"(flags) : : "memory");
+    __asm__ volatile (
+        "pushfl\n\t"
+        "popl %0\n\t"
+        "cli"
+        : "=r"(flags)
+        :
+        : "memory"
+    );
 #endif
     spin_lock(lock);
     return flags;
 }
 
-/* Release a lock taken with spin_lock_irqsave, restoring saved IF. */
+/* Release spinlock and restore previous RFLAGS interrupt state. */
 static inline void spin_unlock_irqrestore(spinlock_t *lock, unsigned long flags)
 {
     spin_unlock(lock);
-    if (flags & (1ul << 9))
-        __asm__ volatile ("sti" : : : "memory");
+#ifdef __x86_64__
+    __asm__ volatile (
+        "pushq %0\n\t"
+        "popfq"
+        :
+        : "r"(flags)
+        : "memory", "cc"
+    );
+#else
+    __asm__ volatile (
+        "pushl %0\n\t"
+        "popfl"
+        :
+        : "r"(flags)
+        : "memory", "cc"
+    );
+#endif
 }
 
 #endif /* SPINLOCK_H */

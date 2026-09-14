@@ -1,5 +1,5 @@
 /*
- * Project Tsukasa — Kernel wait queue and poll infrastructure
+ * Project Tsukasa - Kernel wait queue and poll infrastructure
  *
  * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
@@ -53,6 +53,8 @@ void wait_queue_init(wait_queue_head_t *h);
 void wait_queue_add(wait_queue_head_t *h, wait_queue_entry_t *entry);
 void wait_queue_remove(wait_queue_head_t *h, wait_queue_entry_t *entry);
 void wait_queue_wake_all(wait_queue_head_t *h);
+void wait_queue_prepare_to_wait(wait_queue_head_t *h, wait_queue_entry_t *entry);
+void wait_queue_finish_wait(wait_queue_head_t *h, wait_queue_entry_t *entry);
 
 #define POLLIN      0x0001
 #define POLLOUT     0x0004

@@ -1,5 +1,5 @@
 /*
- * Project Tsukasa — Input event ring buffer with overflow-aware fairness policy
+ * Project Tsukasa - Input Event Ring Buffer with Fairness and IRQ Safety
  *
  * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
@@ -15,7 +15,6 @@
  */
 
 #include "event.h"
-
 #include "../include/spinlock.h"
 
 static struct gui_event event_buf[EVENT_BUF_SIZE];
