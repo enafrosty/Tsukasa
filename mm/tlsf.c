@@ -1,25 +1,24 @@
 /*
- * tlsf.c - Two-Level Segregated Fit allocator.
+ * Project Tsukasa — Two-Level Segregated Fit allocator
  *
- * Adapted to be fully freestanding (no libc, no OS headers).
- * O(1) allocation and deallocation.
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
- * Design:
- *   Blocks are tagged with a header containing size + free/prev-free bits.
- *   A two-level bitmap (FL = floor(log2(size)), SL = next 4 bits) indexes
- *   free lists so any suitable block is found in O(1) bit operations.
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
  *
- *   FL range: 4..27 (16 bytes .. 128 MiB)
- *   SL count:  16 (4 SL bits)
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "tlsf.h"
 #include <stdint.h>
 #include <stddef.h>
 
-/* ---- Configuration ---------------------------------------------------- */
-
-#define FL_INDEX_MAX   28
+#define FL_INDEX_MAX   30
 #define SL_INDEX_BITS   4
 #define SL_INDEX_COUNT (1 << SL_INDEX_BITS)
 #define FL_INDEX_COUNT (FL_INDEX_MAX - SL_INDEX_BITS + 1)
@@ -27,34 +26,24 @@
 #define BLOCK_ALIGN  sizeof(void *)
 #define BLOCK_MIN    (sizeof(block_t))
 
-/* ---- Block structure -------------------------------------------------- */
-
 /* Status bits stored in the low bits of block.size. */
 #define BLOCK_FREE    1u
 #define BLOCK_PREV_FREE 2u
 #define BLOCK_OVERHEAD  sizeof(uint32_t)   /* just size field at block start */
 
 typedef struct block_s {
-    /* Size field: upper bits = payload size (multiple of BLOCK_ALIGN).
-     * Bit 0: 1 = free, 0 = used.
-     * Bit 1: 1 = previous physical block is free.
-     */
+    /* Size field: upper bits = payload size (multiple of BLOCK_ALIGN). */
     uint32_t size;
 
-    /* Intrusive free-list links (only valid when free). */
     struct block_s *prev_free;
     struct block_s *next_free;
 
-    /* Immediately followed by the user payload (or the next block header). */
 } block_t;
 
-/* Physical footer: stored at the end of every FREE block.
- * Points back to the block header so the next block can coalesce. */
+/* Physical footer: stored at the end of every FREE block. Points back to the block header so the next block... */
 typedef struct {
     block_t *header;
 } footer_t;
-
-/* ---- Helper macros ----------------------------------------------------- */
 
 #define SZ_MASK   (~3u)
 
@@ -88,7 +77,6 @@ static inline block_t *block_phys_next(block_t *b)
 }
 static inline block_t *block_phys_prev(block_t *b)
 {
-    /* Footer of previous block sits just before this header. */
     footer_t *f = (footer_t *)((char *)b - sizeof(footer_t));
     return f->header;
 }
@@ -101,7 +89,7 @@ static inline void block_write_footer(block_t *b)
     block_footer(b)->header = b;
 }
 
-/* ---- Find-first-bit helpers ------------------------------------------- */
+/* Find-first-bit helpers */
 
 static inline int fls(uint32_t v)   /* floor(log2(v)); v must be != 0 */
 {
@@ -116,14 +104,11 @@ static inline int ffs(uint32_t v)   /* index of lowest set bit */
     return n;
 }
 
-/* ---- Control structure (stored inside the pool memory) ---------------- */
-
 typedef struct {
     block_t  *free_lists[FL_INDEX_COUNT][SL_INDEX_COUNT];
     uint32_t  fl_bitmap;
     uint32_t  sl_bitmap[FL_INDEX_COUNT];
 
-    /* Sentinel block — a dummy zero-size "used" block at the very end. */
     block_t   sentinel;
 } control_t;
 
@@ -132,31 +117,32 @@ struct tlsf_s {
     control_t ctrl;
 };
 
-/* ---- Mapping ---------------------------------------------------------- */
-
 static void mapping_insert(uint32_t size, int *fl, int *sl)
 {
     if (size < (1u << SL_INDEX_BITS)) {
         *fl = 0;
         *sl = (int)size;
     } else {
-        *fl = fls(size);
-        *sl = (int)((size >> (*fl - SL_INDEX_BITS)) & (SL_INDEX_COUNT - 1));
-        /* Round up: use next SL bucket to guarantee the block is large enough. */
+        int raw_fl = fls(size);
+        *fl = raw_fl - SL_INDEX_BITS + 1;
+        *sl = (int)((size >> (raw_fl - SL_INDEX_BITS)) & (SL_INDEX_COUNT - 1));
+        if (*fl >= FL_INDEX_COUNT)
+            *fl = FL_INDEX_COUNT - 1;
     }
 }
 
 static void mapping_search(uint32_t size, int *fl, int *sl)
 {
-    /* Round up size to next bucket boundary before searching. */
     if (size >= (1u << SL_INDEX_BITS)) {
-        uint32_t round = (1u << (fls(size) - SL_INDEX_BITS)) - 1u;
-        size += round;
+        int rfl = fls(size);
+        if (rfl >= SL_INDEX_BITS) {
+            uint32_t round = (1u << (rfl - SL_INDEX_BITS)) - 1u;
+            if (size <= UINT32_MAX - round)
+                size += round;
+        }
     }
     mapping_insert(size, fl, sl);
 }
-
-/* ---- Free list management --------------------------------------------- */
 
 static inline void fl_sl_set(control_t *c, int fl, int sl)
 {
@@ -193,7 +179,6 @@ static void remove_block(control_t *c, block_t *b)
         fl_sl_clear(c, fl, sl);
 }
 
-/* Find a free block >= size. Returns NULL if not found. */
 static block_t *find_suitable(control_t *c, uint32_t size)
 {
     int fl, sl;
@@ -201,16 +186,17 @@ static block_t *find_suitable(control_t *c, uint32_t size)
 
     uint32_t sl_map = c->sl_bitmap[fl] & (~0u << sl);
     if (!sl_map) {
-        uint32_t fl_map = c->fl_bitmap & (~0u << (fl + 1));
-        if (!fl_map) return NULL;
+        uint32_t fl_map = 0;
+        if (fl + 1 < FL_INDEX_COUNT)
+            fl_map = c->fl_bitmap & (~0u << (fl + 1));
+        if (!fl_map)
+            return NULL;
         fl = ffs(fl_map);
         sl_map = c->sl_bitmap[fl];
     }
     sl = ffs(sl_map);
     return c->free_lists[fl][sl];
 }
-
-/* ---- Merge / split ----------------------------------------------------- */
 
 static block_t *coalesce_prev(control_t *c, block_t *b)
 {
@@ -235,8 +221,13 @@ static block_t *coalesce_next(control_t *c, block_t *b)
 
 static block_t *split_block(block_t *b, uint32_t size)
 {
-    uint32_t remain = block_size(b) - size - HDR_SIZE;
-    if (remain < (uint32_t)BLOCK_MIN) return NULL;
+    uint32_t bsz = block_size(b);
+    uint32_t remain;
+
+    /* Underflow guard: for an exact-fit (or near-fit) block the old unsigned math wrapped: e.g. */
+    if (bsz < size + HDR_SIZE + (uint32_t)BLOCK_MIN)
+        return NULL;
+    remain = bsz - size - HDR_SIZE;
 
     block_t *rest = (block_t *)((char *)b + HDR_SIZE + size);
     rest->size = remain;
@@ -246,11 +237,8 @@ static block_t *split_block(block_t *b, uint32_t size)
     return rest;
 }
 
-/* ---- Pool bootstrap --------------------------------------------------- */
-
 static void pool_add(control_t *c, void *mem, size_t size)
 {
-    /* Minimum: one free block + sentinel. */
     if (size < (HDR_SIZE + BLOCK_MIN + HDR_SIZE + sizeof(footer_t) + 4))
         return;
 
@@ -264,15 +252,12 @@ static void pool_add(control_t *c, void *mem, size_t size)
     block_set_prev_free(b, 0);
     block_write_footer(b);
 
-    /* Sentinel immediately after. */
     block_t *sent = block_phys_next(b);
-    sent->size = 0;   /* size=0, not free */
+    sent->size = 0;
     block_set_prev_free(sent, 1);
 
     insert_block(c, b);
 }
-
-/* ---- Public API ------------------------------------------------------- */
 
 tlsf_t *tlsf_create(void *mem, size_t size)
 {
@@ -281,7 +266,6 @@ tlsf_t *tlsf_create(void *mem, size_t size)
     tlsf_t *t = (tlsf_t *)mem;
     control_t *c = &t->ctrl;
 
-    /* Zero bitmaps and free lists. */
     c->fl_bitmap = 0;
     for (int f = 0; f < FL_INDEX_COUNT; f++) {
         c->sl_bitmap[f] = 0;
@@ -289,7 +273,6 @@ tlsf_t *tlsf_create(void *mem, size_t size)
             c->free_lists[f][s] = NULL;
     }
 
-    /* The remaining memory after the control structure becomes the pool. */
     void *pool = (char *)mem + sizeof(control_t);
     size_t pool_size = size - sizeof(control_t);
     pool_add(c, pool, pool_size);
@@ -307,7 +290,6 @@ void *tlsf_malloc(tlsf_t *t, size_t size)
 {
     if (!t || size == 0) return NULL;
 
-    /* Align and clamp. */
     size = (size + BLOCK_ALIGN - 1) & ~(BLOCK_ALIGN - 1);
     if (size < BLOCK_MIN) size = BLOCK_MIN;
 
@@ -318,7 +300,6 @@ void *tlsf_malloc(tlsf_t *t, size_t size)
     remove_block(c, b);
     block_set_free(b, 0);
 
-    /* Split if there is enough remainder. */
     block_t *rest = split_block(b, (uint32_t)size);
     if (rest) {
         block_set_free(rest, 1);
@@ -346,7 +327,6 @@ void tlsf_free(tlsf_t *t, void *ptr)
     b = coalesce_prev(c, b);
     b = coalesce_next(c, b);
 
-    /* Mark next physical block's prev_free bit. */
     block_t *next = block_phys_next(b);
     block_set_prev_free(next, 1);
     block_write_footer(b);

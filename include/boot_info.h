@@ -1,3 +1,19 @@
+/*
+ * Project Tsukasa — Boot information abstraction
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
 #ifndef TSUKASA_BOOT_INFO_H
 #define TSUKASA_BOOT_INFO_H
 
@@ -46,13 +62,21 @@ struct tsukasa_boot_info {
     uint32_t framebuffer_width;
     uint32_t framebuffer_height;
     uint8_t framebuffer_bpp;
-    uint8_t reserved0[7];
+    uint8_t framebuffer_red_mask_size;
+    uint8_t framebuffer_red_mask_shift;
+    uint8_t framebuffer_green_mask_size;
+    uint8_t framebuffer_green_mask_shift;
+    uint8_t framebuffer_blue_mask_size;
+    uint8_t framebuffer_blue_mask_shift;
+    uint8_t reserved0[1];
 
     uint64_t memmap_entry_count;
     const struct tsukasa_boot_memmap_entry *memmap_entries;
 
     uint64_t module_count;
     const struct tsukasa_boot_module *modules;
+
+    uint64_t rsdp_addr;
 };
 
 static inline int tsukasa_boot_info_is_valid(const void *opaque)

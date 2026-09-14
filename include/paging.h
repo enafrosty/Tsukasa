@@ -1,5 +1,17 @@
 /*
- * paging.h - Architecture-aware paging contracts.
+ * Project Tsukasa — Architecture-aware paging contracts
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #ifndef PAGING_H
@@ -13,10 +25,7 @@
 #define PAGE_SIZE 4096
 #endif
 
-/*
- * Architecture-neutral mapping flags consumed by x64 VMM helpers.
- * i386 code can ignore these without behavior change.
- */
+/* Architecture-neutral mapping flags consumed by x64 VMM helpers. i386 code can ignore these without... */
 #define PAGING_MAP_READ    (1ULL << 0)
 #define PAGING_MAP_WRITE   (1ULL << 1)
 #define PAGING_MAP_EXEC    (1ULL << 2)

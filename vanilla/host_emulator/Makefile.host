@@ -1,0 +1,74 @@
+#
+# Project Tsukasa — Vanilla Display Server Host Emulator Makefile
+#
+# Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+#
+# Project Tsukasa was created and is maintained by frosty (@enafrosty).
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version. See the top-level LICENSE file.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+
+EMU_DIR     := $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))
+ifeq ($(EMU_DIR),)
+EMU_DIR     := .
+endif
+VANILLA_DIR := $(EMU_DIR)/..
+ROOT_DIR    := $(VANILLA_DIR)/..
+
+HOST_CC     ?= gcc
+
+ifeq ($(OS),Windows_NT)
+BIN_EXT     := .exe
+SDL_LIBS    := -lmingw32 -lSDL2main -lSDL2 -lm
+else
+BIN_EXT     :=
+SDL_LIBS    := -lSDL2 -lm
+endif
+
+CFLAGS      := -Wall -Wextra -O2 \
+               -Wno-unused-function -Wno-unused-parameter -Wno-unknown-pragmas \
+               -I$(EMU_DIR)/sys_compat \
+               -I$(VANILLA_DIR)/include \
+               -I$(VANILLA_DIR)/server \
+               -I$(EMU_DIR)
+
+HOST_SRCS   := $(EMU_DIR)/sdl_backend.c \
+               $(EMU_DIR)/host_compat.c \
+               $(EMU_DIR)/host_main.c \
+               $(VANILLA_DIR)/server/blitter.c \
+               $(VANILLA_DIR)/server/compositor.c \
+               $(VANILLA_DIR)/server/font.c \
+               $(VANILLA_DIR)/server/default_font.c \
+               $(VANILLA_DIR)/server/image.c \
+               $(VANILLA_DIR)/server/shell.c \
+               $(VANILLA_DIR)/server/launcher.c \
+               $(VANILLA_DIR)/server/wm.c \
+               $(VANILLA_DIR)/libvanilla/surface.c
+
+HOST_OBJS   := $(patsubst %.c,%.host.o,$(HOST_SRCS))
+BIN         := $(EMU_DIR)/bin/vanilla_host$(BIN_EXT)
+
+.PHONY: all run clean
+
+all: $(BIN)
+	@echo "[OK] Vanilla host emulator built: $(BIN)"
+
+$(BIN): $(HOST_OBJS)
+	@mkdir -p $(dir $@)
+	$(HOST_CC) $(CFLAGS) -o $@ $(HOST_OBJS) $(SDL_LIBS)
+
+%.host.o: %.c
+	@mkdir -p $(dir $@)
+	$(HOST_CC) $(CFLAGS) -c -o $@ $<
+
+run: $(BIN)
+	$(BIN)
+
+clean:
+	rm -rf $(HOST_OBJS) $(EMU_DIR)/bin

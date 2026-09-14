@@ -1,4 +1,18 @@
-#include "../include/unistd.h"
+/*
+ * Project Tsukasa — include "../include/unistd.h"
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
 
 #include "../lib/syscall.h"
 #include "../include/string.h"
@@ -63,13 +77,13 @@ char *getcwd(char *buf, size_t size)
     return buf;
 }
 
-static int parse_pid_from_status(const char *status)
+static int parse_field_from_status(const char *status, const char *prefix, size_t prefix_len)
 {
     const char *p = status;
     int v = 0;
     while (p && *p) {
-        if (strncmp(p, "pid: ", 5) == 0) {
-            p += 5;
+        if (strncmp(p, prefix, prefix_len) == 0) {
+            p += prefix_len;
             while (*p >= '0' && *p <= '9') {
                 v = v * 10 + (*p - '0');
                 p++;
@@ -96,7 +110,23 @@ int getpid(void)
     if (n == 0 || n == (size_t)-1)
         return -1;
     buf[n] = '\0';
-    return parse_pid_from_status(buf);
+    return parse_field_from_status(buf, "pid: ", 5);
+}
+
+int getppid(void)
+{
+    int fd = fs_open("/proc/self/status", 0);
+    char buf[128];
+    size_t n;
+    if (fd < 0)
+        return 0;
+    n = fs_read(fd, buf, sizeof(buf) - 1);
+    fs_close(fd);
+    if (n == 0 || n == (size_t)-1)
+        return 0;
+    buf[n] = '\0';
+    int ppid = parse_field_from_status(buf, "ppid: ", 6);
+    return (ppid >= 0) ? ppid : 0;
 }
 
 int kill(pid_t pid, int sig)

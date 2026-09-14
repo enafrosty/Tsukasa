@@ -1,5 +1,17 @@
 /*
- * shm.c - Shared memory IPC implementation.
+ * Project Tsukasa — Shared memory IPC implementation
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "shm.h"
@@ -15,6 +27,7 @@
 #include "../include/kprintf.h"
 #include "../include/paging.h"
 #include "../proc/process.h"
+#include "../mm/vmm_x64.h"
 
 #define SHM_MAX_REGIONS 64
 #define SHM_MAX_ATTACHMENTS 256
@@ -135,6 +148,15 @@ int shm_create(size_t size)
     if (!phys)
         return -1;
 
+#ifdef __x86_64__
+    uintptr_t hhdm = vmm_x64_hhdm_offset();
+    if (hhdm) {
+        uint8_t *kptr = (uint8_t *)(phys + hhdm);
+        for (size_t b = 0; b < page_count * PAGE_SIZE; b++)
+            kptr[b] = 0;
+    }
+#endif
+
     spin_lock(&g_shm_lock);
     r = shm_alloc_region_locked();
     if (!r) {
@@ -174,7 +196,7 @@ void *shm_attach(int shm_id)
 
     spin_lock(&g_shm_lock);
     r = shm_find_region_locked(shm_id);
-    if (!r) {
+    if (!r || r->destroy_pending) {
         spin_unlock(&g_shm_lock);
         return NULL;
     }
@@ -279,6 +301,16 @@ int shm_detach(void *addr)
     }
 
     return unmap_rc;
+}
+
+void *shm_map(int shm_id)
+{
+    return shm_attach(shm_id);
+}
+
+int shm_unmap(void *addr)
+{
+    return shm_detach(addr);
 }
 
 int shm_destroy(int shm_id)
@@ -465,7 +497,6 @@ int shm_create(size_t size)
 void *shm_attach(int shm_id)
 {
     (void)shm_id;
-    /* Legacy i386 path is intentionally disabled for physical-return attach. */
     return NULL;
 }
 

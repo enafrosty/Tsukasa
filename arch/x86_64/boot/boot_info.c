@@ -1,3 +1,19 @@
+/*
+ * Project Tsukasa — Boot information abstraction and Limine interface
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -103,6 +119,12 @@ static void populate_boot_info(void)
     g_boot_info.framebuffer_width = 0;
     g_boot_info.framebuffer_height = 0;
     g_boot_info.framebuffer_bpp = 0;
+    g_boot_info.framebuffer_red_mask_size = 0;
+    g_boot_info.framebuffer_red_mask_shift = 0;
+    g_boot_info.framebuffer_green_mask_size = 0;
+    g_boot_info.framebuffer_green_mask_shift = 0;
+    g_boot_info.framebuffer_blue_mask_size = 0;
+    g_boot_info.framebuffer_blue_mask_shift = 0;
 
     g_boot_info.memmap_entry_count = 0;
     g_boot_info.memmap_entries = g_memmap_entries;
@@ -125,6 +147,12 @@ static void populate_boot_info(void)
             g_boot_info.framebuffer_width = (uint32_t)fb->width;
             g_boot_info.framebuffer_height = (uint32_t)fb->height;
             g_boot_info.framebuffer_bpp = (uint8_t)fb->bpp;
+            g_boot_info.framebuffer_red_mask_size = fb->red_mask_size;
+            g_boot_info.framebuffer_red_mask_shift = fb->red_mask_shift;
+            g_boot_info.framebuffer_green_mask_size = fb->green_mask_size;
+            g_boot_info.framebuffer_green_mask_shift = fb->green_mask_shift;
+            g_boot_info.framebuffer_blue_mask_size = fb->blue_mask_size;
+            g_boot_info.framebuffer_blue_mask_shift = fb->blue_mask_shift;
         }
     }
 

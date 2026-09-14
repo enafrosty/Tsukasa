@@ -1,16 +1,23 @@
 /*
- * blit.c  -  Bit-blit engine implementation with compositing support.
+ * Project Tsukasa — Bit-blit engine implementation with compositing support
  *
- * Alpha blend formula (per channel, 8-bit fixed-point):
- *   out = (fg * a + bg * (255 - a)) >> 8
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "blit.h"
 #include "../drv/fb.h"
 #include <stddef.h>
 #include <stdint.h>
-
-/* ---- Internal helpers ------------------------------------------------- */
 
 static inline uint32_t *pixel_ptr(int x, int y)
 {
@@ -50,8 +57,6 @@ static inline uint32_t blend32(uint32_t src, uint32_t dst)
     return 0xFF000000u | ((uint32_t)or_ << 16) | ((uint32_t)og << 8) | ob;
 }
 
-/* ---- Basic primitives ------------------------------------------------- */
-
 void fb_putpixel(int x, int y, color_t color)
 {
     uint32_t *p = pixel_ptr(x, y);
@@ -70,7 +75,6 @@ void fb_fill_rect(int x, int y, int w, int h, color_t color)
     if (!fb->addr || fb->bpp != 32 || w <= 0 || h <= 0)
         return;
 
-    /* Clip. */
     int x1 = x + w, y1 = y + h;
     if (x  < 0) x  = 0;
     if (y  < 0) y  = 0;
@@ -78,7 +82,7 @@ void fb_fill_rect(int x, int y, int w, int h, color_t color)
     if (y1 > (int)fb->height) y1 = (int)fb->height;
     if (x >= x1 || y >= y1) return;
 
-    uint32_t c = color | 0xFF000000u;   /* force opaque */
+    uint32_t c = color | 0xFF000000u;
 
     for (int row = y; row < y1; row++) {
         uint32_t *p = (uint32_t *)((char *)fb->addr +
@@ -127,8 +131,6 @@ void fb_draw_vline(int x, int y, int len, color_t color)
         fb_fill_rect(x, y, 1, len, color);
 }
 
-/* ---- Gradient --------------------------------------------------------- */
-
 void fb_fill_gradient_v(int x, int y, int w, int h,
                         color_t top_col, color_t bot_col)
 {
@@ -142,7 +144,6 @@ void fb_fill_gradient_v(int x, int y, int w, int h,
             bb =  bot_col        & 0xFF;
 
     for (int row = 0; row < h; row++) {
-        /* Lerp: t = row / (h-1). Multiply by 256 for fixed-point. */
         uint32_t t  = (h > 1) ? (uint32_t)(row * 255) / (uint32_t)(h - 1) : 0;
         uint32_t it = 255u - t;
         uint8_t  r  = (uint8_t)((tr * it + br * t) >> 8);
@@ -152,25 +153,18 @@ void fb_fill_gradient_v(int x, int y, int w, int h,
     }
 }
 
-/* ---- Drop shadow ------------------------------------------------------ */
-
 void fb_draw_shadow_rect(int x, int y, int w, int h, int radius)
 {
-    /* Draw semitransparent rectangles of decreasing alpha around the rect. */
     for (int i = radius; i >= 1; i--) {
         uint8_t alpha = (uint8_t)(80u / (uint32_t)i);
         color_t shadow = rgba(0, 0, 0, alpha);
-        /* bottom strip */
         fb_fill_rect_alpha(x + i, y + h + (radius - i),
                            w, 1, shadow);
-        /* right strip */
         fb_fill_rect_alpha(x + w + (radius - i), y + i,
                            1, h, shadow);
     }
     (void)radius;
 }
-
-/* ---- Rounded rectangle ------------------------------------------------ */
 
 /* Approximate corner rounding: mask out corners pixel by pixel. */
 static inline int in_rounded_rect(int px, int py,
@@ -178,7 +172,6 @@ static inline int in_rounded_rect(int px, int py,
 {
     if (px < x || px >= x + w || py < y || py >= y + h) return 0;
 
-    /* Check which corner quadrant we're in. */
     int dx = 0, dy = 0;
 
     if (px < x + r)         dx = x + r - px;
@@ -188,7 +181,6 @@ static inline int in_rounded_rect(int px, int py,
     else if (py >= y + h - r) dy = py - (y + h - r - 1);
 
     if (dx > 0 && dy > 0) {
-        /* In a corner region — use Euclidean test. */
         return (dx * dx + dy * dy) <= r * r;
     }
     return 1;
@@ -221,45 +213,38 @@ void fb_fill_rounded_rect(int x, int y, int w, int h, int r, color_t color)
 
 void fb_draw_rounded_rect(int x, int y, int w, int h, int r, color_t color)
 {
-    /* Draw 4 straight edges + 4 corner arcs (Bresenham). */
-    /* Straight sections. */
-    fb_draw_hline(x + r, y,         w - 2 * r, color);   /* top    */
-    fb_draw_hline(x + r, y + h - 1, w - 2 * r, color);   /* bottom */
-    fb_draw_vline(x,         y + r, h - 2 * r, color);   /* left   */
-    fb_draw_vline(x + w - 1, y + r, h - 2 * r, color);   /* right  */
+    fb_draw_hline(x + r, y,         w - 2 * r, color);
+    fb_draw_hline(x + r, y + h - 1, w - 2 * r, color);
+    fb_draw_vline(x,         y + r, h - 2 * r, color);
+    fb_draw_vline(x + w - 1, y + r, h - 2 * r, color);
 
-    /* Bresenham circle quadrants. */
     int f  = 1 - r, ddF_x = 1, ddF_y = -2 * r;
     int cx = 0, cy = r;
-    /* Center of each corner arc. */
-    int ox1 = x + r,         oy1 = y + r;           /* TL */
-    int ox2 = x + w - 1 - r;           /* TR */
-    int ox3 = x + r,         oy3 = y + h - 1 - r;   /* BL */
-    int ox4 = x + w - 1 - r, oy4 = y + h - 1 - r;  /* BR */
+    int ox1 = x + r,         oy1 = y + r;
+    int ox2 = x + w - 1 - r;
+    int ox3 = x + r,         oy3 = y + h - 1 - r;
+    int ox4 = x + w - 1 - r, oy4 = y + h - 1 - r;
 
     while (cx <= cy) {
-        fb_putpixel(ox2 + cy, oy1 - cx, color);  /* TR upper */
-        fb_putpixel(ox2 + cx, oy1 - cy, color);  /* TR left  */
-        fb_putpixel(ox1 - cx, oy1 - cy, color);  /* TL right */
-        fb_putpixel(ox1 - cy, oy1 - cx, color);  /* TL upper */
-        fb_putpixel(ox3 - cy, oy3 + cx, color);  /* BL lower */
-        fb_putpixel(ox3 - cx, oy3 + cy, color);  /* BL right */
-        fb_putpixel(ox4 + cx, oy4 + cy, color);  /* BR left  */
-        fb_putpixel(ox4 + cy, oy4 + cx, color);  /* BR lower */
+        fb_putpixel(ox2 + cy, oy1 - cx, color);
+        fb_putpixel(ox2 + cx, oy1 - cy, color);
+        fb_putpixel(ox1 - cx, oy1 - cy, color);
+        fb_putpixel(ox1 - cy, oy1 - cx, color);
+        fb_putpixel(ox3 - cy, oy3 + cx, color);
+        fb_putpixel(ox3 - cx, oy3 + cy, color);
+        fb_putpixel(ox4 + cx, oy4 + cy, color);
+        fb_putpixel(ox4 + cy, oy4 + cx, color);
 
         if (f >= 0) { cy--; ddF_y += 2; f += ddF_y; }
         cx++; ddF_x += 2; f += ddF_x;
     }
 }
 
-/* ---- Filled circle ---------------------------------------------------- */
-
 void fb_fill_circle(int cx, int cy, int radius, color_t color)
 {
     if (radius <= 0) return;
     for (int y = -radius; y <= radius; y++) {
         int xspan = 0;
-        /* x^2 + y^2 <= r^2 */
         for (int xx = 0; xx <= radius; xx++) {
             if (xx * xx + y * y <= radius * radius)
                 xspan = xx;
@@ -267,8 +252,6 @@ void fb_fill_circle(int cx, int cy, int radius, color_t color)
         fb_fill_rect(cx - xspan, cy + y, 2 * xspan + 1, 1, color);
     }
 }
-
-/* ---- Blit ------------------------------------------------------------- */
 
 void fb_blit(const void *src, void *dst, int w, int h, int pitch)
 {

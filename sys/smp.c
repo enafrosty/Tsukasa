@@ -1,30 +1,37 @@
-#include "include/smp.h"
-#include "arch/x86_64/boot/limine.h"
-#include "arch/x86_64/cpu/gdt.h"
-#include "arch/x86_64/cpu/idt.h"
-#include "include/lapic.h"
-#include "mm/pmm.h"
-#include "mm/vmm_x64.h"
-#include "include/kprintf.h"
+/*
+ * Project Tsukasa — Symmetric Multiprocessing (SMP) bootstrap implementation
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
 
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
-#define MSR_GS_BASE         0xC0000101
-#define MSR_KERNEL_GS_BASE  0xC0000102
+#include "include/smp.h"
+#include "include/lapic.h"
+#include "include/kprintf.h"
+#include "arch/x86_64/boot/limine.h"
+#include "arch/x86_64/cpu/gdt.h"
+#include "arch/x86_64/cpu/idt.h"
+#include "mm/vmm_x64.h"
+#include "mm/pmm.h"
+#include "mm/heap.h"
 
 static cpu_state_t *cpu_states = NULL;
 static uint32_t total_cpus = 0;
 static uint32_t bsp_lapic_id = 0;
 static cpu_state_t bsp_cpu_state = {0};
-
-static inline void wrmsr(uint32_t msr, uint64_t value)
-{
-    uint32_t low = (uint32_t)value;
-    uint32_t high = (uint32_t)(value >> 32);
-    __asm__ volatile ("wrmsr" : : "c"(msr), "a"(low), "d"(high));
-}
 
 static uint32_t read_lapic_id(void)
 {
@@ -81,6 +88,7 @@ static void ap_entry(struct limine_smp_info *info)
     __asm__ volatile ("fninit");
 
     gdt_flush();
+    gdt_reload_segments();
     gdt_load_ap_tss(my_id);
     idt_load();
 
@@ -95,24 +103,49 @@ static void ap_entry(struct limine_smp_info *info)
     wrmsr(MSR_GS_BASE, (uint64_t)(uintptr_t)&cpu_states[my_id]);
     wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)(uintptr_t)&cpu_states[my_id]);
 
+    syscall_init_x64();
+    cpu_states[my_id].syscall_rsp = cpu_states[my_id].kernel_stack;
+
     kprintf("[boot:x64] AP %u online\n", my_id);
 
-    __asm__ volatile ("sti");
-    for (;;) {
-        __asm__ volatile ("hlt");
-    }
+    /* Move onto this core's own kernel stack before entering the drain loop: the drain loop is registered as... */
+    __asm__ volatile (
+        "movq %0, %%rsp\n"
+        "xorl %%ebp, %%ebp\n"
+        "call work_queue_drain_loop\n"
+        : : "r"(cpu_states[my_id].kernel_stack) : "memory");
+    __builtin_unreachable();
 }
 
 void smp_init_bsp(void)
 {
+    uint64_t cr0;
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0) : : "memory");
+    cr0 &= ~(1ULL << 2);
+    cr0 |= (1ULL << 1);
+    cr0 |= (1ULL << 5);
+    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0));
+
+    uint64_t cr4;
+    __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4) : : "memory");
+    cr4 |= (1ULL << 9);
+    cr4 |= (1ULL << 10);
+    __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4));
+    __asm__ volatile ("fninit");
+
+    extern char x64_boot_stack_top[];
     bsp_cpu_state.cpu_id = 0;
     bsp_cpu_state.lapic_id = read_lapic_id();
     bsp_cpu_state.self = &bsp_cpu_state;
     bsp_cpu_state.online = true;
+    bsp_cpu_state.kernel_stack = (uint64_t)(uintptr_t)x64_boot_stack_top;
+    bsp_cpu_state.syscall_rsp = bsp_cpu_state.kernel_stack;
     bsp_lapic_id = bsp_cpu_state.lapic_id;
 
     wrmsr(MSR_GS_BASE, (uint64_t)(uintptr_t)&bsp_cpu_state);
     wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)(uintptr_t)&bsp_cpu_state);
+
+    syscall_init_x64();
 }
 
 uint32_t smp_init(struct limine_smp_response *smp_resp)
@@ -125,9 +158,11 @@ uint32_t smp_init(struct limine_smp_response *smp_resp)
 
         cpu_states = (cpu_state_t *)(uintptr_t)vmm_phys_to_virt(cpu_states_phys);
         memset(cpu_states, 0, PAGE_SIZE);
-        cpu_states[0].cpu_id = 0;
-        cpu_states[0].lapic_id = bsp_lapic_id;
-        cpu_states[0].online = true;
+        cpu_states[0] = bsp_cpu_state;
+        cpu_states[0].self = &cpu_states[0];
+
+        wrmsr(MSR_GS_BASE, (uint64_t)(uintptr_t)&cpu_states[0]);
+        wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)(uintptr_t)&cpu_states[0]);
         return 1;
     }
 
@@ -143,6 +178,18 @@ uint32_t smp_init(struct limine_smp_response *smp_resp)
 
     gdt_init_ap_tss(total_cpus);
 
+    /* Ensure BSP is at index 0 in cpus array so APs always receive non-zero IDs */
+    for (uint32_t i = 0; i < total_cpus; i++) {
+        if (smp_resp->cpus[i]->lapic_id == bsp_lapic_id) {
+            if (i != 0) {
+                struct limine_smp_info *tmp = smp_resp->cpus[0];
+                smp_resp->cpus[0] = smp_resp->cpus[i];
+                smp_resp->cpus[i] = tmp;
+            }
+            break;
+        }
+    }
+
     for (uint32_t i = 0; i < total_cpus; i++) {
         struct limine_smp_info *cpu = smp_resp->cpus[i];
         cpu_states[i].cpu_id = i;
@@ -153,6 +200,7 @@ uint32_t smp_init(struct limine_smp_response *smp_resp)
             cpu_states[i] = bsp_cpu_state;
             cpu_states[i].cpu_id = i;
             cpu_states[i].lapic_id = cpu->lapic_id;
+            cpu_states[i].self = &cpu_states[i];
             cpu_states[i].online = true;
 
             wrmsr(MSR_GS_BASE, (uint64_t)(uintptr_t)&cpu_states[i]);

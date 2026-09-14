@@ -1,23 +1,24 @@
 /*
- * fat12.c  -  FAT12 filesystem driver.
+ * Project Tsukasa — FAT12 filesystem driver
  *
- * Supports: read + write on a RAM-resident FAT12 disk image.
- *   - Root directory access (flat, no subdirectories traversed).
- *   - 8.3 short filenames (uppercase).
- *   - BI_RGB only; no FAT12 Variants needing BPB32.
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
- * FAT12 image layout (all offsets from image base):
- *   0         Boot Sector (BPB).
- *   BPB.ReservedSectors * BPB.BytesPerSector   FAT copy 1.
- *   ... + BPB.NumFATs * BPB.FATSz16 * BPBBytesPerSector  Root dir.
- *   ... + RootDirSectors                        Data area (cluster 2 …).
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "fat12.h"
 #include <stdint.h>
 #include <stddef.h>
 
-/* ---- Little-endian accessors ----------------------------------------- */
+/* Little-endian accessors */
 
 static inline uint16_t u16le(const uint8_t *p)
 { return (uint16_t)(p[0] | ((uint16_t)p[1] << 8)); }
@@ -28,8 +29,6 @@ static inline void w16le(uint8_t *p, uint16_t v)
 { p[0]=(uint8_t)(v&0xFF); p[1]=(uint8_t)(v>>8); }
 static inline void w32le(uint8_t *p, uint32_t v)
 { p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24); }
-
-/* ---- Driver state ----------------------------------------------------- */
 
 static uint8_t  *g_disk   = NULL;
 static size_t    g_size   = 0;
@@ -48,8 +47,6 @@ static uint32_t g_total_clusters;
 
 #define DIR_ENTRY_SIZE  32
 
-/* ---- FAT12 cluster chain helpers -------------------------------------- */
-
 /* Get the next cluster number in the chain. 0xFFF = end-of-chain. */
 static uint16_t fat12_get_next_cluster(uint16_t clus)
 {
@@ -62,7 +59,6 @@ static uint16_t fat12_get_next_cluster(uint16_t clus)
     return val;
 }
 
-/* Set FAT12 entry for cluster clus to value val (also writes FAT2). */
 static void fat12_set_cluster(uint16_t clus, uint16_t val)
 {
     if (!g_disk || clus < 2) return;
@@ -80,16 +76,15 @@ static void fat12_set_cluster(uint16_t clus, uint16_t val)
     }
 }
 
-/* Find a free cluster (FAT entry == 0). Returns 0 if disk full. */
 static uint16_t fat12_alloc_cluster(void)
 {
     for (uint16_t c = 2; c < g_total_clusters + 2; c++) {
         if (fat12_get_next_cluster(c) == 0x000) {
-            fat12_set_cluster(c, 0xFFF);  /* mark end-of-chain */
+            fat12_set_cluster(c, 0xFFF);
             return c;
         }
     }
-    return 0;  /* full */
+    return 0;
 }
 
 /* Byte address of the data area for cluster clus. */
@@ -99,8 +94,6 @@ static uint32_t cluster_to_offset(uint16_t clus)
     return g_data_offset + (uint32_t)(clus - 2) *
            (uint32_t)g_secs_per_clus * (uint32_t)g_bytes_per_sec;
 }
-
-/* ---- 8.3 name helpers ------------------------------------------------ */
 
 /* Convert FAT 8.3 raw entry (11 bytes, space-padded) to "NAME.EXT\0". */
 static void fat83_to_str(const uint8_t *raw, char *out)
@@ -117,10 +110,8 @@ static void fat83_to_str(const uint8_t *raw, char *out)
 /* Convert "NAME.EXT" string to FAT 8.3 uppercase space-padded 11 bytes. */
 static void str_to_fat83(const char *name, uint8_t *out)
 {
-    /* Init with spaces. */
     for (int i = 0; i < 11; i++) out[i] = ' ';
     int i = 0, j = 0;
-    /* Copy name part (up to 8 chars). */
     while (name[i] && name[i] != '.' && j < 8) {
         char c = name[i++];
         out[j++] = (char)(c >= 'a' && c <= 'z' ? c - 32 : c);
@@ -145,15 +136,12 @@ static int fat83_match(const uint8_t *raw, const char *name)
     return 1;
 }
 
-/* ---- Initialization --------------------------------------------------- */
-
 int fat12_init(void *disk, size_t size)
 {
     if (!disk || size < 512) return -1;
 
     uint8_t *d = (uint8_t *)disk;
 
-    /* Check boot signature. */
     if (d[510] != 0x55 || d[511] != 0xAA) return -1;
 
     g_disk            = d;
@@ -182,12 +170,9 @@ int fat12_init(void *disk, size_t size)
     return 0;
 }
 
-/* ---- Directory listing ------------------------------------------------ */
-
 int fat12_list_dir(const char *path, fat12_dirent_t *out, int max)
 {
     if (!g_disk || !out || max <= 0) return -1;
-    /* Only root supported. */
     if (!path || (path[0] != '/' && path[0] != '\0')) return -1;
 
     int count = 0;
@@ -199,11 +184,11 @@ int fat12_list_dir(const char *path, fat12_dirent_t *out, int max)
         off += DIR_ENTRY_SIZE;
 
         uint8_t first = e[0];
-        if (first == 0x00) break;        /* no more entries */
-        if (first == 0xE5) continue;     /* deleted */
+        if (first == 0x00) break;
+        if (first == 0xE5) continue;
 
         uint8_t attr = e[11];
-        if (attr == 0x0F) continue;      /* LFN entry */
+        if (attr == 0x0F) continue;
         if (attr & FAT_ATTR_VOLUME_ID)   continue;
 
         fat83_to_str(e, out[count].name);
@@ -217,11 +202,8 @@ int fat12_list_dir(const char *path, fat12_dirent_t *out, int max)
     return count;
 }
 
-/* ---- File lookup ------------------------------------------------------ */
-
-/* Find a root-dir entry matching the given short name.
- * Returns byte offset into g_disk, or 0 if not found. */
-static uint32_t find_dirent(const char *short_name)
+/* Find a root-dir entry matching the given short name. Returns byte offset into g_disk, or 0 if not found. */
+static uint32_t find_dirent_raw(const char *short_name)
 {
     uint32_t off = g_root_dir_offset;
     uint32_t end = off + (uint32_t)g_root_entry_cnt * DIR_ENTRY_SIZE;
@@ -238,10 +220,52 @@ static uint32_t find_dirent(const char *short_name)
     return 0;
 }
 
-/* Strip leading slash and return pointer to short-name portion. */
+/* Find a root-dir entry with transparent .ELF extension fallback. */
+static uint32_t find_dirent(const char *short_name)
+{
+    if (!short_name || !short_name[0])
+        return 0;
+
+    uint32_t off = find_dirent_raw(short_name);
+    if (off != 0)
+        return off;
+
+    /* If not found and no dot extension is present, try appending ".ELF" */
+    const char *dot = NULL;
+    for (const char *p = short_name; *p; p++) {
+        if (*p == '.') {
+            dot = p;
+            break;
+        }
+    }
+
+    if (!dot) {
+        char fallback[32];
+        size_t len = 0;
+        while (short_name[len] && len < sizeof(fallback) - 5) {
+            fallback[len] = short_name[len];
+            len++;
+        }
+        fallback[len++] = '.';
+        fallback[len++] = 'E';
+        fallback[len++] = 'L';
+        fallback[len++] = 'F';
+        fallback[len] = '\0';
+        return find_dirent_raw(fallback);
+    }
+
+    return 0;
+}
+
+/* Extract trailing filename component and strip slashes. */
 static const char *path_to_name(const char *path)
 {
     if (!path) return path;
+    const char *last_slash = 0;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/') last_slash = p;
+    }
+    if (last_slash && *(last_slash + 1)) return last_slash + 1;
     while (*path == '/') path++;
     return path;
 }
@@ -260,8 +284,6 @@ int fat12_stat(const char *path, fat12_dirent_t *out)
     out->first_cluster = u16le(e + 26);
     return 0;
 }
-
-/* ---- File read -------------------------------------------------------- */
 
 int fat12_read_file(const char *path, void *buf, size_t max)
 {
@@ -298,15 +320,83 @@ int fat12_read_file(const char *path, void *buf, size_t max)
     return (int)done;
 }
 
-/* ---- File write ------------------------------------------------------- */
-
 /*
- * fat12_write_file
- * 1. Find or create a directory entry.
- * 2. Free the old cluster chain.
- * 3. Allocate new clusters and write data.
- * 4. Update directory entry (size + first_cluster).
+ * Read up to count bytes from path starting at byte offset.
+ * Traverses FAT12 cluster chain without heap allocations.
  */
+int fat12_read_file_offset(const char *path, void *buf, size_t offset, size_t count)
+{
+    if (!g_disk || !buf)
+        return -1;
+
+    const char *name = path_to_name(path);
+    if (!name || !name[0])
+        return -1;
+
+    uint32_t doff = find_dirent(name);
+    if (!doff)
+        return -1;
+
+    const uint8_t *e = g_disk + doff;
+    if (e[11] & FAT_ATTR_DIRECTORY)
+        return -1;
+
+    uint32_t file_size = u32le(e + 28);
+    if (offset >= (size_t)file_size)
+        return 0;
+
+    if (offset + count > (size_t)file_size)
+        count = (size_t)file_size - offset;
+
+    if (count == 0)
+        return 0;
+
+    uint16_t clus = u16le(e + 26);
+    uint32_t cluster_bytes = (uint32_t)g_secs_per_clus * (uint32_t)g_bytes_per_sec;
+    if (cluster_bytes == 0)
+        return -1;
+
+    /* Skip clusters preceding the requested start offset */
+    size_t skip_clusters = offset / cluster_bytes;
+    size_t in_cluster_offset = offset % cluster_bytes;
+
+    while (skip_clusters > 0 && clus >= 2 && clus < 0xFF8) {
+        clus = fat12_get_next_cluster(clus);
+        skip_clusters--;
+    }
+
+    if (clus < 2 || clus >= 0xFF8)
+        return 0;
+
+    uint8_t *dst = (uint8_t *)buf;
+    size_t done = 0;
+
+    while (clus >= 2 && clus < 0xFF8 && done < count) {
+        uint32_t src_off = cluster_to_offset(clus) + (uint32_t)in_cluster_offset;
+        uint32_t avail_in_cluster = cluster_bytes - (uint32_t)in_cluster_offset;
+        uint32_t to_copy = avail_in_cluster;
+
+        if (done + to_copy > count)
+            to_copy = (uint32_t)(count - done);
+
+        if (src_off + to_copy > g_size) {
+            if (src_off >= g_size)
+                break;
+            to_copy = (uint32_t)(g_size - src_off);
+        }
+
+        for (uint32_t i = 0; i < to_copy; i++)
+            dst[done + i] = g_disk[src_off + i];
+
+        done += to_copy;
+        in_cluster_offset = 0;
+        clus = fat12_get_next_cluster(clus);
+    }
+
+    return (int)done;
+}
+
+/* fat12_write_file 1. */
 int fat12_write_file(const char *path, const void *data, size_t len)
 {
     if (!g_disk || !data) return -1;
@@ -315,10 +405,8 @@ int fat12_write_file(const char *path, const void *data, size_t len)
 
     uint32_t cluster_bytes = (uint32_t)g_secs_per_clus * g_bytes_per_sec;
 
-    /* --- Find or create directory entry. --- */
     uint32_t doff = find_dirent(name);
     if (!doff) {
-        /* Find a free (0x00 or 0xE5) slot. */
         uint32_t off = g_root_dir_offset;
         uint32_t end = off + (uint32_t)g_root_entry_cnt * DIR_ENTRY_SIZE;
         while (off < end && off + DIR_ENTRY_SIZE <= g_size) {
@@ -326,9 +414,8 @@ int fat12_write_file(const char *path, const void *data, size_t len)
             if (f == 0x00 || f == 0xE5) { doff = off; break; }
             off += DIR_ENTRY_SIZE;
         }
-        if (!doff) return -1;  /* root dir full */
+        if (!doff) return -1;
 
-        /* Initialise the new entry. */
         uint8_t *e = g_disk + doff;
         for (int i = 0; i < DIR_ENTRY_SIZE; i++) e[i] = 0;
         str_to_fat83(name, e);
@@ -337,7 +424,6 @@ int fat12_write_file(const char *path, const void *data, size_t len)
 
     uint8_t *e = g_disk + doff;
 
-    /* --- Free old cluster chain. --- */
     uint16_t old_clus = u16le(e + 26);
     while (old_clus >= 2 && old_clus < 0xFF8) {
         uint16_t next = fat12_get_next_cluster(old_clus);
@@ -349,7 +435,6 @@ int fat12_write_file(const char *path, const void *data, size_t len)
 
     if (len == 0) return 0;
 
-    /* --- Allocate clusters and write data. --- */
     uint16_t first_clus = 0;
     uint16_t prev_clus  = 0;
     const uint8_t *src  = (const uint8_t *)data;
@@ -357,7 +442,7 @@ int fat12_write_file(const char *path, const void *data, size_t len)
 
     while (remaining > 0) {
         uint16_t c = fat12_alloc_cluster();
-        if (c == 0) return -1;  /* disk full */
+        if (c == 0) return -1;
 
         if (prev_clus) fat12_set_cluster(prev_clus, c);
         else           first_clus = c;
@@ -374,7 +459,6 @@ int fat12_write_file(const char *path, const void *data, size_t len)
         remaining -= to_write;
     }
 
-    /* --- Update directory entry. --- */
     w16le(e + 26, first_clus);
     w32le(e + 28, (uint32_t)len);
 

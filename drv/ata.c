@@ -1,22 +1,21 @@
 /*
- * ata.c - ATA PIO 28-bit LBA driver (primary bus, master drive, polling).
+ * Project Tsukasa — ATA PIO 28-bit LBA driver (primary bus, master drive, polling)
  *
- * Tested against QEMU -hda disk.img.
- * Does NOT use interrupts — uses polling on BSY/DRQ status bits.
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
- * Primary bus I/O ports:
- *   0x1F0  Data (16-bit)
- *   0x1F1  Error / Features
- *   0x1F2  Sector count
- *   0x1F3  LBA low
- *   0x1F4  LBA mid
- *   0x1F5  LBA high
- *   0x1F6  Drive / head select
- *   0x1F7  Status (read) / Command (write)
- *   0x3F6  Alternate status / Device control
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "../drv/ata.h"
+#include "../drv/blockdev.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -50,6 +49,25 @@
 static int  g_drive_present = 0;
 static uint32_t g_sector_count = 0;
 
+/* The wrappers chunk 32-bit sector counts into the <=255-sector transfers this LBA28 driver supports. */
+static int ata_bd_read(block_dev_t *bd, uint64_t lba, uint32_t count,
+                       void *buf);
+static int ata_bd_write(block_dev_t *bd, uint64_t lba, uint32_t count,
+                        const void *buf);
+static int ata_bd_sync(block_dev_t *bd);
+
+static block_dev_t g_ata_bdev = {
+    .name = "",
+    .type = BLOCKDEV_TYPE_IDE,
+    .label = "IDE PIO drive",
+    .sector_size = 512,
+    .sector_count = 0,
+    .read = ata_bd_read,
+    .write = ata_bd_write,
+    .sync = ata_bd_sync,
+    .drv_data = NULL,
+};
+
 static inline void outb(uint16_t port, uint8_t val)
 {
     __asm__ volatile ("outb %0, %1" :: "a"(val), "Nd"(port));
@@ -77,9 +95,8 @@ static inline uint16_t inw(uint16_t port)
 /* Software reset via control port. */
 static void ata_soft_reset(void)
 {
-    outb(ATA_CTRL, 0x04u);  /* SRST bit */
-    outb(ATA_CTRL, 0x00u);  /* clear */
-    /* Wait 400ns (4 × alternate status reads). */
+    outb(ATA_CTRL, 0x04u);
+    outb(ATA_CTRL, 0x00u);
     inb(ATA_CTRL); inb(ATA_CTRL); inb(ATA_CTRL); inb(ATA_CTRL);
 }
 
@@ -113,40 +130,37 @@ int ata_init(void)
 
     ata_soft_reset();
 
-    /* Select master (drive 0). */
     outb(ATA_BASE + ATA_DRIVE, 0xA0u);
-    /* 400ns delay. */
     inb(ATA_CTRL); inb(ATA_CTRL); inb(ATA_CTRL); inb(ATA_CTRL);
 
     if (!ata_wait_bsy()) return 0;
 
-    /* Send IDENTIFY command. */
     outb(ATA_BASE + ATA_COUNT, 0);
     outb(ATA_BASE + ATA_LBA0,  0);
     outb(ATA_BASE + ATA_LBA1,  0);
     outb(ATA_BASE + ATA_LBA2,  0);
     outb(ATA_BASE + ATA_CMD,   ATA_CMD_IDENT);
 
-    /* Check if drive exists. */
     uint8_t status = inb(ATA_BASE + ATA_STATUS);
-    if (status == 0) return 0;     /* no drive */
+    if (status == 0) return 0;
 
     if (!ata_wait_bsy()) return 0;
 
-    /* If LBA1 or LBA2 are non-zero, it's not ATA (might be ATAPI). */
     if (inb(ATA_BASE + ATA_LBA1) != 0 || inb(ATA_BASE + ATA_LBA2) != 0)
         return 0;
 
     if (ata_wait_drq() < 0) return 0;
 
-    /* Read IDENTIFY data (256 × 16-bit words). */
     uint16_t ident[256];
     for (int i = 0; i < 256; i++)
         ident[i] = inw(ATA_BASE + ATA_DATA);
 
-    /* Words 60–61 contain the 28-bit LBA sector count. */
     g_sector_count = ((uint32_t)ident[61] << 16) | (uint32_t)ident[60];
     g_drive_present = 1;
+
+    /* Registration order is priority order: vfs_init() calls ata_init() before ahci_init(), keeping the IDE boot... */
+    g_ata_bdev.sector_count = g_sector_count;
+    blockdev_register(&g_ata_bdev);
     return 1;
 }
 
@@ -155,7 +169,6 @@ uint32_t ata_sector_count(void)
     return g_sector_count;
 }
 
-/* Set up LBA28 CHS registers for a given LBA and sector count. */
 static void ata_setup_lba(uint32_t lba, uint8_t count)
 {
     outb(ATA_BASE + ATA_DRIVE,  (uint8_t)(0xE0u | ((lba >> 24) & 0x0Fu)));
@@ -178,7 +191,6 @@ int ata_read_sectors(uint32_t lba, uint8_t count, void *buf)
         if (ata_wait_drq() < 0) return -1;
         for (int w = 0; w < 256; w++)
             dst[s * 256 + w] = inw(ATA_BASE + ATA_DATA);
-        /* 400ns delay between sectors. */
         inb(ATA_CTRL); inb(ATA_CTRL); inb(ATA_CTRL); inb(ATA_CTRL);
     }
     return 0;
@@ -199,8 +211,57 @@ int ata_write_sectors(uint32_t lba, uint8_t count, const void *buf)
             outw(ATA_BASE + ATA_DATA, src[s * 256 + w]);
     }
 
-    /* Flush write cache. */
     outb(ATA_BASE + ATA_CMD, ATA_CMD_FLUSH);
     if (!ata_wait_bsy()) return -1;
+    return 0;
+}
+
+static int ata_bd_read(block_dev_t *bd, uint64_t lba, uint32_t count,
+                       void *buf)
+{
+    uint8_t *p = (uint8_t *)buf;
+
+    (void)bd;
+    if (!buf || count == 0)
+        return -1;
+    if (lba + count < lba || lba + count > (uint64_t)g_sector_count)
+        return -1;
+
+    while (count > 0) {
+        uint8_t n = (count > 255u) ? 255u : (uint8_t)count;
+        if (ata_read_sectors((uint32_t)lba, n, p) != 0)
+            return -1;
+        lba += n;
+        p += (size_t)n * 512u;
+        count -= n;
+    }
+    return 0;
+}
+
+static int ata_bd_write(block_dev_t *bd, uint64_t lba, uint32_t count,
+                        const void *buf)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+
+    (void)bd;
+    if (!buf || count == 0)
+        return -1;
+    if (lba + count < lba || lba + count > (uint64_t)g_sector_count)
+        return -1;
+
+    while (count > 0) {
+        uint8_t n = (count > 255u) ? 255u : (uint8_t)count;
+        if (ata_write_sectors((uint32_t)lba, n, p) != 0)
+            return -1;
+        lba += n;
+        p += (size_t)n * 512u;
+        count -= n;
+    }
+    return 0;
+}
+
+static int ata_bd_sync(block_dev_t *bd)
+{
+    (void)bd;
     return 0;
 }

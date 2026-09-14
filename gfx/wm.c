@@ -1,5 +1,17 @@
 /*
- * wm.c - Window manager with dirty-region tracking and normalized routing.
+ * Project Tsukasa — Window manager with dirty-region tracking and normalized routing
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "wm.h"
@@ -14,15 +26,12 @@
 #define WM_MIN_W       140
 #define WM_MIN_H        90
 
-/* Pool of window structs (avoid per-alloc overhead). */
 static wm_window_t win_pool[WM_MAX_WINDOWS];
 static int win_pool_used[WM_MAX_WINDOWS];
 
-/* Z-order doubly-linked list: head = bottom, tail = top. */
 static wm_window_t *zlist_head;
 static wm_window_t *zlist_tail;
 
-/* Interaction state. */
 static wm_window_t *drag_win;
 static wm_window_t *resize_win;
 static int drag_offset_x, drag_offset_y;
@@ -30,11 +39,8 @@ static int resize_start_w, resize_start_h;
 static int resize_start_mx, resize_start_my;
 static int prev_buttons;
 
-/* Dirty region queue. */
 static wm_dirty_rect_t dirty_regions[WM_DIRTY_MAX];
 static int dirty_count;
-
-/* ---- String helpers --------------------------------------------------- */
 
 static void kstrcpy(char *dst, const char *src, int max)
 {
@@ -45,8 +51,6 @@ static void kstrcpy(char *dst, const char *src, int max)
     }
     dst[i] = '\0';
 }
-
-/* ---- Rect helpers ----------------------------------------------------- */
 
 static int rect_intersects(int ax, int ay, int aw, int ah,
                            int bx, int by, int bw, int bh)
@@ -72,18 +76,12 @@ static void wm_mark_window_dirty(const wm_window_t *w)
     int margin;
     if (!w)
         return;
-    /*
-     * Include shadow spill so moving/resizing windows does not leave ghost
-     * silhouettes from rounded drop-shadows.
-     */
     margin = UI_SHADOW_R + 2;
     wm_mark_dirty_rect(w->x - margin,
                        w->y - margin,
                        w->w + margin * 2,
                        w->h + margin * 2);
 }
-
-/* ---- Dirty queue ------------------------------------------------------ */
 
 void wm_mark_dirty_rect(int x, int y, int w, int h)
 {
@@ -104,7 +102,6 @@ void wm_mark_dirty_rect(int x, int y, int w, int h)
         return;
 
     if (dirty_count >= WM_DIRTY_MAX) {
-        /* Collapse on overflow to one full-screen repaint region. */
         dirty_regions[0].x = 0;
         dirty_regions[0].y = 0;
         dirty_regions[0].w = (int)fb_info.width;
@@ -133,7 +130,7 @@ int wm_collect_dirty_regions(wm_dirty_rect_t *out, int max)
     return n;
 }
 
-/* ---- Z-list manipulation ---------------------------------------------- */
+/* Z-list manipulation */
 
 static void zlist_remove(wm_window_t *w)
 {
@@ -154,17 +151,15 @@ static void zlist_push_top(wm_window_t *w)
     zlist_tail = w;
 }
 
-/* ---- Event dispatch --------------------------------------------------- */
-
 static void dispatch_to_window(wm_window_t *w,
-                               const struct input_event *src,
+                               const struct gui_event *src,
                                uint16_t event_id,
                                uint8_t subtype,
                                uint32_t keycode,
                                int32_t x,
                                int32_t y)
 {
-    struct input_event ev;
+    struct gui_event ev;
     if (!w || !w->handle_event)
         return;
     if (src)
@@ -190,8 +185,6 @@ static void dispatch_to_window(wm_window_t *w,
     w->handle_event(w, &ev);
     wm_mark_window_dirty(w);
 }
-
-/* ---- Public API ------------------------------------------------------- */
 
 void wm_init(void)
 {
@@ -347,7 +340,6 @@ int wm_handle_mouse(int mx, int my, int buttons, int btn_changed)
     int right_down_edge = right_pressed && (btn_changed & MOUSE_BUTTON_RIGHT);
     int right_up_edge = (!right_pressed) && (btn_changed & MOUSE_BUTTON_RIGHT);
 
-    /* Resize in progress. */
     if (resize_win) {
         if (left_pressed) {
             int old_x = resize_win->x;
@@ -381,7 +373,6 @@ int wm_handle_mouse(int mx, int my, int buttons, int btn_changed)
         return 1;
     }
 
-    /* Drag in progress. */
     if (drag_win) {
         if (left_pressed) {
             int old_x = drag_win->x;
@@ -474,7 +465,7 @@ int wm_handle_mouse(int mx, int my, int buttons, int btn_changed)
     return 0;
 }
 
-int wm_handle_input(const struct input_event *ev)
+int wm_handle_input(const struct gui_event *ev)
 {
     if (!ev)
         return 0;

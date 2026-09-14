@@ -1,7 +1,17 @@
 /*
- * event.h - Normalized input/gui event contract and queue API.
+ * Project Tsukasa — Normalized input/gui event contract and queue API
  *
- * Event IDs intentionally mirror SYS_GUI GUI_EVENT_* values.
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #ifndef EVENT_H
@@ -43,15 +53,10 @@
 
 #define EVENT_BUF_SIZE 128
 
-struct input_event {
-    /* Normalized event ID used by SYS_GUI and new desktop routing. */
+struct gui_event {
     uint16_t event_id;
 
-    /*
-     * Legacy compatibility fields:
-     *   - type/subtype retain the old EVENT_KEY/EVENT_MOUSE model.
-     *   - keycode carries ASCII or scan/virtual key payload as before.
-     */
+    /* Legacy compatibility fields: type/subtype retain the old EVENT_KEY/EVENT_MOUSE model. */
     uint8_t type;
     uint8_t subtype;
 
@@ -65,26 +70,14 @@ struct input_event {
     int32_t window_id;
 };
 
-/**
- * Initialize input event buffer.
- */
+typedef struct gui_event gui_event_t;
+
 void event_init(void);
 
-/**
- * Enqueue an event (called from IRQ handlers and desktop internals).
- *
- * Ordering guarantee:
- *   FIFO order is preserved for retained events.
- * Starvation control:
- *   queue pressure coalesces low-value motion/paint events first.
- */
-int event_enqueue(const struct input_event *e);
+/* Enqueue an event (called from IRQ handlers and desktop internals). */
+int event_enqueue(const struct gui_event *e);
 
-/**
- * Dequeue one event.
- *
- * @return 1 if event available, 0 if buffer empty.
- */
-int event_dequeue(struct input_event *e);
+/* Dequeue one event. @return 1 if event available, 0 if buffer empty. */
+int event_dequeue(struct gui_event *e);
 
 #endif /* EVENT_H */

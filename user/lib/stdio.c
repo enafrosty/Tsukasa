@@ -1,9 +1,25 @@
-#include "../include/stdio.h"
+/*
+ * Project Tsukasa — include "../include/stdio.h"
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
 
-#include "../include/unistd.h"
-#include "../include/string.h"
-
+#include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
+#include "user/include/stdio.h"
+#include "user/include/unistd.h"
+#include "user/include/string.h"
 
 typedef struct fmt_out {
     int fd;
@@ -68,6 +84,7 @@ static void out_i(fmt_out_t *o, long long v)
     out_u(o, (unsigned long long)v, 10, 0);
 }
 
+/* Supported conversions: %% %c %s %d %i %u %x %X %p — and NOTHING else: no width, precision or flag modifiers. */
 static int vfmt(fmt_out_t *o, const char *fmt, va_list ap)
 {
     for (size_t i = 0; fmt && fmt[i]; i++) {

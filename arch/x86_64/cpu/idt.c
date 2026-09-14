@@ -1,8 +1,27 @@
+/*
+ * Project Tsukasa — x86_64 Interrupt Descriptor Table setup
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
 #include <stdint.h>
 #include <stddef.h>
 
 #include "idt.h"
+#include "include/smp.h"
 #include "include/kprintf.h"
+#include "proc/process.h"
+#include "mm/vmm_x64.h"
 #include "drv/fb.h"
 #include "drv/serial.h"
 #include "gfx/blit.h"
@@ -76,6 +95,7 @@ extern void isr_x64_44(void);
 extern void isr_x64_45(void);
 extern void isr_x64_46(void);
 extern void isr_x64_47(void);
+extern void isr_x64_65(void);
 extern void isr_x64_ignore(void);
 
 static void (*const exception_stubs[32])(void) = {
@@ -134,21 +154,55 @@ static void draw_exception_banner(uint64_t vector, uint64_t error_code, uint64_t
      */
 }
 
-void idt_exception_handler_x64(uint64_t vector, uint64_t error_code, uint64_t rip)
+void idt_exception_handler_x64(uint64_t vector, uint64_t error_code, uint64_t rip,
+                               uint64_t cs, uint64_t fault_rsp, uint64_t ss)
 {
     uint64_t cr2 = 0;
+    uint64_t cr3 = 0;
+    uint64_t k_rsp = 0;
+    uint32_t cpu = smp_this_cpu_id();
+    process_t *cur = process_current();
 
     __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile ("mov %%rsp, %0" : "=r"(k_rsp));
     __asm__ volatile ("cli");
 
-    kprintf("[x64][exc] vec=%u err=0x%08x%08x rip=0x%08x%08x cr2=0x%08x%08x\n",
+    kprintf("[x64][exc][cpu%u] pid=%d (%s) vec=%u err=0x%08x%08x rip=0x%08x%08x cs=0x%04x cr2=0x%08x%08x cr3=0x%08x%08x rsp=0x%08x%08x ss=0x%04x krsp=0x%08x%08x\n",
+            cpu,
+            cur ? (int)cur->pid : -1,
+            (cur && cur->name[0]) ? cur->name : "none",
             (uint32_t)vector,
             (uint32_t)(error_code >> 32),
             (uint32_t)(error_code & 0xFFFFFFFFu),
             (uint32_t)(rip >> 32),
             (uint32_t)(rip & 0xFFFFFFFFu),
+            (uint32_t)cs,
             (uint32_t)(cr2 >> 32),
-            (uint32_t)(cr2 & 0xFFFFFFFFu));
+            (uint32_t)(cr2 & 0xFFFFFFFFu),
+            (uint32_t)(cr3 >> 32),
+            (uint32_t)(cr3 & 0xFFFFFFFFu),
+            (uint32_t)(fault_rsp >> 32),
+            (uint32_t)(fault_rsp & 0xFFFFFFFFu),
+            (uint32_t)ss,
+            (uint32_t)(k_rsp >> 32),
+            (uint32_t)(k_rsp & 0xFFFFFFFFu));
+
+    if (vector == 14) {
+        uint64_t pa = 0, fl = 0;
+        int qr = vmm_query_page(cr3, cr2, &pa, &fl);
+        kprintf("[x64][exc][cpu%u] vmm_query cr3=0x%08x%08x va=0x%08x%08x -> res=%d pa=0x%08x%08x fl=0x%08x%08x\n",
+                cpu, (uint32_t)(cr3 >> 32), (uint32_t)(cr3 & 0xFFFFFFFFu),
+                (uint32_t)(cr2 >> 32), (uint32_t)(cr2 & 0xFFFFFFFFu),
+                qr, (uint32_t)(pa >> 32), (uint32_t)(pa & 0xFFFFFFFFu),
+                (uint32_t)(fl >> 32), (uint32_t)(fl & 0xFFFFFFFFu));
+    }
+
+    uint64_t *sp = (uint64_t *)(uintptr_t)k_rsp;
+    for (int i = 0; i < 16; i++) {
+        kprintf("[x64][exc][cpu%u] st[%d]=0x%08x%08x\n",
+                cpu, i, (uint32_t)(sp[i] >> 32), (uint32_t)(sp[i] & 0xFFFFFFFFu));
+    }
 
     draw_exception_banner(vector, error_code, rip, cr2);
 
@@ -159,8 +213,6 @@ void idt_exception_handler_x64(uint64_t vector, uint64_t error_code, uint64_t ri
 
 void idt_init_x64(void)
 {
-    struct idt_ptr ptr;
-
     for (uint32_t i = 0; i < 32; i++)
         set_gate((uint8_t)i, exception_stubs[i], 0x8Eu);
 
@@ -183,6 +235,7 @@ void idt_init_x64(void)
     set_gate(45, isr_x64_45, 0x8Eu);
     set_gate(46, isr_x64_46, 0x8Eu);
     set_gate(47, isr_x64_47, 0x8Eu);
+    set_gate(65, isr_x64_65, 0x8Eu);
 
     idtp.limit = (uint16_t)(sizeof(idt) - 1);
     idtp.base = (uint64_t)(uintptr_t)&idt;

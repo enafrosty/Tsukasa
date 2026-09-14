@@ -1,5 +1,17 @@
 /*
- * gui_srv.c - SYS_GUI service implementation.
+ * Project Tsukasa — SYS_GUI service implementation
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "gui_srv.h"
@@ -218,6 +230,8 @@ static void gui_window_draw(wm_window_t *win)
     gui_window_t *gw;
     int cx, cy, cw, ch;
     int draw_w, draw_h;
+    int src_x = 0;
+    int src_y = 0;
 
     if (!win || !fb_info.addr || fb_info.bpp != 32)
         return;
@@ -232,6 +246,22 @@ static void gui_window_draw(wm_window_t *win)
     wm_client_rect(win, &cx, &cy, &cw, &ch);
     draw_w = (gw->client_w < cw) ? gw->client_w : cw;
     draw_h = (gw->client_h < ch) ? gw->client_h : ch;
+
+    /* Clip the composite rect against the framebuffer. */
+    if (cx < 0) {
+        src_x = -cx;
+        draw_w -= src_x;
+        cx = 0;
+    }
+    if (cy < 0) {
+        src_y = -cy;
+        draw_h -= src_y;
+        cy = 0;
+    }
+    if (cx + draw_w > (int)fb_info.width)
+        draw_w = (int)fb_info.width - cx;
+    if (cy + draw_h > (int)fb_info.height)
+        draw_h = (int)fb_info.height - cy;
     if (draw_w <= 0 || draw_h <= 0) {
         spin_unlock(&g_gui_lock);
         return;
@@ -241,7 +271,7 @@ static void gui_window_draw(wm_window_t *win)
         uint32_t *dst = (uint32_t *)((char *)fb_info.addr +
                                      (uint32_t)(cy + row) * fb_info.pitch +
                                      (uint32_t)cx * 4u);
-        uint32_t *src = &gw->pixels[row * gw->client_w];
+        uint32_t *src = &gw->pixels[(src_y + row) * gw->client_w + src_x];
         for (int col = 0; col < draw_w; col++)
             dst[col] = src[col] | 0xFF000000u;
     }
@@ -283,7 +313,7 @@ static int reallocate_client_buffer(gui_window_t *gw, int new_w, int new_h)
 
 static void gui_window_event(wm_window_t *win, const void *event)
 {
-    const struct input_event *in = (const struct input_event *)event;
+    const struct gui_event *in = (const struct gui_event *)event;
     gui_window_t *gw;
     struct tsukasa_gui_event out;
 
@@ -393,7 +423,7 @@ int gui_srv_window_create(int pid,
     for (int i = 0; i < GUI_SRV_MAX_WINDOWS; i++) {
         if (!g_windows[i].used) {
             slot = &g_windows[i];
-            slot->used = 2; /* reserved */
+            slot->used = 2;
             break;
         }
     }

@@ -1,5 +1,17 @@
 /*
- * memfs.c  -  In-memory writable filesystem implementation.
+ * Project Tsukasa — In-memory writable filesystem implementation
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "memfs.h"
@@ -8,8 +20,6 @@
 #include <stddef.h>
 
 static memfs_inode_t g_inodes[MEMFS_MAX_FILES];
-
-/* ---- String helpers --------------------------------------------------- */
 
 static int mstrlen(const char *s)
 {
@@ -30,8 +40,6 @@ static void mstrcpy(char *dst, const char *src, int max)
     dst[i] = '\0';
 }
 
-/* ---- API -------------------------------------------------------------- */
-
 void memfs_init(void)
 {
     for (int i = 0; i < MEMFS_MAX_FILES; i++) {
@@ -47,13 +55,11 @@ int memfs_create(const char *name)
 {
     if (!name || mstrlen(name) == 0) return -1;
 
-    /* Check if it already exists — update in place. */
     for (int i = 0; i < MEMFS_MAX_FILES; i++) {
         if (g_inodes[i].used && mstreq(g_inodes[i].name, name))
-            return i;  /* re-use existing inode */
+            return i;
     }
 
-    /* Find free slot. */
     for (int i = 0; i < MEMFS_MAX_FILES; i++) {
         if (!g_inodes[i].used) {
             mstrcpy(g_inodes[i].name, name, MEMFS_MAX_NAME);
@@ -64,7 +70,7 @@ int memfs_create(const char *name)
             return i;
         }
     }
-    return -1;  /* full */
+    return -1;
 }
 
 int memfs_open(const char *name)
@@ -96,7 +102,6 @@ size_t memfs_write(int inode, size_t pos, const void *buf, size_t count)
 
     size_t needed = pos + count;
     if (needed > n->capacity) {
-        /* Grow: double until large enough. */
         size_t new_cap = n->capacity ? n->capacity * 2 : MEMFS_INIT_CAP;
         while (new_cap < needed) new_cap *= 2;
         uint8_t *new_data = (uint8_t *)kmalloc(new_cap);
@@ -151,3 +156,39 @@ int memfs_stat(const char *name, size_t *size_out)
         *size_out = g_inodes[inode].size;
     return 0;
 }
+
+int memfs_unlink(const char *name)
+{
+    if (!name)
+        return -1;
+    while (*name == '/')
+        name++;
+    int in = memfs_open(name);
+    if (in < 0)
+        return -1;
+    if (g_inodes[in].data) {
+        kfree(g_inodes[in].data);
+        g_inodes[in].data = NULL;
+    }
+    g_inodes[in].used = 0;
+    g_inodes[in].size = 0;
+    g_inodes[in].capacity = 0;
+    g_inodes[in].name[0] = '\0';
+    return 0;
+}
+
+int memfs_rename(const char *old_name, const char *new_name)
+{
+    if (!old_name || !new_name)
+        return -1;
+    while (*old_name == '/')
+        old_name++;
+    while (*new_name == '/')
+        new_name++;
+    int in = memfs_open(old_name);
+    if (in < 0)
+        return -1;
+    mstrcpy(g_inodes[in].name, new_name, MEMFS_MAX_NAME);
+    return 0;
+}
+

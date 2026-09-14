@@ -1,12 +1,18 @@
-# boot.s - Assembly entry point: Multiboot header and stack setup.
-# GRUB loads this at 0x100000 and jumps to _start.
-# We set up a minimal stack and call the C kernel.
-#
-# Stack and execution assumptions (see kernel.md):
-#   - Single kernel stack: 16 KiB, stack_top is 16-byte aligned.
-#   - After pushing eax/ebx (8 bytes), esp is 8-byte aligned at kernel_main entry.
-#   - No separate stacks for ISRs or tasks yet; all code shares this stack.
-#
+/*
+ * Project Tsukasa — Assembly entry point: Multiboot header and stack setup
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
 
 .equ MB_MAGIC,        0x1BADB002
 .equ MB_FLAGS,        0x00000007

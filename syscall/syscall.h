@@ -1,5 +1,17 @@
 /*
- * syscall.h - Syscall ABI definitions and dispatcher entry.
+ * Project Tsukasa — Syscall ABI definitions and dispatcher entry
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #ifndef TSUKASA_SYSCALL_H
@@ -7,16 +19,15 @@
 
 #include <stdint.h>
 
-/*
- * Top-level syscall numbers.
- * Legacy values (0-5) are preserved for compatibility.
- */
+/* Top-level syscall numbers. Legacy values (0-5) are preserved for compatibility. */
 #define SYS_YIELD          0
 #define SYS_EXIT           1
 #define SYS_SHM_CREATE     2
 #define SYS_SHM_ATTACH     3
 #define SYS_SHM_DETACH     4
 #define SYS_SHM_DESTROY    5
+#define SYS_SHM_MAP        SYS_SHM_ATTACH
+#define SYS_SHM_UNMAP      SYS_SHM_DETACH
 
 #define SYS_GUI            6
 #define SYS_FS             7
@@ -44,6 +55,11 @@
 #define FS_CMD_MMAP        19
 #define FS_CMD_MUNMAP      20
 #define FS_CMD_POLL        21
+#define FS_CMD_MKDIR       22
+#define FS_CMD_UNLINK      23
+#define FS_CMD_RMDIR       24
+#define FS_CMD_RENAME      25
+
 
 #define TSUKASA_O_RDONLY   0x0001
 #define TSUKASA_O_WRONLY   0x0002
@@ -79,6 +95,7 @@
 #define TSUKASA_STAT_TYPE_PIPE    3
 #define TSUKASA_STAT_TYPE_CHAR    4
 #define TSUKASA_STAT_TYPE_BLOCK   5
+#define TSUKASA_STAT_TYPE_SOCKET  6
 
 struct tsukasa_stat {
     uint64_t size;
@@ -93,12 +110,42 @@ struct tsukasa_pollfd {
     int16_t revents;
 };
 
+struct tsukasa_fb_bitfield {
+    uint32_t offset;
+    uint32_t length;
+    uint32_t msb_right;
+};
+
 struct tsukasa_fb_var_screeninfo {
     uint32_t xres;
     uint32_t yres;
     uint32_t xres_virtual;
     uint32_t yres_virtual;
+    uint32_t xoffset;
+    uint32_t yoffset;
     uint32_t bits_per_pixel;
+    uint32_t grayscale;
+    struct tsukasa_fb_bitfield red;
+    struct tsukasa_fb_bitfield green;
+    struct tsukasa_fb_bitfield blue;
+    struct tsukasa_fb_bitfield transp;
+    uint32_t nonstd;
+    uint32_t activate;
+    uint32_t height;
+    uint32_t width;
+    uint32_t accel_flags;
+    uint32_t pixclock;
+    uint32_t left_margin;
+    uint32_t right_margin;
+    uint32_t upper_margin;
+    uint32_t lower_margin;
+    uint32_t hsync_len;
+    uint32_t vsync_len;
+    uint32_t sync;
+    uint32_t vmode;
+    uint32_t rotate;
+    uint32_t colorspace;
+    uint32_t reserved[4];
 };
 
 struct tsukasa_fb_fix_screeninfo {
@@ -174,6 +221,12 @@ struct tsukasa_gui_event {
 #define SYSTEM_CMD_SIGACTION       6
 #define SYSTEM_CMD_SIGPROCMASK     7
 #define SYSTEM_CMD_SIGPENDING      8
+
+struct tsukasa_sigaction {
+    uintptr_t sa_handler;
+    uint64_t sa_mask;
+    int sa_flags;
+};
 #define SYSTEM_CMD_TTY_CREATE      9
 #define SYSTEM_CMD_TTY_SET_FG      10
 #define SYSTEM_CMD_TTY_GET_FG      11
@@ -182,6 +235,8 @@ struct tsukasa_gui_event {
 #define SYSTEM_CMD_SHM_ATTACH      14
 #define SYSTEM_CMD_SHM_DETACH      15
 #define SYSTEM_CMD_SHM_DESTROY     16
+#define SYSTEM_CMD_SHM_MAP         SYSTEM_CMD_SHM_ATTACH
+#define SYSTEM_CMD_SHM_UNMAP       SYSTEM_CMD_SHM_DETACH
 #define SYSTEM_CMD_MEM_STATS       17
 #define SYSTEM_CMD_MEM_DUMP        18
 #define SYSTEM_CMD_NET_INIT        19

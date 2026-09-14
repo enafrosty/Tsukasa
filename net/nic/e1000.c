@@ -1,5 +1,17 @@
 /*
- * e1000.c - Intel 82540/82545 class NIC driver (QEMU e1000 path).
+ * Project Tsukasa — Intel 82540/82545 class NIC driver (QEMU e1000 path)
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "e1000.h"
@@ -87,15 +99,15 @@ typedef struct e1000_state {
 
 static e1000_state_t g_e1000;
 
-static e1000_tx_desc_t g_tx_desc[E1000_TX_RING_SIZE] __attribute__((aligned(16)));
-static e1000_rx_desc_t g_rx_desc[E1000_RX_RING_SIZE] __attribute__((aligned(16)));
+static e1000_tx_desc_t g_tx_desc[E1000_TX_RING_SIZE] __attribute__((aligned(128)));
+static e1000_rx_desc_t g_rx_desc[E1000_RX_RING_SIZE] __attribute__((aligned(128)));
 static uint8_t g_tx_buf[E1000_TX_RING_SIZE][2048] __attribute__((aligned(16)));
 static uint8_t g_rx_buf[E1000_RX_RING_SIZE][2048] __attribute__((aligned(16)));
 
 static uint8_t g_supported_ids[] = {
-    0x0E, /* 0x100E */
-    0x0F, /* 0x100F */
-    0xD3, /* 0x10D3 */
+    0x0E,
+    0x0F,
+    0xD3,
 };
 
 static uint64_t virt_to_phys_ptr(const void *ptr)
@@ -151,7 +163,6 @@ static void e1000_irq_cb(uint8_t irq, void *ctx)
         return;
     (void)e1000_read(E1000_REG_ICR);
     nic_note_irq();
-    (void)nic_poll_rx();
 }
 
 static int e1000_get_mac(uint8_t mac_out[6])
@@ -183,7 +194,7 @@ static int e1000_send_packet(const void *data, size_t len)
 
     mem_copy(g_tx_buf[g_e1000.tx_tail], data, len);
     desc->length = (uint16_t)len;
-    desc->cmd = 0x0B; /* EOP | IFCS | RS */
+    desc->cmd = 0x0B;
     desc->status = 0;
 
     next = (uint16_t)((g_e1000.tx_tail + 1) % E1000_TX_RING_SIZE);
@@ -310,6 +321,30 @@ static int e1000_attach(const pci_device_info_t *dev)
         pic_unmask_irq(dev->irq_line);
     }
     return 0;
+}
+
+void e1000_debug_dump(void)
+{
+    extern int kprintf(const char *fmt, ...);
+    if (!g_e1000.initialized) {
+        kprintf("[e1000] not initialized\n");
+        return;
+    }
+    kprintf("[e1000] STATUS=0x%x RCTL=0x%x TCTL=0x%x\n",
+            e1000_read(E1000_REG_STATUS), e1000_read(E1000_REG_RCTL),
+            e1000_read(E1000_REG_TCTL));
+    kprintf("[e1000] TDH=%u TDT=%u RDH=%u RDT=%u\n",
+            e1000_read(E1000_REG_TDH), e1000_read(E1000_REG_TDT),
+            e1000_read(E1000_REG_RDH), e1000_read(E1000_REG_RDT));
+    kprintf("[e1000] tx_desc_phys=0x%x%08x rx_desc_phys=0x%x%08x\n",
+            (uint32_t)(virt_to_phys_ptr(g_tx_desc) >> 32),
+            (uint32_t)(virt_to_phys_ptr(g_tx_desc) & 0xFFFFFFFFu),
+            (uint32_t)(virt_to_phys_ptr(g_rx_desc) >> 32),
+            (uint32_t)(virt_to_phys_ptr(g_rx_desc) & 0xFFFFFFFFu));
+    kprintf("[e1000] rx0.status=0x%x rx0.len=%u mac=%x:%x:%x:%x:%x:%x\n",
+            g_rx_desc[0].status, g_rx_desc[0].length,
+            g_e1000.mac[0], g_e1000.mac[1], g_e1000.mac[2],
+            g_e1000.mac[3], g_e1000.mac[4], g_e1000.mac[5]);
 }
 
 int e1000_register_pci_driver(void)

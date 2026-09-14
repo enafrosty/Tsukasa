@@ -1,5 +1,17 @@
 /*
- * vm_space.c - Per-process virtual address space ownership.
+ * Project Tsukasa — Per-process virtual address space ownership
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "vm_space.h"
@@ -24,6 +36,7 @@ int vm_space_init_kernel(vm_space_t *space)
     space->user_min = (uintptr_t)PAGING_USER_VA_MIN;
     space->user_max = (uintptr_t)PAGING_USER_VA_MAX;
     space->shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE;
+    space->anon_cursor = (uintptr_t)VM_SPACE_ANON_BASE;
     space->mapped_pages = 0;
     space->shm_pages = 0;
     space->owns_pml4 = 0;
@@ -43,6 +56,7 @@ int vm_space_create(vm_space_t *space)
     space->user_min = (uintptr_t)PAGING_USER_VA_MIN;
     space->user_max = (uintptr_t)PAGING_USER_VA_MAX;
     space->shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE;
+    space->anon_cursor = (uintptr_t)VM_SPACE_ANON_BASE;
     space->mapped_pages = 0;
     space->shm_pages = 0;
     space->owns_pml4 = 1;
@@ -65,6 +79,7 @@ int vm_space_clone(const vm_space_t *src, vm_space_t *dst)
     dst->user_min = src->user_min;
     dst->user_max = src->user_max;
     dst->shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE;
+    dst->anon_cursor = (uintptr_t)VM_SPACE_ANON_BASE;
     dst->mapped_pages = 0;
     dst->shm_pages = 0;
     dst->owns_pml4 = 1;
@@ -83,6 +98,7 @@ void vm_space_destroy(vm_space_t *space)
     space->mapped_pages = 0;
     space->shm_pages = 0;
     space->shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE;
+    space->anon_cursor = (uintptr_t)VM_SPACE_ANON_BASE;
     space->owns_pml4 = 0;
 }
 
@@ -123,6 +139,31 @@ uintptr_t vm_space_reserve_shm_range(vm_space_t *space, size_t page_count)
         return 0;
 
     space->shm_cursor = next;
+    return base;
+}
+
+uintptr_t vm_space_reserve_anon_range(vm_space_t *space, size_t page_count)
+{
+    uint64_t span;
+    uintptr_t base;
+    uintptr_t next;
+
+    if (!space || page_count == 0)
+        return 0;
+
+    span = (uint64_t)page_count * (uint64_t)PAGE_SIZE;
+    if (span == 0 || span > (uint64_t)SIZE_MAX)
+        return 0;
+
+    base = align_up_page(space->anon_cursor);
+    next = (uintptr_t)((uint64_t)base + span);
+    if (next < base)
+        return 0;
+
+    if (base < (uintptr_t)VM_SPACE_ANON_BASE || next > (uintptr_t)VM_SPACE_ANON_LIMIT)
+        return 0;
+
+    space->anon_cursor = next;
     return base;
 }
 

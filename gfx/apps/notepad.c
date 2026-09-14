@@ -1,13 +1,17 @@
 /*
- * notepad.c  -  Enhanced text editor.
+ * Project Tsukasa — Enhanced text editor
  *
- * Features:
- *   - Dynamic kmalloc'd text buffer (grows as needed).
- *   - Vertical scrolling with visible-line tracking.
- *   - Cursor movement: arrows, Home, End, Backspace, Delete.
- *   - File load: vfs_open + vfs_read.
- *   - File save: Ctrl+S  → vfs_create + vfs_write.
- *   - Modern UI chrome via ui.h / theme.h.
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "apps.h"
@@ -22,8 +26,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* ---- Layout ----------------------------------------------------------- */
-
 #define NP_W           480
 #define NP_H           340
 #define NP_CHAR_W        8
@@ -32,7 +34,6 @@
 #define NP_MARGIN_Y      6
 #define NP_INIT_CAP   4096
 
-/* Scrollbar width is UI_SCROLLBAR_W (10). */
 #define NP_TEXT_AREA_MARGIN_RIGHT (UI_SCROLLBAR_W + 4)
 
 /* Extended key codes (expected in keycode high byte via PS/2 driver). */
@@ -45,26 +46,20 @@
 #define KEY_DEL     0x5300
 #define KEY_CTRL_S  0x001F   /* Ctrl+S */
 
-/* ---- Data structure --------------------------------------------------- */
-
 typedef struct {
-    char   *text;        /* kmalloc'd buffer, null-terminated    */
-    size_t  len;         /* bytes of text (not counting \0)      */
-    size_t  capacity;    /* allocated bytes (incl. null)         */
-    int     cursor_pos;  /* byte index of insertion cursor       */
-    int     scroll_line; /* index of first visible line          */
-    char    filepath[VFS_NAME_MAX]; /* "" if unsaved             */
-    int     dirty;       /* non-zero = unsaved changes           */
+    char   *text;
+    size_t  len;
+    size_t  capacity;
+    int     cursor_pos;
+    int     scroll_line;
+    char    filepath[VFS_NAME_MAX];
+    int     dirty;
 } notepad_data_t;
-
-/* ---- String helpers --------------------------------------------------- */
 
 static void np_strcpy(char *dst, const char *src, int max)
 {
     int i = 0; while (src[i] && i < max-1) { dst[i]=src[i]; i++; } dst[i]='\0';
 }
-
-/* ---- Buffer management ------------------------------------------------ */
 
 static int np_ensure_cap(notepad_data_t *nd, size_t needed)
 {
@@ -84,7 +79,6 @@ static int np_ensure_cap(notepad_data_t *nd, size_t needed)
 static void np_insert(notepad_data_t *nd, char c)
 {
     if (!np_ensure_cap(nd, nd->len + 2)) return;
-    /* Shift right. */
     for (int i = (int)nd->len; i >= nd->cursor_pos; i--)
         nd->text[i + 1] = nd->text[i];
     nd->text[nd->cursor_pos++] = c;
@@ -113,8 +107,6 @@ static void np_delete(notepad_data_t *nd)
     nd->dirty = 1;
 }
 
-/* ---- Line tracking ---------------------------------------------------- */
-
 /* Count line number (0-based) of byte position pos. */
 static int np_line_of(const char *text, int pos)
 {
@@ -130,16 +122,15 @@ static int np_line_start(const char *text, int len, int line)
     int cur = 0;
     for (int i = 0; i < len && cur < line; i++)
         if (text[i] == '\n') cur++;
-    /* Walk back to after the last \n. */
     int start = 0;
     int lcount = 0;
     for (int i = 0; i < len; i++) {
         if (lcount == line) { start = i; break; }
         if (text[i] == '\n') lcount++;
     }
-    if (lcount == line) return start; /* line 0 edge case */
+    if (lcount == line) return start;
     if (line == 0) return 0;
-    return (int)len;   /* past end */
+    return (int)len;
 }
 
 /* Total number of lines in the buffer. */
@@ -151,8 +142,6 @@ static int np_total_lines(const char *text, int len)
     return lines;
 }
 
-/* ---- Drawing ---------------------------------------------------------- */
-
 static void notepad_draw(wm_window_t *win)
 {
     notepad_data_t *nd = (notepad_data_t *)win->app_data;
@@ -161,10 +150,8 @@ static void notepad_draw(wm_window_t *win)
     int cx, cy, cw, ch;
     wm_client_rect(win, &cx, &cy, &cw, &ch);
 
-    /* Background. */
     fb_fill_rect(cx, cy, cw, ch, (color_t)THEME_WIN_BG);
 
-    /* Toolbar strip (save indicator). */
     color_t tb_col = nd->dirty ? rgba(80, 20, 20, 255) : rgba(20, 40, 20, 255);
     fb_fill_rect(cx, cy, cw, 16, tb_col);
     const char *status = nd->dirty ? "* Unsaved" : "Saved";
@@ -175,7 +162,6 @@ static void notepad_draw(wm_window_t *win)
         fb_draw_char(ix, cy + 4, fname[i], (color_t)THEME_TEXT_DIM, tb_col);
         ix += 8;
     }
-    /* Save hint on right. */
     {
         int hx = cx + cw - 88;
         for (int i = 0; status[i] && hx + 8 <= cx + cw - 4; i++) {
@@ -184,7 +170,6 @@ static void notepad_draw(wm_window_t *win)
                          tb_col);
             hx += 8;
         }
-        /* Ctrl+S hint. */
         const char *hint = " [Ctrl+S]";
         if (nd->dirty) {
             for (int i = 0; hint[i] && hx + 8 <= cx + cw - 4; i++) {
@@ -194,7 +179,6 @@ static void notepad_draw(wm_window_t *win)
         }
     }
 
-    /* Text area. */
     int tx0 = cx + NP_MARGIN_X;
     int ty0 = cy + 16 + NP_MARGIN_Y;
     int tw  = cw - 2 * NP_MARGIN_X - NP_TEXT_AREA_MARGIN_RIGHT;
@@ -204,21 +188,17 @@ static void notepad_draw(wm_window_t *win)
     if (cols_visible < 1) cols_visible = 1;
     if (rows_visible < 1) rows_visible = 1;
 
-    /* Inset textbox background. */
     ui_draw_textbox_bg(tx0 - 2, ty0 - 2, tw + 4, th + 4);
 
-    /* Draw text lines. */
     int total_lines = np_total_lines(nd->text, (int)nd->len);
     int cursor_line = np_line_of(nd->text, nd->cursor_pos);
 
-    /* Auto-scroll so cursor is visible. */
     if (cursor_line < nd->scroll_line)
         nd->scroll_line = cursor_line;
     if (cursor_line >= nd->scroll_line + rows_visible)
         nd->scroll_line = cursor_line - rows_visible + 1;
     if (nd->scroll_line < 0) nd->scroll_line = 0;
 
-    /* Render visible lines. */
     int line  = 0;
     int col   = 0;
     int py    = ty0;
@@ -229,7 +209,6 @@ static void notepad_draw(wm_window_t *win)
     for (int i = 0; i <= (int)nd->len && drawn_lines <= rows_visible; i++) {
         char c = (i < (int)nd->len) ? nd->text[i] : '\0';
 
-        /* Draw cursor at this position. */
         if (i == nd->cursor_pos && in_vis) {
             int cur_py = ty0 + (line - nd->scroll_line) * NP_CHAR_H;
             if (cur_py >= ty0 && cur_py + NP_CHAR_H <= ty0 + th)
@@ -252,7 +231,6 @@ static void notepad_draw(wm_window_t *win)
 
         if (!in_vis) continue;
 
-        /* Word-wrap. */
         if (col >= cols_visible) {
             line++;
             col = 0;
@@ -272,27 +250,23 @@ static void notepad_draw(wm_window_t *win)
         col++;
     }
 
-    /* Scrollbar. */
     ui_draw_scrollbar(cx + cw - UI_SCROLLBAR_W - 2,
                       cy + 16 + 2,
                       ch - 16 - 4,
                       total_lines, rows_visible, nd->scroll_line);
 }
 
-/* ---- Event handling --------------------------------------------------- */
-
 static void notepad_event(wm_window_t *win, const void *event)
 {
     notepad_data_t *nd = (notepad_data_t *)win->app_data;
     if (!nd) return;
 
-    const struct input_event *ev = (const struct input_event *)event;
+    const struct gui_event *ev = (const struct gui_event *)event;
     if (ev->type != EVENT_KEY || ev->subtype != KEY_PRESS)
         return;
 
     uint32_t kc = (uint32_t)ev->keycode;
 
-    /* --- Extended keys (high byte non-zero). --- */
     uint32_t ext = kc & 0xFF00;
 
     if (ext == 0xFF00 || kc == KEY_UP || kc == KEY_DOWN ||
@@ -302,13 +276,11 @@ static void notepad_event(wm_window_t *win, const void *event)
         if (kc == KEY_LEFT && nd->cursor_pos > 0) nd->cursor_pos--;
         else if (kc == KEY_RIGHT && nd->cursor_pos < (int)nd->len) nd->cursor_pos++;
         else if (kc == KEY_HOME) {
-            /* Go to start of current line. */
             int pos = nd->cursor_pos - 1;
             while (pos > 0 && nd->text[pos-1] != '\n') pos--;
             nd->cursor_pos = pos;
         }
         else if (kc == KEY_END) {
-            /* Go to end of current line. */
             while (nd->cursor_pos < (int)nd->len && nd->text[nd->cursor_pos] != '\n')
                 nd->cursor_pos++;
         }
@@ -318,7 +290,6 @@ static void notepad_event(wm_window_t *win, const void *event)
             if (cur_line > 0) {
                 int prev_start = np_line_start(nd->text, (int)nd->len, cur_line - 1);
                 nd->cursor_pos = prev_start + cur_col;
-                /* Don't go past end of previous line. */
                 int prev_end = np_line_start(nd->text, (int)nd->len, cur_line);
                 if (nd->cursor_pos > prev_end - 1) nd->cursor_pos = prev_end - 1;
                 if (nd->cursor_pos < prev_start) nd->cursor_pos = prev_start;
@@ -340,10 +311,8 @@ static void notepad_event(wm_window_t *win, const void *event)
 
     char key = (char)(kc & 0xFF);
 
-    /* Ctrl+S: save. */
     if (key == 0x13 /* Ctrl+S */ || key == KEY_CTRL_S) {
         if (nd->filepath[0] == '\0') {
-            /* Default: save to /tmp/notepad.txt */
             np_strcpy(nd->filepath, "/tmp/notepad.txt", VFS_NAME_MAX);
         }
         int fd = vfs_create(nd->filepath);
@@ -355,21 +324,16 @@ static void notepad_event(wm_window_t *win, const void *event)
         return;
     }
 
-    /* Backspace. */
     if (key == '\b') { np_backspace(nd); return; }
 
-    /* Enter. */
     if (key == '\n' || key == '\r' || key == 0x0A || key == 0x0D) {
         np_insert(nd, '\n');
         return;
     }
 
-    /* Printable. */
     if (key >= ' ' && key <= '~')
         np_insert(nd, key);
 }
-
-/* ---- Public API ------------------------------------------------------- */
 
 static notepad_data_t *np_alloc(void)
 {

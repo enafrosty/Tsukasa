@@ -1,26 +1,40 @@
 /*
- * pmm.c - Physical Memory Manager implementation.
- * Parses Multiboot or Tsukasa boot info memory maps and manages physical pages via bitmap.
+ * Project Tsukasa — Physical Memory Manager implementation
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "pmm.h"
 #include "../include/multiboot.h"
 #include "../include/boot_info.h"
+#include "../include/spinlock.h"
 #include <stdbool.h>
 
 /* External symbols from linker. */
 extern char _kernel_start[];
 extern char _kernel_end[];
 
-/** Bitmap: 1 = free, 0 = allocated. */
+/* Bitmap: 1 = free, 0 = allocated. */
 static unsigned char pmm_bitmap[PMM_FRAME_COUNT / 8];
 
-/** Total number of frames we are tracking. */
+/* Total number of frames we are tracking. */
 static size_t pmm_total_frames;
 
-/** First frame index (after reserved regions). */
+/* First frame index (after reserved regions). */
 static size_t pmm_first_usable;
 static size_t pmm_free_frames;
+
+static spinlock_t pmm_lock = SPINLOCK_INIT;
 
 static inline size_t addr_to_frame(uint64_t addr)
 {
@@ -135,10 +149,8 @@ int pmm_init(const void *boot_info)
                 mark_region(base, end, true);
         }
 
-        /* Keep low memory reserved. */
         mark_region(0, 0x100000u, false);
 
-        /* Reserve loaded kernel image explicitly on boot-info path. */
         {
             uint64_t kstart = boot_addr_to_phys(bi, (uint64_t)(uintptr_t)_kernel_start);
             uint64_t kend = boot_addr_to_phys(bi, (uint64_t)(uintptr_t)_kernel_end);
@@ -146,7 +158,6 @@ int pmm_init(const void *boot_info)
             mark_region(kstart, kend, false);
         }
 
-        /* Reserve boot modules explicitly when present. */
         if (bi->modules && bi->module_count > 0) {
             for (uint64_t i = 0; i < bi->module_count; i++) {
                 uint64_t mstart = boot_addr_to_phys(bi, bi->modules[i].address);
@@ -183,10 +194,8 @@ int pmm_init(const void *boot_info)
         }
     }
 
-    /* Reserve low memory (0 - 1 MiB). */
     mark_region(0, 0x100000u, false);
 
-    /* Reserve kernel (.text, .rodata, .data, .bss). */
     {
         uint64_t kstart = (uint64_t)(uintptr_t)_kernel_start;
         uint64_t kend = (uint64_t)(uintptr_t)_kernel_end;
@@ -194,7 +203,6 @@ int pmm_init(const void *boot_info)
         mark_region(kstart, kend, false);
     }
 
-    /* Reserve Multiboot modules. */
     if (mb->flags & MULTIBOOT_INFO_MODS && mb->mods_count > 0) {
         const struct multiboot_mod_list *mod =
             (const struct multiboot_mod_list *)(uintptr_t)mb->mods_addr;
@@ -218,9 +226,12 @@ uintptr_t pmm_alloc(void)
 
 uintptr_t pmm_alloc_pages(size_t count)
 {
+    unsigned long irq_flags;
+
     if (count == 0)
         return 0;
 
+    irq_flags = spin_lock_irqsave(&pmm_lock);
     for (size_t start = pmm_first_usable; start + count <= pmm_total_frames; start++) {
         bool found = true;
         for (size_t i = 0; i < count; i++) {
@@ -237,9 +248,11 @@ uintptr_t pmm_alloc_pages(size_t count)
                 pmm_free_frames -= count;
             else
                 pmm_free_frames = 0;
+            spin_unlock_irqrestore(&pmm_lock, irq_flags);
             return frame_to_addr(start);
         }
     }
+    spin_unlock_irqrestore(&pmm_lock, irq_flags);
     return 0;
 }
 
@@ -250,11 +263,14 @@ void pmm_free(uintptr_t phys)
 
 void pmm_free_pages(uintptr_t phys, size_t count)
 {
+    unsigned long irq_flags;
+
     if (phys == 0 || count == 0)
         return;
     if ((phys & (PAGE_SIZE - 1)) != 0)
         return;
 
+    irq_flags = spin_lock_irqsave(&pmm_lock);
     size_t start = addr_to_frame((uint64_t)phys);
     for (size_t i = 0; i < count && (start + i) < pmm_total_frames; i++) {
         if (!bitmap_get(start + i)) {
@@ -265,6 +281,7 @@ void pmm_free_pages(uintptr_t phys, size_t count)
 
     if (start < pmm_first_usable)
         pmm_first_usable = start;
+    spin_unlock_irqrestore(&pmm_lock, irq_flags);
 }
 
 uintptr_t pmm_total_page_count(void)

@@ -1,8 +1,17 @@
 /*
- * ui.c  -  Modern window chrome and widget implementation.
+ * Project Tsukasa — Modern window chrome and widget implementation
  *
- * All drawing uses blit.h primitives and theme.h colours.
- * No libc, no standard headers beyond <stdint.h> / <stddef.h>.
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "ui.h"
@@ -16,8 +25,6 @@
 /* Global accent — can be changed at runtime by the Settings app. */
 uint32_t g_accent_color = THEME_ACCENT_DEFAULT;
 
-/* ---- Internal helpers ------------------------------------------------- */
-
 static int kstrlen_ui(const char *s)
 {
     int n = 0;
@@ -28,18 +35,7 @@ static int kstrlen_ui(const char *s)
 /* Inline abs. */
 static inline int absi(int v) { return v < 0 ? -v : v; }
 
-/* ---- Window chrome ---------------------------------------------------- */
-
-/*
- * ui_draw_window
- *
- * Layout (y axis, top-down):
- *   shadow area (UI_SHADOW_R px above and left — drawn BELOW the window)
- *   outer border (UI_BORDER px, UI_WIN_BORDER color)
- *   title bar   (UI_TITLE_H px, gradient)
- *   client area (rest, THEME_WIN_BG)
- *   outer border bottom/right
- */
+/* ui_draw_window Layout (y axis, top-down): shadow area (UI_SHADOW_R px above and left — drawn BELOW the... */
 void ui_draw_window(int x, int y, int w, int h,
                     const char *title, int active, uint32_t accent)
 {
@@ -49,14 +45,11 @@ void ui_draw_window(int x, int y, int w, int h,
     if (accent == 0)
         accent = g_accent_color;
 
-    /* --- 1. Drop shadow ------------------------------------------------- */
     fb_draw_shadow_rect(x, y, w, h, UI_SHADOW_R);
 
-    /* --- 2. Outer rounded border ---------------------------------------- */
     color_t border_col = active ? (color_t)accent : (color_t)THEME_WIN_BORDER;
     fb_fill_rounded_rect(x, y, w, h, UI_CORNER_R, border_col);
 
-    /* --- 3. Inner title bar fill (gradient) ----------------------------- */
     {
         int tx = x + UI_BORDER;
         int ty = y + UI_BORDER;
@@ -68,12 +61,9 @@ void ui_draw_window(int x, int y, int w, int h,
         color_t t_bot = active ? (color_t)THEME_TITLEBAR_ACTIVE_BOT
                                : (color_t)THEME_TITLEBAR_BOT;
 
-        /* Rounded top cap of the title bar. The corners of the gradient
-           should match the outer window's corner radius. */
         fb_fill_gradient_v(tx, ty, tw, th, t_top, t_bot);
     }
 
-    /* --- 4. Client area fill -------------------------------------------- */
     {
         int cx = x + UI_BORDER;
         int cy = y + UI_BORDER + UI_TITLE_H;
@@ -83,11 +73,9 @@ void ui_draw_window(int x, int y, int w, int h,
             fb_fill_rect(cx, cy, cw, ch, THEME_WIN_BG);
     }
 
-    /* --- 5. Separator line under title bar ------------------------------ */
     fb_draw_hline(x + UI_BORDER, y + UI_BORDER + UI_TITLE_H,
                   w - 2 * UI_BORDER, (color_t)THEME_WIN_BORDER);
 
-    /* --- 6. Traffic-light close/min/max buttons (left side) ------------- */
     {
         int by = y + UI_BORDER + UI_TBTN_Y_OFF;
         int bx = x + UI_BORDER + 14;
@@ -99,12 +87,10 @@ void ui_draw_window(int x, int y, int w, int h,
         fb_fill_circle(bx, by, UI_TBTN_R, THEME_BTN_MAX);
     }
 
-    /* --- 7. Title text (centered, right of traffic lights) -------------- */
     if (title && kstrlen_ui(title) > 0) {
         int title_x_start = x + UI_BORDER + 14 + 2 * UI_TBTN_SPACING + UI_TBTN_R + 8;
         int title_y  = y + UI_BORDER + (UI_TITLE_H - FONT_HEIGHT) / 2;
         int max_w    = w - (title_x_start - x) - UI_BORDER - 8;
-        /* Draw each character but stop when we'd overflow. */
         int cx2 = title_x_start;
         for (int i = 0; title[i] && cx2 + 8 <= title_x_start + max_w; i++) {
             fb_draw_char(cx2, title_y, title[i],
@@ -115,8 +101,6 @@ void ui_draw_window(int x, int y, int w, int h,
         }
     }
 }
-
-/* ---- Button ----------------------------------------------------------- */
 
 void ui_draw_button(int x, int y, int w, int h,
                     const char *label, int pressed, int hovered)
@@ -130,10 +114,8 @@ void ui_draw_button(int x, int y, int w, int h,
 
     fb_fill_rounded_rect(x, y, w, h, 4, bg);
 
-    /* 1px border using the accent color. */
     fb_draw_rounded_rect(x, y, w, h, 4, (color_t)g_accent_color);
 
-    /* Center text. */
     if (label) {
         int len   = kstrlen_ui(label);
         int tx    = x + (w - len * 8) / 2;
@@ -145,19 +127,15 @@ void ui_draw_button(int x, int y, int w, int h,
     }
 }
 
-/* ---- Scrollbar -------------------------------------------------------- */
-
 void ui_draw_scrollbar(int x, int y, int h,
                        int total_lines, int visible_lines, int scroll_line)
 {
     if (h <= 0 || total_lines <= 0) return;
 
-    /* Track. */
     fb_fill_rect(x, y, UI_SCROLLBAR_W, h, (color_t)THEME_TITLEBAR_TOP);
 
-    if (total_lines <= visible_lines) return;  /* no scrolling needed */
+    if (total_lines <= visible_lines) return;
 
-    /* Thumb proportional size. */
     int thumb_h = (h * visible_lines) / total_lines;
     if (thumb_h < 12) thumb_h = 12;
 
@@ -167,23 +145,17 @@ void ui_draw_scrollbar(int x, int y, int h,
                          3, (color_t)g_accent_color);
 }
 
-/* ---- Textbox background ----------------------------------------------- */
-
 void ui_draw_textbox_bg(int x, int y, int w, int h)
 {
-    /* Slightly darker than normal window bg, with a 1px inset border. */
-    color_t bg = rgba(13, 19, 28, 0xFF);   /* #0D131C */
+    color_t bg = rgba(13, 19, 28, 0xFF);
     fb_fill_rect(x, y, w, h, bg);
     fb_draw_rounded_rect(x, y, w, h, 3, (color_t)THEME_WIN_BORDER);
 }
 
-/* ---- Sidebar ---------------------------------------------------------- */
-
 void ui_draw_sidebar(int x, int y, int w, int h)
 {
-    color_t bg = rgba(14, 22, 34, 0xFF);   /* slightly darker navy */
+    color_t bg = rgba(14, 22, 34, 0xFF);
     fb_fill_rect(x, y, w, h, bg);
-    /* Right edge separator. */
     fb_draw_vline(x + w - 1, y, h, (color_t)THEME_WIN_BORDER);
 }
 
@@ -192,8 +164,8 @@ void ui_draw_sidebar_item(int x, int y, int w, int h,
 {
     if (selected) {
         fb_fill_rect_alpha(x, y, w, h,
-                           rgba(79, 195, 247, 30));   /* subtle accent tint */
-        fb_draw_vline(x, y, h, (color_t)g_accent_color);  /* accent left bar */
+                           rgba(79, 195, 247, 30));
+        fb_draw_vline(x, y, h, (color_t)g_accent_color);
     }
 
     color_t fg = selected ? (color_t)THEME_TEXT_ACCENT : (color_t)THEME_TEXT_DIM;
@@ -209,8 +181,6 @@ void ui_draw_sidebar_item(int x, int y, int w, int h,
     }
 }
 
-/* ---- Color swatch ----------------------------------------------------- */
-
 void ui_draw_color_swatch(int x, int y, int size, uint32_t color, int selected)
 {
     fb_fill_rounded_rect(x, y, size, size, 4, (color_t)color);
@@ -221,35 +191,28 @@ void ui_draw_color_swatch(int x, int y, int size, uint32_t color, int selected)
         fb_draw_rounded_rect(x, y, size, size, 4, (color_t)THEME_WIN_BORDER);
 }
 
-/* ---- Icons ------------------------------------------------------------ */
-
-/*
- * Simple pixel-art style icons drawn procedurally.
- * type: 0=folder, 1=text, 2=image, 3=app, 4=settings
- */
+/* Simple pixel-art style icons drawn procedurally. type: 0=folder, 1=text, 2=image, 3=app, 4=settings */
 void ui_draw_icon(int x, int y, int size, int type)
 {
-    /* Icon background (subtle). */
     color_t bg;
     switch (type) {
-    case 0:  bg = rgba( 40,  28,   0, 200); break;   /* folder: dark amber */
-    case 1:  bg = rgba(  0,  28,  60, 200); break;   /* text:   dark blue  */
-    case 2:  bg = rgba(  0,  40,  20, 200); break;   /* image:  dark green */
-    case 3:  bg = rgba( 40,   0,  60, 200); break;   /* terminal: dark purple*/
-    case 4:  bg = rgba(  0,  35,  42, 200); break;   /* settings: dark cyan*/
-    case 5:  bg = rgba( 60,  30,  10, 200); break;   /* calc: orange/brown */
-    default: bg = rgba( 30,  30,  40, 200); break;   /* about: dark grey */
+    case 0:  bg = rgba( 40,  28,   0, 200); break;
+    case 1:  bg = rgba(  0,  28,  60, 200); break;
+    case 2:  bg = rgba(  0,  40,  20, 200); break;
+    case 3:  bg = rgba( 40,   0,  60, 200); break;
+    case 4:  bg = rgba(  0,  35,  42, 200); break;
+    case 5:  bg = rgba( 60,  30,  10, 200); break;
+    default: bg = rgba( 30,  30,  40, 200); break;
     }
 
     fb_fill_rounded_rect(x, y, size, size, size / 6, bg);
 
-    /* Icon glyph (large, centered). */
     int mid_x = x + size / 2;
     int mid_y = y + size / 2;
     int s3    = size / 3;
 
     switch (type) {
-    case 0: /* Folder — two rectangles (tab + body). */
+    case 0:
         {
             color_t fc = THEME_ICON_FOLDER;
             fb_fill_rounded_rect(x + 4,         y + size / 3,
@@ -258,7 +221,7 @@ void ui_draw_icon(int x, int y, int size, int type)
                                  size / 2 - 2,  size / 4, 2, fc);
         }
         break;
-    case 1: /* Text file — lines. */
+    case 1:
         {
             color_t fc = THEME_ICON_TEXT;
             int ly = mid_y - s3;
@@ -269,12 +232,10 @@ void ui_draw_icon(int x, int y, int size, int type)
             }
         }
         break;
-    case 2: /* Image — mountain silhouette + circle sun. */
+    case 2:
         {
             color_t fc = THEME_ICON_IMAGE;
-            /* Sun. */
             fb_fill_circle(x + size * 3 / 4, y + size / 3, size / 7, fc);
-            /* Mountain triangle (drawn as filled rects). */
             for (int ly = 0; ly < size / 2; ly++) {
                 int xspan = ly * (size / 2) / (size / 2);
                 fb_fill_rect(mid_x - xspan, y + size / 2 + ly,
@@ -282,7 +243,7 @@ void ui_draw_icon(int x, int y, int size, int type)
             }
         }
         break;
-    case 3: /* Terminal — stylised window icon. */
+    case 3:
         {
             color_t fc = THEME_ICON_APP;
             fb_fill_rounded_rect(x + 4, y + 4, size - 8, size - 8, 3, fc);
@@ -290,7 +251,7 @@ void ui_draw_icon(int x, int y, int size, int type)
                          rgba(80, 20, 120, 255));
         }
         break;
-    case 4: /* Settings — gear-like circles. */
+    case 4:
         {
             color_t fc = THEME_ICON_SETTINGS;
             fb_fill_circle(mid_x, mid_y, size / 4, fc);
@@ -298,9 +259,9 @@ void ui_draw_icon(int x, int y, int size, int type)
                            rgba(14, 22, 34, 255));
         }
         break;
-    case 5: /* Calc — 4x4 grid. */
+    case 5:
         {
-            color_t fc = rgba(255, 180, 100, 255); /* Orange-ish */
+            color_t fc = rgba(255, 180, 100, 255);
             int sq = size / 4;
             int px = x + (size - (sq*2+2))/2;
             int py = y + (size - (sq*2+2))/2;
@@ -310,12 +271,10 @@ void ui_draw_icon(int x, int y, int size, int type)
             fb_fill_rounded_rect(px+sq+2, py+sq+2, sq, sq, 2, fc);
         }
         break;
-    default: /* About — 'i' symbol. */
+    default:
         {
             color_t fc = rgba(200, 200, 220, 255);
-            /* Dot */
             fb_fill_circle(mid_x, mid_y - size/5, 2, fc);
-            /* Stem */
             fb_fill_rect(mid_x - 1, mid_y, 3, size/4, fc);
         }
         break;

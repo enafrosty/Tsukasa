@@ -1,6 +1,18 @@
-# switch.s - Switch to user mode via iret.
-# void switch_to_user(uint32_t eip, uint32_t esp, uint32_t eflags);
-#
+;
+; Project Tsukasa — Switch to user mode via iret
+;
+; Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+;
+; Project Tsukasa was created and is maintained by frosty (@enafrosty).
+; This program is free software: you can redistribute it and/or modify it
+; under the terms of the GNU General Public License as published by the
+; Free Software Foundation, either version 3 of the License, or (at your
+; option) any later version. See the top-level LICENSE file.
+;
+; This program is distributed in the hope that it will be useful, but
+; WITHOUT ANY WARRANTY; without even the implied warranty of
+; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+;
 
 .section .text
 .global switch_to_user

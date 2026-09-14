@@ -1,5 +1,17 @@
 /*
- * task.c - Task creation and management.
+ * Project Tsukasa — Task creation and management
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "task.h"
@@ -30,7 +42,6 @@ void task_init(void)
     ready_list = NULL;
     next_pid = 1;
 
-    /* Create idle task. */
     task_t *idle = task_create(idle_task);
     if (idle) {
         idle->pid = 0;
@@ -50,10 +61,8 @@ void main_kernel_task(void)
 {
     kprintf("[task] main kernel task started\n");
 
-    /* If we have a 32bpp framebuffer, run the desktop shell. */
     if (fb_info.addr && fb_info.bpp == 32) {
         desktop_run();
-        /* desktop_run does not return. */
     }
 
     for (;;) {
@@ -81,7 +90,6 @@ task_t *task_create(void (*entry)(void))
     t->state = TASK_READY;
     t->next = NULL;
 
-    /* Set up stack: at top of stack, push entry point so ret jumps there. */
     uint32_t *stack_top = (uint32_t *)(stack_phys + TASK_STACK_SIZE - 4);
     stack_top[0] = (uint32_t)(uintptr_t)entry;
     t->esp = (uint32_t)(uintptr_t)stack_top;
@@ -110,12 +118,11 @@ task_t *task_create_user(uint32_t entry_addr, uint32_t stack_addr)
     t->state = TASK_READY;
     t->next = NULL;
 
-    /* ESP for first switch: point to top of kernel stack with iret frame. */
     uint32_t *stack_top = (uint32_t *)(stack_phys + TASK_STACK_SIZE);
-    stack_top -= 5;  /* iret frame: eip, cs, eflags, esp, ss */
+    stack_top -= 5;
     stack_top[0] = entry_addr;
     stack_top[1] = 0x1B;
-    stack_top[2] = 0x202;   /* eflags with IF=1 */
+    stack_top[2] = 0x202;
     stack_top[3] = stack_addr;
     stack_top[4] = 0x23;
     t->esp = (uint32_t)(uintptr_t)stack_top;

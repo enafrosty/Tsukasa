@@ -1,11 +1,17 @@
 /*
- * settings.c  -  System Settings application.
+ * Project Tsukasa — System Settings application
  *
- * Two tabs:
- *   "Personalize"  - accent color swatches + wallpaper file picker.
- *   "Display"      - resolution info (read-only).
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
- * Accent color changes take effect immediately (modifies g_accent_color).
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "apps.h"
@@ -24,8 +30,6 @@
 /* Defined in desktop.c. */
 extern void desktop_set_wallpaper(const char *path);
 
-/* ---- Layout ----------------------------------------------------------- */
-
 #define ST_W          420
 #define ST_H          300
 #define ST_SIDEBAR_W   96
@@ -36,31 +40,27 @@ static const char *tab_labels[ST_TABS] = { "Personalize", "Display" };
 /* Accent color palette. */
 #define NUM_ACCENTS  6
 static const uint32_t accent_palette[NUM_ACCENTS] = {
-    0xFF4FC3F7,   /* sky blue (default) */
-    0xFF81D4FA,   /* light blue         */
-    0xFF80CBC4,   /* teal               */
-    0xFF80DEEA,   /* cyan               */
-    0xFFCE93D8,   /* purple             */
-    0xFFEF9A9A,   /* rose               */
+    0xFF4FC3F7,
+    0xFF81D4FA,
+    0xFF80CBC4,
+    0xFF80DEEA,
+    0xFFCE93D8,
+    0xFFEF9A9A,
 };
 
 #define SWATCH_SIZE    28
 #define SWATCH_GAP      8
 
-/* ---- App state -------------------------------------------------------- */
-
 #define WP_MAX  16
 
 typedef struct {
-    int    active_tab;        /* 0 = Personalize, 1 = Display */
+    int    active_tab;
     int    selected_accent;
     char   wallpapers[WP_MAX][VFS_NAME_MAX];
     int    wp_count;
     int    selected_wp;
     char   status[64];
 } settings_data_t;
-
-/* ---- String helpers --------------------------------------------------- */
 
 static int st_strlen(const char *s)
 { int n=0; while(s&&s[n])n++; return n; }
@@ -79,8 +79,6 @@ static int st_streq_suffix(const char *name, const char *suf)
 static void st_strcpy(char *dst, const char *src, int max)
 { int i=0;while(src[i]&&i<max-1){dst[i]=src[i];i++;}dst[i]='\0'; }
 
-/* ---- Wallpaper enumeration -------------------------------------------- */
-
 static void st_refresh_wallpapers(settings_data_t *st)
 {
     char names[WP_MAX][VFS_NAME_MAX];
@@ -95,8 +93,6 @@ static void st_refresh_wallpapers(settings_data_t *st)
     }
 }
 
-/* ---- Drawing ---------------------------------------------------------- */
-
 static void draw_string(int x, int y, const char *s, color_t fg, color_t bg)
 {
     while (*s) { fb_draw_char(x, y, *s, fg, bg); x += 8; s++; }
@@ -108,7 +104,6 @@ static void st_draw_personalize(settings_data_t *st,
     int px = cx + ST_SIDEBAR_W + 12;
     int py = cy + 8;
 
-    /* Accent color section. */
     draw_string(px, py, "Accent Color",
                 (color_t)THEME_TEXT_ACCENT, (color_t)THEME_WIN_BG);
     py += 14;
@@ -124,7 +119,6 @@ static void st_draw_personalize(settings_data_t *st,
     }
     py += SWATCH_SIZE + 14;
 
-    /* Wallpaper section. */
     draw_string(px, py, "Wallpaper",
                 (color_t)THEME_TEXT_ACCENT, (color_t)THEME_WIN_BG);
     py += 14;
@@ -151,14 +145,12 @@ static void st_draw_personalize(settings_data_t *st,
         }
     }
 
-    /* "Set Wallpaper" button. */
     {
         int by = cy + ch - 32;
         int bx = px;
         ui_draw_button(bx, by, 108, 22, "Set Wallpaper", 0, 0);
     }
 
-    /* Status. */
     if (st->status[0])
         draw_string(px, cy + ch - 10, st->status,
                     (color_t)THEME_TEXT_DIM, (color_t)THEME_WIN_BG);
@@ -178,16 +170,12 @@ static void st_draw_display(settings_data_t *st,
     fb_draw_hline(px, py, cw - ST_SIDEBAR_W - 20, (color_t)THEME_WIN_BORDER);
     py += 10;
 
-    /* Resolution readout (printf-free using itoa trick). */
     char buf[64];
-    /* Manual uint→string. */
     {
         uint32_t w = fb_info.width, h = fb_info.height;
-        /* Simple render: "Resolution: WWWW x HHHH @ 32bpp" */
         int bi = 0;
         const char *lbl = "Resolution:  ";
         while (*lbl) buf[bi++] = *lbl++;
-        /* w */
         char tmp[12]; int ti=0;
         uint32_t ww = w;
         if (!ww) tmp[ti++]='0';
@@ -221,24 +209,20 @@ static void settings_draw(wm_window_t *win)
 
     fb_fill_rect(cx, cy, cw, ch, (color_t)THEME_WIN_BG);
 
-    /* Sidebar. */
     ui_draw_sidebar(cx, cy, ST_SIDEBAR_W, ch);
 
-    /* App title in sidebar. */
     draw_string(cx + 8, cy + 8, "Settings",
                 (color_t)THEME_TEXT_ACCENT,
                 rgba(14, 22, 34, 255));
 
     fb_draw_hline(cx, cy + 24, ST_SIDEBAR_W, (color_t)THEME_WIN_BORDER);
 
-    /* Tab items. */
     for (int i = 0; i < ST_TABS; i++) {
         ui_draw_sidebar_item(cx, cy + 32 + i * 28,
                              ST_SIDEBAR_W, 26,
                              tab_labels[i], (i == st->active_tab));
     }
 
-    /* Content area. */
     fb_fill_rect(cx + ST_SIDEBAR_W, cy, cw - ST_SIDEBAR_W, ch,
                  (color_t)THEME_WIN_BG);
 
@@ -248,26 +232,22 @@ static void settings_draw(wm_window_t *win)
         st_draw_display(st, cx, cy, cw, ch);
 }
 
-/* ---- Event handling --------------------------------------------------- */
-
 static void settings_event(wm_window_t *win, const void *event)
 {
     settings_data_t *st = (settings_data_t *)win->app_data;
     if (!st || !event) return;
 
-    const struct input_event *ev = (const struct input_event *)event;
+    const struct gui_event *ev = (const struct gui_event *)event;
     if (ev->type != EVENT_MOUSE) return;
 
     int mx = ev->x, my = ev->y;
     int left_down = (ev->keycode & 1) && (ev->subtype == MOUSE_BTN_DOWN);
 
-    /* Only process left click down */
     if (!left_down) return;
 
     int cx, cy, cw, ch;
     wm_client_rect(win, &cx, &cy, &cw, &ch);
 
-    /* Sidebar tab click. */
     if (mx >= cx && mx < cx + ST_SIDEBAR_W) {
         for (int i = 0; i < ST_TABS; i++) {
             int ty = cy + 32 + i * 28;
@@ -279,14 +259,12 @@ static void settings_event(wm_window_t *win, const void *event)
         return;
     }
 
-    /* Content area clicks (Personalize tab). */
     if (st->active_tab != 0) return;
 
     int px = cx + ST_SIDEBAR_W + 12;
 
-    /* Accent swatches: y range = cy+36 .. cy+36+SWATCH_SIZE */
     {
-        int sy = cy + 28;   /* match draw_personalize offset */
+        int sy = cy + 28;
         for (int i = 0; i < NUM_ACCENTS; i++) {
             int sx = px + i * (SWATCH_SIZE + SWATCH_GAP);
             if (mx >= sx && mx < sx + SWATCH_SIZE &&
@@ -298,7 +276,6 @@ static void settings_event(wm_window_t *win, const void *event)
         }
     }
 
-    /* Wallpaper list. */
     {
         int wy0 = cy + 28 + SWATCH_SIZE + 34;
         for (int i = 0; i < st->wp_count; i++) {
@@ -311,7 +288,6 @@ static void settings_event(wm_window_t *win, const void *event)
         }
     }
 
-    /* "Set Wallpaper" button. */
     {
         int by = cy + ch - 32;
         if (my >= by && my < by + 22 && mx >= px && mx < px + 108) {
@@ -330,15 +306,13 @@ static void settings_event(wm_window_t *win, const void *event)
     }
 }
 
-/* ---- Public API ------------------------------------------------------- */
-
 void app_settings_open(void)
 {
     settings_data_t *st = (settings_data_t *)kmalloc(sizeof(settings_data_t));
     if (!st) return;
 
     st->active_tab    = 0;
-    st->selected_accent = 0;  /* sky blue */
+    st->selected_accent = 0;
     st->wp_count      = 0;
     st->selected_wp   = -1;
     st->status[0]     = '\0';

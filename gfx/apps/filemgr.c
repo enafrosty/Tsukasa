@@ -1,9 +1,17 @@
 /*
- * filemgr.c  -  File Manager application.
+ * Project Tsukasa — File Manager application
  *
- * Enumerates the FAT12 root directory (and /tmp/) via vfs_list.
- * Displays files in an icon grid.
- * Click to select, double-click to open (.txt → Notepad, .bmp → wallpaper).
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "apps.h"
@@ -21,8 +29,6 @@
 /* Defined in desktop.c, declared as extern. */
 extern void desktop_set_wallpaper(const char *path);
 
-/* ---- Layout ----------------------------------------------------------- */
-
 #define FM_W           480
 #define FM_H           340
 #define FM_COLS          4
@@ -32,8 +38,6 @@ extern void desktop_set_wallpaper(const char *path);
 #define FM_MAX_ENTRIES  64
 #define FM_TOOLBAR_H    24
 
-/* ---- File entry type detection ---------------------------------------- */
-
 typedef enum { FT_TEXT, FT_BMP, FT_DIR, FT_OTHER } file_type_t;
 
 typedef struct {
@@ -41,20 +45,15 @@ typedef struct {
     file_type_t type;
 } fm_entry_t;
 
-/* ---- App state -------------------------------------------------------- */
-
 typedef struct {
     fm_entry_t entries[FM_MAX_ENTRIES];
     int        count;
-    int        selected;          /* -1 = none                       */
-    int        scroll_row;        /* first visible icon row          */
-    /* Simple double-click tracking: store last click index + a counter. */
+    int        selected;
+    int        scroll_row;
     int        last_click;
-    int        click_timer;       /* decrements on each draw; click if >0 */
+    int        click_timer;
     char       status_msg[64];
 } fm_data_t;
-
-/* ---- String helpers --------------------------------------------------- */
 
 static int fm_strlen(const char *s)
 { int n=0; while(s&&s[n])n++; return n; }
@@ -99,8 +98,6 @@ static int icon_type_for(file_type_t ft)
     }
 }
 
-/* ---- Populate file list ----------------------------------------------- */
-
 static void fm_refresh(fm_data_t *fm)
 {
     char names[FM_MAX_ENTRIES][VFS_NAME_MAX];
@@ -115,13 +112,11 @@ static void fm_refresh(fm_data_t *fm)
         fm->count++;
     }
 
-    /* Also list /tmp/. */
     int tmp_n = vfs_list("/tmp/", names, FM_MAX_ENTRIES - fm->count);
     if (tmp_n > 0) {
         for (int i = 0; i < tmp_n && fm->count < FM_MAX_ENTRIES; i++) {
             if (!names[i][0]) continue;
-            /* Prepend "tmp/" marker in display name. */
-            fm->entries[fm->count].name[0] = '*';  /* * = memfs */
+            fm->entries[fm->count].name[0] = '*';
             fm_strcpy(fm->entries[fm->count].name + 1, names[i],
                       VFS_NAME_MAX - 1);
             fm->entries[fm->count].type = classify(names[i]);
@@ -133,8 +128,6 @@ static void fm_refresh(fm_data_t *fm)
     fm->scroll_row = 0;
 }
 
-/* ---- Drawing ---------------------------------------------------------- */
-
 static void fm_draw(wm_window_t *win)
 {
     fm_data_t *fm = (fm_data_t *)win->app_data;
@@ -145,7 +138,6 @@ static void fm_draw(wm_window_t *win)
 
     fb_fill_rect(cx, cy, cw, ch, (color_t)THEME_WIN_BG);
 
-    /* Toolbar. */
     fb_fill_rect(cx, cy, cw, FM_TOOLBAR_H, rgba(16, 24, 36, 255));
     const char *hdr = "File Manager - /";
     int hx = cx + 8, hy = cy + (FM_TOOLBAR_H - 8) / 2;
@@ -155,7 +147,6 @@ static void fm_draw(wm_window_t *win)
         hx += 8;
     }
 
-    /* Status message (bottom strip). */
     fb_fill_rect(cx, cy + ch - 16, cw, 16, rgba(10, 16, 26, 255));
     if (fm->status_msg[0]) {
         int sx = cx + 8;
@@ -166,7 +157,6 @@ static void fm_draw(wm_window_t *win)
         }
     }
 
-    /* Icon grid. */
     int grid_x = cx + 8;
     int grid_y = cy + FM_TOOLBAR_H + 8;
     int grid_h = ch - FM_TOOLBAR_H - 16 - 8;
@@ -188,19 +178,16 @@ static void fm_draw(wm_window_t *win)
             int iy = grid_y + row * FM_CELL_H;
             if (iy + FM_CELL_H > cy + ch - 16) break;
 
-            /* Selection highlight. */
             if (idx == fm->selected)
                 fb_fill_rect_alpha(ix - 2, iy - 2,
                                    FM_CELL_W, FM_CELL_H,
                                    rgba(79, 195, 247, 30));
 
-            /* Icon. */
             int icon_size = 36;
             int icon_x = ix + (FM_CELL_W - icon_size) / 2;
             ui_draw_icon(icon_x, iy + 4, icon_size,
                          icon_type_for(fm->entries[idx].type));
 
-            /* Filename label (truncated). */
             const char *label = fm->entries[idx].name;
             int label_len = fm_strlen(label);
             int max_chars = FM_CELL_W / 8;
@@ -217,24 +204,19 @@ static void fm_draw(wm_window_t *win)
         }
     }
 
-    /* Scrollbar. */
     ui_draw_scrollbar(cx + cw - UI_SCROLLBAR_W - 2, cy + FM_TOOLBAR_H,
                       ch - FM_TOOLBAR_H - 16,
                       total_rows, rows_visible, fm->scroll_row);
 }
-
-/* ---- Event handling --------------------------------------------------- */
 
 static void fm_open_entry(fm_data_t *fm, int idx)
 {
     if (idx < 0 || idx >= fm->count) return;
     fm_entry_t *e = &fm->entries[idx];
 
-    /* Build full path. */
     char path[VFS_NAME_MAX + 2];
     int pi = 0;
     if (e->name[0] == '*') {
-        /* memfs file: /tmp/name. */
         path[pi++] = '/';
         path[pi++] = 't'; path[pi++] = 'm'; path[pi++] = 'p'; path[pi++] = '/';
         const char *n = e->name + 1;
@@ -273,9 +255,8 @@ static void fm_event(wm_window_t *win, const void *event)
     fm_data_t *fm = (fm_data_t *)win->app_data;
     if (!fm || !event) return;
 
-    const struct input_event *ev = (const struct input_event *)event;
+    const struct gui_event *ev = (const struct gui_event *)event;
 
-    /* Keyboard: R to refresh. */
     if (ev->type == EVENT_KEY && ev->subtype == KEY_PRESS) {
         char key = (char)(ev->keycode & 0xFF);
         if (key == 'r' || key == 'R') fm_refresh(fm);
@@ -303,22 +284,18 @@ static void fm_event(wm_window_t *win, const void *event)
             int idx = row * FM_COLS + col;
             if (idx >= 0 && idx < fm->count) {
                 if (fm->selected == idx && fm->click_timer > 0) {
-                    /* Double-click. */
                     fm_open_entry(fm, idx);
                     fm->click_timer = 0;
                 } else {
                     fm->selected   = idx;
-                    fm->click_timer = 20; /* ~20 frames to double click */
+                    fm->click_timer = 20;
                 }
             }
         }
     }
 
-    /* Decrement click timer. */
     if (fm->click_timer > 0) fm->click_timer--;
 }
-
-/* ---- Public API ------------------------------------------------------- */
 
 void app_filemgr_open(void)
 {

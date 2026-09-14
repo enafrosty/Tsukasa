@@ -1,16 +1,17 @@
 /*
- * fat32.h - FAT32 filesystem driver.
- * Layered on ata_read_sectors / ata_write_sectors.
- * Mounted at /disk/ in the VFS.
+ * Project Tsukasa — FAT32 filesystem driver (multi-volume since guide 12)
  *
- * Supported semantics:
- *   - Nested directory traversal for normalized absolute paths.
- *   - Writes overwrite existing files in-place when cluster capacity is enough.
- *   - Rename supports same-directory 8.3 target names only.
- * Unsupported:
- *   - Cross-directory rename.
- *   - Cluster-chain growth during write.
- *   - LFN rename.
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #ifndef FAT32_H
@@ -18,6 +19,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+struct block_dev;
 
 /* Maximum length of a file/directory name (8.3 long-name path). */
 #define FAT32_NAME_MAX  256
@@ -30,44 +33,34 @@ typedef struct {
     uint32_t first_cluster;
 } fat32_dirent_t;
 
-/**
- * Initialise the FAT32 driver.
- * Reads the BPB from LBA 0 of the ATA drive.
- * Returns 0 on success, -1 if not a valid FAT32 volume.
- */
+/* Opaque mounted-volume handle (static pool inside fat32.c). */
+typedef struct fat32_volume fat32_volume_t;
+
+/* Bind a volume to `bd` and read/validate its BPB (the device is expected to be partition-relative: its... */
+fat32_volume_t *fat32_vol_mount(struct block_dev *bd);
+
+int fat32_vol_create_file(fat32_volume_t *vol, const char *path);
+
+int fat32_vol_list_dir(fat32_volume_t *vol, const char *path,
+                       fat32_dirent_t *entries, int max);
+int fat32_vol_stat(fat32_volume_t *vol, const char *path,
+                   fat32_dirent_t *out);
+int fat32_vol_read_file(fat32_volume_t *vol, const char *path,
+                        void *buf, size_t max_bytes);
+int fat32_vol_write_file(fat32_volume_t *vol, const char *path,
+                         const void *buf, size_t size);
+int fat32_vol_rename(fat32_volume_t *vol, const char *old_path,
+                     const char *new_path);
+
+/* Legacy single-volume API (the /disk mount) */
+
+/* Mount the primary volume: the first whole disk carrying a raw FAT32 filesystem. */
 int fat32_init(void);
 
-/**
- * List directory at `path` (e.g. "/" or "/mydir").
- * Fills `entries` with up to `max` entries.
- * Returns count, or -1 on error.
- */
 int fat32_list_dir(const char *path, fat32_dirent_t *entries, int max);
-
-/**
- * Stat a path.  Returns 0 on success, -1 if not found.
- */
 int fat32_stat(const char *path, fat32_dirent_t *out);
-
-/**
- * Read a file into `buf` (up to `max_bytes`).
- * Returns bytes read, or -1 on error.
- */
 int fat32_read_file(const char *path, void *buf, size_t max_bytes);
-
-/**
- * Write/create a file at `path` with `buf` contents.
- * If the file exists it is overwritten.
- * Returns 0 on success, -1 on error.
- */
 int fat32_write_file(const char *path, const void *buf, size_t size);
-
-/**
- * Rename a file or directory in-place.
- * Constraints: source/target must stay in the same parent directory and the
- * target leaf must be a short 8.3 name.
- * Returns 0 on success, -1 on unsupported or error.
- */
 int fat32_rename(const char *old_path, const char *new_path);
 
 #endif /* FAT32_H */

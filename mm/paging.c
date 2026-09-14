@@ -1,6 +1,17 @@
 /*
- * paging.c - x86 paging setup and management.
- * Identity-maps kernel region and enables paging.
+ * Project Tsukasa — x86 paging setup and management
+ *
+ * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
+ *
+ * Project Tsukasa was created and is maintained by frosty (@enafrosty).
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. See the top-level LICENSE file.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
 #include "include/paging.h"
@@ -14,18 +25,17 @@ extern char _kernel_end[];
 #define IDENTITY_MAP_MB 16
 #define IDENTITY_MAP_TABLES (IDENTITY_MAP_MB / 4)
 
-/** Boot page directory (must be 4K-aligned). */
+/* Boot page directory (must be 4K-aligned). */
 static page_directory_t boot_pd __attribute__((aligned(4096)));
 
-/** Boot page tables for identity mapping (first 16 MiB). */
+/* Boot page tables for identity mapping (first 16 MiB). */
 static page_table_t boot_pt[IDENTITY_MAP_TABLES] __attribute__((aligned(4096)));
 
-/** Page table for framebuffer (one 4 MiB region above low memory). */
+/* Page table for framebuffer (one 4 MiB region above low memory). */
 static page_table_t boot_pt_fb __attribute__((aligned(4096)));
 
 void paging_init(void)
 {
-    /* Clear structures. */
     for (unsigned int i = 0; i < PAGING_ENTRIES; i++) {
         boot_pd[i] = 0;
     }
@@ -35,17 +45,14 @@ void paging_init(void)
         }
     }
 
-    /* Identity-map first 16 MiB. */
     for (unsigned int t = 0; t < IDENTITY_MAP_TABLES; t++) {
         for (unsigned int i = 0; i < PAGING_ENTRIES; i++) {
             uintptr_t phys = (t * PAGING_ENTRIES + i) * PAGE_SIZE;
             boot_pt[t][i] = phys | PTE_PRESENT | PTE_WRITABLE;
         }
-        /* Point corresponding PD entry to this boot page table. */
         boot_pd[t] = ((uintptr_t)&boot_pt[t] & 0xFFFFF000u) | PTE_PRESENT | PTE_WRITABLE;
     }
 
-    /* Load CR3 and enable paging. */
     uintptr_t pd_phys = (uintptr_t)boot_pd;
     __asm__ volatile (
         "movl %0, %%cr3\n"
@@ -75,8 +82,7 @@ int paging_map(uintptr_t virt, uintptr_t phys, uint32_t flags)
         return 0;
     }
 
-    /* For higher addresses, we would need to allocate a new page table.
-     * For now, only first 16 MiB is supported in paging_map. */
+    /* For higher addresses, we would need to allocate a new page table. For now, only first 16 MiB is supported... */
     (void)pde_idx;
     return -1;
 }
@@ -92,11 +98,10 @@ void paging_unmap(uintptr_t virt)
 
 int paging_map_framebuffer(uintptr_t phys_base, size_t size)
 {
-    /* Already in identity-mapped region. */
     if (phys_base < (uintptr_t)IDENTITY_MAP_MB * 1024 * 1024)
         return 0;
 
-    uintptr_t region_base = phys_base & ~0x3FFFFFu;  /* Round down to 4 MiB. */
+    uintptr_t region_base = phys_base & ~0x3FFFFFu;
     unsigned int pde_idx = (unsigned int)(region_base >> 22);
 
     for (unsigned int i = 0; i < PAGING_ENTRIES; i++)
