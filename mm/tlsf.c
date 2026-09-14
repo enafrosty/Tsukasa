@@ -1,5 +1,5 @@
 /*
- * Project Tsukasa — Two-Level Segregated Fit allocator
+ * Project Tsukasa - Two-Level Segregated Fit allocator
  *
  * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
@@ -122,13 +122,24 @@ static void mapping_insert(uint32_t size, int *fl, int *sl)
     if (size < (1u << SL_INDEX_BITS)) {
         *fl = 0;
         *sl = (int)size;
-    } else {
-        int raw_fl = fls(size);
-        *fl = raw_fl - SL_INDEX_BITS + 1;
-        *sl = (int)((size >> (raw_fl - SL_INDEX_BITS)) & (SL_INDEX_COUNT - 1));
-        if (*fl >= FL_INDEX_COUNT)
-            *fl = FL_INDEX_COUNT - 1;
+        return;
     }
+
+    int raw_fl = fls(size);
+    if (raw_fl < SL_INDEX_BITS) {
+        *fl = 0;
+        *sl = (int)size;
+        return;
+    }
+
+    int computed_fl = raw_fl - SL_INDEX_BITS + 1;
+    if (computed_fl >= FL_INDEX_COUNT)
+        computed_fl = FL_INDEX_COUNT - 1;
+
+    *fl = computed_fl;
+    *sl = (int)((size >> (raw_fl - SL_INDEX_BITS)) & (SL_INDEX_COUNT - 1));
+    if (*sl >= SL_INDEX_COUNT)
+        *sl = SL_INDEX_COUNT - 1;
 }
 
 static void mapping_search(uint32_t size, int *fl, int *sl)
@@ -139,6 +150,8 @@ static void mapping_search(uint32_t size, int *fl, int *sl)
             uint32_t round = (1u << (rfl - SL_INDEX_BITS)) - 1u;
             if (size <= UINT32_MAX - round)
                 size += round;
+            else
+                size = UINT32_MAX;
         }
     }
     mapping_insert(size, fl, sl);

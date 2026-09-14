@@ -1,5 +1,5 @@
 /*
- * Project Tsukasa — Kernel wait queue and poll implementation
+ * Project Tsukasa - Kernel wait queue and poll implementation
  *
  * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
@@ -86,6 +86,49 @@ void wait_queue_wake_all(wait_queue_head_t *h) {
 
     for (int i = 0; i < count; i++) {
         process_wake_blocked(to_wake[i]);
+    }
+}
+
+void wait_queue_prepare_to_wait(wait_queue_head_t *h, wait_queue_entry_t *entry)
+{
+    if (!h || !entry)
+        return;
+
+    unsigned long flags = spin_lock_irqsave(&h->lock);
+
+    wait_queue_entry_t *curr = h->head;
+    int already_queued = 0;
+    while (curr) {
+        if (curr == entry) {
+            already_queued = 1;
+            break;
+        }
+        curr = curr->next;
+    }
+
+    if (!already_queued) {
+        entry->next = h->head;
+        h->head = entry;
+    }
+
+    /* Transition state to blocked while holding wait queue lock to prevent lost wakeups */
+    process_block_current();
+
+    spin_unlock_irqrestore(&h->lock, flags);
+}
+
+void wait_queue_finish_wait(wait_queue_head_t *h, wait_queue_entry_t *entry)
+{
+    if (!h || !entry)
+        return;
+
+    wait_queue_remove(h, entry);
+
+    /* If thread resumed without yielding, ensure running state is restored */
+    process_t *self = process_current();
+    if (self && self->state == PROCESS_BLOCKED) {
+        self->state = PROCESS_RUNNING;
+        self->main_thread.state = THREAD_RUNNING;
     }
 }
 

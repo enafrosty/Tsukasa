@@ -82,7 +82,7 @@ void *kmalloc(size_t size)
     irq_flags = spin_lock_irqsave(&g_lock);
     ptr = tlsf_malloc(g_heap, req_size);
     if (!ptr) {
-        size_t pages = (req_size + 4095u) / 4096u;
+        size_t pages = (req_size + 64u + 4095u) / 4096u;
         uintptr_t phys;
         if (pages < HEAP_GROW_PAGES)
             pages = HEAP_GROW_PAGES;

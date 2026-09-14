@@ -235,7 +235,7 @@ void *shm_attach(int shm_id)
                                 phys_base,
                                 page_count,
                                 PAGING_MAP_READ | PAGING_MAP_WRITE |
-                                PAGING_MAP_EXEC | PAGING_MAP_USER) != 0) {
+                                PAGING_MAP_USER) != 0) {
         spin_lock(&g_shm_lock);
         att = shm_find_attachment_by_addr_locked(cur->pid, virt_addr);
         if (att)
@@ -326,13 +326,10 @@ int shm_destroy(int shm_id)
         spin_unlock(&g_shm_lock);
         return -1;
     }
-    if (r->ref_count > 0) {
-        spin_unlock(&g_shm_lock);
-        return -1;
-    }
-
     r->destroy_pending = 1;
-    shm_reap_region_locked(r);
+    if (r->ref_count == 0) {
+        shm_reap_region_locked(r);
+    }
     spin_unlock(&g_shm_lock);
     return 0;
 }

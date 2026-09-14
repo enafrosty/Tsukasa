@@ -859,7 +859,7 @@ static uintptr_t handle_system(uintptr_t cmd,
         size_t proc_shm_pages = 0;
         size_t proc_shm_attachments = 0;
 
-        if (!out)
+        if (!out || !vmm_validate_user_ptr(out, sizeof(*out), 1))
             return (uintptr_t)-1;
 
         heap_get_stats(&heap_stats);
@@ -945,7 +945,7 @@ static uintptr_t handle_system(uintptr_t cmd,
     {
         net_link_info_t info;
         struct tsukasa_net_mac *out = (struct tsukasa_net_mac *)(uintptr_t)arg2;
-        if (!out)
+        if (!out || !vmm_validate_user_ptr(out, sizeof(*out), 1))
             return (uintptr_t)-1;
         if (network_get_link_info(&info) != 0)
             return (uintptr_t)-1;
@@ -957,7 +957,7 @@ static uintptr_t handle_system(uintptr_t cmd,
     {
         net_link_info_t info;
         struct tsukasa_net_ipv4 *out = (struct tsukasa_net_ipv4 *)(uintptr_t)arg2;
-        if (!out)
+        if (!out || !vmm_validate_user_ptr(out, sizeof(*out), 1))
             return (uintptr_t)-1;
         if (network_get_link_info(&info) != 0)
             return (uintptr_t)-1;
@@ -969,7 +969,7 @@ static uintptr_t handle_system(uintptr_t cmd,
     {
         net_link_info_t info;
         struct tsukasa_net_ipv4 *out = (struct tsukasa_net_ipv4 *)(uintptr_t)arg2;
-        if (!out)
+        if (!out || !vmm_validate_user_ptr(out, sizeof(*out), 1))
             return (uintptr_t)-1;
         if (network_get_link_info(&info) != 0)
             return (uintptr_t)-1;
@@ -981,7 +981,7 @@ static uintptr_t handle_system(uintptr_t cmd,
     {
         net_link_info_t info;
         struct tsukasa_net_ipv4 *out = (struct tsukasa_net_ipv4 *)(uintptr_t)arg2;
-        if (!out)
+        if (!out || !vmm_validate_user_ptr(out, sizeof(*out), 1))
             return (uintptr_t)-1;
         if (network_get_link_info(&info) != 0)
             return (uintptr_t)-1;
@@ -1124,7 +1124,7 @@ static uintptr_t handle_system(uintptr_t cmd,
     {
         rtc_time_t now;
         struct tsukasa_time *out = (struct tsukasa_time *)(uintptr_t)arg2;
-        if (!out)
+        if (!out || !vmm_validate_user_ptr(out, sizeof(*out), 1))
             return (uintptr_t)-1;
         rtc_read(&now);
         out->sec = now.sec;

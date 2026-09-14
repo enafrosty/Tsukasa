@@ -1,5 +1,5 @@
 /*
- * Project Tsukasa — Virtual File System core with per-process FD tables
+ * Project Tsukasa - Virtual File System core with per-process FD tables
  *
  * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
@@ -1335,8 +1335,12 @@ size_t vfs_read(int fd, void *buf, size_t count)
             return 0;
 
         for (;;) {
-            if (p->size > 0)
-                return pipe_ring_read(p, buf, count);
+            if (p->size > 0) {
+                size_t got = pipe_ring_read(p, buf, count);
+                if (got > 0)
+                    wait_queue_wake_all(&p->waitq);
+                return got;
+            }
             if (p->writers == 0)
                 return 0; /* All writers closed and buffer drained: true EOF */
             if (f->flags & VFS_O_NONBLOCK)
@@ -1348,10 +1352,13 @@ size_t vfs_read(int fd, void *buf, size_t count)
             wait_queue_entry_t wqe;
             wqe.proc = proc;
             wqe.next = NULL;
-            wait_queue_add(&p->waitq, &wqe);
-            process_block_current();
+            wait_queue_prepare_to_wait(&p->waitq, &wqe);
+            if (p->size > 0 || p->writers == 0) {
+                wait_queue_finish_wait(&p->waitq, &wqe);
+                continue;
+            }
             process_yield();
-            wait_queue_remove(&p->waitq, &wqe);
+            wait_queue_finish_wait(&p->waitq, &wqe);
 #else
             return 0;
 #endif
@@ -1363,12 +1370,16 @@ size_t vfs_read(int fd, void *buf, size_t count)
             return 0;
         vfs_pipe_t *rx = f->u.sock.rx;
         for (;;) {
-            if (rx->size > 0)
-                return pipe_ring_read(rx, buf, count);
+            if (rx->size > 0) {
+                size_t got = pipe_ring_read(rx, buf, count);
+                if (got > 0)
+                    wait_queue_wake_all(&rx->waitq);
+                return got;
+            }
             if (rx->writers == 0)
                 return 0;
             if (f->flags & VFS_O_NONBLOCK)
-                return 0;
+                return (size_t)-EAGAIN;
 #ifdef __x86_64__
             process_t *p = vfs_current_process();
             if (!p)
@@ -1376,10 +1387,13 @@ size_t vfs_read(int fd, void *buf, size_t count)
             wait_queue_entry_t wqe;
             wqe.proc = p;
             wqe.next = NULL;
-            wait_queue_add(&rx->waitq, &wqe);
-            process_block_current();
+            wait_queue_prepare_to_wait(&rx->waitq, &wqe);
+            if (rx->size > 0 || rx->writers == 0) {
+                wait_queue_finish_wait(&rx->waitq, &wqe);
+                continue;
+            }
             process_yield();
-            wait_queue_remove(&rx->waitq, &wqe);
+            wait_queue_finish_wait(&rx->waitq, &wqe);
 #else
             return 0;
 #endif
@@ -1441,10 +1455,34 @@ size_t vfs_write(int fd, const void *buf, size_t count)
         vfs_pipe_t *p = f->u.pipe.pipe;
         if (!p || !f->u.pipe.can_write || p->readers == 0)
             return (size_t)-EPIPE;
-        size_t wr = pipe_ring_write(p, buf, count);
-        if (wr > 0)
-            wait_queue_wake_all(&p->waitq);
-        return wr;
+        for (;;) {
+            size_t wr = pipe_ring_write(p, buf, count);
+            if (wr > 0) {
+                wait_queue_wake_all(&p->waitq);
+                return wr;
+            }
+            if (p->readers == 0)
+                return (size_t)-EPIPE;
+            if (f->flags & VFS_O_NONBLOCK)
+                return (size_t)-EAGAIN;
+#ifdef __x86_64__
+            process_t *proc = vfs_current_process();
+            if (!proc)
+                return 0;
+            wait_queue_entry_t wqe;
+            wqe.proc = proc;
+            wqe.next = NULL;
+            wait_queue_prepare_to_wait(&p->waitq, &wqe);
+            if (p->size < VFS_PIPE_CAPACITY || p->readers == 0) {
+                wait_queue_finish_wait(&p->waitq, &wqe);
+                continue;
+            }
+            process_yield();
+            wait_queue_finish_wait(&p->waitq, &wqe);
+#else
+            return 0;
+#endif
+        }
     }
 
     if (f->backend == VFS_BACKEND_UNIXSOCK) {
