@@ -128,27 +128,7 @@ The build system requires standard GNU and LLVM bare-metal cross tools:
 
 sudo  apt-get  update
 
-sudo  apt-get  install  -y \
-
-build-essential \
-
-clang \
-
-lld \
-
-llvm \
-
-nasm \
-
-xorriso \
-
-mtools \
-
-dosfstools \
-
-git \
-
-qemu-system-x86
+sudo  apt-get  install  -y build-essential clang lld llvm nasm xorriso mtools dosfstools git qemu-system-x86
 
 ```
 
@@ -302,25 +282,7 @@ For full control over QEMU parameters, run:
 
 ```bash
 
-qemu-system-x86_64 \
-
--cdrom tsukasa.iso \
-
--hda  disk.img \
-
--boot d \
-
--m  256 \
-
--smp 2 \
-
--vga  std \
-
--serial stdio \
-
--netdev  user,id=u1 \
-
--device e1000,netdev=u1
+qemu-system-x86_64 -cdrom tsukasa.iso -hda  disk.img -boot d -m  256 -smp 2 -vga  std -serial stdio -netdev  user,id=u1 -device e1000,netdev=u1
 
 ```
 
