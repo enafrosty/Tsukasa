@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: ["**"]
+    branches: ["main"]
   pull_request:
 
 concurrency:
@@ -38,20 +38,7 @@ jobs:
           name: tsukasa-iso
           path: tsukasa.iso
           if-no-files-found: error
-
-  kernel-i386:
-    name: "Kernel (i386 Multiboot ISO)"
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Install toolchain
-        run: bash scripts/ci/install-toolchain.sh
-
-      - name: Build i386 ISO
-        run: make ARCH=i386 iso-i386
-
+          
   userland:
     name: "Userland (SDK, apps, coreutils, disktools)"
     runs-on: ubuntu-24.04
