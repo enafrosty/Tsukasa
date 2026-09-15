@@ -852,7 +852,16 @@ static void c01_test_entry(void)
     else
         kprintf("[guide05] migrated echo loads FAIL code=%d status=0x%x\n",
                 code, (unsigned)status);
-    process_exit(0);
+
+    vfs_stat_t st;
+    for (int i = 0; i < 500; i++) {
+        if (vfs_stat("/tmp/vanilla.sock", &st) == 0)
+            break;
+        process_yield();
+    }
+
+    kprintf("[selftest] ALL DONE\n");
+    acpi_power_off();
 }
 
 void syscall_table_run_selftests(void)

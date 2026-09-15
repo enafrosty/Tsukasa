@@ -19,10 +19,12 @@ BITS 64
 section .text
 
 global isr_x64_ignore
+global isr_x64_128
 global process_entry_resume
 extern idt_exception_handler_x64
 extern irq_handler_x64
 extern process_entry_trampoline
+extern syscall_dispatch
 
 %macro PUSH_GPRS 0
     push r15
@@ -189,6 +191,30 @@ isr_exception_common:
     iretq
 
 isr_x64_ignore:
+    iretq
+
+isr_x64_128:
+    test qword [rsp + 8], 3
+    jz .from_kernel
+    swapgs
+.from_kernel:
+    PUSH_GPRS
+    push qword [rsp + 64]
+    mov r9,  [rsp + 56 + 8]
+    mov r8,  [rsp + 72 + 8]
+    mov rcx, [rsp + 24 + 8]
+    mov rdx, [rsp + 32 + 8]
+    mov rsi, [rsp + 40 + 8]
+    mov rdi, [rsp + 0 + 8]
+    cld
+    call syscall_dispatch
+    add rsp, 8
+    mov [rsp + 0], rax
+    POP_GPRS
+    test qword [rsp + 8], 3
+    jz .skip_swap
+    swapgs
+.skip_swap:
     iretq
 
 process_entry_resume:

@@ -47,6 +47,8 @@
 #include "proc/process.h"
 #include "tty/tty.h"
 #include "user/apps/registry.h"
+#include "include/io.h"
+#include "include/kutils.h"
 
 #include "vga.h"
 
@@ -72,6 +74,55 @@ static void network_bootstrap_entry(void)
         kprintf("[boot:x64] network stack init skipped (no nic)\n");
     }
     process_exit(0);
+}
+
+extern void syscall_table_run_selftests(void);
+
+static int is_selftest_requested(const struct tsukasa_boot_info *boot_info)
+{
+    if (boot_info && boot_info->cmdline) {
+        if (k_strstr(boot_info->cmdline, "tsukasa.selftest=1"))
+            return 1;
+    }
+
+    io_outw(0x510, 0x0000);
+    char sig[4];
+    for (int i = 0; i < 4; i++)
+        sig[i] = (char)io_inb(0x511);
+
+    if (sig[0] == 'Q' && sig[1] == 'E' && sig[2] == 'M' && sig[3] == 'U') {
+        io_outw(0x510, 0x0019);
+        uint32_t count = 0;
+        count |= ((uint32_t)io_inb(0x511)) << 24;
+        count |= ((uint32_t)io_inb(0x511)) << 16;
+        count |= ((uint32_t)io_inb(0x511)) << 8;
+        count |= (uint32_t)io_inb(0x511);
+
+        for (uint32_t i = 0; i < count; i++) {
+            (void)io_inb(0x511); (void)io_inb(0x511);
+            (void)io_inb(0x511); (void)io_inb(0x511);
+
+            uint16_t select = 0;
+            select |= ((uint16_t)io_inb(0x511)) << 8;
+            select |= (uint16_t)io_inb(0x511);
+
+            (void)io_inb(0x511); (void)io_inb(0x511);
+
+            char name[56];
+            for (int j = 0; j < 56; j++)
+                name[j] = (char)io_inb(0x511);
+
+            if (k_strcmp(name, "opt/org.tsukasa.selftest") == 0 ||
+                k_strcmp(name, "opt/tsukasa.selftest") == 0) {
+                io_outw(0x510, select);
+                char val = (char)io_inb(0x511);
+                if (val == '1')
+                    return 1;
+            }
+        }
+    }
+
+    return 0;
 }
 
 void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
@@ -191,6 +242,11 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
         process_t *net_proc = process_spawn_kernel("net-bootstrap", network_bootstrap_entry);
         if (!net_proc)
             kprintf("[boot:x64] WARN: failed to spawn network bootstrap process\n");
+    }
+
+    if (is_selftest_requested(boot_info)) {
+        kprintf("[boot:x64] automated selftest mode enabled\n");
+        syscall_table_run_selftests();
     }
     /*
     kprintf("[boot:x64] phase2 selftests spawn...\n");
