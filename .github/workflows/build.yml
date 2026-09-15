@@ -1,0 +1,107 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLVM_VERSION: "18"
+
+jobs:
+  kernel-x86_64:
+    name: "Kernel (x86_64 Limine ISO)"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: bash scripts/ci/install-toolchain.sh
+
+      - name: Cache Limine bootloader artifacts
+        uses: actions/cache@v4
+        with:
+          path: .limine
+          key: limine-v8.x-binary
+
+      - name: Build x86_64 ISO
+        run: make iso-x86_64
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsukasa-iso
+          path: tsukasa.iso
+          if-no-files-found: error
+
+  kernel-i386:
+    name: "Kernel (i386 Multiboot ISO)"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: bash scripts/ci/install-toolchain.sh
+
+      - name: Build i386 ISO
+        run: make ARCH=i386 iso-i386
+
+  userland:
+    name: "Userland (SDK, apps, coreutils, disktools)"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: bash scripts/ci/install-toolchain.sh
+
+      - name: Build userland components
+        run: bash scripts/ci/build-all.sh
+
+  vanilla:
+    name: "Vanilla (Display server, SDK, client apps)"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: bash scripts/ci/install-toolchain.sh
+
+      - name: Build and verify Vanilla binaries
+        run: make -C vanilla check
+
+  vanilla-host:
+    name: "Vanilla Host (SDL2 emulator)"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install toolchain with SDL2
+        run: bash scripts/ci/install-toolchain.sh --with-sdl
+
+      - name: Build Vanilla host emulator
+        run: make -C vanilla host
+
+  toolchain-gcc:
+    name: "Toolchain (GCC x86_64 build check)"
+    runs-on: ubuntu-24.04
+    # Marked continue-on-error: true per P0-1 specification to monitor GCC bit rot without blocking CI
+    continue-on-error: true
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: bash scripts/ci/install-toolchain.sh
+
+      - name: Build x86_64 kernel with GCC
+        run: make TOOLCHAIN=gcc ARCH=x86_64
