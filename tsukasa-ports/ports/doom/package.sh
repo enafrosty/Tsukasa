@@ -20,7 +20,7 @@ set -e
 PORT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STAGING_DIR="${PORT_DIR}/../../staging"
 SRC_DIR="${PORT_DIR}/src"
-MAKE_CMD="${MAKE:-mingw32-make}"
+MAKE_CMD="${MAKE:-make}"
 
 ACTION="${1:-build}"
 
