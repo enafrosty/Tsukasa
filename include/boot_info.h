@@ -77,6 +77,7 @@ struct tsukasa_boot_info {
     const struct tsukasa_boot_module *modules;
 
     uint64_t rsdp_addr;
+    const char *cmdline;
 };
 
 static inline int tsukasa_boot_info_is_valid(const void *opaque)

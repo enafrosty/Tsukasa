@@ -96,6 +96,7 @@ extern void isr_x64_45(void);
 extern void isr_x64_46(void);
 extern void isr_x64_47(void);
 extern void isr_x64_65(void);
+extern void isr_x64_128(void);
 extern void isr_x64_ignore(void);
 
 static void (*const exception_stubs[32])(void) = {
@@ -236,6 +237,7 @@ void idt_init_x64(void)
     set_gate(46, isr_x64_46, 0x8Eu);
     set_gate(47, isr_x64_47, 0x8Eu);
     set_gate(65, isr_x64_65, 0x8Eu);
+    set_gate(128, isr_x64_128, 0xEEu);
 
     idtp.limit = (uint16_t)(sizeof(idt) - 1);
     idtp.base = (uint64_t)(uintptr_t)&idt;

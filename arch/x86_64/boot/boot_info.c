@@ -73,6 +73,13 @@ static volatile struct limine_kernel_address_request kernel_address_request = {
 };
 
 __attribute__((used, section(".limine_requests")))
+static volatile struct limine_kernel_file_request kernel_file_request = {
+    .id = LIMINE_KERNEL_FILE_REQUEST,
+    .revision = 0,
+    .response = NULL,
+};
+
+__attribute__((used, section(".limine_requests")))
 volatile struct limine_smp_request smp_request = {
     .id = LIMINE_SMP_REQUEST,
     .revision = 0,
@@ -193,6 +200,10 @@ static void populate_boot_info(void)
 
         g_boot_info.module_count = count;
     }
+
+    g_boot_info.cmdline = NULL;
+    if (kernel_file_request.response && kernel_file_request.response->kernel_file)
+        g_boot_info.cmdline = kernel_file_request.response->kernel_file->cmdline;
 
     (void)kernel_address_request;
 }

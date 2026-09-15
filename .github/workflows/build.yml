@@ -92,3 +92,30 @@ jobs:
 
       - name: Build x86_64 kernel with GCC
         run: make TOOLCHAIN=gcc ARCH=x86_64
+
+  boot-test:
+    name: "QEMU Boot Smoke Test"
+    needs: kernel-x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download ISO artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tsukasa-iso
+
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+
+      - name: Run boot smoke test
+        run: bash scripts/ci/boot-test.sh tsukasa.iso boot.log
+
+      - name: Upload boot log
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: boot-log
+          path: boot.log
+
