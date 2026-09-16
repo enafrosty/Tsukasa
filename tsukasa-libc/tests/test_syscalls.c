@@ -31,7 +31,20 @@
 #include <stdio.h>
 #include "../../scripts/test/tsk_test.h"
 
-int main(int argc, char **argv, char **envp)
+static uintptr_t s_entry_rsp;
+
+static int real_main(int argc, char **argv, char **envp) __attribute__((used));
+
+__attribute__((naked)) int main(void)
+{
+    __asm__ volatile (
+        "movq %%rsp, %0\n\t"
+        "jmp real_main\n\t"
+        : "=m"(s_entry_rsp)
+    );
+}
+
+static int real_main(int argc, char **argv, char **envp)
 {
     (void)argc;
     (void)argv;
@@ -40,9 +53,7 @@ int main(int argc, char **argv, char **envp)
     int total = 5;
 
     /* Test 1: Stack frame alignment (rsp % 16 == 8 on function entry). */
-    uintptr_t rsp_val;
-    __asm__ volatile ("mov %%rsp, %0" : "=r"(rsp_val));
-    if ((rsp_val & 0xF) != 8) {
+    if ((s_entry_rsp & 0xF) != 8) {
         TSK_TEST_FAIL("syscalls", "stack_alignment", "stack frame unaligned");
         return 1;
     }

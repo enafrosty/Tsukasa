@@ -28,16 +28,27 @@ static size_t test_strlen(const char *s)
     return len;
 }
 
-int main(int argc, char **argv, char **envp)
+static uintptr_t s_entry_rsp;
+
+static int real_main(int argc, char **argv, char **envp) __attribute__((used));
+
+__attribute__((naked)) int main(void)
+{
+    __asm__ volatile (
+        "movq %%rsp, %0\n\t"
+        "jmp real_main\n\t"
+        : "=m"(s_entry_rsp)
+    );
+}
+
+static int real_main(int argc, char **argv, char **envp)
 {
     (void)envp;
     int passed = 0;
     int total = 4;
 
     /* Verify 16-byte stack frame alignment on entry to main (rsp % 16 == 8 per AMD64 ABI). */
-    uintptr_t rsp_val;
-    __asm__ volatile ("mov %%rsp, %0" : "=r"(rsp_val));
-    if ((rsp_val & 0xF) != 8) {
+    if ((s_entry_rsp & 0xF) != 8) {
         TSK_TEST_FAIL("crt0", "stack_alignment", "rsp % 16 != 8");
         return 1;
     }
