@@ -40,6 +40,127 @@ static void kprintf_lock_release(int owned)
         spin_unlock(&g_kprintf_lock);
 }
 
+#define MAX_LOG_SUBSYSTEMS 16
+typedef struct {
+    char subsys[16];
+    enum k_loglevel level;
+    int active;
+} k_subsys_log_t;
+
+enum k_loglevel k_log_threshold = K_INFO;
+static k_subsys_log_t g_subsys_logs[MAX_LOG_SUBSYSTEMS];
+
+static int k_streq(const char *a, const char *b)
+{
+    if (!a || !b) return 0;
+    while (*a && (*a == *b)) {
+        a++;
+        b++;
+    }
+    return (*a == *b);
+}
+
+static void k_strlcpy(char *dst, const char *src, size_t n)
+{
+    size_t i = 0;
+    if (!n) return;
+    while (i + 1 < n && src[i]) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+void k_log_set_level(const char *subsys, enum k_loglevel lvl)
+{
+    if (!subsys) return;
+    for (int i = 0; i < MAX_LOG_SUBSYSTEMS; i++) {
+        if (g_subsys_logs[i].active && k_streq(g_subsys_logs[i].subsys, subsys)) {
+            g_subsys_logs[i].level = lvl;
+            return;
+        }
+    }
+    for (int i = 0; i < MAX_LOG_SUBSYSTEMS; i++) {
+        if (!g_subsys_logs[i].active) {
+            g_subsys_logs[i].active = 1;
+            k_strlcpy(g_subsys_logs[i].subsys, subsys, sizeof(g_subsys_logs[i].subsys));
+            g_subsys_logs[i].level = lvl;
+            return;
+        }
+    }
+}
+
+int k_log_enabled(enum k_loglevel lvl, const char *subsys)
+{
+    if (subsys) {
+        for (int i = 0; i < MAX_LOG_SUBSYSTEMS; i++) {
+            if (g_subsys_logs[i].active && k_streq(g_subsys_logs[i].subsys, subsys)) {
+                return (int)lvl <= (int)g_subsys_logs[i].level;
+            }
+        }
+    }
+    return (int)lvl <= (int)k_log_threshold;
+}
+
+static enum k_loglevel parse_level_name(const char *name, size_t len)
+{
+    if (len == 3 && name[0] == 'e' && name[1] == 'r' && name[2] == 'r') return K_ERR;
+    if (len == 4 && name[0] == 'w' && name[1] == 'a' && name[2] == 'r' && name[3] == 'n') return K_WARN;
+    if (len == 4 && name[0] == 'i' && name[1] == 'n' && name[2] == 'f' && name[3] == 'o') return K_INFO;
+    if (len == 5 && name[0] == 'd' && name[1] == 'e' && name[2] == 'b' && name[3] == 'u' && name[4] == 'g') return K_DEBUG;
+    if (len == 1) {
+        if (name[0] == '0') return K_ERR;
+        if (name[0] == '1') return K_WARN;
+        if (name[0] == '2') return K_INFO;
+        if (name[0] == '3') return K_DEBUG;
+    }
+    return K_INFO;
+}
+
+void k_log_init(const char *cmdline)
+{
+    if (!cmdline) return;
+
+    const char *p = cmdline;
+    while (*p) {
+        if (p[0] == 't' && p[1] == 's' && p[2] == 'u' && p[3] == 'k' && p[4] == 'a' && p[5] == 's' && p[6] == 'a' && p[7] == '.' &&
+            p[8] == 'l' && p[9] == 'o' && p[10] == 'g' && p[11] == 'l' && p[12] == 'e' && p[13] == 'v' && p[14] == 'e' && p[15] == 'l' && p[16] == '=') {
+            p += 17;
+            const char *start = p;
+            while (*p && *p != ' ') p++;
+            k_log_threshold = parse_level_name(start, (size_t)(p - start));
+            continue;
+        }
+
+        if (p[0] == 't' && p[1] == 's' && p[2] == 'u' && p[3] == 'k' && p[4] == 'a' && p[5] == 's' && p[6] == 'a' && p[7] == '.' &&
+            p[8] == 'l' && p[9] == 'o' && p[10] == 'g' && p[11] == 'f' && p[12] == 'i' && p[13] == 'l' && p[14] == 't' && p[15] == 'e' && p[16] == 'r' && p[17] == '=') {
+            p += 18;
+            while (*p && *p != ' ') {
+                const char *tag_start = p;
+                while (*p && *p != ':' && *p != ',' && *p != ' ') p++;
+                if (*p != ':') break;
+                size_t tag_len = (size_t)(p - tag_start);
+                p++;
+                const char *lvl_start = p;
+                while (*p && *p != ',' && *p != ' ') p++;
+                size_t lvl_len = (size_t)(p - lvl_start);
+
+                char tag[16];
+                if (tag_len >= sizeof(tag)) tag_len = sizeof(tag) - 1;
+                for (size_t t = 0; t < tag_len; t++) tag[t] = tag_start[t];
+                tag[tag_len] = '\0';
+
+                enum k_loglevel lvl = parse_level_name(lvl_start, lvl_len);
+                k_log_set_level(tag, lvl);
+
+                if (*p == ',') p++;
+            }
+            continue;
+        }
+        p++;
+    }
+}
+
 /* low-level output */
 
 static void out_char(char c)
@@ -51,7 +172,7 @@ static const char hex_lower[] = "0123456789abcdef";
 static const char hex_upper[] = "0123456789ABCDEF";
 
 /* Write an unsigned integer in `base` into buf (reversed), return length. */
-static int uint_to_buf(char *buf, uint32_t val, uint32_t base, const char *digits)
+static int uint_to_buf(char *buf, uint64_t val, uint32_t base, const char *digits)
 {
     if (val == 0) {
         buf[0] = '0';
@@ -100,7 +221,7 @@ static void fmt_str(fmt_ctx_t *f, const char *s, int width, char pad)
 
 static int do_fmt(fmt_ctx_t *f, const char *fmt, va_list ap)
 {
-    char tmp[32];
+    char tmp[64];
 
     while (*fmt) {
         if (*fmt != '%') {
@@ -116,34 +237,54 @@ static int do_fmt(fmt_ctx_t *f, const char *fmt, va_list ap)
         while (*fmt >= '1' && *fmt <= '9')
             width = width * 10 + (*fmt++ - '0');
 
+        int is_long = 0;
+        if (*fmt == 'l') {
+            is_long = 1;
+            fmt++;
+            if (*fmt == 'l') {
+                is_long = 2;
+                fmt++;
+            }
+        } else if (*fmt == 'z') {
+            is_long = 1;
+            fmt++;
+        }
+
         char spec = *fmt++;
         switch (spec) {
         case 'd':
         case 'i': {
-            int32_t val = va_arg(ap, int32_t);
+            int64_t val = is_long ? va_arg(ap, int64_t) : (int64_t)va_arg(ap, int32_t);
             if (val < 0) { fmt_putc(f, '-'); val = -val; }
-            int len = uint_to_buf(tmp, (uint32_t)val, 10, hex_lower);
+            int len = uint_to_buf(tmp, (uint64_t)val, 10, hex_lower);
             if (len < width) fmt_pad(f, pad, width - len);
             for (int i = 0; i < len; i++) fmt_putc(f, tmp[i]);
             break;
         }
         case 'u': {
-            uint32_t val = va_arg(ap, uint32_t);
+            uint64_t val = is_long ? va_arg(ap, uint64_t) : (uint64_t)va_arg(ap, uint32_t);
             int len = uint_to_buf(tmp, val, 10, hex_lower);
             if (len < width) fmt_pad(f, pad, width - len);
             for (int i = 0; i < len; i++) fmt_putc(f, tmp[i]);
             break;
         }
         case 'x': {
-            uint32_t val = va_arg(ap, uint32_t);
+            uint64_t val = is_long ? va_arg(ap, uint64_t) : (uint64_t)va_arg(ap, uint32_t);
             int len = uint_to_buf(tmp, val, 16, hex_lower);
             if (len < width) fmt_pad(f, pad, width - len);
             for (int i = 0; i < len; i++) fmt_putc(f, tmp[i]);
             break;
         }
         case 'X': {
-            uint32_t val = va_arg(ap, uint32_t);
+            uint64_t val = is_long ? va_arg(ap, uint64_t) : (uint64_t)va_arg(ap, uint32_t);
             int len = uint_to_buf(tmp, val, 16, hex_upper);
+            if (len < width) fmt_pad(f, pad, width - len);
+            for (int i = 0; i < len; i++) fmt_putc(f, tmp[i]);
+            break;
+        }
+        case 'p': {
+            uint64_t val = (uint64_t)(uintptr_t)va_arg(ap, void *);
+            int len = uint_to_buf(tmp, val, 16, hex_lower);
             if (len < width) fmt_pad(f, pad, width - len);
             for (int i = 0; i < len; i++) fmt_putc(f, tmp[i]);
             break;

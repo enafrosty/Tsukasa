@@ -23,6 +23,7 @@
 #include "gfx/blit.h"
 #include "gfx/font.h"
 #include "include/kprintf.h"
+#include "include/ksymbols.h"
 #include "proc/process.h"
 
 const char* exception_name(uint8_t vector) {
@@ -77,8 +78,8 @@ static void preg2(const char *l1, uint64_t v1, const char *l2, uint64_t v2) {
     pline(buf, COL_WHITE);
 }
 
-static int kptr_ok(uint64_t p) {
-    return p >= 0xffff800000000000ULL && (p & 7) == 0;
+static void panic_emit_line(const char *line) {
+    pline(line, COL_WHITE);
 }
 
 volatile bool g_in_panic = false;
@@ -135,19 +136,11 @@ void kernel_panic(interrupt_frame_t *regs, const char *error_name) {
         pline(buf, COL_HIGHLIGHT);
     }
 
-    if (regs && kptr_ok(regs->rbp)) {
-        pline("", COL_WHITE);
-        pline("-- Stack trace (RBP chain) --", COL_HIGHLIGHT);
-        uint64_t rbp = regs->rbp;
-        for (int i = 0; i < 16 && kptr_ok(rbp); i++) {
-            uint64_t ret = ((uint64_t *)rbp)[1];
-            if (!ret) break;
-            ksprintf(buf, sizeof(buf), "  #%d 0x%08x%08x",
-                     i, (uint32_t)(ret >> 32), (uint32_t)ret);
-            pline(buf, COL_WHITE);
-            rbp = ((uint64_t *)rbp)[0];
-        }
-    }
+    pline("", COL_WHITE);
+    pline("backtrace:", COL_HIGHLIGHT);
+    uint64_t rbp_val = regs ? regs->rbp : (uint64_t)__builtin_frame_address(0);
+    uint64_t rip_hint = regs ? regs->rip : (uint64_t)__builtin_return_address(0);
+    k_backtrace_custom(rbp_val, rip_hint, 16, panic_emit_line);
 
     pline("", COL_WHITE);
     pline("The CPU has been halted. Power off the machine.", COL_WHITE);
