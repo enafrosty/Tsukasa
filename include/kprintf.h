@@ -29,4 +29,29 @@ int ksprintf(char *buf, size_t n, const char *fmt, ...);
 /* Bare string output to serial (no formatting). */
 void kputs(const char *s);
 
+/* Kernel log levels */
+enum k_loglevel {
+    K_ERR = 0,
+    K_WARN = 1,
+    K_INFO = 2,
+    K_DEBUG = 3
+};
+
+/* Global threshold; messages above it are dropped. Default K_INFO. */
+extern enum k_loglevel k_log_threshold;
+
+/* Per-subsystem override: subsystem tag -> threshold. */
+void k_log_set_level(const char *subsys, enum k_loglevel lvl);
+int k_log_enabled(enum k_loglevel lvl, const char *subsys);
+void k_log_init(const char *cmdline);
+
+#define klog(lvl, subsys, fmt, ...) \
+    do { if (k_log_enabled((lvl), (subsys))) \
+            kprintf("[%s] " fmt, (subsys), ##__VA_ARGS__); } while (0)
+
+#define kerr(s, ...)   klog(K_ERR,   s, __VA_ARGS__)
+#define kwarn(s, ...)  klog(K_WARN,  s, __VA_ARGS__)
+#define kinfo(s, ...)  klog(K_INFO,  s, __VA_ARGS__)
+#define kdebug(s, ...) klog(K_DEBUG, s, __VA_ARGS__)
+
 #endif /* KPRINTF_H */

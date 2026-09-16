@@ -23,6 +23,7 @@
 #include "cpu/idt.h"
 
 #include "include/kprintf.h"
+#include "include/ksymbols.h"
 #include "include/smp.h"
 #include "include/lapic.h"
 #include "mm/pmm.h"
@@ -188,6 +189,8 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
         :
         : "rax", "memory");
     kprintf("[boot:x64] Tsukasa x86_64 kernel starting\n");
+    if (boot_info && boot_info->cmdline)
+        k_log_init(boot_info->cmdline);
 
     vmm_x64_init(boot_info ? boot_info->hhdm_offset : 0);
     kprintf("[boot:x64] hhdm=0x%08x%08x\n",

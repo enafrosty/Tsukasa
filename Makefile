@@ -47,7 +47,7 @@ COMMON_OBJS = vga.o \
     fs/vfs.o fs/devfs.o fs/initrd.o fs/fat12.o fs/fat32.o fs/mkfs_fat32.o fs/memfs.o fs/procfs.o fs/sysfs.o fs/bootfs.o \
     fs/tar.o fs/tar_testdata.o \
     loader/elf.o loader/exec.o loader/elf64.o \
-    lib/kprintf.o lib/kutils.o lib/compiler_rt.o \
+    lib/kprintf.o lib/kutils.o lib/compiler_rt.o lib/ksymbols.o lib/backtrace.o \
     gfx/blit.o gfx/font.o gfx/font_8x8.o \
     gfx/ui.o gfx/bmp.o \
     gfx/wm.o gfx/cursor.o gfx/gui_srv.o gfx/desktop.o
@@ -90,6 +90,7 @@ ifeq ($(ARCH),x86_64)
 KERNEL_BIN = tsukasa_x64.elf
 CFLAGS = -m64 -mcmodel=kernel -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
          -ffreestanding -fno-pie -fno-stack-protector -Wall -Wextra -O2 \
+         -fno-omit-frame-pointer \
          -DTSUKASA_USERLIB_KERNEL \
          -I. -Iinclude -Iarch/x86_64 -Inet -Inet/lwip_arch \
          -Inet/third_party/lwip
@@ -150,8 +151,27 @@ arch-guard:
 	@mkdir -p $(dir $@)
 	$(ASM) $(ASMFLAGS) -o $@ $<
 
+lib/ksymbols_table.c:
+	@mkdir -p lib
+	@echo '/* Initial stub */' > $@
+	@echo '#include "include/ksymbols.h"' >> $@
+	@echo 'const struct ksym ksym_table[] = {};' >> $@
+	@echo 'const unsigned long ksym_count = 0;' >> $@
+
+lib/ksymbols_table.o: lib/ksymbols_table.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+ifeq ($(ARCH),x86_64)
+$(KERNEL_BIN): arch-guard $(OBJS) lib/ksymbols_table.o
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) lib/ksymbols_table.o
+	bash scripts/build/gen-ksymbols.sh $@ lib/ksymbols_table.c
+	$(CC) $(CFLAGS) -c -o lib/ksymbols_table.o lib/ksymbols_table.c
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) lib/ksymbols_table.o
+else
 $(KERNEL_BIN): arch-guard $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+endif
 
 $(INITRD_FILES)/hello.elf: user_elf/hello64.asm
 	@mkdir -p $(INITRD_FILES)
@@ -448,7 +468,7 @@ qemu run: iso-x86_64
 
 clean:
 	find . -name '*.o' -delete
-	rm -f tsukasa.bin tsukasa_x64.elf $(ISO_IMAGE) $(INITRD_IMG) $(ARCH_MARKER)
+	rm -f tsukasa.bin tsukasa_x64.elf $(ISO_IMAGE) $(INITRD_IMG) $(ARCH_MARKER) lib/ksymbols_table.c
 	rm -rf $(ISO_DIR) $(SDK_DIR) $(INITRD_FILES)
 	$(MAKE) -C vanilla clean
 	$(MAKE) -C tsukasa-disktools clean
