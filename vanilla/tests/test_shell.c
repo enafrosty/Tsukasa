@@ -18,15 +18,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/input.h>
+#include "../../scripts/test/tsk_test.h"
 
 #include "../server/server.h"
 #include "../server/shell.h"
 #include "../server/launcher.h"
 
+static const char *g_shell_case = "";
+
 #define ASSERT(cond, msg) \
     do { \
         if (!(cond)) { \
-            printf("[FAIL] %s:%d: ASSERT failed: %s (%s)\n", __FILE__, __LINE__, #cond, msg); \
+            TSK_TEST_FAIL("shell", g_shell_case, (msg)); \
             exit(1); \
         } \
     } while (0)
@@ -282,14 +285,39 @@ int main(void)
     printf("============================================================\n");
     printf("  Project Tsukasa - Desktop Shell & Launcher Unit Tests\n");
     printf("============================================================\n");
+    int passed = 0;
+    int total = 6;
 
+    g_shell_case = "layout_clock";
     test_shell_layout_and_clock();
-    test_fuzzy_matching_and_ranking();
-    test_evdev_to_ascii_and_nav();
-    test_aero_snap_and_work_area();
-    test_input_cursor_tracking_and_damage();
-    test_shell_click_and_window_toggle();
+    TSK_TEST_PASS("shell", "layout_clock");
+    passed++;
 
-    printf("\n[SUCCESS] All Desktop Shell & Launcher unit tests passed!\n");
+    g_shell_case = "fuzzy_matching";
+    test_fuzzy_matching_and_ranking();
+    TSK_TEST_PASS("shell", "fuzzy_matching");
+    passed++;
+
+    g_shell_case = "evdev_keymap";
+    test_evdev_to_ascii_and_nav();
+    TSK_TEST_PASS("shell", "evdev_keymap");
+    passed++;
+
+    g_shell_case = "aero_snap";
+    test_aero_snap_and_work_area();
+    TSK_TEST_PASS("shell", "aero_snap");
+    passed++;
+
+    g_shell_case = "cursor_tracking";
+    test_input_cursor_tracking_and_damage();
+    TSK_TEST_PASS("shell", "cursor_tracking");
+    passed++;
+
+    g_shell_case = "click_toggle";
+    test_shell_click_and_window_toggle();
+    TSK_TEST_PASS("shell", "click_toggle");
+    passed++;
+
+    TSK_TEST_DONE("shell", passed, total);
     return 0;
 }

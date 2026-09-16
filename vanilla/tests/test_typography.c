@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../scripts/test/tsk_test.h"
 
 #define TEST_ASSERT(cond, msg) \
     do { \
@@ -216,29 +217,44 @@ int main(void)
     printf("========================================================\n");
     printf(" Project Vanilla - Phase 4, Step 4.3 Typography & Images\n");
     printf("========================================================\n");
+    int passed = 0;
+    int total = 5;
 
-    if (test_font_init_and_glyph() != 0)
+    if (test_font_init_and_glyph() != 0) {
+        TSK_TEST_FAIL("typography", "font_glyph", "test_font_init_and_glyph failed");
         return 1;
-    printf("[PASS] 1. Font initialization and vector glyph rasterization\n");
+    }
+    TSK_TEST_PASS("typography", "font_glyph");
+    passed++;
 
-    if (test_lru_glyph_cache() != 0)
+    if (test_lru_glyph_cache() != 0) {
+        TSK_TEST_FAIL("typography", "lru_cache", "test_lru_glyph_cache failed");
         return 1;
-    printf("[PASS] 2. LRU glyph cache eviction and retrieval\n");
+    }
+    TSK_TEST_PASS("typography", "lru_cache");
+    passed++;
 
-    if (test_font_measure_text() != 0)
+    if (test_font_measure_text() != 0) {
+        TSK_TEST_FAIL("typography", "measure_text", "test_font_measure_text failed");
         return 1;
-    printf("[PASS] 3. Font text measurement and vertical metrics\n");
+    }
+    TSK_TEST_PASS("typography", "measure_text");
+    passed++;
 
-    if (test_font_alpha_blending() != 0)
+    if (test_font_alpha_blending() != 0) {
+        TSK_TEST_FAIL("typography", "alpha_blending", "test_font_alpha_blending failed");
         return 1;
-    printf("[PASS] 4. Anti-aliased font alpha blending onto ARGB buffer\n");
+    }
+    TSK_TEST_PASS("typography", "alpha_blending");
+    passed++;
 
-    if (test_image_decode_and_blt() != 0)
+    if (test_image_decode_and_blt() != 0) {
+        TSK_TEST_FAIL("typography", "image_decode_blt", "test_image_decode_and_blt failed");
         return 1;
-    printf("[PASS] 5. Image memory decoding and scaled blitter\n");
+    }
+    TSK_TEST_PASS("typography", "image_decode_blt");
+    passed++;
 
-    printf("========================================================\n");
-    printf("[OK] Step 4.3 Typography & Image Pipeline test PASSED.\n");
-    printf("========================================================\n");
+    TSK_TEST_DONE("typography", passed, total);
     return 0;
 }

@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include "../../scripts/test/tsk_test.h"
 
 #define TEST_SOCKET_PATH "/tmp/vanilla_test.sock"
 #define TEST_WIN_W 320
@@ -540,51 +541,55 @@ int main(int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], "client") == 0)
         return run_client(sock_path);
 
+    int res = 0;
     if (argc > 1 && strcmp(argv[1], "loopback") == 0) {
         printf("========================================================\n");
         printf(" Project Vanilla - Phase 4, Step 4.1 IPC & SHM Test\n");
         printf("========================================================\n");
-        return run_inprocess_loopback(sock_path);
-    }
+        res = run_inprocess_loopback(sock_path);
+    } else {
+        printf("========================================================\n");
+        printf(" Project Vanilla - Phase 4, Step 4.1 IPC & SHM Test\n");
+        printf("========================================================\n");
 
-    printf("========================================================\n");
-    printf(" Project Vanilla - Phase 4, Step 4.1 IPC & SHM Test\n");
-    printf("========================================================\n");
-
-    vanilla_server_t srv;
-    if (vanilla_server_init(&srv, sock_path) < 0) {
-        printf("[FAIL] 1. Failed to start and bind server socket\n");
-        return 1;
-    }
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        return run_client(sock_path);
-    } else if (pid > 0) {
-        printf("[PASS] 1. Server started and bound socket at %s\n", sock_path);
-        int srv_rc = run_server_loop(&srv);
-        int status = 0;
-        waitpid(pid, &status, 0);
-        vanilla_server_close(&srv);
-
-        if (srv_rc != 0 || status != 0) {
-            printf("[FAIL] Step 4.1 test failed (srv_rc=%d, client_status=%d)\n", srv_rc, status);
+        vanilla_server_t srv;
+        if (vanilla_server_init(&srv, sock_path) < 0) {
+            printf("[FAIL] 1. Failed to start and bind server socket\n");
+            TSK_TEST_FAIL("ipc", "server_bind", "Failed to start and bind server socket");
             return 1;
         }
 
-        printf("[PASS] 2. Client connected and completed HELLO handshake.\n");
-        printf("[PASS] 3. Client requested 320x240 window with SHM surface.\n");
-        printf("[PASS] 4. Client mapped SHM surface and rendered gradient pattern.\n");
-        printf("[PASS] 5. Server received MSG_PRESENT and verified zero-copy pixels.\n");
-        printf("[PASS] 6. Clean disconnection, resource release, and shutdown verified.\n");
-        printf("========================================================\n");
-        printf("[OK] Step 4.1 IPC & Shared Memory Architecture test PASSED.\n");
-        printf("========================================================\n");
+        pid_t pid = fork();
+        if (pid == 0) {
+            return run_client(sock_path);
+        } else if (pid > 0) {
+            printf("[PASS] 1. Server started and bound socket at %s\n", sock_path);
+            int srv_rc = run_server_loop(&srv);
+            int status = 0;
+            waitpid(pid, &status, 0);
+            vanilla_server_close(&srv);
+
+            if (srv_rc != 0 || status != 0)
+                res = 1;
+        } else {
+            /* Single-process environment (fork unsupported): run synchronous loopback */
+            vanilla_server_close(&srv);
+            res = run_inprocess_loopback(sock_path);
+        }
+    }
+
+    if (res == 0) {
+        TSK_TEST_PASS("ipc", "server_bind");
+        TSK_TEST_PASS("ipc", "hello_handshake");
+        TSK_TEST_PASS("ipc", "create_window");
+        TSK_TEST_PASS("ipc", "present_shm");
+        TSK_TEST_PASS("ipc", "move_focus_input");
+        TSK_TEST_PASS("ipc", "destroy_shutdown");
+        TSK_TEST_DONE("ipc", 6, 6);
         return 0;
     } else {
-        /* Single-process environment (fork unsupported): run synchronous loopback */
-        vanilla_server_close(&srv);
-        return run_inprocess_loopback(sock_path);
+        TSK_TEST_FAIL("ipc", "loopback", "IPC and SHM test failed");
+        return 1;
     }
 }
 

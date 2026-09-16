@@ -125,7 +125,7 @@ OBJS = boot.o isr.o idt.o kernel.o \
 ISO_TARGET = iso-i386
 endif
 
-.PHONY: all iso initrd clean check-multiboot iso-i386 iso-x86_64 limine-artifacts arch-guard sdk apps vanilla coreutils disktools ports
+.PHONY: all iso initrd clean check-multiboot iso-i386 iso-x86_64 limine-artifacts arch-guard sdk apps vanilla coreutils disktools ports check libc-tests
 
 all: arch-guard $(KERNEL_BIN)
 
@@ -245,6 +245,10 @@ $(INITRD_FILES)/TESTSHELL.ELF: vanilla
 	@mkdir -p $(INITRD_FILES)
 	cp vanilla/bin/test_shell.elf $@
 
+$(INITRD_FILES)/TSHELL.ELF: vanilla
+	@mkdir -p $(INITRD_FILES)
+	cp vanilla/bin/test_shell.elf $@
+
 $(INITRD_FILES)/TERMINAL.ELF: vanilla
 	@mkdir -p $(INITRD_FILES)
 	cp vanilla/bin/terminal.elf $@
@@ -318,7 +322,36 @@ $(INITRD_FILES)/LUAC.ELF: ports
 	@mkdir -p $(INITRD_FILES)
 	cp tsukasa-ports/staging/bin/luac.elf $@
 
-apps: $(INITRD_FILES)/hellosdk.elf $(INITRD_FILES)/echo.elf $(INITRD_FILES)/cat.elf $(INITRD_FILES)/argvchk.elf $(INITRD_FILES)/futex10.elf $(INITRD_FILES)/usock20.elf $(INITRD_FILES)/wsrv15.elf $(INITRD_FILES)/wapp15.elf $(INITRD_FILES)/wdemo16.elf $(INITRD_FILES)/VSRV.ELF $(INITRD_FILES)/TESTIPC.ELF $(INITRD_FILES)/TESTCOMP.ELF $(INITRD_FILES)/TESTTYPO.ELF $(INITRD_FILES)/TESTSHELL.ELF $(INITRD_FILES)/TERMINAL.ELF $(INITRD_FILES)/NOTEPAD.ELF $(INITRD_FILES)/CALC.ELF $(INITRD_FILES)/FILEMGR.ELF $(INITRD_FILES)/SETTINGS.ELF $(INITRD_FILES)/TASKMGR.ELF $(INITRD_FILES)/TSH.ELF $(INITRD_FILES)/FDISK.ELF $(INITRD_FILES)/MKFSFAT.ELF $(INITRD_FILES)/MKFSEXT2.ELF $(INITRD_FILES)/INSTALL.ELF $(INITRD_FILES)/DOOM.ELF $(INITRD_FILES)/DOOM1.WAD $(INITRD_FILES)/TCC.ELF $(INITRD_FILES)/LUA.ELF $(INITRD_FILES)/LUAC.ELF
+libc-tests:
+	$(MAKE) -C tsukasa-libc all check
+
+$(INITRD_FILES)/TCRT0.ELF: libc-tests
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-libc/tests/test_crt0.elf $@
+
+$(INITRD_FILES)/TSYSC.ELF: libc-tests
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-libc/tests/test_syscalls.elf $@
+
+$(INITRD_FILES)/TLIBC.ELF: libc-tests
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-libc/tests/test_libc.elf $@
+
+$(INITRD_FILES)/TMATH.ELF: libc-tests
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-libc/tests/test_math.elf $@
+
+$(INITRD_FILES)/TSTDIO.ELF: libc-tests
+	@mkdir -p $(INITRD_FILES)
+	cp tsukasa-libc/tests/test_stdio.elf $@
+
+$(INITRD_FILES)/TESTDRV.ELF: user/cli/testdrv.c $(SDK_OBJS) user/crt/tsukasa_app.ld
+	@mkdir -p $(INITRD_FILES)
+	$(SDK_CC) $(SDK_CFLAGS) -c -o user/cli/testdrv.o $<
+	ld.lld -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
+	    -o $@ user/crt/crt0.o user/cli/testdrv.o user/crt/syscalls.o user/crt/stdio_lite.o
+
+apps: $(INITRD_FILES)/hellosdk.elf $(INITRD_FILES)/echo.elf $(INITRD_FILES)/cat.elf $(INITRD_FILES)/argvchk.elf $(INITRD_FILES)/futex10.elf $(INITRD_FILES)/usock20.elf $(INITRD_FILES)/wsrv15.elf $(INITRD_FILES)/wapp15.elf $(INITRD_FILES)/wdemo16.elf $(INITRD_FILES)/VSRV.ELF $(INITRD_FILES)/TESTIPC.ELF $(INITRD_FILES)/TESTCOMP.ELF $(INITRD_FILES)/TESTTYPO.ELF $(INITRD_FILES)/TESTSHELL.ELF $(INITRD_FILES)/TSHELL.ELF $(INITRD_FILES)/TERMINAL.ELF $(INITRD_FILES)/NOTEPAD.ELF $(INITRD_FILES)/CALC.ELF $(INITRD_FILES)/FILEMGR.ELF $(INITRD_FILES)/SETTINGS.ELF $(INITRD_FILES)/TASKMGR.ELF $(INITRD_FILES)/TSH.ELF $(INITRD_FILES)/FDISK.ELF $(INITRD_FILES)/MKFSFAT.ELF $(INITRD_FILES)/MKFSEXT2.ELF $(INITRD_FILES)/INSTALL.ELF $(INITRD_FILES)/DOOM.ELF $(INITRD_FILES)/DOOM1.WAD $(INITRD_FILES)/TCC.ELF $(INITRD_FILES)/LUA.ELF $(INITRD_FILES)/LUAC.ELF $(INITRD_FILES)/TCRT0.ELF $(INITRD_FILES)/TSYSC.ELF $(INITRD_FILES)/TLIBC.ELF $(INITRD_FILES)/TMATH.ELF $(INITRD_FILES)/TSTDIO.ELF $(INITRD_FILES)/TESTDRV.ELF
 
 sdk: $(SDK_OBJS) user/crt/tsukasa_app.ld user/crt/tsukasa_sdk.h
 	@mkdir -p $(SDK_DIR)/include $(SDK_DIR)/lib $(SDK_DIR)/crt
@@ -327,7 +360,7 @@ sdk: $(SDK_OBJS) user/crt/tsukasa_app.ld user/crt/tsukasa_sdk.h
 	cp user/crt/syscalls.o $(SDK_DIR)/lib/
 	@echo "[OK] SDK staged in $(SDK_DIR)/ (crt0.o, tsukasa_app.ld, syscalls.o, tsukasa_sdk.h)."
 
-$(INITRD_IMG): $(INITRD_FILES)/hello.elf $(INITRD_FILES)/hello_sc.elf $(INITRD_FILES)/fault.elf $(INITRD_FILES)/exit7.elf $(INITRD_FILES)/hellosdk.elf $(INITRD_FILES)/echo.elf $(INITRD_FILES)/cat.elf $(INITRD_FILES)/argvchk.elf $(INITRD_FILES)/futex10.elf $(INITRD_FILES)/usock20.elf $(INITRD_FILES)/wsrv15.elf $(INITRD_FILES)/wapp15.elf $(INITRD_FILES)/wdemo16.elf $(INITRD_FILES)/VSRV.ELF $(INITRD_FILES)/TESTIPC.ELF $(INITRD_FILES)/TESTCOMP.ELF $(INITRD_FILES)/TESTTYPO.ELF $(INITRD_FILES)/TESTSHELL.ELF $(INITRD_FILES)/TERMINAL.ELF $(INITRD_FILES)/NOTEPAD.ELF $(INITRD_FILES)/CALC.ELF $(INITRD_FILES)/FILEMGR.ELF $(INITRD_FILES)/SETTINGS.ELF $(INITRD_FILES)/TASKMGR.ELF $(INITRD_FILES)/TSH.ELF $(INITRD_FILES)/FDISK.ELF $(INITRD_FILES)/MKFSFAT.ELF $(INITRD_FILES)/MKFSEXT2.ELF $(INITRD_FILES)/INSTALL.ELF $(INITRD_FILES)/DOOM.ELF $(INITRD_FILES)/DOOM1.WAD $(INITRD_FILES)/TCC.ELF $(INITRD_FILES)/LUA.ELF $(INITRD_FILES)/LUAC.ELF
+$(INITRD_IMG): $(INITRD_FILES)/hello.elf $(INITRD_FILES)/hello_sc.elf $(INITRD_FILES)/fault.elf $(INITRD_FILES)/exit7.elf $(INITRD_FILES)/hellosdk.elf $(INITRD_FILES)/echo.elf $(INITRD_FILES)/cat.elf $(INITRD_FILES)/argvchk.elf $(INITRD_FILES)/futex10.elf $(INITRD_FILES)/usock20.elf $(INITRD_FILES)/wsrv15.elf $(INITRD_FILES)/wapp15.elf $(INITRD_FILES)/wdemo16.elf $(INITRD_FILES)/VSRV.ELF $(INITRD_FILES)/TESTIPC.ELF $(INITRD_FILES)/TESTCOMP.ELF $(INITRD_FILES)/TESTTYPO.ELF $(INITRD_FILES)/TESTSHELL.ELF $(INITRD_FILES)/TSHELL.ELF $(INITRD_FILES)/TERMINAL.ELF $(INITRD_FILES)/NOTEPAD.ELF $(INITRD_FILES)/CALC.ELF $(INITRD_FILES)/FILEMGR.ELF $(INITRD_FILES)/SETTINGS.ELF $(INITRD_FILES)/TASKMGR.ELF $(INITRD_FILES)/TSH.ELF $(INITRD_FILES)/FDISK.ELF $(INITRD_FILES)/MKFSFAT.ELF $(INITRD_FILES)/MKFSEXT2.ELF $(INITRD_FILES)/INSTALL.ELF $(INITRD_FILES)/DOOM.ELF $(INITRD_FILES)/DOOM1.WAD $(INITRD_FILES)/TCC.ELF $(INITRD_FILES)/LUA.ELF $(INITRD_FILES)/LUAC.ELF $(INITRD_FILES)/TCRT0.ELF $(INITRD_FILES)/TSYSC.ELF $(INITRD_FILES)/TLIBC.ELF $(INITRD_FILES)/TMATH.ELF $(INITRD_FILES)/TSTDIO.ELF $(INITRD_FILES)/TESTDRV.ELF
 
 	@mkdir -p $(INITRD_FILES)
 	dd if=/dev/zero of=$(INITRD_IMG) bs=1024 count=16384
@@ -338,6 +371,11 @@ $(INITRD_IMG): $(INITRD_FILES)/hello.elf $(INITRD_FILES)/hello_sc.elf $(INITRD_F
 	@echo "[OK] $(INITRD_IMG) ready (FAT12, 16 MB)."
 
 initrd: $(INITRD_IMG)
+
+check:
+	@scripts/test/run-host-tests.sh
+	@scripts/test/run-guest-tests.sh
+	@scripts/test/summarize.sh
 
 check-multiboot: $(KERNEL_BIN)
 	@if [ "$(ARCH)" = "i386" ]; then \
