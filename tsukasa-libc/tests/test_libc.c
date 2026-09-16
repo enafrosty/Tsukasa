@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdint.h>
+#include "../../scripts/test/tsk_test.h"
 
 static int cmp_int(const void *a, const void *b)
 {
@@ -32,13 +33,13 @@ int main(int argc, char **argv, char **envp)
     (void)argc;
     (void)argv;
     (void)envp;
-
-    printf("[test] Starting tsukasa-libc Step 2.3 verification...\n");
+    int passed = 0;
+    int total = 4;
 
     /* 1. String Operations */
     const char *orig = "Hello, Tsukasa OS!";
     if (strlen(orig) != 18) {
-        printf("[FAIL] strlen mismatch\n");
+        TSK_TEST_FAIL("libc", "strings", "strlen mismatch");
         return 1;
     }
 
@@ -46,34 +47,35 @@ int main(int argc, char **argv, char **envp)
     strcpy(buf, "Tsukasa");
     strcat(buf, " Libc");
     if (strcmp(buf, "Tsukasa Libc") != 0) {
-        printf("[FAIL] strcmp/strcpy/strcat mismatch\n");
+        TSK_TEST_FAIL("libc", "strings", "strcmp/strcpy/strcat mismatch");
         return 2;
     }
 
     if (strncmp(buf, "Tsukasa XYZ", 7) != 0) {
-        printf("[FAIL] strncmp mismatch\n");
+        TSK_TEST_FAIL("libc", "strings", "strncmp mismatch");
         return 3;
     }
 
     const char *sub = strstr(buf, "Libc");
     if (!sub || strcmp(sub, "Libc") != 0) {
-        printf("[FAIL] strstr mismatch\n");
+        TSK_TEST_FAIL("libc", "strings", "strstr mismatch");
         return 4;
     }
 
     char *dup = strdup(buf);
     if (!dup || strcmp(dup, buf) != 0) {
-        printf("[FAIL] strdup mismatch\n");
+        TSK_TEST_FAIL("libc", "strings", "strdup mismatch");
         return 5;
     }
     free(dup);
 
     const char *err_msg = strerror(2); /* ENOENT */
     if (!err_msg || strcmp(err_msg, "No such file or directory") != 0) {
-        printf("[FAIL] strerror mismatch\n");
+        TSK_TEST_FAIL("libc", "strings", "strerror mismatch");
         return 6;
     }
-    printf("[PASS] String operations (strlen, strcpy, strcat, strcmp, strstr, strdup, strerror)\n");
+    TSK_TEST_PASS("libc", "strings");
+    passed++;
 
     /* 2. Heap Allocator (16-byte alignment & realloc) */
     void *ptrs[10];
@@ -81,11 +83,11 @@ int main(int argc, char **argv, char **envp)
         size_t sz = (size_t)(16 * (i + 1));
         ptrs[i] = malloc(sz);
         if (!ptrs[i]) {
-            printf("[FAIL] malloc returned NULL for size %zu\n", sz);
+            TSK_TEST_FAIL("libc", "heap", "malloc returned NULL");
             return 7;
         }
         if (((uintptr_t)ptrs[i] & 0xFULL) != 0) {
-            printf("[FAIL] malloc pointer not 16-byte aligned: %p\n", ptrs[i]);
+            TSK_TEST_FAIL("libc", "heap", "malloc pointer not 16-byte aligned");
             return 8;
         }
         memset(ptrs[i], 0xAA + i, sz);
@@ -96,7 +98,7 @@ int main(int argc, char **argv, char **envp)
         const unsigned char *b = (const unsigned char *)ptrs[i];
         for (size_t j = 0; j < sz; j++) {
             if (b[j] != (unsigned char)(0xAA + i)) {
-                printf("[FAIL] heap memory data corrupted\n");
+                TSK_TEST_FAIL("libc", "heap", "heap memory data corrupted");
                 return 9;
             }
         }
@@ -107,7 +109,7 @@ int main(int argc, char **argv, char **envp)
     strcpy(realloc_ptr, "1234567890");
     realloc_ptr = (char *)realloc(realloc_ptr, 1024);
     if (!realloc_ptr || strcmp(realloc_ptr, "1234567890") != 0) {
-        printf("[FAIL] realloc expansion failed\n");
+        TSK_TEST_FAIL("libc", "heap", "realloc expansion failed");
         return 10;
     }
     free(realloc_ptr);
@@ -115,12 +117,12 @@ int main(int argc, char **argv, char **envp)
     /* Test calloc zeroing */
     int *calloc_arr = (int *)calloc(64, sizeof(int));
     if (!calloc_arr) {
-        printf("[FAIL] calloc returned NULL\n");
+        TSK_TEST_FAIL("libc", "heap", "calloc returned NULL");
         return 11;
     }
     for (int i = 0; i < 64; i++) {
         if (calloc_arr[i] != 0) {
-            printf("[FAIL] calloc memory not zeroed\n");
+            TSK_TEST_FAIL("libc", "heap", "calloc memory not zeroed");
             return 12;
         }
     }
@@ -129,7 +131,8 @@ int main(int argc, char **argv, char **envp)
     for (int i = 0; i < 10; i++)
         free(ptrs[i]);
 
-    printf("[PASS] Dynamic heap allocator (malloc 16-byte aligned, realloc, calloc, free)\n");
+    TSK_TEST_PASS("libc", "heap");
+    passed++;
 
     /* 3. Standard I/O & Formatting */
     char fmt_buf[128];
@@ -137,29 +140,29 @@ int main(int argc, char **argv, char **envp)
              -42, 0xcafe, 0x1234abcd, "Tsukasa");
     const char *expected = "Dec: -42, Hex: 0xcafe, UpperHex: 1234ABCD, Str: Tsukasa !";
     if (strcmp(fmt_buf, expected) != 0) {
-        printf("[FAIL] snprintf output mismatch:\nExpected: [%s]\nGot:      [%s]\n",
-               expected, fmt_buf);
+        TSK_TEST_FAIL("libc", "stdio_formatting", "snprintf output mismatch");
         return 13;
     }
 
     snprintf(fmt_buf, sizeof(fmt_buf), "Binary: %b", 5);
     if (strcmp(fmt_buf, "Binary: 101") != 0) {
-        printf("[FAIL] snprintf binary specifier failed: %s\n", fmt_buf);
+        TSK_TEST_FAIL("libc", "stdio_formatting", "snprintf binary specifier failed");
         return 14;
     }
-    printf("[PASS] Formatted I/O (snprintf integer, hex, padding, alignment, binary)\n");
+    TSK_TEST_PASS("libc", "stdio_formatting");
+    passed++;
 
     /* 4. Conversions & Algorithms */
     if (atoi(" -12345 ") != -12345) {
-        printf("[FAIL] atoi failed\n");
+        TSK_TEST_FAIL("libc", "utilities", "atoi failed");
         return 15;
     }
     if (strtol("0xDeadBeef", NULL, 0) != 0xdeadbeefL) {
-        printf("[FAIL] strtol hex prefix failed\n");
+        TSK_TEST_FAIL("libc", "utilities", "strtol hex prefix failed");
         return 16;
     }
     if (abs(-999) != 999) {
-        printf("[FAIL] abs failed\n");
+        TSK_TEST_FAIL("libc", "utilities", "abs failed");
         return 17;
     }
 
@@ -167,7 +170,7 @@ int main(int argc, char **argv, char **envp)
     qsort(arr, 6, sizeof(int), cmp_int);
     for (int i = 0; i < 5; i++) {
         if (arr[i] > arr[i + 1]) {
-            printf("[FAIL] qsort did not sort array correctly\n");
+            TSK_TEST_FAIL("libc", "utilities", "qsort did not sort array correctly");
             return 18;
         }
     }
@@ -175,11 +178,12 @@ int main(int argc, char **argv, char **envp)
     int key = 42;
     int *found = (int *)bsearch(&key, arr, 6, sizeof(int), cmp_int);
     if (!found || *found != 42) {
-        printf("[FAIL] bsearch failed to find 42\n");
+        TSK_TEST_FAIL("libc", "utilities", "bsearch failed to find 42");
         return 19;
     }
-    printf("[PASS] General utilities (atoi, strtol, abs, qsort, bsearch)\n");
+    TSK_TEST_PASS("libc", "utilities");
+    passed++;
 
-    printf("[ALL PASS] tsukasa-libc Step 2.3 core standard library verified successfully\n");
+    TSK_TEST_DONE("libc", passed, total);
     return 0;
 }

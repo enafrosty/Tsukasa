@@ -18,34 +18,31 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-static void assert_test(int cond, const char *msg)
-{
-    if (!cond) {
-        printf("[FAIL] stdio assertion: %s\n", msg);
-        exit(1);
-    }
-}
+#include "../../scripts/test/tsk_test.h"
 
 int main(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-
-    printf("[TEST] Starting tsukasa-libc buffered stdio test suite...\n");
+    int passed = 0;
+    int total = 4;
 
     const char *test_path = "/tmp/test_stdio.tmp";
 
     /* Test 1: File creation and formatted/buffered writing */
     FILE *fp = fopen(test_path, "w");
-    assert_test(fp != NULL, "fopen(..., 'w') returned non-null");
+    if (!fp) {
+        TSK_TEST_FAIL("stdio", "file_write_buffered", "fopen('w') returned NULL");
+        return 1;
+    }
 
     int written = fprintf(fp, "Line %d: The quick brown fox jumps over the lazy dog.\n", 1);
-    assert_test(written > 0, "fprintf returned positive written count");
-
-    assert_test(fputs("Line 2: Standard I/O buffering in Project Tsukasa.\n", fp) >= 0, "fputs succeeded");
-    assert_test(fputc('A', fp) == 'A', "fputc wrote 'A'");
-    assert_test(fputc('\n', fp) == '\n', "fputc wrote newline");
+    if (written <= 0 || fputs("Line 2: Standard I/O buffering in Project Tsukasa.\n", fp) < 0 ||
+        fputc('A', fp) != 'A' || fputc('\n', fp) != '\n') {
+        TSK_TEST_FAIL("stdio", "file_write_buffered", "buffered write/formatting failed");
+        fclose(fp);
+        return 1;
+    }
 
     /* Write 2048 bytes of sequential pattern to verify multi-block buffering */
     char pattern[2048];
@@ -53,92 +50,124 @@ int main(int argc, char **argv)
         pattern[i] = (char)('a' + (i % 26));
 
     size_t nw = fwrite(pattern, 1, sizeof(pattern), fp);
-    assert_test(nw == sizeof(pattern), "fwrite wrote 2048 pattern bytes");
-
-    assert_test(fflush(fp) == 0, "fflush succeeded");
-    assert_test(fclose(fp) == 0, "fclose succeeded");
+    if (nw != sizeof(pattern) || fflush(fp) != 0 || fclose(fp) != 0) {
+        TSK_TEST_FAIL("stdio", "file_write_buffered", "fwrite, fflush or fclose failed");
+        return 1;
+    }
+    TSK_TEST_PASS("stdio", "file_write_buffered");
+    passed++;
 
     /* Test 2: File reading and ftell read-buffer offset accuracy */
     fp = fopen(test_path, "r");
-    assert_test(fp != NULL, "fopen(..., 'r') returned non-null");
+    if (!fp) {
+        TSK_TEST_FAIL("stdio", "file_read_offset", "fopen('r') returned NULL");
+        return 2;
+    }
 
     long pos0 = ftell(fp);
-    assert_test(pos0 == 0L, "initial ftell is 0");
+    if (pos0 != 0L) {
+        TSK_TEST_FAIL("stdio", "file_read_offset", "initial ftell is not 0");
+        fclose(fp);
+        return 2;
+    }
 
     char line_buf[128];
     char *s = fgets(line_buf, sizeof(line_buf), fp);
-    assert_test(s != NULL, "fgets read line 1");
+    if (!s) {
+        TSK_TEST_FAIL("stdio", "file_read_offset", "fgets line 1 returned NULL");
+        fclose(fp);
+        return 2;
+    }
     size_t line1_len = strlen(line_buf);
-
-    long pos1 = ftell(fp);
-    assert_test(pos1 == (long)line1_len, "ftell accurately accounts for read buffer after fgets");
+    if (ftell(fp) != (long)line1_len) {
+        TSK_TEST_FAIL("stdio", "file_read_offset", "ftell mismatch after line 1");
+        fclose(fp);
+        return 2;
+    }
 
     /* Read another line */
     s = fgets(line_buf, sizeof(line_buf), fp);
-    assert_test(s != NULL, "fgets read line 2");
+    if (!s) {
+        TSK_TEST_FAIL("stdio", "file_read_offset", "fgets line 2 returned NULL");
+        fclose(fp);
+        return 2;
+    }
     size_t line2_len = strlen(line_buf);
-
-    long pos2 = ftell(fp);
-    assert_test(pos2 == (long)(line1_len + line2_len), "ftell accurate after line 2");
+    if (ftell(fp) != (long)(line1_len + line2_len)) {
+        TSK_TEST_FAIL("stdio", "file_read_offset", "ftell mismatch after line 2");
+        fclose(fp);
+        return 2;
+    }
 
     /* Read the 'A\n' line */
     s = fgets(line_buf, sizeof(line_buf), fp);
-    assert_test(s != NULL && line_buf[0] == 'A', "fgets read 'A\\n'");
+    if (!s || line_buf[0] != 'A') {
+        TSK_TEST_FAIL("stdio", "file_read_offset", "fgets line 3 returned unexpected content");
+        fclose(fp);
+        return 2;
+    }
     size_t line3_len = strlen(line_buf);
-
     long header_total = (long)(line1_len + line2_len + line3_len);
-    assert_test(ftell(fp) == header_total, "ftell at header total");
+    if (ftell(fp) != header_total) {
+        TSK_TEST_FAIL("stdio", "file_read_offset", "ftell mismatch at header total");
+        fclose(fp);
+        return 2;
+    }
 
-    /*
-     * Crucial test: fread 100 bytes from the pattern.
-     * The underlying read() will buffer BUFSIZ (1024) bytes.
-     * ftell() must report header_total + 100, NOT header_total + 1024!
-     */
     char read_buf[100];
     size_t nr = fread(read_buf, 1, 100, fp);
-    assert_test(nr == 100, "fread read 100 bytes");
-    assert_test(memcmp(read_buf, pattern, 100) == 0, "read pattern bytes match written pattern");
+    if (nr != 100 || memcmp(read_buf, pattern, 100) != 0 ||
+        ftell(fp) != header_total + 100L) {
+        TSK_TEST_FAIL("stdio", "file_read_offset", "fread chunk 1 pattern/ftell mismatch");
+        fclose(fp);
+        return 2;
+    }
 
-    long pos_100 = ftell(fp);
-    assert_test(pos_100 == header_total + 100L, "ftell accurately subtracts (rend - rpos)");
-
-    /* Read another 150 bytes */
     char read_buf2[150];
     nr = fread(read_buf2, 1, 150, fp);
-    assert_test(nr == 150, "fread read 150 bytes");
-    assert_test(memcmp(read_buf2, pattern + 100, 150) == 0, "second chunk matches pattern");
-
-    long pos_250 = ftell(fp);
-    assert_test(pos_250 == header_total + 250L, "ftell accurately advances by 150 bytes");
+    if (nr != 150 || memcmp(read_buf2, pattern + 100, 150) != 0 ||
+        ftell(fp) != header_total + 250L) {
+        TSK_TEST_FAIL("stdio", "file_read_offset", "fread chunk 2 pattern/ftell mismatch");
+        fclose(fp);
+        return 2;
+    }
+    TSK_TEST_PASS("stdio", "file_read_offset");
+    passed++;
 
     /* Test 3: fseek with SEEK_SET, SEEK_CUR, SEEK_END */
-    assert_test(fseek(fp, header_total, SEEK_SET) == 0, "fseek to header_total with SEEK_SET");
-    assert_test(ftell(fp) == header_total, "ftell after fseek matches header_total");
-
-    int c = fgetc(fp);
-    assert_test(c == (int)pattern[0], "fgetc reads pattern[0] after seek");
-    assert_test(ftell(fp) == header_total + 1L, "ftell is header_total + 1");
-
-    assert_test(fseek(fp, 99, SEEK_CUR) == 0, "fseek +99 from CUR");
-    assert_test(ftell(fp) == header_total + 100L, "ftell is header_total + 100");
-
-    assert_test(fseek(fp, 0, SEEK_END) == 0, "fseek to SEEK_END");
-    long file_size = ftell(fp);
-    assert_test(file_size == header_total + 2048L, "file_size matches expected total bytes");
+    if (fseek(fp, header_total, SEEK_SET) != 0 || ftell(fp) != header_total ||
+        fgetc(fp) != (int)pattern[0] || ftell(fp) != header_total + 1L ||
+        fseek(fp, 99, SEEK_CUR) != 0 || ftell(fp) != header_total + 100L ||
+        fseek(fp, 0, SEEK_END) != 0 || ftell(fp) != header_total + 2048L) {
+        TSK_TEST_FAIL("stdio", "fseek_eof", "fseek positioning mismatch");
+        fclose(fp);
+        return 3;
+    }
 
     /* EOF check */
     int eof_char = fgetc(fp);
-    assert_test(eof_char == EOF, "fgetc at end returns EOF");
-    assert_test(feof(fp) != 0, "feof(fp) is true");
+    if (eof_char != EOF || feof(fp) == 0) {
+        TSK_TEST_FAIL("stdio", "fseek_eof", "fgetc at EOF did not set feof");
+        fclose(fp);
+        return 3;
+    }
 
     clearerr(fp);
-    assert_test(feof(fp) == 0, "clearerr cleared eof");
-
-    assert_test(fclose(fp) == 0, "fclose succeeded");
+    if (feof(fp) != 0 || fclose(fp) != 0) {
+        TSK_TEST_FAIL("stdio", "fseek_eof", "clearerr or fclose failed");
+        return 3;
+    }
+    TSK_TEST_PASS("stdio", "fseek_eof");
+    passed++;
 
     /* Test 4: Global flush */
-    assert_test(fflush(NULL) == 0, "fflush(NULL) succeeds");
+    if (fflush(NULL) != 0) {
+        TSK_TEST_FAIL("stdio", "global_flush", "fflush(NULL) failed");
+        return 4;
+    }
+    TSK_TEST_PASS("stdio", "global_flush");
+    passed++;
 
-    printf("[PASS] All buffered stdio assertions passed successfully.\n");
+    TSK_TEST_DONE("stdio", passed, total);
     return 0;
 }

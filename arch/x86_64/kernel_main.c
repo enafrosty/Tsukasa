@@ -125,6 +125,53 @@ static int is_selftest_requested(const struct tsukasa_boot_info *boot_info)
     return 0;
 }
 
+static int is_test_requested(const struct tsukasa_boot_info *boot_info)
+{
+    if (boot_info && boot_info->cmdline) {
+        if (k_strstr(boot_info->cmdline, "tsukasa.test=1"))
+            return 1;
+    }
+
+    io_outw(0x510, 0x0000);
+    char sig[4];
+    for (int i = 0; i < 4; i++)
+        sig[i] = (char)io_inb(0x511);
+
+    if (sig[0] == 'Q' && sig[1] == 'E' && sig[2] == 'M' && sig[3] == 'U') {
+        io_outw(0x510, 0x0019);
+        uint32_t count = 0;
+        count |= ((uint32_t)io_inb(0x511)) << 24;
+        count |= ((uint32_t)io_inb(0x511)) << 16;
+        count |= ((uint32_t)io_inb(0x511)) << 8;
+        count |= (uint32_t)io_inb(0x511);
+
+        for (uint32_t i = 0; i < count; i++) {
+            (void)io_inb(0x511); (void)io_inb(0x511);
+            (void)io_inb(0x511); (void)io_inb(0x511);
+
+            uint16_t select = 0;
+            select |= ((uint16_t)io_inb(0x511)) << 8;
+            select |= (uint16_t)io_inb(0x511);
+
+            (void)io_inb(0x511); (void)io_inb(0x511);
+
+            char name[56];
+            for (int j = 0; j < 56; j++)
+                name[j] = (char)io_inb(0x511);
+
+            if (k_strcmp(name, "opt/org.tsukasa.test") == 0 ||
+                k_strcmp(name, "opt/tsukasa.test") == 0) {
+                io_outw(0x510, select);
+                char val = (char)io_inb(0x511);
+                if (val == '1')
+                    return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
 {
     serial_init();
@@ -210,32 +257,50 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     user_apps_register_all();
     kprintf("[boot:x64] userspace app registry ready\n");
 
-    kprintf("[boot:x64] handoff to /bin/init (PID 1)...\n");
     int init_pid = -1;
     vfs_stat_t st;
-    if (vfs_stat("/bin/init", &st) == 0 && st.type != VFS_TYPE_DIR) {
-        init_pid = elf64_spawn("/bin/init", "/bin/init");
-    } else if (vfs_stat("/init", &st) == 0 && st.type != VFS_TYPE_DIR) {
-        init_pid = elf64_spawn("/init", "/init");
-    } else if (vfs_stat("/sbin/init", &st) == 0 && st.type != VFS_TYPE_DIR) {
-        init_pid = elf64_spawn("/sbin/init", "/sbin/init");
-    }
+    if (is_test_requested(boot_info)) {
+        kprintf("[boot:x64] automated test runner mode enabled\n");
+        if (vfs_stat("/fat12/TESTDRV.ELF", &st) == 0 && st.type != VFS_TYPE_DIR)
+            init_pid = elf64_spawn("/fat12/TESTDRV.ELF", "testdrv");
+        else if (vfs_stat("/bin/TESTDRV.ELF", &st) == 0 && st.type != VFS_TYPE_DIR)
+            init_pid = elf64_spawn("/bin/TESTDRV.ELF", "testdrv");
+        else if (vfs_stat("/fat12/testdrv.elf", &st) == 0 && st.type != VFS_TYPE_DIR)
+            init_pid = elf64_spawn("/fat12/testdrv.elf", "testdrv");
+        else if (vfs_stat("/bin/testdrv.elf", &st) == 0 && st.type != VFS_TYPE_DIR)
+            init_pid = elf64_spawn("/bin/testdrv.elf", "testdrv");
 
-    if (init_pid < 0) {
-        exec_entry_t init_entry = NULL;
-        if (exec_resolve_builtin("/bin/init", &init_entry) == 0 && init_entry) {
-            process_t *init_proc = process_spawn_kernel("init", init_entry);
-            if (init_proc) {
-                init_pid = (int)init_proc->pid;
-                process_set_cmdline(init_pid, "/bin/init");
+        if (init_pid >= 0) {
+            kprintf("[boot:x64] /fat12/TESTDRV.ELF running (pid=%d)\n", init_pid);
+        } else {
+            kprintf("[boot:x64] WARN: failed to spawn TESTDRV.ELF\n");
+        }
+    } else {
+        kprintf("[boot:x64] handoff to /bin/init (PID 1)...\n");
+        if (vfs_stat("/bin/init", &st) == 0 && st.type != VFS_TYPE_DIR) {
+            init_pid = elf64_spawn("/bin/init", "/bin/init");
+        } else if (vfs_stat("/init", &st) == 0 && st.type != VFS_TYPE_DIR) {
+            init_pid = elf64_spawn("/init", "/init");
+        } else if (vfs_stat("/sbin/init", &st) == 0 && st.type != VFS_TYPE_DIR) {
+            init_pid = elf64_spawn("/sbin/init", "/sbin/init");
+        }
+
+        if (init_pid < 0) {
+            exec_entry_t init_entry = NULL;
+            if (exec_resolve_builtin("/bin/init", &init_entry) == 0 && init_entry) {
+                process_t *init_proc = process_spawn_kernel("init", init_entry);
+                if (init_proc) {
+                    init_pid = (int)init_proc->pid;
+                    process_set_cmdline(init_pid, "/bin/init");
+                }
             }
         }
-    }
 
-    if (init_pid >= 0) {
-        kprintf("[boot:x64] /bin/init running (pid=%d)\n", init_pid);
-    } else {
-        kprintf("[boot:x64] WARN: failed to spawn /bin/init\n");
+        if (init_pid >= 0) {
+            kprintf("[boot:x64] /bin/init running (pid=%d)\n", init_pid);
+        } else {
+            kprintf("[boot:x64] WARN: failed to spawn /bin/init\n");
+        }
     }
 
     {

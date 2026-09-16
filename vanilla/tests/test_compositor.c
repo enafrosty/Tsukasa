@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../scripts/test/tsk_test.h"
 
 #define TEST_ASSERT(cond, msg) \
     do { \
@@ -443,37 +444,58 @@ int main(void)
     printf("========================================================\n");
     printf(" Project Vanilla - Phase 4, Step 4.2 Compositor & Blitter\n");
     printf("========================================================\n");
+    int passed = 0;
+    int total = 7;
 
-    if (test_offscreen_init() != 0)
+    if (test_offscreen_init() != 0) {
+        TSK_TEST_FAIL("compositor", "offscreen_init", "test_offscreen_init failed");
         return 1;
-    printf("[PASS] 1. Offscreen virtual framebuffer init and destroy\n");
+    }
+    TSK_TEST_PASS("compositor", "offscreen_init");
+    passed++;
 
-    if (test_blt_fill_and_copy() != 0)
+    if (test_blt_fill_and_copy() != 0) {
+        TSK_TEST_FAIL("compositor", "blt_fill_copy", "test_blt_fill_and_copy failed");
         return 1;
-    printf("[PASS] 2. SIMD fill_rect, copy_rect, and copy_subrect\n");
+    }
+    TSK_TEST_PASS("compositor", "blt_fill_copy");
+    passed++;
 
-    if (test_blt_alpha_blending() != 0)
+    if (test_blt_alpha_blending() != 0) {
+        TSK_TEST_FAIL("compositor", "alpha_blending", "test_blt_alpha_blending failed");
         return 1;
-    printf("[PASS] 3. SIMD / SSE2 alpha blending mathematical accuracy\n");
+    }
+    TSK_TEST_PASS("compositor", "alpha_blending");
+    passed++;
 
-    if (test_damage_tracking_and_coalescing() != 0)
+    if (test_damage_tracking_and_coalescing() != 0) {
+        TSK_TEST_FAIL("compositor", "damage_tracking", "test_damage_tracking_and_coalescing failed");
         return 1;
-    printf("[PASS] 4. Dirty rectangle clipping, merging, and coalescing\n");
+    }
+    TSK_TEST_PASS("compositor", "damage_tracking");
+    passed++;
 
-    if (test_z_order_and_wm_raise() != 0)
+    if (test_z_order_and_wm_raise() != 0) {
+        TSK_TEST_FAIL("compositor", "z_order", "test_z_order_and_wm_raise failed");
         return 1;
-    printf("[PASS] 5. Z-order compositor occlusion and window raise/lower\n");
+    }
+    TSK_TEST_PASS("compositor", "z_order");
+    passed++;
 
-    if (test_negative_coordinate_clipping() != 0)
+    if (test_negative_coordinate_clipping() != 0) {
+        TSK_TEST_FAIL("compositor", "negative_clipping", "test_negative_coordinate_clipping failed");
         return 1;
-    printf("[PASS] 6. Partially off-screen window negative clipping\n");
+    }
+    TSK_TEST_PASS("compositor", "negative_clipping");
+    passed++;
 
-    if (test_drop_shadow_and_decorations() != 0)
+    if (test_drop_shadow_and_decorations() != 0) {
+        TSK_TEST_FAIL("compositor", "decorations", "test_drop_shadow_and_decorations failed");
         return 1;
-    printf("[PASS] 7. Server-side window decorations and drop shadow\n");
+    }
+    TSK_TEST_PASS("compositor", "decorations");
+    passed++;
 
-    printf("========================================================\n");
-    printf("[OK] Step 4.2 Compositor & SIMD Blitter test PASSED.\n");
-    printf("========================================================\n");
+    TSK_TEST_DONE("compositor", passed, total);
     return 0;
 }

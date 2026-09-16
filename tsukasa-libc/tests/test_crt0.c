@@ -17,6 +17,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <stdio.h>
+#include "../../scripts/test/tsk_test.h"
 
 static size_t test_strlen(const char *s)
 {
@@ -29,26 +31,45 @@ static size_t test_strlen(const char *s)
 int main(int argc, char **argv, char **envp)
 {
     (void)envp;
+    int passed = 0;
+    int total = 4;
 
     /* Verify 16-byte stack frame alignment on entry to main (rsp % 16 == 8 per AMD64 ABI). */
     uintptr_t rsp_val;
     __asm__ volatile ("mov %%rsp, %0" : "=r"(rsp_val));
-    if ((rsp_val & 0xF) != 8)
+    if ((rsp_val & 0xF) != 8) {
+        TSK_TEST_FAIL("crt0", "stack_alignment", "rsp % 16 != 8");
         return 1;
+    }
+    TSK_TEST_PASS("crt0", "stack_alignment");
+    passed++;
 
     /* Basic sanity check on argc and argv. */
-    if (argc < 1 || !argv || !argv[0] || test_strlen(argv[0]) == 0)
+    if (argc < 1 || !argv || !argv[0] || test_strlen(argv[0]) == 0) {
+        TSK_TEST_FAIL("crt0", "argc_argv", "argc < 1 or null argv[0]");
         return 2;
+    }
+    TSK_TEST_PASS("crt0", "argc_argv");
+    passed++;
 
     const char msg[] = "tsukasa-libc crt0: PASSED\n";
     ssize_t written = write(STDOUT_FILENO, msg, sizeof(msg) - 1);
-    if (written != (ssize_t)(sizeof(msg) - 1))
+    if (written != (ssize_t)(sizeof(msg) - 1)) {
+        TSK_TEST_FAIL("crt0", "write_stdout", "write returned incorrect length");
         return 3;
+    }
+    TSK_TEST_PASS("crt0", "write_stdout");
+    passed++;
 
     /* Check getpid syscall. */
     pid_t pid = getpid();
-    if (pid < 0)
+    if (pid < 0) {
+        TSK_TEST_FAIL("crt0", "getpid", "getpid < 0");
         return 4;
+    }
+    TSK_TEST_PASS("crt0", "getpid");
+    passed++;
 
+    TSK_TEST_DONE("crt0", passed, total);
     return 0;
 }

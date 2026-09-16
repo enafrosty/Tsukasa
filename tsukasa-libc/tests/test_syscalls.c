@@ -28,83 +28,80 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
-
-static void print_str(const char *s)
-{
-    size_t len = 0;
-    while (s && s[len])
-        len++;
-    write(STDOUT_FILENO, s, len);
-}
+#include <stdio.h>
+#include "../../scripts/test/tsk_test.h"
 
 int main(int argc, char **argv, char **envp)
 {
     (void)argc;
     (void)argv;
     (void)envp;
-
-    print_str("[test] Starting tsukasa-libc syscall verification...\n");
+    int passed = 0;
+    int total = 5;
 
     /* Test 1: Stack frame alignment (rsp % 16 == 8 on function entry). */
     uintptr_t rsp_val;
     __asm__ volatile ("mov %%rsp, %0" : "=r"(rsp_val));
     if ((rsp_val & 0xF) != 8) {
-        print_str("[FAIL] Stack frame unaligned\n");
+        TSK_TEST_FAIL("syscalls", "stack_alignment", "stack frame unaligned");
         return 1;
     }
-    print_str("[PASS] Stack frame aligned to 16 bytes\n");
+    TSK_TEST_PASS("syscalls", "stack_alignment");
+    passed++;
 
     /* Test 2: Process telemetry (0-argument syscalls). */
     pid_t pid = getpid();
     if (pid < 0) {
-        print_str("[FAIL] getpid failed\n");
+        TSK_TEST_FAIL("syscalls", "process_telemetry", "getpid failed");
         return 2;
     }
     pid_t ppid = getppid();
     if (ppid < 0) {
-        print_str("[FAIL] getppid failed\n");
+        TSK_TEST_FAIL("syscalls", "process_telemetry", "getppid failed");
         return 3;
     }
     if (sched_yield() != 0) {
-        print_str("[FAIL] sched_yield failed\n");
+        TSK_TEST_FAIL("syscalls", "process_telemetry", "sched_yield failed");
         return 4;
     }
-    print_str("[PASS] Process syscalls (getpid, getppid, sched_yield)\n");
+    TSK_TEST_PASS("syscalls", "process_telemetry");
+    passed++;
 
     /* Test 3: Errno handling on invalid syscall arguments. */
     errno = 0;
     int bad_fd = close(-999);
     if (bad_fd != -1 || errno == 0) {
-        print_str("[FAIL] close(-999) did not set errno\n");
+        TSK_TEST_FAIL("syscalls", "errno_translation", "close(-999) did not set errno");
         return 5;
     }
 
     errno = 0;
     int bad_open = open("/nonexistent_directory/nonexistent_file_xyz", O_RDONLY);
     if (bad_open != -1 || errno != ENOENT) {
-        print_str("[FAIL] open nonexistent file did not set errno = ENOENT\n");
+        TSK_TEST_FAIL("syscalls", "errno_translation", "open nonexistent file did not set errno = ENOENT");
         return 6;
     }
 
     errno = 0;
     int bad_sock = socket(9999, SOCK_STREAM, 0);
     if (bad_sock != -1 || errno != EAFNOSUPPORT) {
-        print_str("[FAIL] socket(9999) did not set errno = EAFNOSUPPORT\n");
+        TSK_TEST_FAIL("syscalls", "errno_translation", "socket(9999) did not set errno = EAFNOSUPPORT");
         return 7;
     }
-    print_str("[PASS] Negative return errno translation (EBADF, ENOENT, EAFNOSUPPORT)\n");
+    TSK_TEST_PASS("syscalls", "errno_translation");
+    passed++;
 
     /* Test 4: Memory management (mmap/munmap). */
     errno = 0;
     void *bad_map = mmap(NULL, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (bad_map != MAP_FAILED || errno != EINVAL) {
-        print_str("[FAIL] mmap(0) did not return MAP_FAILED with EINVAL\n");
+        TSK_TEST_FAIL("syscalls", "mmap_munmap", "mmap(0) did not return MAP_FAILED with EINVAL");
         return 8;
     }
 
     void *mem = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) {
-        print_str("[FAIL] mmap anonymous 4K failed\n");
+        TSK_TEST_FAIL("syscalls", "mmap_munmap", "mmap anonymous 4K failed");
         return 9;
     }
     /* Write test pattern to mapped memory. */
@@ -114,24 +111,26 @@ int main(int argc, char **argv, char **envp)
     buf[2] = 'K';
     buf[3] = '\0';
     if (buf[0] != 'T' || buf[1] != 'S' || buf[2] != 'K') {
-        print_str("[FAIL] Memory readback mismatch\n");
+        TSK_TEST_FAIL("syscalls", "mmap_munmap", "memory readback mismatch");
         return 10;
     }
     if (munmap(mem, 4096) != 0) {
-        print_str("[FAIL] munmap failed\n");
+        TSK_TEST_FAIL("syscalls", "mmap_munmap", "munmap failed");
         return 11;
     }
-    print_str("[PASS] Memory management (mmap/munmap anonymous page)\n");
+    TSK_TEST_PASS("syscalls", "mmap_munmap");
+    passed++;
 
     /* Test 5: Sleep and time syscalls. */
     if (usleep(1000) != 0) {
-        print_str("[FAIL] usleep failed\n");
+        TSK_TEST_FAIL("syscalls", "time_sleep", "usleep failed");
         return 12;
     }
     time_t t = time(NULL);
     (void)t;
-    print_str("[PASS] Time and sleep operations (usleep, time)\n");
+    TSK_TEST_PASS("syscalls", "time_sleep");
+    passed++;
 
-    print_str("[ALL PASS] tsukasa-libc Step 2.2 & 2.3 verification complete\n");
+    TSK_TEST_DONE("syscalls", passed, total);
     return 0;
 }
