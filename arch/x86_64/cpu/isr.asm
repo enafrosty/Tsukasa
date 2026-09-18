@@ -170,16 +170,11 @@ isr_exception_common:
     jz .from_kernel
     swapgs
 .from_kernel:
-    mov rdi, [rsp + 120]
-    mov rsi, [rsp + 128]
-    mov rdx, [rsp + 136]
-    mov rcx, [rsp + 144]
-    mov r8,  [rsp + 160]
-    mov r9,  [rsp + 168]
     cld
     mov r15, rsp
     and rsp, -16
     sub rsp, 8
+    mov rdi, r15
     call idt_exception_handler_x64
     mov rsp, r15
     test qword [rsp + 144], 3

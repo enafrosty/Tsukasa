@@ -19,13 +19,20 @@
 
 #include <stdint.h>
 
-/* Initialise COM1 at 115200 baud, 8N1.  Must be called before serial_putc. */
+#define COM1_BASE  0x3F8u
+#define COM2_BASE  0x2F8u
+
+/* Port-parameterized serial functions */
+void serial_init_port(uint16_t base);
+void serial_putc_port(uint16_t base, char c);
+void serial_puts_port(uint16_t base, const char *s);
+void serial_write_byte_raw_port(uint16_t base, uint8_t b);
+int  serial_has_rx_port(uint16_t base);
+char serial_getc_port(uint16_t base);
+
+/* Legacy COM1 helpers */
 void serial_init(void);
-
-/* Transmit one character (blocks until THR is empty). */
 void serial_putc(char c);
-
-/* Transmit a NUL-terminated string. */
 void serial_puts(const char *s);
 
 #endif /* SERIAL_H */

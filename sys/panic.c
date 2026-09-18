@@ -19,6 +19,7 @@
 #include <stdbool.h>
 #include "sys/panic.h"
 #include "sys/kconsole.h"
+#include "include/gdbstub.h"
 #include "drv/fb.h"
 #include "gfx/blit.h"
 #include "gfx/font.h"
@@ -144,6 +145,14 @@ void kernel_panic(interrupt_frame_t *regs, const char *error_name) {
 
     pline("", COL_WHITE);
     pline("The CPU has been halted. Power off the machine.", COL_WHITE);
+
+#if defined(CONFIG_GDBSTUB)
+    if (gdbstub_is_enabled() && regs) {
+        pline("[gdbstub] waiting for debugger on COM2...", COL_HIGHLIGHT);
+        kprintf("[gdbstub] waiting for debugger on COM2...\n");
+        gdbstub_trap(regs, 11);
+    }
+#endif
 
     while (1) {
         asm volatile("cli; hlt");

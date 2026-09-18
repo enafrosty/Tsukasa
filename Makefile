@@ -110,6 +110,10 @@ OBJS = arch/x86_64/boot/entry.o \
        ipc/shm.o ipc/unix_socket.o \
        $(USER_LIB_OBJS) $(USER_APP_OBJS) \
        $(COMMON_OBJS) $(X64_NET_OBJS) $(X64_STORAGE_OBJS)
+ifeq ($(GDBSTUB),1)
+CFLAGS += -DCONFIG_GDBSTUB=1
+OBJS += sys/gdbstub.o
+endif
 ISO_TARGET = iso-x86_64
 else
 KERNEL_BIN = tsukasa.bin
@@ -133,11 +137,18 @@ all: arch-guard $(KERNEL_BIN)
 iso: arch-guard $(ISO_TARGET)
 
 arch-guard:
-	@if [ -f $(ARCH_MARKER) ] && [ "$$(cat $(ARCH_MARKER))" != "$(ARCH)" ]; then \
-	    echo "[build] ARCH switch detected: $$(cat $(ARCH_MARKER)) -> $(ARCH). Purging stale objects."; \
-	    find . -name '*.o' -delete; \
+	@if [ -f $(ARCH_MARKER) ]; then \
+	    PREV_ARCH=$$(awk '{print $$1}' $(ARCH_MARKER)); \
+	    PREV_GDB=$$(awk '{print $$2}' $(ARCH_MARKER)); \
+	    if [ "$$PREV_ARCH" != "$(ARCH)" ]; then \
+	        echo "[build] ARCH switch detected: $$PREV_ARCH -> $(ARCH). Purging stale objects."; \
+	        find . -name '*.o' -delete; \
+	    elif [ "$$PREV_GDB" != "gdbstub=$(GDBSTUB)" ]; then \
+	        echo "[build] GDBSTUB switch detected: $$PREV_GDB -> gdbstub=$(GDBSTUB). Purging stale objects."; \
+	        find arch sys -name '*.o' -delete; \
+	    fi; \
 	fi
-	@echo "$(ARCH)" > $(ARCH_MARKER)
+	@echo "$(ARCH) gdbstub=$(GDBSTUB)" > $(ARCH_MARKER)
 
 %.o: %.c
 	@mkdir -p $(dir $@)
