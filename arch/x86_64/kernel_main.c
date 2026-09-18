@@ -24,6 +24,7 @@
 
 #include "include/kprintf.h"
 #include "include/ksymbols.h"
+#include "include/gdbstub.h"
 #include "include/smp.h"
 #include "include/lapic.h"
 #include "mm/pmm.h"
@@ -173,6 +174,56 @@ static int is_test_requested(const struct tsukasa_boot_info *boot_info)
     return 0;
 }
 
+#if defined(CONFIG_GDBSTUB)
+static int is_gdb_wait_requested(const struct tsukasa_boot_info *boot_info)
+{
+    if (boot_info && boot_info->cmdline) {
+        if (k_strstr(boot_info->cmdline, "tsukasa.gdb=wait") ||
+            k_strstr(boot_info->cmdline, "tsukasa.gdb=1"))
+            return 1;
+    }
+
+    io_outw(0x510, 0x0000);
+    char sig[4];
+    for (int i = 0; i < 4; i++)
+        sig[i] = (char)io_inb(0x511);
+
+    if (sig[0] == 'Q' && sig[1] == 'E' && sig[2] == 'M' && sig[3] == 'U') {
+        io_outw(0x510, 0x0019);
+        uint32_t count = 0;
+        count |= ((uint32_t)io_inb(0x511)) << 24;
+        count |= ((uint32_t)io_inb(0x511)) << 16;
+        count |= ((uint32_t)io_inb(0x511)) << 8;
+        count |= (uint32_t)io_inb(0x511);
+
+        for (uint32_t i = 0; i < count; i++) {
+            (void)io_inb(0x511); (void)io_inb(0x511);
+            (void)io_inb(0x511); (void)io_inb(0x511);
+
+            uint16_t select = 0;
+            select |= ((uint16_t)io_inb(0x511)) << 8;
+            select |= (uint16_t)io_inb(0x511);
+
+            (void)io_inb(0x511); (void)io_inb(0x511);
+
+            char name[56];
+            for (int j = 0; j < 56; j++)
+                name[j] = (char)io_inb(0x511);
+
+            if (k_strcmp(name, "opt/org.tsukasa.gdb") == 0 ||
+                k_strcmp(name, "opt/tsukasa.gdb") == 0) {
+                io_outw(0x510, select);
+                char val = (char)io_inb(0x511);
+                if (val == '1' || val == 'w')
+                    return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+#endif
+
 void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
 {
     serial_init();
@@ -217,6 +268,13 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
 
     gdt_init_x64();
     idt_init_x64();
+#if defined(CONFIG_GDBSTUB)
+    gdbstub_init(COM2_BASE);
+    if (is_gdb_wait_requested(boot_info)) {
+        kprintf("[gdbstub] gdb wait requested; waiting for debugger on COM2...\n");
+        gdbstub_breakpoint();
+    }
+#endif
     lapic_init();
     smp_init_bsp();
     uint32_t online_cpus = smp_init(smp_request.response);

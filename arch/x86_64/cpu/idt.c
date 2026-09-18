@@ -18,8 +18,10 @@
 #include <stddef.h>
 
 #include "idt.h"
+#include "include/gdbstub.h"
 #include "include/smp.h"
 #include "include/kprintf.h"
+#include "sys/panic.h"
 #include "proc/process.h"
 #include "mm/vmm_x64.h"
 #include "drv/fb.h"
@@ -155,9 +157,31 @@ static void draw_exception_banner(uint64_t vector, uint64_t error_code, uint64_t
      */
 }
 
-void idt_exception_handler_x64(uint64_t vector, uint64_t error_code, uint64_t rip,
-                               uint64_t cs, uint64_t fault_rsp, uint64_t ss)
+void idt_exception_handler_x64(interrupt_frame_t *frame)
 {
+    uint64_t vector = frame->int_no;
+    uint64_t error_code = frame->err_code;
+    uint64_t rip = frame->rip;
+    uint64_t cs = frame->cs;
+    uint64_t fault_rsp = frame->rsp;
+    uint64_t ss = frame->ss;
+
+#if defined(CONFIG_GDBSTUB)
+    if (gdbstub_is_enabled()) {
+        if (vector == 3) {
+            if (gdbstub_has_breakpoint_at(frame->rip - 1)) {
+                frame->rip -= 1;
+            }
+            gdbstub_trap(frame, 5);
+            return;
+        } else if (vector == 1) {
+            frame->rflags &= ~(1ULL << 8);
+            gdbstub_trap(frame, 5);
+            return;
+        }
+    }
+#endif
+
     uint64_t cr2 = 0;
     uint64_t cr3 = 0;
     uint64_t k_rsp = 0;
@@ -207,9 +231,7 @@ void idt_exception_handler_x64(uint64_t vector, uint64_t error_code, uint64_t ri
 
     draw_exception_banner(vector, error_code, rip, cr2);
 
-    for (;;) {
-        __asm__ volatile ("hlt");
-    }
+    kernel_panic(frame, exception_name((uint8_t)vector));
 }
 
 void idt_init_x64(void)
