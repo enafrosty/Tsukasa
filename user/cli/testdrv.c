@@ -49,6 +49,39 @@ static inline void sys_poweroff(void)
     (void)ret;
 }
 
+static inline long sys_stat(const char *path, void *st)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(4L), "D"((long)(uintptr_t)path), "S"((long)(uintptr_t)st), "d"(0L)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
+static int is_vanilla_test(const char *bin_path)
+{
+    const char * const targets[] = {
+        "/fat12/TESTIPC.ELF",
+        "/fat12/TESTCOMP.ELF",
+        "/fat12/TESTTYPO.ELF",
+        "/fat12/TSHELL.ELF",
+        0
+    };
+
+    for (int i = 0; targets[i] != 0; i++) {
+        const char *p = bin_path;
+        const char *t = targets[i];
+        while (*p && *t && *p == *t) {
+            p++;
+            t++;
+        }
+        if (*p == '\0' && *t == '\0')
+            return 1;
+    }
+    return 0;
+}
+
 static const char * const g_test_binaries[] = {
     "/fat12/TCRT0.ELF",
     "/fat12/TSYSC.ELF",
@@ -90,8 +123,21 @@ int main(int argc, char **argv)
 
     dprintf(1, "[testdrv] Starting in-guest test suite runner...\n");
 
+    int vanilla_ready = 0;
+
     for (int i = 0; g_test_binaries[i] != NULL; i++) {
         const char *bin_path = g_test_binaries[i];
+
+        if (!vanilla_ready && is_vanilla_test(bin_path)) {
+            char stat_buf[128];
+            for (int wait_sock = 0; wait_sock < 500; wait_sock++) {
+                if (sys_stat("/tmp/vanilla.sock", stat_buf) == 0)
+                    break;
+                sched_yield();
+            }
+            vanilla_ready = 1;
+        }
+
         dprintf(1, "[testdrv] Executing %s\n", bin_path);
 
         long pid = -1;
