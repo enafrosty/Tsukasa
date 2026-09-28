@@ -8,7 +8,7 @@ Tsukasa is a freestanding operating system written in C and x86_64 assembly. The
 
 
   
-The operating system boots primarily on 64-bit x86 hardware through the Limine bootloader protocol, while retaining a legacy 32-bit Multiboot interface for compatibility testing.
+The operating system boots on 64-bit x86 hardware through the Limine bootloader protocol.
 
   
 
@@ -192,7 +192,7 @@ make  initrd
 
 # 3. Build the x86_64 kernel and package the bootable ISO
 
-make  ARCH=x86_64  iso
+make  iso
 
 ```
 

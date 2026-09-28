@@ -1,6 +1,6 @@
-# Booting Tsukasa with QEMU (legacy BIOS by default)
+# Booting Tsukasa with QEMU
 
-If you want to use **QEMU** instead of VirtualBox. QEMU typically uses **SeaBIOS** (legacy BIOS) by default, so your multiboot kernel should boot without changing any firmware setting.
+Tsukasa boots via the Limine bootloader on x86_64.
 
 ## Install QEMU (Windows)
 
@@ -13,17 +13,18 @@ If you want to use **QEMU** instead of VirtualBox. QEMU typically uses **SeaBIOS
 From the project directory (where `tsukasa.iso` is):
 
 ```powershell
-qemu-system-i386 -cdrom tsukasa.iso -m 64
+qemu-system-x86_64 -cdrom tsukasa.iso -hda disk.img -m 256 -smp 2 -vga std -serial stdio
 ```
 
-- `-m 64` = 64 MB RAM (matches your VM).
-- QEMU will use legacy BIOS and boot from the CD; you should see the GRUB menu and then your kernel.
+- `-m 256` = 256 MB RAM.
+- `-smp 2` = 2 CPU cores.
+- `-vga std` = Standard VGA framebuffer.
+- `-serial stdio` = Redirect COM1 serial output to terminal.
 
-## Optional: no GUI (serial only)
+## Optional: Headless / No GUI (Serial Only)
 
 ```powershell
-qemu-system-i386 -cdrom tsukasa.iso -m 64 -nographic
+qemu-system-x86_64 -cdrom tsukasa.iso -hda disk.img -m 256 -smp 2 -vga std -display none -serial stdio
 ```
 
-(Output goes to the terminal; exit with Ctrl+A then X.)
-
+(Output goes to the terminal; exit with Ctrl+C or kill the process.)
