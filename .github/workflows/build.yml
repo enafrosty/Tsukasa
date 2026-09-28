@@ -94,7 +94,7 @@ jobs:
         run: bash scripts/ci/install-toolchain.sh
 
       - name: Build x86_64 kernel with GCC
-        run: make TOOLCHAIN=gcc ARCH=x86_64
+        run: make TOOLCHAIN=gcc
 
   boot-test:
     name: "QEMU Boot Smoke Test"

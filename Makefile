@@ -1,10 +1,5 @@
 # Makefile for Tsukasa OS
-#
-# Architectures:
-#   make ARCH=i386 iso      -> legacy GRUB/Multiboot i386 image
-#   make ARCH=x86_64 iso    -> Limine x86_64 image
-
-ARCH ?= x86_64
+# Single architecture: x86_64.
 
 # Toolchains:
 #   make TOOLCHAIN=llvm  (default) -> clang/ld.lld targeting bare-metal ELF
@@ -13,8 +8,7 @@ ARCH ?= x86_64
 TOOLCHAIN ?= llvm
 
 ifeq ($(TOOLCHAIN),llvm)
-CLANG_TARGET = $(if $(filter x86_64,$(ARCH)),x86_64-unknown-elf,i386-unknown-elf)
-CC = clang --target=$(CLANG_TARGET)
+CC = clang --target=x86_64-unknown-elf
 LD = ld.lld
 else
 CC = gcc
@@ -27,7 +21,6 @@ MAKE ?= $(MAKE)
 ISO_IMAGE = tsukasa.iso
 ISO_DIR = iso
 BOOT_DIR = $(ISO_DIR)/boot
-GRUB_DIR = $(BOOT_DIR)/grub
 LIMINE_BOOT_DIR = $(BOOT_DIR)/limine
 EFI_BOOT_DIR = $(ISO_DIR)/EFI/BOOT
 
@@ -37,7 +30,6 @@ INITRD_FILES = initrd_files
 LIMINE_DIR = .limine
 LIMINE_REPO = https://github.com/limine-bootloader/limine.git
 LIMINE_BRANCH = v8.x-binary
-ARCH_MARKER = .last_build_arch
 
 COMMON_OBJS = vga.o \
     mm/pmm.o mm/heap.o mm/slab.o mm/tlsf.o mm/vmm_x64.o mm/vm_space.o \
@@ -83,10 +75,9 @@ X64_NET_OBJS = dev/pci.o \
     net/third_party/lwip/core/ipv4/ip4_frag.o \
     net/third_party/lwip/netif/ethernet.o
 
-# x64-only storage drivers (PCI-based; i386 keeps ATA PIO only).
+# x64 storage drivers (PCI-based).
 X64_STORAGE_OBJS =
 
-ifeq ($(ARCH),x86_64)
 KERNEL_BIN = tsukasa_x64.elf
 CFLAGS = -m64 -mcmodel=kernel -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
          -ffreestanding -fno-pie -fstack-protector-strong -Wall -Wextra -O2 \
@@ -119,44 +110,12 @@ CFLAGS += -fsanitize=signed-integer-overflow,shift,integer-divide-by-zero,bounds
 OBJS += lib/ubsan.o
 endif
 ISO_TARGET = iso-x86_64
-else
-KERNEL_BIN = tsukasa.bin
-CFLAGS = -m32 -ffreestanding -fno-pie -fno-stack-protector -Wall -Wextra -O2 -I. -Iinclude
-ASMFLAGS = -f elf32
-LDFLAGS = -m elf_i386 -T linker.ld -nostdlib --build-id=none
-OBJS = boot.o isr.o idt.o kernel.o \
-       mm/gdt.o \
-       mm/paging.o \
-       proc/task.o proc/scheduler.o proc/context.o proc/switch.o \
-       syscall/syscall.o syscall/syscall_entry.o \
-       ipc/shm.o ipc/unix_socket.o user/user_stub.o \
-       $(COMMON_OBJS)
-ISO_TARGET = iso-i386
-endif
 
-.PHONY: all iso initrd clean check-multiboot iso-i386 iso-x86_64 limine-artifacts arch-guard sdk apps vanilla coreutils disktools ports check libc-tests
+.PHONY: all iso initrd clean iso-x86_64 limine-artifacts sdk apps vanilla coreutils disktools ports check libc-tests
 
-all: arch-guard $(KERNEL_BIN)
+all: $(KERNEL_BIN)
 
-iso: arch-guard $(ISO_TARGET)
-
-arch-guard:
-	@if [ -f $(ARCH_MARKER) ]; then \
-	    PREV_ARCH=$$(awk '{print $$1}' $(ARCH_MARKER)); \
-	    PREV_GDB=$$(awk '{print $$2}' $(ARCH_MARKER)); \
-	    PREV_UBSAN=$$(awk '{print $$3}' $(ARCH_MARKER)); \
-	    if [ "$$PREV_ARCH" != "$(ARCH)" ]; then \
-	        echo "[build] ARCH switch detected: $$PREV_ARCH -> $(ARCH). Purging stale objects."; \
-	        find . -name '*.o' -delete; \
-	    elif [ "$$PREV_GDB" != "gdbstub=$(GDBSTUB)" ]; then \
-	        echo "[build] GDBSTUB switch detected: $$PREV_GDB -> gdbstub=$(GDBSTUB). Purging stale objects."; \
-	        find arch sys -name '*.o' -delete; \
-	    elif [ "$$PREV_UBSAN" != "ubsan=$(UBSAN)" ]; then \
-	        echo "[build] UBSAN switch detected: $$PREV_UBSAN -> ubsan=$(UBSAN). Purging stale objects."; \
-	        find . -name '*.o' -delete; \
-	    fi; \
-	fi
-	@echo "$(ARCH) gdbstub=$(GDBSTUB) ubsan=$(UBSAN)" > $(ARCH_MARKER)
+iso: $(ISO_TARGET)
 
 %.o: %.c
 	@mkdir -p $(dir $@)
@@ -181,16 +140,11 @@ lib/ksymbols_table.o: lib/ksymbols_table.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-ifeq ($(ARCH),x86_64)
-$(KERNEL_BIN): arch-guard $(OBJS) lib/ksymbols_table.o
+$(KERNEL_BIN): $(OBJS) lib/ksymbols_table.o
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) lib/ksymbols_table.o
 	bash scripts/build/gen-ksymbols.sh $@ lib/ksymbols_table.c
 	$(CC) $(CFLAGS) -c -o lib/ksymbols_table.o lib/ksymbols_table.c
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) lib/ksymbols_table.o
-else
-$(KERNEL_BIN): arch-guard $(OBJS)
-	$(LD) $(LDFLAGS) -o $@ $(OBJS)
-endif
 
 $(INITRD_FILES)/hello.elf: user_elf/hello64.asm
 	@mkdir -p $(INITRD_FILES)
@@ -416,25 +370,6 @@ check:
 	@scripts/test/run-guest-tests.sh
 	@scripts/test/summarize.sh
 
-check-multiboot: $(KERNEL_BIN)
-	@if [ "$(ARCH)" = "i386" ]; then \
-	    python3 check_multiboot.py $(KERNEL_BIN) 2>/dev/null || \
-	    python  check_multiboot.py $(KERNEL_BIN) || true; \
-	fi
-
-iso-i386: $(KERNEL_BIN) check-multiboot
-	@mkdir -p $(GRUB_DIR)
-	cp $(KERNEL_BIN) $(BOOT_DIR)/
-	cp grub.cfg $(GRUB_DIR)/
-	@if [ -f $(INITRD_IMG) ]; then \
-	    cp $(INITRD_IMG) $(BOOT_DIR)/; \
-	    echo "[OK] initrd.img included in ISO."; \
-	else \
-	    echo "[WARN] No initrd.img found. Continuing without optional FAT12 compatibility ramdisk."; \
-	fi
-	grub-mkrescue -o $(ISO_IMAGE) $(ISO_DIR)
-	@echo "[OK] $(ISO_IMAGE) ready (i386/GRUB)."
-
 $(LIMINE_DIR)/limine:
 	@if [ ! -d $(LIMINE_DIR) ]; then \
 	    git clone --depth=1 --branch=$(LIMINE_BRANCH) $(LIMINE_REPO) $(LIMINE_DIR); \
@@ -487,7 +422,7 @@ qemu run: iso-x86_64
 
 clean:
 	find . -name '*.o' -delete
-	rm -f tsukasa.bin tsukasa_x64.elf $(ISO_IMAGE) $(INITRD_IMG) $(ARCH_MARKER) lib/ksymbols_table.c
+	rm -f tsukasa_x64.elf $(ISO_IMAGE) $(INITRD_IMG) lib/ksymbols_table.c
 	rm -rf $(ISO_DIR) $(SDK_DIR) $(INITRD_FILES)
 	$(MAKE) -C vanilla clean
 	$(MAKE) -C tsukasa-disktools clean
