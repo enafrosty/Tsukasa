@@ -87,6 +87,12 @@ int dprintf(int fd, const char *fmt, ...)
         sl_out(fd, &fmt[start], i - start);
         count += (int)(i - start);
         i++;
+        int is_long = 0;
+        if (fmt[i] == 'l') {
+            is_long = 1;
+            i++;
+        }
+
         switch (fmt[i]) {
         case 's': {
             const char *s = va_arg(ap, const char *);
@@ -103,23 +109,32 @@ int dprintf(int fd, const char *fmt, ...)
             break;
         }
         case 'd': {
-            long v = (long)va_arg(ap, int);
+            long v = is_long ? va_arg(ap, long) : (long)va_arg(ap, int);
+            unsigned long uv;
             if (v < 0) {
                 sl_out(fd, "-", 1);
-                v = -v;
+                uv = 0UL - (unsigned long)v;
+            } else {
+                uv = (unsigned long)v;
             }
-            sl_udec(fd, (unsigned long)v);
+            sl_udec(fd, uv);
             count++;
             break;
         }
-        case 'u':
-            sl_udec(fd, (unsigned long)va_arg(ap, unsigned int));
+        case 'u': {
+            unsigned long v = is_long ? va_arg(ap, unsigned long)
+                                      : (unsigned long)va_arg(ap, unsigned int);
+            sl_udec(fd, v);
             count++;
             break;
-        case 'x':
-            sl_uhex(fd, (unsigned long)va_arg(ap, unsigned int));
+        }
+        case 'x': {
+            unsigned long v = is_long ? va_arg(ap, unsigned long)
+                                      : (unsigned long)va_arg(ap, unsigned int);
+            sl_uhex(fd, v);
             count++;
             break;
+        }
         case '%':
             sl_out(fd, "%", 1);
             count++;
@@ -127,10 +142,12 @@ int dprintf(int fd, const char *fmt, ...)
         case '\0':
             va_end(ap);
             return count;
-        default:
-            sl_out(fd, &fmt[i - 1], 2);
-            count += 2;
+        default: {
+            size_t spec_len = is_long ? 3 : 2;
+            sl_out(fd, &fmt[i - (spec_len - 1)], spec_len);
+            count += (int)spec_len;
             break;
+        }
         }
         start = i + 1;
     }
