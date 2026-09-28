@@ -22,8 +22,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#ifdef __x86_64__
-
 #include "../include/kprintf.h"
 #include "../include/paging.h"
 #include "../proc/process.h"
@@ -148,14 +146,12 @@ int shm_create(size_t size)
     if (!phys)
         return -1;
 
-#ifdef __x86_64__
     uintptr_t hhdm = vmm_x64_hhdm_offset();
     if (hhdm) {
         uint8_t *kptr = (uint8_t *)(phys + hhdm);
         for (size_t b = 0; b < page_count * PAGE_SIZE; b++)
             kptr[b] = 0;
     }
-#endif
 
     spin_lock(&g_shm_lock);
     r = shm_alloc_region_locked();
@@ -425,124 +421,3 @@ void shm_dump_state(void)
             (uint32_t)stats.attachment_count,
             (uint32_t)stats.reserved_pages);
 }
-
-#else
-
-#define SHM_MAX_REGIONS 32
-
-struct shm_region {
-    int id;
-    uintptr_t phys_base;
-    size_t size;
-    size_t page_count;
-    int ref_count;
-    int attach_count;
-    int in_use;
-};
-
-static struct shm_region shm_regions[SHM_MAX_REGIONS];
-static int next_shm_id = 1;
-static spinlock_t shm_lock = SPINLOCK_INIT;
-
-static struct shm_region *shm_find(int id)
-{
-    for (int i = 0; i < SHM_MAX_REGIONS; i++) {
-        if (shm_regions[i].in_use && shm_regions[i].id == id)
-            return &shm_regions[i];
-    }
-    return NULL;
-}
-
-static struct shm_region *shm_alloc_slot(void)
-{
-    for (int i = 0; i < SHM_MAX_REGIONS; i++) {
-        if (!shm_regions[i].in_use)
-            return &shm_regions[i];
-    }
-    return NULL;
-}
-
-int shm_create(size_t size)
-{
-    if (size == 0)
-        return -1;
-
-    size_t page_count = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    uintptr_t phys = pmm_alloc_pages(page_count);
-    if (phys == 0)
-        return -1;
-
-    spin_lock(&shm_lock);
-    struct shm_region *r = shm_alloc_slot();
-    if (!r) {
-        spin_unlock(&shm_lock);
-        pmm_free_pages(phys, page_count);
-        return -1;
-    }
-
-    r->id = next_shm_id++;
-    r->phys_base = phys;
-    r->size = page_count * PAGE_SIZE;
-    r->page_count = page_count;
-    r->ref_count = 1;
-    r->attach_count = 0;
-    r->in_use = 1;
-    spin_unlock(&shm_lock);
-    return r->id;
-}
-
-void *shm_attach(int shm_id)
-{
-    (void)shm_id;
-    return NULL;
-}
-
-int shm_detach(void *addr)
-{
-    (void)addr;
-    return -1;
-}
-
-int shm_destroy(int shm_id)
-{
-    spin_lock(&shm_lock);
-    struct shm_region *r = shm_find(shm_id);
-    if (!r) {
-        spin_unlock(&shm_lock);
-        return -1;
-    }
-    if (r->attach_count > 0) {
-        spin_unlock(&shm_lock);
-        return -1;
-    }
-    r->ref_count--;
-    int should_free = (r->ref_count <= 0);
-    uintptr_t phys = r->phys_base;
-    size_t pages = r->page_count;
-    if (should_free)
-        r->in_use = 0;
-    spin_unlock(&shm_lock);
-    if (should_free)
-        pmm_free_pages(phys, pages);
-    return 0;
-}
-
-void shm_process_cleanup(struct process *proc)
-{
-    (void)proc;
-}
-
-void shm_get_stats(struct shm_stats *out)
-{
-    if (!out)
-        return;
-    out->region_count = 0;
-    out->attachment_count = 0;
-    out->reserved_pages = 0;
-}
-
-void shm_dump_state(void)
-{
-}
-
-#endif
