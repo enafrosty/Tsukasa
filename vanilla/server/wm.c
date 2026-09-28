@@ -170,13 +170,6 @@ void wm_raise_window(vanilla_server_t *srv, uint32_t window_id)
     }
 
     target->z_index = max_z + 1;
-    target->is_focused = 1;
-    srv->focused_window_id = window_id;
-
-    for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
-        if (srv->windows[i].in_use && srv->windows[i].window_id != window_id)
-            srv->windows[i].is_focused = 0;
-    }
 
     wm_invalidate_window(srv, target);
     shell_invalidate(srv);
@@ -507,7 +500,7 @@ int vanilla_server_dispatch_client(vanilla_server_t *srv, int client_idx)
         w->height = req.height;
         w->flags = req.flags;
         w->is_mapped = 1;
-        w->is_focused = 1;
+        w->is_focused = 0;
         w->z_index = ++srv->next_z_index;
 
         w->is_snapped = SNAP_NONE;
@@ -593,7 +586,6 @@ int vanilla_server_dispatch_client(vanilla_server_t *srv, int client_idx)
         w = vanilla_server_find_window(srv, req.window_id);
         if (w && w->client_fd == cfd) {
             w->is_mapped = 1;
-            wm_raise_window(srv, w->window_id);
             /* Automatically focus window upon map so keyboard input is directed immediately */
             vanilla_server_focus_window(srv, w->window_id);
             wm_invalidate_window(srv, w);
@@ -620,6 +612,7 @@ int vanilla_server_dispatch_client(vanilla_server_t *srv, int client_idx)
         if (w && w->client_fd == cfd) {
             wm_invalidate_window(srv, w);
             w->is_mapped = 0;
+            w->is_focused = 0;
             if (srv->focused_window_id == w->window_id)
                 srv->focused_window_id = 0;
             shell_invalidate(srv);
