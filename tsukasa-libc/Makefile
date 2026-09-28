@@ -28,7 +28,7 @@ ASM ?= nasm
 AR ?= ar
 
 CFLAGS_BASE = -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
-              -fno-pie -fno-stack-protector -O2 -Iinclude
+              -fno-pie -fstack-protector-strong -O2 -Iinclude
 
 CFLAGS      = $(CFLAGS_BASE) -mno-mmx -mno-sse -mno-sse2
 MATH_CFLAGS = $(CFLAGS_BASE)
@@ -54,7 +54,8 @@ STDLIB_OBJS  = src/stdlib/stdlib.o \
                src/stdlib/malloc.o \
                src/stdlib/locale.o \
                src/stdlib/assert.o \
-               src/stdlib/strtod.o
+               src/stdlib/strtod.o \
+               src/stdlib/stack_chk.o
 
 STDIO_OBJS   = src/stdio/printf.o \
                src/stdio/stdio.o \

@@ -4,6 +4,9 @@ on:
   push:
     branches: ["main"]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -142,4 +145,47 @@ jobs:
           path: |
             test-host.log
             test-guest.log
+
+  ubsan-nightly:
+    name: "Kernel UBSan Nightly"
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: bash scripts/ci/install-toolchain.sh
+
+      - name: Cache Limine bootloader artifacts
+        uses: actions/cache@v4
+        with:
+          path: .limine
+          key: limine-v8.x-binary
+
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+
+      - name: Build x86_64 ISO with UBSan
+        run: make UBSAN=1 iso-x86_64
+
+      - name: Boot test UBSan build
+        run: bash scripts/ci/boot-test.sh tsukasa.iso boot-ubsan.log
+
+      - name: Scan for undefined behavior reports
+        run: |
+          if grep -q "\[ubsan\]" boot-ubsan.log; then
+            echo "::error::Undefined behavior detected in boot log:"
+            grep "\[ubsan\]" boot-ubsan.log
+            exit 1
+          fi
+          echo "No undefined behavior reports found."
+
+      - name: Upload UBSan boot log
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: boot-ubsan-log
+          path: boot-ubsan.log
+
 

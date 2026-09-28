@@ -139,3 +139,17 @@ int dprintf(int fd, const char *fmt, ...)
     va_end(ap);
     return count;
 }
+
+/* Compile-time constant canary for SDK userland apps */
+uintptr_t __stack_chk_guard = 0x00000aff595e2f0aUL;
+
+__attribute__((noreturn, no_stack_protector))
+void __stack_chk_fail(void)
+{
+    const char msg[] = "[stack] canary corrupted - stack smashing detected\n";
+    write(2, msg, sizeof(msg) - 1);
+    for (;;) {
+        exit(134);
+    }
+}
+

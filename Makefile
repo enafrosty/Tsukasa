@@ -47,7 +47,7 @@ COMMON_OBJS = vga.o \
     fs/vfs.o fs/devfs.o fs/initrd.o fs/fat12.o fs/fat32.o fs/mkfs_fat32.o fs/memfs.o fs/procfs.o fs/sysfs.o fs/bootfs.o \
     fs/tar.o fs/tar_testdata.o \
     loader/elf.o loader/exec.o loader/elf64.o \
-    lib/kprintf.o lib/kutils.o lib/compiler_rt.o lib/ksymbols.o lib/backtrace.o \
+    lib/kprintf.o lib/kutils.o lib/compiler_rt.o lib/ksymbols.o lib/backtrace.o lib/stack_chk.o \
     gfx/blit.o gfx/font.o gfx/font_8x8.o \
     gfx/ui.o gfx/bmp.o \
     gfx/wm.o gfx/cursor.o gfx/gui_srv.o gfx/desktop.o
@@ -89,7 +89,7 @@ X64_STORAGE_OBJS =
 ifeq ($(ARCH),x86_64)
 KERNEL_BIN = tsukasa_x64.elf
 CFLAGS = -m64 -mcmodel=kernel -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
-         -ffreestanding -fno-pie -fno-stack-protector -Wall -Wextra -O2 \
+         -ffreestanding -fno-pie -fstack-protector-strong -Wall -Wextra -O2 \
          -fno-omit-frame-pointer \
          -DTSUKASA_USERLIB_KERNEL \
          -I. -Iinclude -Iarch/x86_64 -Inet -Inet/lwip_arch \
@@ -113,6 +113,10 @@ OBJS = arch/x86_64/boot/entry.o \
 ifeq ($(GDBSTUB),1)
 CFLAGS += -DCONFIG_GDBSTUB=1
 OBJS += sys/gdbstub.o
+endif
+ifeq ($(UBSAN),1)
+CFLAGS += -fsanitize=signed-integer-overflow,shift,integer-divide-by-zero,bounds,unreachable -fno-sanitize=alignment -DCONFIG_UBSAN=1
+OBJS += lib/ubsan.o
 endif
 ISO_TARGET = iso-x86_64
 else
@@ -140,15 +144,19 @@ arch-guard:
 	@if [ -f $(ARCH_MARKER) ]; then \
 	    PREV_ARCH=$$(awk '{print $$1}' $(ARCH_MARKER)); \
 	    PREV_GDB=$$(awk '{print $$2}' $(ARCH_MARKER)); \
+	    PREV_UBSAN=$$(awk '{print $$3}' $(ARCH_MARKER)); \
 	    if [ "$$PREV_ARCH" != "$(ARCH)" ]; then \
 	        echo "[build] ARCH switch detected: $$PREV_ARCH -> $(ARCH). Purging stale objects."; \
 	        find . -name '*.o' -delete; \
 	    elif [ "$$PREV_GDB" != "gdbstub=$(GDBSTUB)" ]; then \
 	        echo "[build] GDBSTUB switch detected: $$PREV_GDB -> gdbstub=$(GDBSTUB). Purging stale objects."; \
 	        find arch sys -name '*.o' -delete; \
+	    elif [ "$$PREV_UBSAN" != "ubsan=$(UBSAN)" ]; then \
+	        echo "[build] UBSAN switch detected: $$PREV_UBSAN -> ubsan=$(UBSAN). Purging stale objects."; \
+	        find . -name '*.o' -delete; \
 	    fi; \
 	fi
-	@echo "$(ARCH) gdbstub=$(GDBSTUB)" > $(ARCH_MARKER)
+	@echo "$(ARCH) gdbstub=$(GDBSTUB) ubsan=$(UBSAN)" > $(ARCH_MARKER)
 
 %.o: %.c
 	@mkdir -p $(dir $@)
@@ -208,7 +216,7 @@ $(INITRD_FILES)/exit7.elf: user_elf/exit7.asm
 SDK_DIR    = sdk
 SDK_CC     = clang --target=x86_64-unknown-elf
 
-SDK_CFLAGS = -ffreestanding -fno-pie -fno-stack-protector -mno-red-zone \
+SDK_CFLAGS = -ffreestanding -fno-pie -fstack-protector-strong -mno-red-zone \
              -mno-mmx -mno-sse -mno-sse2 \
              -O2 -Wall -Wextra -Iuser/crt
 SDK_OBJS   = user/crt/crt0.o user/crt/syscalls.o user/crt/stdio_lite.o
