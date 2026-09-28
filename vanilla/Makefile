@@ -27,7 +27,7 @@ AR = ar
 endif
 
 CFLAGS = -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
-         -fno-pie -fno-stack-protector -O2 \
+         -fno-pie -fstack-protector-strong -O2 \
          -I../tsukasa-libc/include -Iinclude -DSTBI_NO_THREAD_LOCALS
 
 LDFLAGS = -m elf_x86_64 -T ../tsukasa-libc/tsukasa_app.ld -nostdlib
