@@ -50,6 +50,6 @@ void app_draw_progress_bar(vanilla_surface_t *surf, int32_t x, int32_t y, int32_
                            int progress_pct, uint32_t bar_color, uint32_t bg_color);
 
 /* Evdev Keycode Translation */
-char app_evdev_to_ascii(uint16_t code, int shift);
+#include "../input/keymap.h"
 
 #endif /* _VANILLA_APP_COMMON_H */

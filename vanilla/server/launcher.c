@@ -122,49 +122,6 @@ static void launcher_update_matches(vanilla_launcher_t *launcher)
         launcher->selected_idx = launcher->match_count > 0 ? launcher->match_count - 1 : 0;
 }
 
-char launcher_evdev_to_ascii(uint16_t code, int shift)
-{
-    if (code >= KEY_1 && code <= KEY_9) {
-        static const char num_normal[] = "123456789";
-        static const char num_shift[]  = "!@#$%^&*(";
-        return shift ? num_shift[code - KEY_1] : num_normal[code - KEY_1];
-    }
-    if (code == KEY_0)
-        return shift ? ')' : '0';
-
-    if (code >= KEY_Q && code <= KEY_P) {
-        static const char row1[] = "qwertyuiop";
-        char c = row1[code - KEY_Q];
-        return shift ? (c - 32) : c;
-    }
-    if (code >= KEY_A && code <= KEY_L) {
-        static const char row2[] = "asdfghjkl";
-        char c = row2[code - KEY_A];
-        return shift ? (c - 32) : c;
-    }
-    if (code >= KEY_Z && code <= KEY_M) {
-        static const char row3[] = "zxcvbnm";
-        char c = row3[code - KEY_Z];
-        return shift ? (c - 32) : c;
-    }
-
-    switch (code) {
-    case KEY_SPACE:      return ' ';
-    case KEY_MINUS:      return shift ? '_' : '-';
-    case KEY_EQUAL:      return shift ? '+' : '=';
-    case KEY_LEFTBRACE:  return shift ? '{' : '[';
-    case KEY_RIGHTBRACE: return shift ? '}' : ']';
-    case KEY_SEMICOLON:  return shift ? ':' : ';';
-    case KEY_APOSTROPHE: return shift ? '"' : '\'';
-    case KEY_GRAVE:      return shift ? '~' : '`';
-    case KEY_BACKSLASH:  return shift ? '|' : '\\';
-    case KEY_COMMA:      return shift ? '<' : ',';
-    case KEY_DOT:        return shift ? '>' : '.';
-    case KEY_SLASH:      return shift ? '?' : '/';
-    default:             return 0;
-    }
-}
-
 void launcher_init(vanilla_launcher_t *launcher)
 {
     if (!launcher)
@@ -276,7 +233,7 @@ int launcher_handle_key(vanilla_server_t *srv, uint16_t code, int pressed)
         return 1;
     }
 
-    char ch = launcher_evdev_to_ascii(code, srv->shift_pressed);
+    char ch = vanilla_evdev_to_ascii(code, srv->shift_pressed);
     if (ch != 0 && srv->launcher.query_len < LAUNCHER_SEARCH_MAX - 1) {
         srv->launcher.query[srv->launcher.query_len++] = ch;
         srv->launcher.query[srv->launcher.query_len] = '\0';

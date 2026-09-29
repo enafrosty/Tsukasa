@@ -28,7 +28,7 @@ endif
 
 CFLAGS = -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
          -fno-pie -fstack-protector-strong -O2 \
-         -I../tsukasa-libc/include -Iinclude -DSTBI_NO_THREAD_LOCALS
+         -I../tsukasa-libc/include -Iinclude -Iinput -DSTBI_NO_THREAD_LOCALS
 
 LDFLAGS = -m elf_x86_64 -T ../tsukasa-libc/tsukasa_app.ld -nostdlib
 
@@ -43,7 +43,8 @@ BIN_DIR = bin
 LIB_DIR = lib
 
 LIBVANILLA_OBJS = libvanilla/client.o \
-                  libvanilla/surface.o
+                  libvanilla/surface.o \
+                  input/keymap.o
 
 SERVER_OBJS     = server/main.o \
                   server/wm.o \
@@ -182,7 +183,7 @@ check: all
 	@echo "     - bin/taskmgr.elf"
 
 clean:
-	rm -rf libvanilla/*.o server/*.o tests/*.o apps/*.o $(BIN_DIR) $(LIB_DIR) host_emulator/*.host.o server/*.host.o libvanilla/*.host.o host_emulator/bin
+	rm -rf libvanilla/*.o server/*.o tests/*.o apps/*.o input/*.o $(BIN_DIR) $(LIB_DIR) host_emulator/*.host.o server/*.host.o libvanilla/*.host.o input/*.host.o host_emulator/bin
 
 host:
 	$(MAKE) -f host_emulator/Makefile.host all

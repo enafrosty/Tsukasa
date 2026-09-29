@@ -220,7 +220,7 @@ int main(int argc, char **argv)
                     if (iev->code == KEY_LEFTSHIFT || iev->code == KEY_RIGHTSHIFT) {
                         state.shift_down = (iev->value != 0);
                     } else if (iev->value == 1) {
-                        char ascii = app_evdev_to_ascii(iev->code, state.shift_down);
+                        char ascii = vanilla_evdev_to_ascii(iev->code, state.shift_down);
                         if (ascii != 0) {
                             write(state.in_pipe[1], &ascii, 1);
                         } else if (iev->code == KEY_UP) {

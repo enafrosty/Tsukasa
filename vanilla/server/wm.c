@@ -1096,20 +1096,16 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     if (!(hit->flags & WINDOW_FLAG_BORDERLESS) &&
                         srv->cursor_y < frame.y + TITLEBAR_HEIGHT + WINDOW_BORDER_WIDTH) {
 
+                        chrome_btn_rects_t btns = chrome_metrics(&frame);
+
                         /* Close button [X] */
-                        if (srv->cursor_x >= frame.x + frame.w - 18 &&
-                            srv->cursor_x < frame.x + frame.w - 6 &&
-                            srv->cursor_y >= frame.y + 6 &&
-                            srv->cursor_y < frame.y + 18) {
+                        if (vanilla_rect_contains(&btns.close_btn, srv->cursor_x, srv->cursor_y)) {
                             vanilla_server_close_request(srv, hit->window_id);
                             return 0;
                         }
 
                         /* Maximize button [] */
-                        if (srv->cursor_x >= frame.x + frame.w - 34 &&
-                            srv->cursor_x < frame.x + frame.w - 22 &&
-                            srv->cursor_y >= frame.y + 6 &&
-                            srv->cursor_y < frame.y + 18) {
+                        if (vanilla_rect_contains(&btns.max_btn, srv->cursor_x, srv->cursor_y)) {
                             if (hit->is_snapped == SNAP_MAXIMIZE)
                                 wm_unsnap_window(srv, hit->window_id);
                             else
@@ -1118,10 +1114,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                         }
 
                         /* Minimize button [_] */
-                        if (srv->cursor_x >= frame.x + frame.w - 50 &&
-                            srv->cursor_x < frame.x + frame.w - 38 &&
-                            srv->cursor_y >= frame.y + 6 &&
-                            srv->cursor_y < frame.y + 18) {
+                        if (vanilla_rect_contains(&btns.min_btn, srv->cursor_x, srv->cursor_y)) {
                             hit->is_mapped = 0;
                             hit->is_focused = 0;
                             if (srv->focused_window_id == hit->window_id)
