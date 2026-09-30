@@ -58,7 +58,7 @@ static void settings_render(vanilla_surface_t *surf, settings_state_t *st)
     app_fill_rect(surf, 0, 0, SETTINGS_WIDTH, SETTINGS_HEIGHT, g_theme->bg_base);
 
     /* Top Tabs Header */
-    app_fill_rect(surf, 0, 0, SETTINGS_WIDTH, TAB_HEIGHT, g_theme->titlebar_active);
+    app_fill_rect(surf, 0, 0, SETTINGS_WIDTH, TAB_HEIGHT, g_theme->bg_elevated);
     app_fill_rect(surf, 0, TAB_HEIGHT - 1, SETTINGS_WIDTH, 1, g_theme->border);
 
     /* Tab buttons */

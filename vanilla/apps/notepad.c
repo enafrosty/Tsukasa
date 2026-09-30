@@ -162,7 +162,7 @@ static void note_render(vanilla_surface_t *surf, notepad_state_t *st)
     app_fill_rect(surf, 0, 0, NOTE_WIDTH, NOTE_HEIGHT, g_theme->bg_base);
 
     /* Toolbar header */
-    app_fill_rect(surf, 0, 0, NOTE_WIDTH, TOOLBAR_HEIGHT, g_theme->titlebar_active);
+    app_fill_rect(surf, 0, 0, NOTE_WIDTH, TOOLBAR_HEIGHT, g_theme->bg_elevated);
     app_fill_rect(surf, 0, TOOLBAR_HEIGHT - 1, NOTE_WIDTH, 1, g_theme->border);
     app_draw_button(surf, 8, 4, 52, 20, "New", 0);
     app_draw_button(surf, 66, 4, 52, 20, "Save", 0);
@@ -204,7 +204,7 @@ static void note_render(vanilla_surface_t *surf, notepad_state_t *st)
 
     /* Status bar */
     int status_y = NOTE_HEIGHT - STATUS_HEIGHT;
-    app_fill_rect(surf, 0, status_y, NOTE_WIDTH, STATUS_HEIGHT, g_theme->titlebar_active);
+    app_fill_rect(surf, 0, status_y, NOTE_WIDTH, STATUS_HEIGHT, g_theme->bg_elevated);
     app_fill_rect(surf, 0, status_y, NOTE_WIDTH, 1, g_theme->border);
 
     int total_chars = 0;

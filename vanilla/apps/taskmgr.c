@@ -142,7 +142,7 @@ static void tm_render(vanilla_surface_t *surf, taskmgr_state_t *st)
     app_fill_rect(surf, 0, 0, TM_WIDTH, TM_HEIGHT, g_theme->bg_base);
 
     /* Telemetry Header */
-    app_fill_rect(surf, 0, 0, TM_WIDTH, TM_HEADER_H, g_theme->titlebar_active);
+    app_fill_rect(surf, 0, 0, TM_WIDTH, TM_HEADER_H, g_theme->bg_elevated);
     app_fill_rect(surf, 0, TM_HEADER_H - 1, TM_WIDTH, 1, g_theme->border);
 
     char mem_str[64];
@@ -193,7 +193,7 @@ static void tm_render(vanilla_surface_t *surf, taskmgr_state_t *st)
 
     /* Bottom Action Bar */
     int bot_y = TM_HEIGHT - 36;
-    app_fill_rect(surf, 0, bot_y, TM_WIDTH, 36, g_theme->titlebar_active);
+    app_fill_rect(surf, 0, bot_y, TM_WIDTH, 36, g_theme->bg_elevated);
     app_fill_rect(surf, 0, bot_y, TM_WIDTH, 1, g_theme->border);
 
     app_draw_button(surf, TM_WIDTH - 110, bot_y + 6, 96, 24, "End Task", 0);

@@ -397,7 +397,7 @@ void compositor_render_frame(struct vanilla_server *srv)
 
                     /* Maximize button [] */
                     if (vanilla_rect_intersect(&btns.max_btn, dirty, &vis_btn)) {
-                        uint32_t btn_bg = win->is_focused ? g_theme->titlebar_btn_bg : g_theme->titlebar_active;
+                        uint32_t btn_bg = g_theme->titlebar_btn_bg;
                         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, btn_bg);
                         for (int k = 2; k <= 9; k++) {
                             int32_t top_y = btns.max_btn.y + 2;
@@ -423,7 +423,7 @@ void compositor_render_frame(struct vanilla_server *srv)
 
                     /* Minimize button [_] */
                     if (vanilla_rect_intersect(&btns.min_btn, dirty, &vis_btn)) {
-                        uint32_t btn_bg = win->is_focused ? g_theme->titlebar_btn_bg : g_theme->titlebar_active;
+                        uint32_t btn_bg = g_theme->titlebar_btn_bg;
                         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, btn_bg);
                         int32_t py = btns.min_btn.y + 9;
                         if (py >= dirty->y && py < dirty->y + dirty->h) {

@@ -279,7 +279,7 @@ void app_draw_text_scale(vanilla_surface_t *surf, int32_t x, int32_t y, const ch
 void app_draw_button(vanilla_surface_t *surf, int32_t x, int32_t y, int32_t w, int32_t h,
                      const char *text, int is_pressed)
 {
-    uint32_t bg_col = is_pressed ? g_theme->bg_elevated : g_theme->titlebar_active;
+    uint32_t bg_col = is_pressed ? g_theme->accent_pressed : g_theme->bg_elevated;
     uint32_t border_col = is_pressed ? g_theme->accent : g_theme->border;
     uint32_t text_col = g_theme->fg_primary;
 

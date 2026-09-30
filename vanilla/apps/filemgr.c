@@ -123,7 +123,7 @@ static void fm_render(vanilla_surface_t *surf, filemgr_state_t *st)
     app_fill_rect(surf, 0, 0, FM_WIDTH, FM_HEIGHT, g_theme->bg_base);
 
     /* Header Bar */
-    app_fill_rect(surf, 0, 0, FM_WIDTH, HEADER_HEIGHT, g_theme->titlebar_active);
+    app_fill_rect(surf, 0, 0, FM_WIDTH, HEADER_HEIGHT, g_theme->bg_elevated);
     app_fill_rect(surf, 0, HEADER_HEIGHT - 1, FM_WIDTH, 1, g_theme->border);
 
     app_draw_button(surf, 8, 6, 40, 24, "Up", 0);
