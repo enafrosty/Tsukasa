@@ -29,6 +29,7 @@
 #include "../sys/futex.h"
 #include "../sys/panic.h"
 #include "../drv/acpi.h"
+#include "../drv/pit.h"
 #include "../include/kutils.h"
 
 #define SYSCALL_TABLE_SIZE 351
@@ -118,6 +119,8 @@ static long sys_open(long path, long flags, long a3, long a4, long a5, long a6)
 static long sys_close(long fd, long a2, long a3, long a4, long a5, long a6)
 {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    if (fd < 0 || fd >= 256)
+        return -EBADF;
     return mux_fs(FS_CMD_CLOSE, fd, 0, 0);
 }
 
@@ -133,8 +136,146 @@ static long sys_stat(long path, long st, long a3, long a4, long a5, long a6)
 static long sys_poll(long fds, long nfds, long timeout, long a4, long a5, long a6)
 {
     (void)a4; (void)a5; (void)a6;
-    if (!user_ok(fds, nfds * (long)sizeof(struct tsukasa_pollfd), 1)) return -EFAULT;
+    if (nfds < 0) return -EINVAL;
+    if (nfds > 0 && !user_ok(fds, nfds * (long)sizeof(struct tsukasa_pollfd), 1)) return -EFAULT;
     return mux_fs(FS_CMD_POLL, fds, nfds, timeout);
+}
+
+static long sys_select(long nfds, long rp, long wp, long ep, long tvp, long a6)
+{
+    (void)a6;
+    if (nfds < 0 || nfds > 256)
+        return -EINVAL;
+
+    size_t set_bytes = (nfds > 0) ? ((size_t)nfds + 7) / 8 : 0;
+    if (rp && set_bytes > 0 && !user_ok(rp, (long)set_bytes, 1)) return -EFAULT;
+    if (wp && set_bytes > 0 && !user_ok(wp, (long)set_bytes, 1)) return -EFAULT;
+    if (ep && set_bytes > 0 && !user_ok(ep, (long)set_bytes, 1)) return -EFAULT;
+
+    int timeout_ms = -1;
+    if (tvp) {
+        if (!user_ok(tvp, (long)sizeof(struct timeval), 0))
+            return -EFAULT;
+        const struct timeval *tv = (const struct timeval *)(uintptr_t)tvp;
+        if (tv->tv_sec < 0 || tv->tv_usec < 0 || tv->tv_usec >= 1000000)
+            return -EINVAL;
+        timeout_ms = (int)(tv->tv_sec * 1000 + (tv->tv_usec + 999) / 1000);
+    }
+
+    if (nfds == 0) {
+        int r = vfs_poll(NULL, 0, timeout_ms);
+        return (r < 0) ? r : 0;
+    }
+
+    uint8_t in_r[32] = {0}, in_w[32] = {0}, in_e[32] = {0};
+    uint8_t out_r[32] = {0}, out_w[32] = {0}, out_e[32] = {0};
+
+    if (rp) {
+        const uint8_t *src = (const uint8_t *)(uintptr_t)rp;
+        for (size_t i = 0; i < set_bytes; i++) in_r[i] = src[i];
+    }
+    if (wp) {
+        const uint8_t *src = (const uint8_t *)(uintptr_t)wp;
+        for (size_t i = 0; i < set_bytes; i++) in_w[i] = src[i];
+    }
+    if (ep) {
+        const uint8_t *src = (const uint8_t *)(uintptr_t)ep;
+        for (size_t i = 0; i < set_bytes; i++) in_e[i] = src[i];
+    }
+
+    vfs_pollfd_t pfds[256];
+    size_t count = 0;
+    for (int fd = 0; fd < nfds; fd++) {
+        int r_bit = rp && (in_r[fd / 8] & (1U << (fd % 8)));
+        int w_bit = wp && (in_w[fd / 8] & (1U << (fd % 8)));
+        int e_bit = ep && (in_e[fd / 8] & (1U << (fd % 8)));
+        if (r_bit || w_bit || e_bit) {
+            pfds[count].fd = fd;
+            pfds[count].events = 0;
+            if (r_bit) pfds[count].events |= VFS_POLLIN;
+            if (w_bit) pfds[count].events |= VFS_POLLOUT;
+            if (e_bit) pfds[count].events |= VFS_POLLERR | VFS_POLLHUP;
+            pfds[count].revents = 0;
+            count++;
+        }
+    }
+
+    int ret = vfs_poll(pfds, count, timeout_ms);
+    if (ret < 0)
+        return ret;
+
+    int total_ready = 0;
+    for (size_t i = 0; i < count; i++) {
+        int fd = pfds[i].fd;
+        int16_t rev = pfds[i].revents;
+        if (rp && (in_r[fd / 8] & (1U << (fd % 8))) && (rev & (VFS_POLLIN | VFS_POLLERR | VFS_POLLHUP))) {
+            out_r[fd / 8] |= (1U << (fd % 8));
+            total_ready++;
+        }
+        if (wp && (in_w[fd / 8] & (1U << (fd % 8))) && (rev & (VFS_POLLOUT | VFS_POLLERR | VFS_POLLHUP))) {
+            out_w[fd / 8] |= (1U << (fd % 8));
+            total_ready++;
+        }
+        if (ep && (in_e[fd / 8] & (1U << (fd % 8))) && (rev & (VFS_POLLERR | VFS_POLLHUP))) {
+            out_e[fd / 8] |= (1U << (fd % 8));
+            total_ready++;
+        }
+    }
+
+    if (rp) {
+        uint8_t *dst = (uint8_t *)(uintptr_t)rp;
+        for (size_t i = 0; i < set_bytes; i++) dst[i] = out_r[i];
+    }
+    if (wp) {
+        uint8_t *dst = (uint8_t *)(uintptr_t)wp;
+        for (size_t i = 0; i < set_bytes; i++) dst[i] = out_w[i];
+    }
+    if (ep) {
+        uint8_t *dst = (uint8_t *)(uintptr_t)ep;
+        for (size_t i = 0; i < set_bytes; i++) dst[i] = out_e[i];
+    }
+
+    return total_ready;
+}
+
+static long sys_epoll_create1(long flags, long a2, long a3, long a4, long a5, long a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    if (flags & ~EPOLL_CLOEXEC)
+        return -EINVAL;
+    int fd = vfs_epoll_create1((int)flags);
+    return (long)fd;
+}
+
+static long sys_epoll_ctl(long epfd, long op, long fd, long event_ptr, long a5, long a6)
+{
+    (void)a5; (void)a6;
+    uint32_t events = 0;
+    uint64_t data = 0;
+    if (op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD) {
+        if (!event_ptr)
+            return -EFAULT;
+        if (!user_ok(event_ptr, (long)sizeof(epoll_event_t), 0))
+            return -EFAULT;
+        const epoll_event_t *ev = (const epoll_event_t *)(uintptr_t)event_ptr;
+        events = ev->events;
+        data = ev->data.u64;
+    }
+    int r = vfs_epoll_ctl((int)epfd, (int)op, (int)fd, events, data);
+    return (long)r;
+}
+
+static long sys_epoll_wait(long epfd, long events_ptr, long maxevents, long timeout, long a5, long a6)
+{
+    (void)a5; (void)a6;
+    if (maxevents <= 0)
+        return -EINVAL;
+    if (!events_ptr)
+        return -EFAULT;
+    if (!user_ok(events_ptr, maxevents * (long)sizeof(epoll_event_t), 1))
+        return -EFAULT;
+    int r = vfs_epoll_wait((int)epfd, (epoll_event_t *)(uintptr_t)events_ptr, (int)maxevents, (int)timeout);
+    return (long)r;
 }
 
 static long sys_lseek(long fd, long off, long whence, long a4, long a5, long a6)
@@ -678,6 +819,7 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [14] = sys_rt_sigprocmask,
     [16] = sys_ioctl,
     [22] = sys_pipe,
+    [23] = sys_select,
     [24] = sys_sched_yield,
     [29] = sys_shm_create,
     [30] = sys_shm_attach,
@@ -709,6 +851,9 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [169] = sys_reboot,
     [201] = sys_time,
     [202] = sys_futex,
+    [232] = sys_epoll_wait,
+    [233] = sys_epoll_ctl,
+    [291] = sys_epoll_create1,
     [300] = sys_list,
     [301] = sys_fsize,
     [302] = sys_ftell,
@@ -754,6 +899,57 @@ static void c01_test_entry(void)
         kprintf("[parity][C01] bad user ptr -EFAULT PASS\n");
     else
         kprintf("[parity][C01] bad user ptr -EFAULT FAIL\n");
+
+    /* Test: poll with 0 fds and 50ms timeout blocks and returns 0 */
+    uint64_t poll_t0 = pit_ticks_ms();
+    int poll_r = vfs_poll(NULL, 0, 50);
+    uint64_t poll_t1 = pit_ticks_ms();
+    if (poll_r == 0 && (poll_t1 - poll_t0) >= 30)
+        kprintf("[parity][C01] poll 0-fd timeout PASS\n");
+    else
+        kprintf("[parity][C01] poll 0-fd timeout FAIL (r=%d dt=%llu)\n",
+                poll_r, (unsigned long long)(poll_t1 - poll_t0));
+
+    /* Test: pipe + poll readiness */
+    int pfd[2];
+    if (vfs_pipe(pfd) == 0) {
+        vfs_pollfd_t p_in = { .fd = pfd[0], .events = VFS_POLLIN, .revents = 0 };
+        int r_empty = vfs_poll(&p_in, 1, 10);
+        char ch = 'P';
+        vfs_write(pfd[1], &ch, 1);
+        int r_data = vfs_poll(&p_in, 1, 50);
+        char out_ch = 0;
+        vfs_read(pfd[0], &out_ch, 1);
+        vfs_close(pfd[0]);
+        vfs_close(pfd[1]);
+        if (r_empty == 0 && r_data == 1 && (p_in.revents & VFS_POLLIN) && out_ch == 'P')
+            kprintf("[parity][C01] poll pipe PASS\n");
+        else
+            kprintf("[parity][C01] poll pipe FAIL (empty=%d data=%d rev=0x%x)\n",
+                    r_empty, r_data, (unsigned)p_in.revents);
+    }
+
+    /* Test: epoll round-trip (create, ctl-add, wait) */
+    if (vfs_pipe(pfd) == 0) {
+        int epfd = vfs_epoll_create1(0);
+        if (epfd >= 0) {
+            int ctl_add = vfs_epoll_ctl(epfd, EPOLL_CTL_ADD, pfd[0], EPOLLIN, 0x12345ULL);
+            epoll_event_t out_ev[2];
+            int w_empty = vfs_epoll_wait(epfd, out_ev, 2, 10);
+            char c = 'E';
+            vfs_write(pfd[1], &c, 1);
+            int w_data = vfs_epoll_wait(epfd, out_ev, 2, 50);
+            vfs_close(epfd);
+            vfs_close(pfd[0]);
+            vfs_close(pfd[1]);
+            if (ctl_add == 0 && w_empty == 0 && w_data == 1 &&
+                (out_ev[0].events & EPOLLIN) && out_ev[0].data.u64 == 0x12345ULL)
+                kprintf("[parity][C01] epoll round-trip PASS\n");
+            else
+                kprintf("[parity][C01] epoll round-trip FAIL (add=%d empty=%d data=%d)\n",
+                        ctl_add, w_empty, w_data);
+        }
+    }
 
     /* elf64_spawn is a single-slot handoff; retry while another spawn (e.g. */
     int pid = -1;

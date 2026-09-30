@@ -35,5 +35,9 @@
 #define EADDRINUSE   98  // Address already in use
 #define ECONNREFUSED 111 // Connection refused
 #define EPIPE        32  // Broken pipe
+#define EINTR        4   // Interrupted system call
+#define EBADF        9   // Bad file descriptor
+#define EMFILE       24  // Too many open files
+#define ENFILE       23  // File table overflow
 
 #endif // CORE_ERRNO_H

@@ -22,6 +22,7 @@
 void pit_init(uint32_t hz);
 void pit_irq_tick(void);
 uint64_t pit_ticks(void);
+uint64_t pit_ticks_ms(void);
 uint32_t pit_frequency(void);
 
 #endif /* TSUKASA_PIT_H */

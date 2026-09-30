@@ -19,6 +19,7 @@
 #include "sys/wait_queue.h"
 #include "proc/process.h"
 #include "include/kprintf.h"
+#include "mm/heap.h"
 
 void wait_queue_init(wait_queue_head_t *h) {
     if (!h) return;
@@ -134,7 +135,12 @@ void wait_queue_finish_wait(wait_queue_head_t *h, wait_queue_entry_t *entry)
 
 void poll_wtable_queue(wait_queue_head_t *h, poll_table_t *pt) {
     poll_wtable_t *wt = (poll_wtable_t *)pt;
-    if (wt->count >= MAX_POLL_ENTRIES) return;
+    if (!h || !wt || !wt->entries) return;
+    for (int i = 0; i < wt->count; i++) {
+        if (wt->entries[i].h == h)
+            return;
+    }
+    if (wt->count >= wt->capacity) return;
     poll_entry_t *pe = &wt->entries[wt->count++];
     pe->h = h;
     pe->entry.proc = process_current();
@@ -142,19 +148,47 @@ void poll_wtable_queue(wait_queue_head_t *h, poll_table_t *pt) {
     wait_queue_add(h, &pe->entry);
 }
 
-void poll_wtable_init(poll_wtable_t *wt, struct process *proc) {
+void poll_wtable_init_with_capacity(poll_wtable_t *wt, struct process *proc, int needed_capacity) {
     (void)proc;
+    if (!wt) return;
     wt->pt.qproc = poll_wtable_queue;
     wt->count = 0;
+    if (needed_capacity <= MAX_POLL_ENTRIES) {
+        wt->entries = wt->inline_entries;
+        wt->capacity = MAX_POLL_ENTRIES;
+        wt->is_heap = 0;
+    } else {
+        kprintf("[poll] allocating %d entries from heap\n", needed_capacity);
+        wt->entries = (poll_entry_t *)kmalloc((size_t)needed_capacity * sizeof(poll_entry_t));
+        if (!wt->entries) {
+            wt->entries = wt->inline_entries;
+            wt->capacity = MAX_POLL_ENTRIES;
+            wt->is_heap = 0;
+        } else {
+            wt->capacity = needed_capacity;
+            wt->is_heap = 1;
+        }
+    }
+}
+
+void poll_wtable_init(poll_wtable_t *wt, struct process *proc) {
+    poll_wtable_init_with_capacity(wt, proc, MAX_POLL_ENTRIES);
 }
 
 void poll_wtable_unregister_all(poll_wtable_t *wt) {
+    if (!wt || !wt->entries) return;
     for (int i = 0; i < wt->count; i++) {
         poll_entry_t *pe = &wt->entries[i];
         if (pe->h)
             wait_queue_remove(pe->h, &pe->entry);
     }
     wt->count = 0;
+    if (wt->is_heap && wt->entries) {
+        kfree(wt->entries);
+        wt->entries = wt->inline_entries;
+        wt->capacity = MAX_POLL_ENTRIES;
+        wt->is_heap = 0;
+    }
 }
 
 static volatile int wq_test_woken __attribute__((unused)) = 0;
@@ -170,8 +204,9 @@ void wait_queue_run_selftests(void) {
     wait_queue_head_t q;
     wait_queue_init(&q);
 
-    wait_queue_entry_t entries[MAX_POLL_ENTRIES];
-    for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
+    #define WQ_TEST_ENTRIES 32
+    wait_queue_entry_t entries[WQ_TEST_ENTRIES];
+    for (int i = 0; i < WQ_TEST_ENTRIES; i++) {
         entries[i].proc = process_current();
         entries[i].next = NULL;
         wait_queue_add(&q, &entries[i]);
@@ -180,12 +215,12 @@ void wait_queue_run_selftests(void) {
     int cnt = 0;
     wait_queue_entry_t *cur = q.head;
     while (cur) { cnt++; cur = cur->next; }
-    if (cnt == MAX_POLL_ENTRIES)
+    if (cnt == WQ_TEST_ENTRIES)
         kprintf("[parity][K01] 32-entry add PASS\n");
     else
         kprintf("[parity][K01] 32-entry add FAIL (cnt=%d)\n", cnt);
 
-    for (int i = 0; i < MAX_POLL_ENTRIES; i++)
+    for (int i = 0; i < WQ_TEST_ENTRIES; i++)
         wait_queue_remove(&q, &entries[i]);
 
     cnt = 0;
@@ -199,8 +234,8 @@ void wait_queue_run_selftests(void) {
     poll_wtable_t wt;
     poll_wtable_init(&wt, process_current());
 
-    wait_queue_head_t queues[MAX_POLL_ENTRIES];
-    for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
+    wait_queue_head_t queues[WQ_TEST_ENTRIES];
+    for (int i = 0; i < WQ_TEST_ENTRIES; i++) {
         wait_queue_init(&queues[i]);
         wt.pt.qproc(&queues[i], &wt.pt);
     }
@@ -209,11 +244,11 @@ void wait_queue_run_selftests(void) {
     poll_wtable_unregister_all(&wt);
 
     int leaked = 0;
-    for (int i = 0; i < MAX_POLL_ENTRIES; i++) {
+    for (int i = 0; i < WQ_TEST_ENTRIES; i++) {
         if (queues[i].head != NULL) leaked++;
     }
 
-    if (pre == MAX_POLL_ENTRIES && wt.count == 0 && leaked == 0)
+    if (pre == WQ_TEST_ENTRIES && wt.count == 0 && leaked == 0)
         kprintf("[parity][K01] poll_wtable 32-fd PASS\n");
     else
         kprintf("[parity][K01] poll_wtable 32-fd FAIL (pre=%d count=%d leaked=%d)\n",

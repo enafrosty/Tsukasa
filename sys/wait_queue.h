@@ -62,7 +62,7 @@ void wait_queue_finish_wait(wait_queue_head_t *h, wait_queue_entry_t *entry);
 #define POLLHUP     0x0010
 #define POLLNVAL    0x0020
 
-#define MAX_POLL_ENTRIES 32
+#define MAX_POLL_ENTRIES 64
 
 typedef struct {
     wait_queue_head_t *h;
@@ -71,11 +71,15 @@ typedef struct {
 
 typedef struct {
     poll_table_t pt;
-    poll_entry_t entries[MAX_POLL_ENTRIES];
+    poll_entry_t *entries;
+    poll_entry_t inline_entries[MAX_POLL_ENTRIES];
     int count;
+    int capacity;
+    int is_heap;
 } poll_wtable_t;
 
 void poll_wtable_init(poll_wtable_t *wt, struct process *proc);
+void poll_wtable_init_with_capacity(poll_wtable_t *wt, struct process *proc, int needed_capacity);
 void poll_wtable_unregister_all(poll_wtable_t *wt);
 void poll_wtable_queue(wait_queue_head_t *h, poll_table_t *pt);
 

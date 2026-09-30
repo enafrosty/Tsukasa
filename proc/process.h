@@ -184,6 +184,7 @@ struct process {
     uint32_t priority;
     uint32_t time_slice;
     uint64_t sched_ticks;
+    uint64_t poll_deadline_ms;
     process_t *next_queue;
     process_t *prev_queue;
     process_t *parent;
@@ -265,6 +266,7 @@ void process_run_guide16_selftests(void);
 
 /* process_block_current marks the CALLER blocked (both state fields) without descheduling — the caller... */
 void process_block_current(void);
+void process_block_on_poll(uint64_t deadline_ms);
 int process_wake_blocked(process_t *p);
 void process_dump_memory_state(void);
 int process_snapshot(process_snapshot_t *out, int max);
