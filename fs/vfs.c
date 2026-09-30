@@ -43,6 +43,7 @@
 #include "../proc/process.h"
 #include "../tty/tty.h"
 #include "../sys/wait_queue.h"
+#include "../drv/pit.h"
 #ifdef __x86_64__
 #include "../include/paging.h"
 #include "../mm/vm_space.h"      /* map the fb into a ring-3 address space   */
@@ -60,21 +61,6 @@
 #define VFS_MAX_PIPES         32
 #define VFS_PIPE_CAPACITY     4096
 
-typedef enum vfs_backend {
-    VFS_BACKEND_NONE = 0,
-    VFS_BACKEND_INITRD,
-    VFS_BACKEND_FAT12,
-    VFS_BACKEND_MEMFS,
-    VFS_BACKEND_FAT32,
-    VFS_BACKEND_FAT32VOL,
-    VFS_BACKEND_PROCFS,
-    VFS_BACKEND_SYSFS,
-    VFS_BACKEND_BOOTFS,
-    VFS_BACKEND_TAR,
-    VFS_BACKEND_DEVFS,
-    VFS_BACKEND_PIPE,
-    VFS_BACKEND_UNIXSOCK
-} vfs_backend_t;
 
 typedef enum vfs_device_kind {
     VFS_DEV_NONE = 0,
@@ -145,6 +131,10 @@ typedef struct vfs_file {
             unix_listener_t *listener;
             int is_listener;
         } sock;
+        struct {
+            epoll_item_t *items;
+            int count;
+        } epoll;
     } u;
 } vfs_file_t;
 
@@ -644,6 +634,18 @@ static void file_release(vfs_file_t *f)
 
     if (f->u.regular.owns_buf && f->u.regular.buf)
         kfree(f->u.regular.buf);
+
+    if (f->backend == VFS_BACKEND_EPOLL) {
+        epoll_item_t *curr = f->u.epoll.items;
+        while (curr) {
+            epoll_item_t *next = curr->next;
+            kfree(curr);
+            curr = next;
+        }
+        f->u.epoll.items = NULL;
+        f->u.epoll.count = 0;
+    }
+
     f->used = 0;
     f->refcount = 0;
 }
@@ -674,6 +676,28 @@ static void fd_close_on_table(void **tbl, int fd)
     f = (vfs_file_t *)tbl[fd];
     if (!f)
         return;
+
+    for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
+        vfs_file_t *ef = (vfs_file_t *)tbl[i];
+        if (ef && ef->backend == VFS_BACKEND_EPOLL) {
+            epoll_item_t *prev = NULL;
+            epoll_item_t *curr = ef->u.epoll.items;
+            while (curr) {
+                if (curr->fd == fd) {
+                    if (prev)
+                        prev->next = curr->next;
+                    else
+                        ef->u.epoll.items = curr->next;
+                    ef->u.epoll.count--;
+                    kfree(curr);
+                    break;
+                }
+                prev = curr;
+                curr = curr->next;
+            }
+        }
+    }
+
     tbl[fd] = NULL;
     file_release(f);
 }
@@ -2053,6 +2077,21 @@ static int vfs_file_poll_mask(vfs_file_t *f)
         return mask;
     }
 
+    if (f->backend == VFS_BACKEND_EPOLL) {
+        epoll_item_t *item = f->u.epoll.items;
+        process_t *proc = vfs_current_process();
+        while (item) {
+            vfs_file_t *tf = fd_lookup(proc, item->fd);
+            if (tf) {
+                int tmask = vfs_file_poll_mask(tf);
+                if (tmask & (item->events | VFS_POLLERR | VFS_POLLHUP))
+                    return VFS_POLLIN;
+            }
+            item = item->next;
+        }
+        return 0;
+    }
+
     if (f->mode & VFS_MODE_READ)
         mask |= VFS_POLLIN;
     if (f->mode & VFS_MODE_WRITE)
@@ -2060,24 +2099,313 @@ static int vfs_file_poll_mask(vfs_file_t *f)
     return mask;
 }
 
-int vfs_poll(vfs_pollfd_t *fds, size_t nfds, int timeout_ms)
+static int vfs_poll_scan(vfs_pollfd_t *fds, size_t nfds)
 {
     process_t *proc = vfs_current_process();
     int ready = 0;
-    (void)timeout_ms;
-
     if (!fds)
-        return -1;
+        return 0;
+
     for (size_t i = 0; i < nfds; i++) {
+        fds[i].revents = 0;
+        if (fds[i].fd < 0)
+            continue;
         vfs_file_t *f = fd_lookup(proc, fds[i].fd);
+        if (!f) {
+            fds[i].revents = VFS_POLLNVAL;
+            ready++;
+            continue;
+        }
         int mask = vfs_file_poll_mask(f);
-        fds[i].revents = (int16_t)(mask & fds[i].events);
-        if ((mask & (VFS_POLLERR | VFS_POLLHUP)) != 0)
-            fds[i].revents |= (int16_t)(mask & (VFS_POLLERR | VFS_POLLHUP));
-        if (fds[i].revents)
+        int rev = mask & (fds[i].events | VFS_POLLERR | VFS_POLLHUP);
+        fds[i].revents = (int16_t)rev;
+        if (rev)
             ready++;
     }
     return ready;
+}
+
+static void vfs_poll_register_file(vfs_file_t *f, poll_table_t *pt, int16_t events)
+{
+    (void)events;
+    if (!f || !pt)
+        return;
+
+    if (f->backend == VFS_BACKEND_PIPE) {
+        vfs_pipe_t *p = f->u.pipe.pipe;
+        if (p)
+            poll_wtable_queue(&p->waitq, pt);
+        return;
+    }
+
+    if (f->backend == VFS_BACKEND_UNIXSOCK) {
+        if (f->u.sock.is_listener) {
+            wait_queue_head_t *wq = unix_listener_get_accept_waitq(f->u.sock.listener);
+            if (wq)
+                poll_wtable_queue(wq, pt);
+            return;
+        }
+        if (f->u.sock.rx)
+            poll_wtable_queue(&f->u.sock.rx->waitq, pt);
+        if (f->u.sock.tx && f->u.sock.tx != f->u.sock.rx)
+            poll_wtable_queue(&f->u.sock.tx->waitq, pt);
+        return;
+    }
+
+    if (f->backend == VFS_BACKEND_EPOLL) {
+        epoll_item_t *item = f->u.epoll.items;
+        process_t *proc = vfs_current_process();
+        while (item) {
+            vfs_file_t *tf = fd_lookup(proc, item->fd);
+            if (tf)
+                vfs_poll_register_file(tf, pt, (int16_t)item->events);
+            item = item->next;
+        }
+        return;
+    }
+}
+
+static void vfs_poll_register(vfs_pollfd_t *fds, size_t nfds, poll_table_t *pt)
+{
+    process_t *proc = vfs_current_process();
+    if (!fds || !pt)
+        return;
+
+    for (size_t i = 0; i < nfds; i++) {
+        if (fds[i].fd < 0)
+            continue;
+        vfs_file_t *f = fd_lookup(proc, fds[i].fd);
+        if (f)
+            vfs_poll_register_file(f, pt, fds[i].events);
+    }
+}
+
+int vfs_poll(vfs_pollfd_t *fds, size_t nfds, int timeout_ms)
+{
+    process_t *proc = vfs_current_process();
+
+    if (nfds > 256)
+        return -EINVAL;
+
+    if (nfds == 0) {
+        if (timeout_ms == 0)
+            return 0;
+        uint64_t deadline = (timeout_ms > 0) ? pit_ticks_ms() + (uint64_t)timeout_ms : 0;
+        for (;;) {
+            if (timeout_ms > 0 && pit_ticks_ms() >= deadline)
+                break;
+            process_block_on_poll(deadline);
+            if (proc && proc->signal_pending)
+                return -EINTR;
+            if (timeout_ms > 0 && pit_ticks_ms() >= deadline)
+                break;
+            if (timeout_ms < 0)
+                continue;
+        }
+        return 0;
+    }
+
+    if (!fds)
+        return -EFAULT;
+
+    /* Phase 1: non-blocking scan */
+    int ready = vfs_poll_scan(fds, nfds);
+    if (ready > 0 || timeout_ms == 0)
+        return ready;
+
+    /* Phase 2: register on wait queues */
+    poll_wtable_t wt;
+    int cap = (int)nfds * 2;
+    if (cap < MAX_POLL_ENTRIES)
+        cap = MAX_POLL_ENTRIES;
+    poll_wtable_init_with_capacity(&wt, proc, cap);
+    vfs_poll_register(fds, nfds, &wt.pt);
+
+    /* Double check after registration to avoid lost wakeup race */
+    ready = vfs_poll_scan(fds, nfds);
+    if (ready > 0) {
+        poll_wtable_unregister_all(&wt);
+        return ready;
+    }
+
+    /* Phase 3: sleep */
+    uint64_t deadline = (timeout_ms > 0) ? pit_ticks_ms() + (uint64_t)timeout_ms : 0;
+    for (;;) {
+        if (timeout_ms > 0 && pit_ticks_ms() >= deadline)
+            break;
+
+        process_block_on_poll(deadline);
+
+        ready = vfs_poll_scan(fds, nfds);
+        if (ready > 0)
+            break;
+
+        if (proc && proc->signal_pending) {
+            poll_wtable_unregister_all(&wt);
+            return -EINTR;
+        }
+
+        if (timeout_ms > 0 && pit_ticks_ms() >= deadline)
+            break;
+        if (timeout_ms < 0)
+            continue;
+    }
+
+    /* Phase 4: deregister and return final scan */
+    poll_wtable_unregister_all(&wt);
+    return vfs_poll_scan(fds, nfds);
+}
+
+int vfs_epoll_create1(int flags)
+{
+    process_t *proc = vfs_current_process();
+    void **tbl = fd_table_for_process(proc);
+    int fd = process_fd_alloc(proc);
+    if (fd < 0)
+        return -EMFILE;
+    vfs_file_t *f = file_alloc();
+    if (!f)
+        return -ENFILE;
+    f->backend = VFS_BACKEND_EPOLL;
+    f->mode = VFS_MODE_READ | VFS_MODE_WRITE;
+    f->flags = flags;
+    f->u.epoll.items = NULL;
+    f->u.epoll.count = 0;
+    tbl[fd] = f;
+    return fd;
+}
+
+int vfs_epoll_ctl(int epfd, int op, int fd, uint32_t events, uint64_t data)
+{
+    process_t *proc = vfs_current_process();
+    if (!fd_valid(epfd) || !fd_valid(fd))
+        return -EBADF;
+    if (epfd == fd)
+        return -EINVAL;
+    vfs_file_t *epf = fd_lookup(proc, epfd);
+    if (!epf)
+        return -EBADF;
+    if (epf->backend != VFS_BACKEND_EPOLL)
+        return -EINVAL;
+    vfs_file_t *target = fd_lookup(proc, fd);
+    if (!target)
+        return -EBADF;
+    if (target->backend == VFS_BACKEND_EPOLL)
+        return -EINVAL;
+
+    epoll_item_t *prev = NULL;
+    epoll_item_t *curr = epf->u.epoll.items;
+    while (curr) {
+        if (curr->fd == fd)
+            break;
+        prev = curr;
+        curr = curr->next;
+    }
+
+    switch (op) {
+    case EPOLL_CTL_ADD:
+        if (curr)
+            return -EEXIST;
+        epoll_item_t *item = (epoll_item_t *)kmalloc(sizeof(epoll_item_t));
+        if (!item)
+            return -ENOMEM;
+        item->fd = fd;
+        item->events = events;
+        item->data = data;
+        item->next = epf->u.epoll.items;
+        epf->u.epoll.items = item;
+        epf->u.epoll.count++;
+        return 0;
+
+    case EPOLL_CTL_MOD:
+        if (!curr)
+            return -ENOENT;
+        curr->events = events;
+        curr->data = data;
+        return 0;
+
+    case EPOLL_CTL_DEL:
+        if (!curr)
+            return -ENOENT;
+        if (prev)
+            prev->next = curr->next;
+        else
+            epf->u.epoll.items = curr->next;
+        epf->u.epoll.count--;
+        kfree(curr);
+        return 0;
+
+    default:
+        return -EINVAL;
+    }
+}
+
+int vfs_epoll_wait(int epfd, epoll_event_t *events, int maxevents, int timeout_ms)
+{
+    process_t *proc = vfs_current_process();
+    if (!fd_valid(epfd))
+        return -EBADF;
+    if (!events || maxevents <= 0 || maxevents > 256)
+        return -EINVAL;
+    vfs_file_t *epf = fd_lookup(proc, epfd);
+    if (!epf)
+        return -EBADF;
+    if (epf->backend != VFS_BACKEND_EPOLL)
+        return -EINVAL;
+
+    int count = epf->u.epoll.count;
+    if (count == 0) {
+        if (timeout_ms == 0)
+            return 0;
+        return vfs_poll(NULL, 0, timeout_ms);
+    }
+
+    vfs_pollfd_t pfds_stack[64];
+    vfs_pollfd_t *pfds = pfds_stack;
+    int is_heap = 0;
+    if (count > 64) {
+        pfds = (vfs_pollfd_t *)kmalloc((size_t)count * sizeof(vfs_pollfd_t));
+        if (!pfds)
+            return -ENOMEM;
+        is_heap = 1;
+    }
+
+    epoll_item_t *item = epf->u.epoll.items;
+    int idx = 0;
+    while (item && idx < count) {
+        pfds[idx].fd = item->fd;
+        pfds[idx].events = (int16_t)(item->events & (VFS_POLLIN | VFS_POLLOUT | VFS_POLLERR | VFS_POLLHUP));
+        pfds[idx].revents = 0;
+        item = item->next;
+        idx++;
+    }
+
+    int ret = vfs_poll(pfds, (size_t)idx, timeout_ms);
+    if (ret <= 0) {
+        if (is_heap)
+            kfree(pfds);
+        return ret;
+    }
+
+    int num_ready = 0;
+    for (int i = 0; i < idx && num_ready < maxevents; i++) {
+        if (pfds[i].revents) {
+            epoll_item_t *it = epf->u.epoll.items;
+            while (it) {
+                if (it->fd == pfds[i].fd) {
+                    events[num_ready].events = (uint32_t)pfds[i].revents;
+                    events[num_ready].data.u64 = it->data;
+                    num_ready++;
+                    break;
+                }
+                it = it->next;
+            }
+        }
+    }
+
+    if (is_heap)
+        kfree(pfds);
+    return num_ready;
 }
 
 /* stat/fstat/cwd/list */

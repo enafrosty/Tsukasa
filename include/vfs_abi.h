@@ -44,15 +44,54 @@
 
 /* poll event bits */
 #define VFS_POLLIN   0x0001
+#define VFS_POLLPRI  0x0002
 #define VFS_POLLOUT  0x0004
 #define VFS_POLLERR  0x0008
 #define VFS_POLLHUP  0x0010
+#define VFS_POLLNVAL 0x0020
 
 typedef struct vfs_pollfd {
     int fd;
     int16_t events;
     int16_t revents;
 } vfs_pollfd_t;
+
+#ifndef _TIMEVAL_DEFINED
+#define _TIMEVAL_DEFINED
+struct timeval {
+    int64_t tv_sec;
+    int64_t tv_usec;
+};
+#endif
+
+/* epoll constants and structures */
+#define EPOLLIN      0x0001
+#define EPOLLPRI     0x0002
+#define EPOLLOUT     0x0004
+#define EPOLLERR     0x0008
+#define EPOLLHUP     0x0010
+#define EPOLLRDHUP   0x2000
+#define EPOLLONESHOT (1U << 30)
+#define EPOLLET      (1U << 31)
+
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+
+#define EPOLL_CLOEXEC 0x80000
+
+typedef union epoll_data {
+    void    *ptr;
+    int      fd;
+    uint32_t u32;
+    uint64_t u64;
+} epoll_data_t;
+
+typedef struct epoll_event {
+    uint32_t     events;
+    epoll_data_t data;
+} __attribute__((packed)) epoll_event_t;
+typedef struct epoll_event vfs_epoll_event_t;
 
 typedef struct vfs_fb_bitfield {
     uint32_t offset;

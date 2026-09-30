@@ -40,6 +40,7 @@
 #include "../syscall/syscall.h"
 #include "../tty/tty.h"
 #include "../user/include/shell.h"
+#include "../drv/pit.h"
 
 #define CPU_COUNT_MAX 32
 #define WAIT_STATUS_EXIT(code)   (((code) & 0xFF) << 8)
@@ -551,11 +552,36 @@ void process_block_current(void)
     spin_unlock_irqrestore(&g_sched_lock, irqf);
 }
 
+void process_block_on_poll(uint64_t deadline_ms)
+{
+    unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
+    process_t *self = g_current[sched_this_cpu()];
+    if (self && !self->is_idle) {
+        self->poll_deadline_ms = deadline_ms;
+        self->state = PROCESS_BLOCKED;
+        self->main_thread.state = THREAD_BLOCKED;
+    }
+    spin_unlock_irqrestore(&g_sched_lock, irqf);
+    process_yield();
+
+    irqf = spin_lock_irqsave(&g_sched_lock);
+    self = g_current[sched_this_cpu()];
+    if (self) {
+        self->poll_deadline_ms = 0;
+        if (self->state == PROCESS_BLOCKED) {
+            self->state = PROCESS_RUNNING;
+            self->main_thread.state = THREAD_RUNNING;
+        }
+    }
+    spin_unlock_irqrestore(&g_sched_lock, irqf);
+}
+
 int process_wake_blocked(process_t *p)
 {
     int woke = 0;
     unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
     if (p && p->used && !p->is_idle && p->state == PROCESS_BLOCKED) {
+        p->poll_deadline_ms = 0;
         p->state = PROCESS_READY;
         p->main_thread.state = THREAD_READY;
         runq_push_locked(p);
@@ -1465,8 +1491,21 @@ uint64_t process_schedule_tick(uint64_t current_rsp)
     }
 
     spin_lock(&g_sched_lock);
-    if (cpu == 0)
+    if (cpu == 0) {
         g_sched_ticks++;
+        uint64_t now_ms = pit_ticks_ms();
+        for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
+            process_t *p = &g_processes[i];
+            if (p->used && !p->is_idle && p->state == PROCESS_BLOCKED && p->poll_deadline_ms != 0) {
+                if (now_ms >= p->poll_deadline_ms) {
+                    p->poll_deadline_ms = 0;
+                    p->state = PROCESS_READY;
+                    p->main_thread.state = THREAD_READY;
+                    runq_push_locked(p);
+                }
+            }
+        }
+    }
     g_core_ticks[cpu]++;
 
     cur = g_current[cpu];

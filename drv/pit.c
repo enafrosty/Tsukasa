@@ -51,6 +51,14 @@ uint64_t pit_ticks(void)
     return g_pit_ticks;
 }
 
+uint64_t pit_ticks_ms(void)
+{
+    uint32_t hz = g_pit_hz;
+    if (hz == 0)
+        hz = 100;
+    return (g_pit_ticks * 1000ULL) / hz;
+}
+
 uint32_t pit_frequency(void)
 {
     return g_pit_hz;

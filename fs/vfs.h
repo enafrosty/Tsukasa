@@ -56,6 +56,30 @@
 #define VFS_MODE_READ  0x01
 #define VFS_MODE_WRITE 0x02
 
+typedef enum vfs_backend {
+    VFS_BACKEND_NONE = 0,
+    VFS_BACKEND_INITRD,
+    VFS_BACKEND_FAT12,
+    VFS_BACKEND_MEMFS,
+    VFS_BACKEND_FAT32,
+    VFS_BACKEND_FAT32VOL,
+    VFS_BACKEND_PROCFS,
+    VFS_BACKEND_SYSFS,
+    VFS_BACKEND_BOOTFS,
+    VFS_BACKEND_TAR,
+    VFS_BACKEND_DEVFS,
+    VFS_BACKEND_PIPE,
+    VFS_BACKEND_UNIXSOCK,
+    VFS_BACKEND_EPOLL
+} vfs_backend_t;
+
+typedef struct epoll_item {
+    int               fd;
+    uint32_t          events;
+    uint64_t          data;
+    struct epoll_item *next;
+} epoll_item_t;
+
 typedef struct vfs_stat {
     uint64_t size;
     uint32_t type;
@@ -106,6 +130,9 @@ int vfs_ioctl(int fd, unsigned long request, void *arg);
 void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t offset);
 int vfs_munmap(void *addr, size_t length);
 int vfs_poll(vfs_pollfd_t *fds, size_t nfds, int timeout_ms);
+int vfs_epoll_create1(int flags);
+int vfs_epoll_ctl(int epfd, int op, int fd, uint32_t events, uint64_t data);
+int vfs_epoll_wait(int epfd, epoll_event_t *events, int maxevents, int timeout_ms);
 
 int vfs_stat(const char *path, vfs_stat_t *out);
 int vfs_fstat(int fd, vfs_stat_t *out);
