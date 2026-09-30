@@ -262,6 +262,32 @@ void compositor_merge_damage(vanilla_compositor_t *comp)
     }
 }
 
+chrome_btn_rects_t chrome_metrics(const vanilla_rect_t *frame)
+{
+    chrome_btn_rects_t r;
+    int32_t btn   = TITLEBAR_BTN_SIZE;
+    int32_t pad   = (TITLEBAR_HEIGHT - btn) / 2;
+    int32_t gap   = btn + TITLEBAR_BTN_PAD;
+    int32_t right = frame->x + frame->w;
+
+    r.close_btn.x = right - 18;
+    r.close_btn.y = frame->y + pad;
+    r.close_btn.w = btn;
+    r.close_btn.h = btn;
+
+    r.max_btn.x = r.close_btn.x - gap;
+    r.max_btn.y = frame->y + pad;
+    r.max_btn.w = btn;
+    r.max_btn.h = btn;
+
+    r.min_btn.x = r.max_btn.x - gap;
+    r.min_btn.y = frame->y + pad;
+    r.min_btn.w = btn;
+    r.min_btn.h = btn;
+
+    return r;
+}
+
 void compositor_render_frame(struct vanilla_server *srv)
 {
     if (!srv || srv->compositor.dirty_count <= 0)
@@ -349,21 +375,17 @@ void compositor_render_frame(struct vanilla_server *srv)
                     uint32_t tb_color = win->is_focused ? 0xFF3B4252 : 0xFF2E3440;
                     blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_title, tb_color);
 
-                    /* Close button [X] */
-                    vanilla_rect_t close_btn;
-                    close_btn.x = frame_rect.x + frame_rect.w - 18;
-                    close_btn.y = frame_rect.y + 6;
-                    close_btn.w = 12;
-                    close_btn.h = 12;
+                    /* Titlebar buttons */
+                    chrome_btn_rects_t btns = chrome_metrics(&frame_rect);
 
                     vanilla_rect_t vis_btn;
-                    if (vanilla_rect_intersect(&close_btn, dirty, &vis_btn)) {
+                    if (vanilla_rect_intersect(&btns.close_btn, dirty, &vis_btn)) {
                         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, 0xFFBF616A);
                         for (int k = 2; k <= 9; k++) {
-                            int32_t px1 = close_btn.x + k;
-                            int32_t py1 = close_btn.y + k;
-                            int32_t px2 = close_btn.x + (11 - k);
-                            int32_t py2 = close_btn.y + k;
+                            int32_t px1 = btns.close_btn.x + k;
+                            int32_t py1 = btns.close_btn.y + k;
+                            int32_t px2 = btns.close_btn.x + (11 - k);
+                            int32_t py2 = btns.close_btn.y + k;
                             if (px1 >= dirty->x && px1 < dirty->x + dirty->w &&
                                 py1 >= dirty->y && py1 < dirty->y + dirty->h)
                                 comp->backbuffer[py1 * comp->pitch_px + px1] = 0xFFECEFF4;
@@ -374,27 +396,22 @@ void compositor_render_frame(struct vanilla_server *srv)
                     }
 
                     /* Maximize button [] */
-                    vanilla_rect_t max_btn;
-                    max_btn.x = close_btn.x - 16;
-                    max_btn.y = frame_rect.y + 6;
-                    max_btn.w = 12;
-                    max_btn.h = 12;
-                    if (vanilla_rect_intersect(&max_btn, dirty, &vis_btn)) {
+                    if (vanilla_rect_intersect(&btns.max_btn, dirty, &vis_btn)) {
                         uint32_t btn_bg = win->is_focused ? 0xFF4C566A : 0xFF3B4252;
                         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, btn_bg);
                         for (int k = 2; k <= 9; k++) {
-                            int32_t top_y = max_btn.y + 2;
-                            int32_t bot_y = max_btn.y + 9;
-                            int32_t px = max_btn.x + k;
+                            int32_t top_y = btns.max_btn.y + 2;
+                            int32_t bot_y = btns.max_btn.y + 9;
+                            int32_t px = btns.max_btn.x + k;
                             if (px >= dirty->x && px < dirty->x + dirty->w) {
                                 if (top_y >= dirty->y && top_y < dirty->y + dirty->h)
                                     comp->backbuffer[top_y * comp->pitch_px + px] = 0xFFECEFF4;
                                 if (bot_y >= dirty->y && bot_y < dirty->y + dirty->h)
                                     comp->backbuffer[bot_y * comp->pitch_px + px] = 0xFFECEFF4;
                             }
-                            int32_t left_x = max_btn.x + 2;
-                            int32_t right_x = max_btn.x + 9;
-                            int32_t py = max_btn.y + k;
+                            int32_t left_x = btns.max_btn.x + 2;
+                            int32_t right_x = btns.max_btn.x + 9;
+                            int32_t py = btns.max_btn.y + k;
                             if (py >= dirty->y && py < dirty->y + dirty->h) {
                                 if (left_x >= dirty->x && left_x < dirty->x + dirty->w)
                                     comp->backbuffer[py * comp->pitch_px + left_x] = 0xFFECEFF4;
@@ -405,18 +422,13 @@ void compositor_render_frame(struct vanilla_server *srv)
                     }
 
                     /* Minimize button [_] */
-                    vanilla_rect_t min_btn;
-                    min_btn.x = max_btn.x - 16;
-                    min_btn.y = frame_rect.y + 6;
-                    min_btn.w = 12;
-                    min_btn.h = 12;
-                    if (vanilla_rect_intersect(&min_btn, dirty, &vis_btn)) {
+                    if (vanilla_rect_intersect(&btns.min_btn, dirty, &vis_btn)) {
                         uint32_t btn_bg = win->is_focused ? 0xFF4C566A : 0xFF3B4252;
                         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, btn_bg);
-                        int32_t py = min_btn.y + 9;
+                        int32_t py = btns.min_btn.y + 9;
                         if (py >= dirty->y && py < dirty->y + dirty->h) {
                             for (int k = 2; k <= 9; k++) {
-                                int32_t px = min_btn.x + k;
+                                int32_t px = btns.min_btn.x + k;
                                 if (px >= dirty->x && px < dirty->x + dirty->w)
                                     comp->backbuffer[py * comp->pitch_px + px] = 0xFFECEFF4;
                             }
@@ -428,7 +440,7 @@ void compositor_render_frame(struct vanilla_server *srv)
                         vanilla_rect_t text_clip;
                         text_clip.x = frame_rect.x + 6;
                         text_clip.y = frame_rect.y;
-                        text_clip.w = min_btn.x - text_clip.x - 4;
+                        text_clip.w = btns.min_btn.x - text_clip.x - 4;
                         text_clip.h = TITLEBAR_HEIGHT;
 
                         vanilla_rect_t vis_text;

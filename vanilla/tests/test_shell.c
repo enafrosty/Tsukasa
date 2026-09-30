@@ -104,17 +104,29 @@ static void test_evdev_to_ascii_and_nav(void)
 {
     printf("[TEST] Evdev keycode to ASCII and navigation...\n");
 
-    ASSERT(launcher_evdev_to_ascii(KEY_A, 0) == 'a', "KEY_A lowercase");
-    ASSERT(launcher_evdev_to_ascii(KEY_A, 1) == 'A', "KEY_A uppercase with Shift");
-    ASSERT(launcher_evdev_to_ascii(KEY_Z, 0) == 'z', "KEY_Z lowercase");
-    ASSERT(launcher_evdev_to_ascii(KEY_Z, 1) == 'Z', "KEY_Z uppercase with Shift");
-    ASSERT(launcher_evdev_to_ascii(KEY_1, 0) == '1', "KEY_1 digit");
-    ASSERT(launcher_evdev_to_ascii(KEY_1, 1) == '!', "KEY_1 exclamation with Shift");
-    ASSERT(launcher_evdev_to_ascii(KEY_0, 0) == '0', "KEY_0 digit");
-    ASSERT(launcher_evdev_to_ascii(KEY_0, 1) == ')', "KEY_0 paren with Shift");
-    ASSERT(launcher_evdev_to_ascii(KEY_SPACE, 0) == ' ', "KEY_SPACE is space");
-    ASSERT(launcher_evdev_to_ascii(KEY_MINUS, 0) == '-', "KEY_MINUS is hyphen");
-    ASSERT(launcher_evdev_to_ascii(KEY_MINUS, 1) == '_', "KEY_MINUS is underscore with Shift");
+    ASSERT(vanilla_evdev_to_ascii(KEY_A, 0) == 'a', "KEY_A lowercase");
+    ASSERT(vanilla_evdev_to_ascii(KEY_A, 1) == 'A', "KEY_A uppercase with Shift");
+    ASSERT(vanilla_evdev_to_ascii(KEY_Z, 0) == 'z', "KEY_Z lowercase");
+    ASSERT(vanilla_evdev_to_ascii(KEY_Z, 1) == 'Z', "KEY_Z uppercase with Shift");
+    ASSERT(vanilla_evdev_to_ascii(KEY_1, 0) == '1', "KEY_1 digit");
+    ASSERT(vanilla_evdev_to_ascii(KEY_1, 1) == '!', "KEY_1 exclamation with Shift");
+    ASSERT(vanilla_evdev_to_ascii(KEY_0, 0) == '0', "KEY_0 digit");
+    ASSERT(vanilla_evdev_to_ascii(KEY_0, 1) == ')', "KEY_0 paren with Shift");
+    ASSERT(vanilla_evdev_to_ascii(KEY_SPACE, 0) == ' ', "KEY_SPACE is space");
+    ASSERT(vanilla_evdev_to_ascii(KEY_MINUS, 0) == '-', "KEY_MINUS is hyphen");
+    ASSERT(vanilla_evdev_to_ascii(KEY_MINUS, 1) == '_', "KEY_MINUS is underscore with Shift");
+
+    /* Unified titlebar button geometry and hit-testing */
+    vanilla_rect_t frame = { 100, 200, 400, 300 };
+    chrome_btn_rects_t btns = chrome_metrics(&frame);
+    ASSERT(btns.close_btn.x == 100 + 400 - 18, "close_btn x coordinate");
+    ASSERT(btns.close_btn.y == 200 + 6, "close_btn y coordinate");
+    ASSERT(btns.close_btn.w == 12, "close_btn width");
+    ASSERT(btns.close_btn.h == 12, "close_btn height");
+    ASSERT(btns.max_btn.x == 100 + 400 - 34, "max_btn x coordinate");
+    ASSERT(btns.min_btn.x == 100 + 400 - 50, "min_btn x coordinate");
+    ASSERT(vanilla_rect_contains(&btns.close_btn, 482, 206) == 1, "hit inside close button");
+    ASSERT(vanilla_rect_contains(&btns.close_btn, 481, 206) == 0, "miss outside close button");
 
     vanilla_server_t srv;
     memset(&srv, 0, sizeof(srv));

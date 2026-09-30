@@ -21,6 +21,7 @@
 #include <sys/input.h>
 #include <sys/types.h>
 #include "../include/surface.h"
+#include "../input/keymap.h"
 
 #if defined(_WIN32)
 pid_t spawn(const char *path, char *const argv[], char *const envp[]);
@@ -63,7 +64,6 @@ void launcher_render(struct vanilla_server *srv, const vanilla_rect_t *dirty);
 int  launcher_handle_click(struct vanilla_server *srv, int32_t x, int32_t y, uint32_t button);
 void launcher_invalidate(struct vanilla_server *srv);
 int  launcher_fuzzy_match(const char *pattern, const char *target);
-char launcher_evdev_to_ascii(uint16_t code, int shift);
 void launcher_exec_selected(struct vanilla_server *srv);
 
 #endif /* _VANILLA_LAUNCHER_H */

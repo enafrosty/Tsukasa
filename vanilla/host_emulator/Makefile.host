@@ -36,6 +36,7 @@ CFLAGS      := -Wall -Wextra -O2 \
                -I$(EMU_DIR)/sys_compat \
                -I$(VANILLA_DIR)/include \
                -I$(VANILLA_DIR)/server \
+               -I$(VANILLA_DIR)/input \
                -I$(EMU_DIR)
 
 HOST_SRCS   := $(EMU_DIR)/sdl_backend.c \
@@ -49,7 +50,8 @@ HOST_SRCS   := $(EMU_DIR)/sdl_backend.c \
                $(VANILLA_DIR)/server/shell.c \
                $(VANILLA_DIR)/server/launcher.c \
                $(VANILLA_DIR)/server/wm.c \
-               $(VANILLA_DIR)/libvanilla/surface.c
+               $(VANILLA_DIR)/libvanilla/surface.c \
+               $(VANILLA_DIR)/input/keymap.c
 
 HOST_OBJS   := $(patsubst %.c,%.host.o,$(HOST_SRCS))
 BIN         := $(EMU_DIR)/bin/vanilla_host$(BIN_EXT)

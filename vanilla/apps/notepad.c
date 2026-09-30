@@ -324,7 +324,7 @@ int main(int argc, char **argv)
                             state->cursor_col = (int)strlen(state->lines[state->cursor_line]);
                             state->dirty = 1;
                         } else {
-                            char c = app_evdev_to_ascii(iev->code, state->shift_down);
+                            char c = vanilla_evdev_to_ascii(iev->code, state->shift_down);
                             if (c != 0)
                                 note_insert_char(state, c);
                         }

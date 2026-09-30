@@ -313,7 +313,7 @@ int main(int argc, char **argv)
                     } else if (iev->code == KEY_LEFTSHIFT || iev->code == KEY_RIGHTSHIFT) {
                         shift_down = (iev->value != 0);
                     } else if (iev->value == 1) {
-                        char asc = app_evdev_to_ascii(iev->code, shift_down);
+                        char asc = vanilla_evdev_to_ascii(iev->code, shift_down);
                         if (asc >= '0' && asc <= '9') {
                             char tok[2] = { asc, '\0' };
                             calc_handle_input(&state, tok);

@@ -68,4 +68,26 @@ void compositor_damage_all(vanilla_compositor_t *comp);
 /* Frame rendering */
 void compositor_render_frame(struct vanilla_server *srv);
 
+/*
+ * Button geometry within a frame rect.
+ * All values are in screen pixels at current scale.
+ * Both the compositor paint path and the WM hit-test path call this function.
+ */
+typedef struct {
+    vanilla_rect_t close_btn;    /* Bounding box of close [X] button */
+    vanilla_rect_t max_btn;      /* Bounding box of maximize [] button */
+    vanilla_rect_t min_btn;      /* Bounding box of minimize [_] button */
+} chrome_btn_rects_t;
+
+/*
+ * Derive all titlebar button rects from the active metrics and the given frame rect.
+ * frame: the full frame rect including titlebar and border.
+ */
+chrome_btn_rects_t chrome_metrics(const vanilla_rect_t *frame);
+
+static inline int vanilla_rect_contains(const vanilla_rect_t *r, int32_t x, int32_t y)
+{
+    return x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
+}
+
 #endif /* _VANILLA_COMPOSITOR_H */
