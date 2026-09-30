@@ -29,9 +29,9 @@
 #define CELL_WIDTH   8
 #define CELL_HEIGHT  16
 
-#define COLOR_TERM_BG     0xFF1A1C23u
-#define COLOR_TERM_FG     0xFFD8DEE9u
-#define COLOR_TERM_CURSOR 0xFF88C0D0u
+#define COLOR_TERM_BG     (g_theme->bg_base)
+#define COLOR_TERM_FG     (g_theme->fg_primary)
+#define COLOR_TERM_CURSOR (g_theme->accent)
 
 typedef struct {
     char     grid[TERM_ROWS][TERM_COLS];

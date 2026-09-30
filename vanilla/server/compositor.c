@@ -41,7 +41,7 @@ int compositor_init_offscreen(vanilla_compositor_t *comp, uint32_t width, uint32
     comp->fb_mem = NULL;
     comp->fb_size = 0;
     comp->is_offscreen = 1;
-    comp->bg_color = 0xFF282C34;
+    comp->bg_color = g_theme->bg_base;
     comp->has_wallpaper = 0;
     font_init(&comp->font, NULL, 0);
 
@@ -63,7 +63,7 @@ int compositor_init(vanilla_compositor_t *comp, const char *fb_dev)
 
     memset(comp, 0, sizeof(*comp));
     comp->fb_fd = -1;
-    comp->bg_color = 0xFF282C34;
+    comp->bg_color = g_theme->bg_base;
     comp->has_wallpaper = 0;
     font_init(&comp->font, NULL, 0);
 
@@ -265,9 +265,9 @@ void compositor_merge_damage(vanilla_compositor_t *comp)
 chrome_btn_rects_t chrome_metrics(const vanilla_rect_t *frame)
 {
     chrome_btn_rects_t r;
-    int32_t btn   = TITLEBAR_BTN_SIZE;
-    int32_t pad   = (TITLEBAR_HEIGHT - btn) / 2;
-    int32_t gap   = btn + TITLEBAR_BTN_PAD;
+    int32_t btn   = g_theme->btn_size;
+    int32_t pad   = (g_theme->titlebar_height - btn) / 2;
+    int32_t gap   = btn + g_theme->space_1;
     int32_t right = frame->x + frame->w;
 
     r.close_btn.x = right - 18;
@@ -339,15 +339,15 @@ void compositor_render_frame(struct vanilla_server *srv)
             wm_get_frame_rect(win, &frame_rect);
 
             vanilla_rect_t shadow_bounds;
-            shadow_bounds.x = frame_rect.x - SHADOW_RADIUS;
-            shadow_bounds.y = frame_rect.y - SHADOW_RADIUS;
-            shadow_bounds.w = frame_rect.w + 2 * SHADOW_RADIUS;
-            shadow_bounds.h = frame_rect.h + 2 * SHADOW_RADIUS + SHADOW_RADIUS / 2;
+            shadow_bounds.x = frame_rect.x - g_theme->shadow_radius;
+            shadow_bounds.y = frame_rect.y - g_theme->shadow_radius;
+            shadow_bounds.w = frame_rect.w + 2 * g_theme->shadow_radius;
+            shadow_bounds.h = frame_rect.h + 2 * g_theme->shadow_radius + g_theme->shadow_radius / 2;
 
             vanilla_rect_t dummy;
             if (vanilla_rect_intersect(&shadow_bounds, dirty, &dummy)) {
                 blt_drop_shadow(comp->backbuffer, comp->pitch_px, comp->width, comp->height,
-                                &frame_rect, dirty, SHADOW_RADIUS, SHADOW_ALPHA);
+                                &frame_rect, dirty, g_theme->shadow_radius, g_theme->shadow_alpha);
             }
         }
 
@@ -368,11 +368,11 @@ void compositor_render_frame(struct vanilla_server *srv)
                 title_rect.x = frame_rect.x;
                 title_rect.y = frame_rect.y;
                 title_rect.w = frame_rect.w;
-                title_rect.h = TITLEBAR_HEIGHT + WINDOW_BORDER_WIDTH;
+                title_rect.h = g_theme->titlebar_height + g_theme->border_width;
 
                 vanilla_rect_t vis_title;
                 if (vanilla_rect_intersect(&title_rect, dirty, &vis_title)) {
-                    uint32_t tb_color = win->is_focused ? 0xFF3B4252 : 0xFF2E3440;
+                    uint32_t tb_color = win->is_focused ? g_theme->titlebar_active : g_theme->titlebar_inactive;
                     blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_title, tb_color);
 
                     /* Titlebar buttons */
@@ -380,7 +380,7 @@ void compositor_render_frame(struct vanilla_server *srv)
 
                     vanilla_rect_t vis_btn;
                     if (vanilla_rect_intersect(&btns.close_btn, dirty, &vis_btn)) {
-                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, 0xFFBF616A);
+                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, g_theme->danger);
                         for (int k = 2; k <= 9; k++) {
                             int32_t px1 = btns.close_btn.x + k;
                             int32_t py1 = btns.close_btn.y + k;
@@ -388,16 +388,16 @@ void compositor_render_frame(struct vanilla_server *srv)
                             int32_t py2 = btns.close_btn.y + k;
                             if (px1 >= dirty->x && px1 < dirty->x + dirty->w &&
                                 py1 >= dirty->y && py1 < dirty->y + dirty->h)
-                                comp->backbuffer[py1 * comp->pitch_px + px1] = 0xFFECEFF4;
+                                comp->backbuffer[py1 * comp->pitch_px + px1] = g_theme->titlebar_btn_icon;
                             if (px2 >= dirty->x && px2 < dirty->x + dirty->w &&
                                 py2 >= dirty->y && py2 < dirty->y + dirty->h)
-                                comp->backbuffer[py2 * comp->pitch_px + px2] = 0xFFECEFF4;
+                                comp->backbuffer[py2 * comp->pitch_px + px2] = g_theme->titlebar_btn_icon;
                         }
                     }
 
                     /* Maximize button [] */
                     if (vanilla_rect_intersect(&btns.max_btn, dirty, &vis_btn)) {
-                        uint32_t btn_bg = win->is_focused ? 0xFF4C566A : 0xFF3B4252;
+                        uint32_t btn_bg = win->is_focused ? g_theme->titlebar_btn_bg : g_theme->titlebar_active;
                         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, btn_bg);
                         for (int k = 2; k <= 9; k++) {
                             int32_t top_y = btns.max_btn.y + 2;
@@ -405,32 +405,32 @@ void compositor_render_frame(struct vanilla_server *srv)
                             int32_t px = btns.max_btn.x + k;
                             if (px >= dirty->x && px < dirty->x + dirty->w) {
                                 if (top_y >= dirty->y && top_y < dirty->y + dirty->h)
-                                    comp->backbuffer[top_y * comp->pitch_px + px] = 0xFFECEFF4;
+                                    comp->backbuffer[top_y * comp->pitch_px + px] = g_theme->titlebar_btn_icon;
                                 if (bot_y >= dirty->y && bot_y < dirty->y + dirty->h)
-                                    comp->backbuffer[bot_y * comp->pitch_px + px] = 0xFFECEFF4;
+                                    comp->backbuffer[bot_y * comp->pitch_px + px] = g_theme->titlebar_btn_icon;
                             }
                             int32_t left_x = btns.max_btn.x + 2;
                             int32_t right_x = btns.max_btn.x + 9;
                             int32_t py = btns.max_btn.y + k;
                             if (py >= dirty->y && py < dirty->y + dirty->h) {
                                 if (left_x >= dirty->x && left_x < dirty->x + dirty->w)
-                                    comp->backbuffer[py * comp->pitch_px + left_x] = 0xFFECEFF4;
+                                    comp->backbuffer[py * comp->pitch_px + left_x] = g_theme->titlebar_btn_icon;
                                 if (right_x >= dirty->x && right_x < dirty->x + dirty->w)
-                                    comp->backbuffer[py * comp->pitch_px + right_x] = 0xFFECEFF4;
+                                    comp->backbuffer[py * comp->pitch_px + right_x] = g_theme->titlebar_btn_icon;
                             }
                         }
                     }
 
                     /* Minimize button [_] */
                     if (vanilla_rect_intersect(&btns.min_btn, dirty, &vis_btn)) {
-                        uint32_t btn_bg = win->is_focused ? 0xFF4C566A : 0xFF3B4252;
+                        uint32_t btn_bg = win->is_focused ? g_theme->titlebar_btn_bg : g_theme->titlebar_active;
                         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, btn_bg);
                         int32_t py = btns.min_btn.y + 9;
                         if (py >= dirty->y && py < dirty->y + dirty->h) {
                             for (int k = 2; k <= 9; k++) {
                                 int32_t px = btns.min_btn.x + k;
                                 if (px >= dirty->x && px < dirty->x + dirty->w)
-                                    comp->backbuffer[py * comp->pitch_px + px] = 0xFFECEFF4;
+                                    comp->backbuffer[py * comp->pitch_px + px] = g_theme->titlebar_btn_icon;
                             }
                         }
                     }
@@ -441,31 +441,31 @@ void compositor_render_frame(struct vanilla_server *srv)
                         text_clip.x = frame_rect.x + 6;
                         text_clip.y = frame_rect.y;
                         text_clip.w = btns.min_btn.x - text_clip.x - 4;
-                        text_clip.h = TITLEBAR_HEIGHT;
+                        text_clip.h = g_theme->titlebar_height;
 
                         vanilla_rect_t vis_text;
                         if (vanilla_rect_intersect(&text_clip, dirty, &vis_text) && text_clip.w > 0) {
-                            uint32_t text_color = win->is_focused ? 0xFFECEFF4 : 0xFFD8DEE9;
-                            int32_t text_y = frame_rect.y + (TITLEBAR_HEIGHT - 13) / 2;
+                            uint32_t text_color = win->is_focused ? g_theme->titlebar_text_active : g_theme->titlebar_text_inactive;
+                            int32_t text_y = frame_rect.y + (g_theme->titlebar_height - 13) / 2;
                             font_draw_text(comp->backbuffer, comp->pitch_px, &vis_text,
                                            &comp->font, win->title, text_clip.x, text_y,
-                                           TITLEBAR_FONT_SIZE, text_color);
+                                           g_theme->title_font_size, text_color);
                         }
                     }
                 }
 
-                uint32_t border_color = win->is_focused ? 0xFF88C0D0 : 0xFF4C566A;
+                uint32_t border_color = win->is_focused ? g_theme->border_focus : g_theme->border;
 
-                vanilla_rect_t b_left = { frame_rect.x, frame_rect.y, WINDOW_BORDER_WIDTH, frame_rect.h };
+                vanilla_rect_t b_left = { frame_rect.x, frame_rect.y, g_theme->border_width, frame_rect.h };
                 vanilla_rect_t vis_b;
                 if (vanilla_rect_intersect(&b_left, dirty, &vis_b))
                     blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, border_color);
 
-                vanilla_rect_t b_right = { frame_rect.x + frame_rect.w - WINDOW_BORDER_WIDTH, frame_rect.y, WINDOW_BORDER_WIDTH, frame_rect.h };
+                vanilla_rect_t b_right = { frame_rect.x + frame_rect.w - g_theme->border_width, frame_rect.y, g_theme->border_width, frame_rect.h };
                 if (vanilla_rect_intersect(&b_right, dirty, &vis_b))
                     blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, border_color);
 
-                vanilla_rect_t b_bottom = { frame_rect.x, frame_rect.y + frame_rect.h - WINDOW_BORDER_WIDTH, frame_rect.w, WINDOW_BORDER_WIDTH };
+                vanilla_rect_t b_bottom = { frame_rect.x, frame_rect.y + frame_rect.h - g_theme->border_width, frame_rect.w, g_theme->border_width };
                 if (vanilla_rect_intersect(&b_bottom, dirty, &vis_b))
                     blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, border_color);
             }
@@ -481,7 +481,7 @@ void compositor_render_frame(struct vanilla_server *srv)
                 vanilla_rect_t vis_client;
                 if (vanilla_rect_intersect(&client_rect, dirty, &vis_client)) {
                     /* Fill client background for areas where surface is smaller than window container */
-                    blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_client, 0xFF2E3440);
+                    blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_client, g_theme->bg_base);
 
                     /* Intersect visible client rectangle with actual allocated surface bounds */
                     int32_t surf_w = (int32_t)win->surface.width;

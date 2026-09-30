@@ -120,30 +120,30 @@ static void fm_open_entry(filemgr_state_t *st, int idx)
 
 static void fm_render(vanilla_surface_t *surf, filemgr_state_t *st)
 {
-    app_fill_rect(surf, 0, 0, FM_WIDTH, FM_HEIGHT, APP_COLOR_BG);
+    app_fill_rect(surf, 0, 0, FM_WIDTH, FM_HEIGHT, g_theme->bg_base);
 
     /* Header Bar */
-    app_fill_rect(surf, 0, 0, FM_WIDTH, HEADER_HEIGHT, APP_COLOR_SURFACE);
-    app_fill_rect(surf, 0, HEADER_HEIGHT - 1, FM_WIDTH, 1, APP_COLOR_BORDER);
+    app_fill_rect(surf, 0, 0, FM_WIDTH, HEADER_HEIGHT, g_theme->titlebar_active);
+    app_fill_rect(surf, 0, HEADER_HEIGHT - 1, FM_WIDTH, 1, g_theme->border);
 
     app_draw_button(surf, 8, 6, 40, 24, "Up", 0);
     app_draw_button(surf, 54, 6, 48, 24, "Home", 0);
 
     char path_lbl[160];
     snprintf(path_lbl, sizeof(path_lbl), "Path: %s", st->cwd);
-    app_draw_text(surf, 114, 14, path_lbl, APP_COLOR_TEXT);
+    app_draw_text(surf, 114, 14, path_lbl, g_theme->fg_primary);
 
     /* Sidebar */
     int content_y = HEADER_HEIGHT;
     int content_h = FM_HEIGHT - HEADER_HEIGHT;
-    app_fill_rect(surf, 0, content_y, SIDEBAR_WIDTH, content_h, 0xFF242933u);
-    app_fill_rect(surf, SIDEBAR_WIDTH - 1, content_y, 1, content_h, APP_COLOR_BORDER);
+    app_fill_rect(surf, 0, content_y, SIDEBAR_WIDTH, content_h, g_theme->taskbar_bg);
+    app_fill_rect(surf, SIDEBAR_WIDTH - 1, content_y, 1, content_h, g_theme->border);
 
-    app_draw_text(surf, 12, content_y + 12, "QUICK ACCESS", APP_COLOR_DIM);
+    app_draw_text(surf, 12, content_y + 12, "QUICK ACCESS", g_theme->fg_dim);
     static const char *shortcuts[] = { "/", "/bin", "/tmp", "/dev", "/proc", "/sys" };
     for (int i = 0; i < 6; i++) {
         int sy = content_y + 34 + i * 26;
-        app_draw_text(surf, 16, sy, shortcuts[i], APP_COLOR_MUTED);
+        app_draw_text(surf, 16, sy, shortcuts[i], g_theme->fg_muted);
     }
 
     /* Main File List */
@@ -160,22 +160,22 @@ static void fm_render(vanilla_surface_t *surf, filemgr_state_t *st)
         int row_y = content_y + i * ROW_HEIGHT;
 
         if (e_idx == st->selected_idx) {
-            app_fill_rect(surf, main_x, row_y, main_w, ROW_HEIGHT, APP_COLOR_CARD);
+            app_fill_rect(surf, main_x, row_y, main_w, ROW_HEIGHT, g_theme->bg_elevated);
         }
 
         /* Icon tag */
         if (e->is_dir) {
-            app_draw_text(surf, main_x + 12, row_y + 8, "[DIR]", APP_COLOR_PRIMARY);
-            app_draw_text(surf, main_x + 60, row_y + 8, e->name, APP_COLOR_TEXT);
-            app_draw_text(surf, main_x + main_w - 70, row_y + 8, "<DIR>", APP_COLOR_DIM);
+            app_draw_text(surf, main_x + 12, row_y + 8, "[DIR]", g_theme->accent);
+            app_draw_text(surf, main_x + 60, row_y + 8, e->name, g_theme->fg_primary);
+            app_draw_text(surf, main_x + main_w - 70, row_y + 8, "<DIR>", g_theme->fg_dim);
         } else {
             size_t l = strlen(e->name);
             int is_elf = (l > 4 && strcmp(e->name + l - 4, ".elf") == 0);
-            uint32_t icon_col = is_elf ? APP_COLOR_SUCCESS : APP_COLOR_MUTED;
+            uint32_t icon_col = is_elf ? g_theme->success : g_theme->fg_muted;
             const char *tag = is_elf ? "[APP]" : "[FILE]";
 
             app_draw_text(surf, main_x + 12, row_y + 8, tag, icon_col);
-            app_draw_text(surf, main_x + 60, row_y + 8, e->name, APP_COLOR_TEXT);
+            app_draw_text(surf, main_x + 60, row_y + 8, e->name, g_theme->fg_primary);
 
             char sz_str[24];
             if (e->size >= 1024 * 1024)
@@ -185,10 +185,10 @@ static void fm_render(vanilla_surface_t *surf, filemgr_state_t *st)
             else
                 snprintf(sz_str, sizeof(sz_str), "%lu B", (unsigned long)e->size);
 
-            app_draw_text(surf, main_x + main_w - 70, row_y + 8, sz_str, APP_COLOR_DIM);
+            app_draw_text(surf, main_x + main_w - 70, row_y + 8, sz_str, g_theme->fg_dim);
         }
 
-        app_fill_rect(surf, main_x, row_y + ROW_HEIGHT - 1, main_w, 1, 0xFF353B49u);
+        app_fill_rect(surf, main_x, row_y + ROW_HEIGHT - 1, main_w, 1, g_theme->border);
     }
 }
 
