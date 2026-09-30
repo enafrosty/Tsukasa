@@ -136,7 +136,7 @@ static long sys_stat(long path, long st, long a3, long a4, long a5, long a6)
 static long sys_poll(long fds, long nfds, long timeout, long a4, long a5, long a6)
 {
     (void)a4; (void)a5; (void)a6;
-    if (nfds < 0) return -EINVAL;
+    if (nfds < 0 || nfds > 256) return -EINVAL;
     if (nfds > 0 && !user_ok(fds, nfds * (long)sizeof(struct tsukasa_pollfd), 1)) return -EFAULT;
     return mux_fs(FS_CMD_POLL, fds, nfds, timeout);
 }
@@ -159,7 +159,11 @@ static long sys_select(long nfds, long rp, long wp, long ep, long tvp, long a6)
         const struct timeval *tv = (const struct timeval *)(uintptr_t)tvp;
         if (tv->tv_sec < 0 || tv->tv_usec < 0 || tv->tv_usec >= 1000000)
             return -EINVAL;
-        timeout_ms = (int)(tv->tv_sec * 1000 + (tv->tv_usec + 999) / 1000);
+        int64_t ms = (int64_t)tv->tv_sec * 1000LL + (tv->tv_usec + 999) / 1000;
+        if (ms > 0x7FFFFFFF)
+            timeout_ms = 0x7FFFFFFF;
+        else
+            timeout_ms = (int)ms;
     }
 
     if (nfds == 0) {
@@ -268,7 +272,7 @@ static long sys_epoll_ctl(long epfd, long op, long fd, long event_ptr, long a5, 
 static long sys_epoll_wait(long epfd, long events_ptr, long maxevents, long timeout, long a5, long a6)
 {
     (void)a5; (void)a6;
-    if (maxevents <= 0)
+    if (maxevents <= 0 || maxevents > 256)
         return -EINVAL;
     if (!events_ptr)
         return -EFAULT;
@@ -910,6 +914,15 @@ static void c01_test_entry(void)
         kprintf("[parity][C01] poll 0-fd timeout FAIL (r=%d dt=%llu)\n",
                 poll_r, (unsigned long long)(poll_t1 - poll_t0));
 
+    /* Test: poll error cases (-EFAULT on NULL fds with nfds > 0, -EINVAL on nfds > 256) */
+    int poll_efault = vfs_poll(NULL, 1, 10);
+    int poll_einval = vfs_poll(NULL, 300, 10);
+    if (poll_efault == -EFAULT && poll_einval == -EINVAL)
+        kprintf("[parity][C01] poll error codes PASS\n");
+    else
+        kprintf("[parity][C01] poll error codes FAIL (efault=%d einval=%d)\n",
+                poll_efault, poll_einval);
+
     /* Test: pipe + poll readiness */
     int pfd[2];
     if (vfs_pipe(pfd) == 0) {
@@ -929,25 +942,32 @@ static void c01_test_entry(void)
                     r_empty, r_data, (unsigned)p_in.revents);
     }
 
-    /* Test: epoll round-trip (create, ctl-add, wait) */
+    /* Test: epoll round-trip (create, ctl-add, wait, close unregister) */
     if (vfs_pipe(pfd) == 0) {
         int epfd = vfs_epoll_create1(0);
         if (epfd >= 0) {
+            int ctl_self = vfs_epoll_ctl(epfd, EPOLL_CTL_ADD, epfd, EPOLLIN, 0);
+            int ctl_bad = vfs_epoll_ctl(999, EPOLL_CTL_ADD, pfd[0], EPOLLIN, 0);
             int ctl_add = vfs_epoll_ctl(epfd, EPOLL_CTL_ADD, pfd[0], EPOLLIN, 0x12345ULL);
             epoll_event_t out_ev[2];
             int w_empty = vfs_epoll_wait(epfd, out_ev, 2, 10);
             char c = 'E';
             vfs_write(pfd[1], &c, 1);
             int w_data = vfs_epoll_wait(epfd, out_ev, 2, 50);
-            vfs_close(epfd);
+
+            /* Test closing monitored fd: should be removed automatically */
             vfs_close(pfd[0]);
+            int w_closed = vfs_epoll_wait(epfd, out_ev, 2, 0);
+
+            vfs_close(epfd);
             vfs_close(pfd[1]);
-            if (ctl_add == 0 && w_empty == 0 && w_data == 1 &&
+            if (ctl_self == -EINVAL && ctl_bad == -EBADF && ctl_add == 0 &&
+                w_empty == 0 && w_data == 1 && w_closed == 0 &&
                 (out_ev[0].events & EPOLLIN) && out_ev[0].data.u64 == 0x12345ULL)
                 kprintf("[parity][C01] epoll round-trip PASS\n");
             else
-                kprintf("[parity][C01] epoll round-trip FAIL (add=%d empty=%d data=%d)\n",
-                        ctl_add, w_empty, w_data);
+                kprintf("[parity][C01] epoll round-trip FAIL (self=%d bad=%d add=%d empty=%d data=%d closed=%d)\n",
+                        ctl_self, ctl_bad, ctl_add, w_empty, w_data, w_closed);
         }
     }
 

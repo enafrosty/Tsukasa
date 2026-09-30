@@ -149,6 +149,16 @@ static int real_main(int argc, char **argv, char **envp)
         TSK_TEST_FAIL("syscalls", "poll_multiplexing", "poll(NULL, 0, 10) did not return 0");
         return 13;
     }
+    errno = 0;
+    if (poll(NULL, 1, 10) != -1 || errno != EFAULT) {
+        TSK_TEST_FAIL("syscalls", "poll_multiplexing", "poll(NULL, 1, 10) did not return -1 EFAULT");
+        return 13;
+    }
+    errno = 0;
+    if (poll(NULL, 300, 10) != -1 || errno != EINVAL) {
+        TSK_TEST_FAIL("syscalls", "poll_multiplexing", "poll(NULL, 300, 10) did not return -1 EINVAL");
+        return 13;
+    }
 
     int pfd[2];
     if (pipe(pfd) != 0) {
@@ -211,6 +221,14 @@ static int real_main(int argc, char **argv, char **envp)
     FD_SET(pfd[0], &rfds);
     FD_SET(pfd[1], &wfds);
 
+    errno = 0;
+    if (select(300, &rfds, NULL, NULL, NULL) != -1 || errno != EINVAL) {
+        close(pfd[0]);
+        close(pfd[1]);
+        TSK_TEST_FAIL("syscalls", "select_multiplexing", "select(300, ...) did not return -1 EINVAL");
+        return 19;
+    }
+
     struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
     int maxfd = (pfd[0] > pfd[1] ? pfd[0] : pfd[1]) + 1;
     int sel_res = select(maxfd, &rfds, &wfds, NULL, &tv);
@@ -267,6 +285,25 @@ static int real_main(int argc, char **argv, char **envp)
     struct epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.fd = pfd[0];
+
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, epfd, &ev) != -1 || errno != EINVAL) {
+        close(pfd[0]);
+        close(pfd[1]);
+        close(epfd);
+        TSK_TEST_FAIL("syscalls", "epoll_facility", "epoll_ctl ADD epfd to itself did not return -1 EINVAL");
+        return 26;
+    }
+
+    errno = 0;
+    if (epoll_ctl(999, EPOLL_CTL_ADD, pfd[0], &ev) != -1 || errno != EBADF) {
+        close(pfd[0]);
+        close(pfd[1]);
+        close(epfd);
+        TSK_TEST_FAIL("syscalls", "epoll_facility", "epoll_ctl bad epfd did not return -1 EBADF");
+        return 26;
+    }
+
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, pfd[0], &ev) != 0) {
         close(pfd[0]);
         close(pfd[1]);
@@ -310,7 +347,16 @@ static int real_main(int argc, char **argv, char **envp)
         return 30;
     }
 
+    /* Test closed fd unregistration from epoll */
     close(pfd[0]);
+    int ep_closed = epoll_wait(epfd, events, 2, 0);
+    if (ep_closed != 0) {
+        close(pfd[1]);
+        close(epfd);
+        TSK_TEST_FAIL("syscalls", "epoll_facility", "epoll_wait on closed fd returned events");
+        return 31;
+    }
+
     close(pfd[1]);
     close(epfd);
     TSK_TEST_PASS("syscalls", "epoll_facility");

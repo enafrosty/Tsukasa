@@ -676,6 +676,28 @@ static void fd_close_on_table(void **tbl, int fd)
     f = (vfs_file_t *)tbl[fd];
     if (!f)
         return;
+
+    for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
+        vfs_file_t *ef = (vfs_file_t *)tbl[i];
+        if (ef && ef->backend == VFS_BACKEND_EPOLL) {
+            epoll_item_t *prev = NULL;
+            epoll_item_t *curr = ef->u.epoll.items;
+            while (curr) {
+                if (curr->fd == fd) {
+                    if (prev)
+                        prev->next = curr->next;
+                    else
+                        ef->u.epoll.items = curr->next;
+                    ef->u.epoll.count--;
+                    kfree(curr);
+                    break;
+                }
+                prev = curr;
+                curr = curr->next;
+            }
+        }
+    }
+
     tbl[fd] = NULL;
     file_release(f);
 }
@@ -2162,6 +2184,9 @@ int vfs_poll(vfs_pollfd_t *fds, size_t nfds, int timeout_ms)
 {
     process_t *proc = vfs_current_process();
 
+    if (nfds > 256)
+        return -EINVAL;
+
     if (nfds == 0) {
         if (timeout_ms == 0)
             return 0;
@@ -2175,13 +2200,13 @@ int vfs_poll(vfs_pollfd_t *fds, size_t nfds, int timeout_ms)
             if (timeout_ms > 0 && pit_ticks_ms() >= deadline)
                 break;
             if (timeout_ms < 0)
-                break;
+                continue;
         }
         return 0;
     }
 
     if (!fds)
-        return -1;
+        return -EFAULT;
 
     /* Phase 1: non-blocking scan */
     int ready = vfs_poll_scan(fds, nfds);
@@ -2253,14 +2278,20 @@ int vfs_epoll_create1(int flags)
 int vfs_epoll_ctl(int epfd, int op, int fd, uint32_t events, uint64_t data)
 {
     process_t *proc = vfs_current_process();
-    if (!fd_valid(epfd) || !fd_valid(fd) || epfd == fd)
+    if (!fd_valid(epfd) || !fd_valid(fd))
         return -EBADF;
+    if (epfd == fd)
+        return -EINVAL;
     vfs_file_t *epf = fd_lookup(proc, epfd);
-    if (!epf || epf->backend != VFS_BACKEND_EPOLL)
+    if (!epf)
+        return -EBADF;
+    if (epf->backend != VFS_BACKEND_EPOLL)
         return -EINVAL;
     vfs_file_t *target = fd_lookup(proc, fd);
     if (!target)
         return -EBADF;
+    if (target->backend == VFS_BACKEND_EPOLL)
+        return -EINVAL;
 
     epoll_item_t *prev = NULL;
     epoll_item_t *curr = epf->u.epoll.items;
@@ -2312,10 +2343,14 @@ int vfs_epoll_ctl(int epfd, int op, int fd, uint32_t events, uint64_t data)
 int vfs_epoll_wait(int epfd, epoll_event_t *events, int maxevents, int timeout_ms)
 {
     process_t *proc = vfs_current_process();
-    if (!fd_valid(epfd) || !events || maxevents <= 0)
+    if (!fd_valid(epfd))
+        return -EBADF;
+    if (!events || maxevents <= 0 || maxevents > 256)
         return -EINVAL;
     vfs_file_t *epf = fd_lookup(proc, epfd);
-    if (!epf || epf->backend != VFS_BACKEND_EPOLL)
+    if (!epf)
+        return -EBADF;
+    if (epf->backend != VFS_BACKEND_EPOLL)
         return -EINVAL;
 
     int count = epf->u.epoll.count;

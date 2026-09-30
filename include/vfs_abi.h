@@ -44,6 +44,7 @@
 
 /* poll event bits */
 #define VFS_POLLIN   0x0001
+#define VFS_POLLPRI  0x0002
 #define VFS_POLLOUT  0x0004
 #define VFS_POLLERR  0x0008
 #define VFS_POLLHUP  0x0010
