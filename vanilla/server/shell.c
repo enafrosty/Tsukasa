@@ -120,8 +120,8 @@ void shell_update_clock(vanilla_shell_t *shell, vanilla_server_t *srv)
                 int32_t screen_w = (int32_t)srv->compositor.width;
                 int32_t screen_h = (int32_t)srv->compositor.height;
                 vanilla_rect_t clock_damage = {
-                    screen_w - TASKBAR_CLOCK_W - 4,
-                    screen_h - TASKBAR_HEIGHT + 4,
+                    screen_w - TASKBAR_CLOCK_W - THEME_PX(4),
+                    screen_h - TASKBAR_HEIGHT + THEME_PX(4),
                     TASKBAR_CLOCK_W,
                     TASKBAR_CLOCK_H
                 };
@@ -173,13 +173,14 @@ void shell_render_start_menu(vanilla_server_t *srv, const vanilla_rect_t *dirty)
     /* Panel background */
     blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_panel, g_theme->bg_base);
 
-    /* 1px top border and right border */
-    vanilla_rect_t top_border = { sm_x, sm_y, sm_w, 1 };
+    /* Top border and right border */
+    int32_t sm_bw = g_theme->border_width;
+    vanilla_rect_t top_border = { sm_x, sm_y, sm_w, sm_bw };
     vanilla_rect_t vis_top;
     if (vanilla_rect_intersect(&top_border, dirty, &vis_top))
         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_top, g_theme->border);
 
-    vanilla_rect_t right_border = { sm_x + sm_w - 1, sm_y, 1, sm_h };
+    vanilla_rect_t right_border = { sm_x + sm_w - sm_bw, sm_y, sm_bw, sm_h };
     vanilla_rect_t vis_right;
     if (vanilla_rect_intersect(&right_border, dirty, &vis_right))
         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_right, g_theme->border);
@@ -187,28 +188,30 @@ void shell_render_start_menu(vanilla_server_t *srv, const vanilla_rect_t *dirty)
     /* Render Start Menu items */
     for (int i = 0; i < START_MENU_NUM_ITEMS; i++) {
         const start_menu_item_t *item = &g_start_menu_items[i];
-        int32_t item_y = sm_y + 12 + i * START_MENU_ITEM_H;
+        int32_t item_y = sm_y + THEME_PX(12) + i * START_MENU_ITEM_H;
 
-        vanilla_rect_t item_rect = { sm_x + 6, item_y, sm_w - 12, START_MENU_ITEM_H - 4 };
+        vanilla_rect_t item_rect = { sm_x + THEME_PX(6), item_y, sm_w - THEME_PX(12), START_MENU_ITEM_H - THEME_PX(4) };
         vanilla_rect_t vis_item;
         if (!vanilla_rect_intersect(&item_rect, dirty, &vis_item))
             continue;
 
         /* Item badge / icon */
-        vanilla_rect_t badge_rect = { item_rect.x + 4, item_rect.y + 3, 18, 18 };
+        vanilla_rect_t badge_rect = { item_rect.x + THEME_PX(4), item_rect.y + THEME_PX(3), THEME_PX(18), THEME_PX(18) };
         vanilla_rect_t vis_badge;
         if (vanilla_rect_intersect(&badge_rect, dirty, &vis_badge)) {
             blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_badge, shell_get_badge_color(i));
             if (comp->font.info) {
                 font_draw_text(comp->backbuffer, comp->pitch_px, &vis_badge, &comp->font,
-                               item->badge, badge_rect.x + 2, badge_rect.y + 4, 10, g_theme->fg_primary);
+                               item->badge, badge_rect.x + THEME_PX(2), badge_rect.y + THEME_PX(4),
+                               THEME_F(10.0f), g_theme->fg_primary);
             }
         }
 
         /* Item title text */
         if (comp->font.info) {
             font_draw_text(comp->backbuffer, comp->pitch_px, &vis_item, &comp->font,
-                           item->title, item_rect.x + 28, item_rect.y + 6, 12, g_theme->fg_primary);
+                           item->title, item_rect.x + THEME_PX(28), item_rect.y + THEME_PX(6),
+                           THEME_F(12.0f), g_theme->fg_primary);
         }
     }
 }
@@ -228,21 +231,23 @@ void shell_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
         /* Taskbar panel background */
         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_tb, g_theme->taskbar_bg);
 
-        /* 1px top border line */
-        vanilla_rect_t border_rect = { 0, screen_h - TASKBAR_HEIGHT, screen_w, 1 };
+        /* Top border line */
+        int32_t tb_bw = g_theme->border_width;
+        vanilla_rect_t border_rect = { 0, screen_h - TASKBAR_HEIGHT, screen_w, tb_bw };
         vanilla_rect_t vis_border;
         if (vanilla_rect_intersect(&border_rect, dirty, &vis_border))
             blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_border, g_theme->border);
 
         /* Start button */
-        vanilla_rect_t start_rect = { TASKBAR_START_X, screen_h - TASKBAR_HEIGHT + 4, TASKBAR_START_W, TASKBAR_START_H };
+        vanilla_rect_t start_rect = { TASKBAR_START_X, screen_h - TASKBAR_HEIGHT + THEME_PX(4), TASKBAR_START_W, TASKBAR_START_H };
         vanilla_rect_t vis_start;
         if (vanilla_rect_intersect(&start_rect, dirty, &vis_start)) {
             uint32_t btn_color = srv->shell.start_menu_open ? g_theme->accent_hover : g_theme->accent_pressed;
             blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_start, btn_color);
             if (comp->font.info) {
                 font_draw_text(comp->backbuffer, comp->pitch_px, &vis_start, &comp->font,
-                               "Start", start_rect.x + 14, start_rect.y + 7, 13, g_theme->taskbar_text);
+                               "Start", start_rect.x + THEME_PX(14), start_rect.y + THEME_PX(7),
+                               THEME_F(13.0f), g_theme->taskbar_text);
             }
         }
 
@@ -254,17 +259,17 @@ void shell_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
                 continue;
 
             int32_t px = TASKBAR_PILL_START_X + pill_idx * (TASKBAR_PILL_W + TASKBAR_PILL_GAP);
-            if (px + TASKBAR_PILL_W > screen_w - TASKBAR_CLOCK_W - 8)
+            if (px + TASKBAR_PILL_W > screen_w - TASKBAR_CLOCK_W - THEME_PX(8))
                 break;
 
-            vanilla_rect_t pill_rect = { px, screen_h - TASKBAR_HEIGHT + 4, TASKBAR_PILL_W, TASKBAR_PILL_H };
+            vanilla_rect_t pill_rect = { px, screen_h - TASKBAR_HEIGHT + THEME_PX(4), TASKBAR_PILL_W, TASKBAR_PILL_H };
             vanilla_rect_t vis_pill;
             if (vanilla_rect_intersect(&pill_rect, dirty, &vis_pill)) {
                 uint32_t bg = win->is_focused ? g_theme->taskbar_item_open : (win->is_mapped ? g_theme->bg_base : g_theme->taskbar_bg);
                 blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_pill, bg);
 
                 if (win->is_focused) {
-                    vanilla_rect_t ind = { pill_rect.x + 2, pill_rect.y + pill_rect.h - 2, pill_rect.w - 4, 2 };
+                    vanilla_rect_t ind = { pill_rect.x + THEME_PX(2), pill_rect.y + pill_rect.h - THEME_PX(2), pill_rect.w - THEME_PX(4), THEME_PX(2) };
                     vanilla_rect_t vis_ind;
                     if (vanilla_rect_intersect(&ind, dirty, &vis_ind))
                         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_ind, g_theme->taskbar_item_active);
@@ -274,20 +279,22 @@ void shell_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
                     const char *title = win->title[0] ? win->title : "App";
                     uint32_t fg = win->is_focused ? g_theme->fg_primary : (win->is_mapped ? g_theme->fg_muted : g_theme->fg_dim);
                     font_draw_text(comp->backbuffer, comp->pitch_px, &vis_pill, &comp->font,
-                                   title, pill_rect.x + 8, pill_rect.y + 7, 12, fg);
+                                   title, pill_rect.x + THEME_PX(8), pill_rect.y + THEME_PX(7),
+                                   THEME_F(12.0f), fg);
                 }
             }
             pill_idx++;
         }
 
         /* System Tray / Digital Clock */
-        vanilla_rect_t clock_rect = { screen_w - TASKBAR_CLOCK_W - 4, screen_h - TASKBAR_HEIGHT + 4, TASKBAR_CLOCK_W, TASKBAR_CLOCK_H };
+        vanilla_rect_t clock_rect = { screen_w - TASKBAR_CLOCK_W - THEME_PX(4), screen_h - TASKBAR_HEIGHT + THEME_PX(4), TASKBAR_CLOCK_W, TASKBAR_CLOCK_H };
         vanilla_rect_t vis_clock;
         if (vanilla_rect_intersect(&clock_rect, dirty, &vis_clock)) {
             blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_clock, g_theme->bg_base);
             if (comp->font.info) {
                 font_draw_text(comp->backbuffer, comp->pitch_px, &vis_clock, &comp->font,
-                               srv->shell.clock_str, clock_rect.x + 16, clock_rect.y + 7, 12, g_theme->taskbar_text);
+                               srv->shell.clock_str, clock_rect.x + THEME_PX(16), clock_rect.y + THEME_PX(7),
+                               THEME_F(12.0f), g_theme->taskbar_text);
             }
         }
     }
@@ -309,7 +316,7 @@ int shell_handle_click(vanilla_server_t *srv, int32_t x, int32_t y, uint32_t but
 
     /* Start button on taskbar */
     if (x >= TASKBAR_START_X && x < TASKBAR_START_X + TASKBAR_START_W &&
-        y >= screen_h - TASKBAR_HEIGHT + 4 && y < screen_h - TASKBAR_HEIGHT + 4 + TASKBAR_START_H) {
+        y >= screen_h - TASKBAR_HEIGHT + THEME_PX(4) && y < screen_h - TASKBAR_HEIGHT + THEME_PX(4) + TASKBAR_START_H) {
         srv->shell.start_menu_open = !srv->shell.start_menu_open;
         shell_invalidate_start_menu(srv);
         shell_invalidate(srv);
@@ -320,7 +327,7 @@ int shell_handle_click(vanilla_server_t *srv, int32_t x, int32_t y, uint32_t but
     if (srv->shell.start_menu_open) {
         if (x >= sm_x && x < sm_x + START_MENU_WIDTH &&
             y >= sm_y && y < sm_y + START_MENU_HEIGHT) {
-            int rel_y = y - (sm_y + 12);
+            int rel_y = y - (sm_y + THEME_PX(12));
             if (rel_y >= 0) {
                 int item_idx = rel_y / START_MENU_ITEM_H;
                 if (item_idx >= 0 && item_idx < START_MENU_NUM_ITEMS) {
@@ -349,11 +356,11 @@ int shell_handle_click(vanilla_server_t *srv, int32_t x, int32_t y, uint32_t but
                 continue;
 
             int32_t px = TASKBAR_PILL_START_X + pill_idx * (TASKBAR_PILL_W + TASKBAR_PILL_GAP);
-            if (px + TASKBAR_PILL_W > screen_w - TASKBAR_CLOCK_W - 8)
+            if (px + TASKBAR_PILL_W > screen_w - TASKBAR_CLOCK_W - THEME_PX(8))
                 break;
 
             if (x >= px && x < px + TASKBAR_PILL_W &&
-                y >= screen_h - TASKBAR_HEIGHT + 4 && y < screen_h - TASKBAR_HEIGHT + 4 + TASKBAR_PILL_H) {
+                y >= screen_h - TASKBAR_HEIGHT + THEME_PX(4) && y < screen_h - TASKBAR_HEIGHT + THEME_PX(4) + TASKBAR_PILL_H) {
                 if (!win->is_mapped) {
                     win->is_mapped = 1;
                     vanilla_server_focus_window(srv, win->window_id);

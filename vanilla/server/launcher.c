@@ -160,14 +160,14 @@ void launcher_invalidate(vanilla_server_t *srv)
     int32_t screen_h = (int32_t)srv->compositor.height;
     int32_t lx = (screen_w - LAUNCHER_WIDTH) / 2;
     int32_t ly = (screen_h - TASKBAR_HEIGHT - LAUNCHER_HEIGHT) / 2;
-    if (ly < 20)
-        ly = 20;
+    if (ly < THEME_PX(20))
+        ly = THEME_PX(20);
 
     vanilla_rect_t r = {
-        lx - 16,
-        ly - 16,
-        LAUNCHER_WIDTH + 32,
-        LAUNCHER_HEIGHT + 32
+        lx - THEME_PX(16),
+        ly - THEME_PX(16),
+        LAUNCHER_WIDTH + THEME_PX(32),
+        LAUNCHER_HEIGHT + THEME_PX(32)
     };
     compositor_add_damage(&srv->compositor, &r);
 }
@@ -327,18 +327,18 @@ int launcher_handle_click(vanilla_server_t *srv, int32_t x, int32_t y, uint32_t 
     int32_t screen_h = (int32_t)srv->compositor.height;
     int32_t lx = (screen_w - LAUNCHER_WIDTH) / 2;
     int32_t ly = (screen_h - TASKBAR_HEIGHT - LAUNCHER_HEIGHT) / 2;
-    if (ly < 20)
-        ly = 20;
+    if (ly < THEME_PX(20))
+        ly = THEME_PX(20);
 
     if (x < lx || x >= lx + LAUNCHER_WIDTH || y < ly || y >= ly + LAUNCHER_HEIGHT) {
         launcher_set_visible(srv, 0);
         return 1;
     }
 
-    int32_t item_start_y = ly + 56;
+    int32_t item_start_y = ly + THEME_PX(54);
     for (int i = 0; i < srv->launcher.match_count && i < 5; i++) {
         int32_t iy = item_start_y + i * LAUNCHER_ITEM_HEIGHT;
-        if (x >= lx + 12 && x < lx + LAUNCHER_WIDTH - 12 &&
+        if (x >= lx + THEME_PX(12) && x < lx + LAUNCHER_WIDTH - THEME_PX(12) &&
             y >= iy && y < iy + LAUNCHER_ITEM_HEIGHT) {
             srv->launcher.selected_idx = i;
             launcher_exec_selected(srv);
@@ -359,8 +359,8 @@ void launcher_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
     int32_t screen_h = (int32_t)comp->height;
     int32_t lx = (screen_w - LAUNCHER_WIDTH) / 2;
     int32_t ly = (screen_h - TASKBAR_HEIGHT - LAUNCHER_HEIGHT) / 2;
-    if (ly < 20)
-        ly = 20;
+    if (ly < THEME_PX(20))
+        ly = THEME_PX(20);
 
     vanilla_rect_t modal_rect = { lx, ly, LAUNCHER_WIDTH, LAUNCHER_HEIGHT };
     vanilla_rect_t vis_modal;
@@ -368,50 +368,54 @@ void launcher_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
         return;
 
     /* Drop shadow behind modal */
-    blt_drop_shadow(comp->backbuffer, comp->pitch_px, comp->width, comp->height, &modal_rect, dirty, 12, 160);
+    blt_drop_shadow(comp->backbuffer, comp->pitch_px, comp->width, comp->height, &modal_rect, dirty,
+                    THEME_PX(12), 160);
 
     /* Background panel */
     blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_modal, g_theme->bg_base);
 
-    /* 2px border */
-    vanilla_rect_t b_top = { lx, ly, LAUNCHER_WIDTH, 2 };
+    /* Border */
+    int32_t bw = THEME_PX(2);
+    vanilla_rect_t b_top = { lx, ly, LAUNCHER_WIDTH, bw };
     vanilla_rect_t vis_b;
     if (vanilla_rect_intersect(&b_top, dirty, &vis_b))
         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border_focus);
-    vanilla_rect_t b_bot = { lx, ly + LAUNCHER_HEIGHT - 2, LAUNCHER_WIDTH, 2 };
+    vanilla_rect_t b_bot = { lx, ly + LAUNCHER_HEIGHT - bw, LAUNCHER_WIDTH, bw };
     if (vanilla_rect_intersect(&b_bot, dirty, &vis_b))
         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border_focus);
-    vanilla_rect_t b_left = { lx, ly, 2, LAUNCHER_HEIGHT };
+    vanilla_rect_t b_left = { lx, ly, bw, LAUNCHER_HEIGHT };
     if (vanilla_rect_intersect(&b_left, dirty, &vis_b))
         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border_focus);
-    vanilla_rect_t b_right = { lx + LAUNCHER_WIDTH - 2, ly, 2, LAUNCHER_HEIGHT };
+    vanilla_rect_t b_right = { lx + LAUNCHER_WIDTH - bw, ly, bw, LAUNCHER_HEIGHT };
     if (vanilla_rect_intersect(&b_right, dirty, &vis_b))
         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border_focus);
 
     /* Search input box */
-    vanilla_rect_t sbox = { lx + 12, ly + 12, LAUNCHER_WIDTH - 24, 32 };
+    vanilla_rect_t sbox = { lx + THEME_PX(12), ly + THEME_PX(12), LAUNCHER_WIDTH - THEME_PX(24), THEME_PX(32) };
     vanilla_rect_t vis_sbox;
     if (vanilla_rect_intersect(&sbox, dirty, &vis_sbox)) {
         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_sbox, g_theme->bg_elevated);
         if (comp->font.info) {
             if (srv->launcher.query_len > 0) {
                 font_draw_text(comp->backbuffer, comp->pitch_px, &vis_sbox, &comp->font,
-                               srv->launcher.query, sbox.x + 8, sbox.y + 9, 13, g_theme->fg_primary);
+                               srv->launcher.query, sbox.x + THEME_PX(8), sbox.y + THEME_PX(9),
+                               THEME_F(13.0f), g_theme->fg_primary);
             } else {
                 font_draw_text(comp->backbuffer, comp->pitch_px, &vis_sbox, &comp->font,
-                               "Type to search apps...", sbox.x + 8, sbox.y + 9, 13, g_theme->fg_muted);
+                               "Type to search apps...", sbox.x + THEME_PX(8), sbox.y + THEME_PX(9),
+                               THEME_F(13.0f), g_theme->fg_muted);
             }
         }
     }
 
     /* Result list (max 5 items shown) */
-    int32_t item_start_y = ly + 54;
+    int32_t item_start_y = ly + THEME_PX(54);
     for (int i = 0; i < srv->launcher.match_count && i < 5; i++) {
         int app_idx = srv->launcher.matches[i].app_index;
         const vanilla_app_entry_t *app = &g_launcher_apps[app_idx];
         int32_t iy = item_start_y + i * LAUNCHER_ITEM_HEIGHT;
 
-        vanilla_rect_t item_rect = { lx + 12, iy, LAUNCHER_WIDTH - 24, LAUNCHER_ITEM_HEIGHT - 2 };
+        vanilla_rect_t item_rect = { lx + THEME_PX(12), iy, LAUNCHER_WIDTH - THEME_PX(24), LAUNCHER_ITEM_HEIGHT - THEME_PX(2) };
         vanilla_rect_t vis_item;
         if (!vanilla_rect_intersect(&item_rect, dirty, &vis_item))
             continue;
@@ -421,14 +425,14 @@ void launcher_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
 
         /* Selection left accent line */
         if (i == srv->launcher.selected_idx) {
-            vanilla_rect_t sel_acc = { item_rect.x, item_rect.y, 3, item_rect.h };
+            vanilla_rect_t sel_acc = { item_rect.x, item_rect.y, THEME_PX(3), item_rect.h };
             vanilla_rect_t vis_acc;
             if (vanilla_rect_intersect(&sel_acc, dirty, &vis_acc))
                 blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_acc, g_theme->accent);
         }
 
         /* App icon badge */
-        vanilla_rect_t icon_rect = { item_rect.x + 8, item_rect.y + 8, 16, 16 };
+        vanilla_rect_t icon_rect = { item_rect.x + THEME_PX(8), item_rect.y + THEME_PX(8), THEME_PX(16), THEME_PX(16) };
         vanilla_rect_t vis_icon;
         if (vanilla_rect_intersect(&icon_rect, dirty, &vis_icon))
             blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_icon, launcher_get_icon_color(app_idx));
@@ -436,11 +440,13 @@ void launcher_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
         if (comp->font.info) {
             /* App Name */
             font_draw_text(comp->backbuffer, comp->pitch_px, &vis_item, &comp->font,
-                           app->name, item_rect.x + 32, item_rect.y + 9, 13, g_theme->fg_primary);
+                           app->name, item_rect.x + THEME_PX(32), item_rect.y + THEME_PX(9),
+                           THEME_F(13.0f), g_theme->fg_primary);
 
             /* App Description */
             font_draw_text(comp->backbuffer, comp->pitch_px, &vis_item, &comp->font,
-                           app->description, item_rect.x + 140, item_rect.y + 9, 11, g_theme->fg_dim);
+                           app->description, item_rect.x + THEME_PX(140), item_rect.y + THEME_PX(9),
+                           THEME_F(11.0f), g_theme->fg_dim);
         }
     }
 }

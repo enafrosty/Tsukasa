@@ -95,6 +95,14 @@ typedef struct {
 extern const vanilla_theme_t *g_theme;
 
 /*
+ * Scale a pixel constant by the active theme's scale_factor.
+ * Use THEME_PX for integer pixel values.
+ * Use THEME_F for float values.
+ */
+#define THEME_PX(n)  ((int32_t)((float)(n) * g_theme->scale_factor))
+#define THEME_F(f)   ((f) * g_theme->scale_factor)
+
+/*
  * Load theme from an INI file. Returns 0 on success, -1 on parse error.
  * Falls back to the compiled-in nord-dark defaults on any failure.
  */

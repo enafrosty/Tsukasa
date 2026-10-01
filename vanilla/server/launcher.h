@@ -21,17 +21,18 @@
 #include <sys/input.h>
 #include <sys/types.h>
 #include "../include/surface.h"
+#include "../include/theme.h"
 #include "../input/keymap.h"
 
 #if defined(_WIN32)
 pid_t spawn(const char *path, char *const argv[], char *const envp[]);
 #endif
 
-#define LAUNCHER_WIDTH        440
-#define LAUNCHER_HEIGHT       280
+#define LAUNCHER_WIDTH        THEME_PX(440)
+#define LAUNCHER_HEIGHT       THEME_PX(280)
 #define LAUNCHER_SEARCH_MAX   64
 #define LAUNCHER_MAX_APPS     16
-#define LAUNCHER_ITEM_HEIGHT  36
+#define LAUNCHER_ITEM_HEIGHT  THEME_PX(36)
 
 typedef struct {
     const char *name;

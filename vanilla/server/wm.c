@@ -1092,7 +1092,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                         return 0;
                     }
                     if (srv->cursor_x >= TASKBAR_START_X && srv->cursor_x < TASKBAR_START_X + TASKBAR_START_W &&
-                        srv->cursor_y >= screen_h - TASKBAR_HEIGHT + 4 && srv->cursor_y < screen_h - TASKBAR_HEIGHT + 4 + TASKBAR_START_H) {
+                        srv->cursor_y >= screen_h - TASKBAR_HEIGHT + THEME_PX(4) && srv->cursor_y < screen_h - TASKBAR_HEIGHT + THEME_PX(4) + TASKBAR_START_H) {
                         shell_handle_click(srv, srv->cursor_x, srv->cursor_y, BTN_LEFT);
                         return 0;
                     }
@@ -1171,7 +1171,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                         if (hit->is_snapped != SNAP_NONE) {
                             wm_unsnap_window(srv, hit->window_id);
                             hit->x = srv->cursor_x - (int32_t)hit->width / 2;
-                            hit->y = srv->cursor_y - 12;
+                            hit->y = srv->cursor_y - g_theme->titlebar_height / 2;
                         }
 
                         srv->is_dragging = 1;
