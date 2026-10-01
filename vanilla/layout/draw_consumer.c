@@ -94,12 +94,16 @@ void vanilla_execute_draw_commands(vanilla_surface_t *target,
                          c->bounds.w, c->bounds.h, c->fill_rect.color);
             break;
 
-        case VCMD_ROUNDED_RECT:
-            blt_rounded_rect_clipped(target->pixels, target->width,
+        case VCMD_ROUNDED_RECT: {
+            uint32_t pitch_px = target->pitch / sizeof(uint32_t);
+            if (pitch_px == 0)
+                pitch_px = target->width;
+            blt_rounded_rect_clipped(target->pixels, pitch_px,
                                      c->bounds.x, c->bounds.y, c->bounds.w, c->bounds.h,
                                      c->rounded_rect.radius, c->rounded_rect.color,
                                      BLT_CORNER_ALL, active_clip);
             break;
+        }
 
         case VCMD_BORDER: {
             int32_t bw = c->border.width > 0 ? c->border.width : 1;

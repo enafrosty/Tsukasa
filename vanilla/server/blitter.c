@@ -551,36 +551,6 @@ const vanilla_shadow_tex_t *vanilla_shadow_tex_get(int32_t radius, uint8_t alpha
         }
     }
 
-    int idx = -1;
-    if (g_shadow_cache_count < SHADOW_CACHE_MAX_ENTRIES) {
-        idx = g_shadow_cache_count++;
-    } else {
-        uint32_t oldest = 0xFFFFFFFF;
-        idx = 0;
-        for (int i = 0; i < SHADOW_CACHE_MAX_ENTRIES; i++) {
-            if (g_shadow_cache[i].last_used < oldest) {
-                oldest = g_shadow_cache[i].last_used;
-                idx = i;
-            }
-        }
-        if (g_shadow_cache[idx].pixels) {
-            free(g_shadow_cache[idx].pixels);
-            g_shadow_cache[idx].pixels = NULL;
-        }
-        if (g_shadow_cache[idx].edge_alpha) {
-            free(g_shadow_cache[idx].edge_alpha);
-            g_shadow_cache[idx].edge_alpha = NULL;
-        }
-        if (g_shadow_cache[idx].edge_left) {
-            free(g_shadow_cache[idx].edge_left);
-            g_shadow_cache[idx].edge_left = NULL;
-        }
-        if (g_shadow_cache[idx].edge_right) {
-            free(g_shadow_cache[idx].edge_right);
-            g_shadow_cache[idx].edge_right = NULL;
-        }
-    }
-
     int32_t sz = 2 * radius;
     uint32_t *pix = (uint32_t *)malloc((size_t)sz * (size_t)sz * sizeof(uint32_t));
     uint32_t *edge = (uint32_t *)malloc((size_t)radius * sizeof(uint32_t));
@@ -593,6 +563,28 @@ const vanilla_shadow_tex_t *vanilla_shadow_tex_get(int32_t radius, uint8_t alpha
         if (e_l) free(e_l);
         if (e_r) free(e_r);
         return NULL;
+    }
+
+    int idx = -1;
+    if (g_shadow_cache_count < SHADOW_CACHE_MAX_ENTRIES) {
+        idx = g_shadow_cache_count++;
+    } else {
+        uint32_t oldest = 0xFFFFFFFF;
+        idx = 0;
+        for (int i = 0; i < SHADOW_CACHE_MAX_ENTRIES; i++) {
+            if (g_shadow_cache[i].last_used < oldest) {
+                oldest = g_shadow_cache[i].last_used;
+                idx = i;
+            }
+        }
+        if (g_shadow_cache[idx].pixels)
+            free(g_shadow_cache[idx].pixels);
+        if (g_shadow_cache[idx].edge_alpha)
+            free(g_shadow_cache[idx].edge_alpha);
+        if (g_shadow_cache[idx].edge_left)
+            free(g_shadow_cache[idx].edge_left);
+        if (g_shadow_cache[idx].edge_right)
+            free(g_shadow_cache[idx].edge_right);
     }
 
     vanilla_shadow_tex_t *tex = &g_shadow_cache[idx];
