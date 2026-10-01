@@ -1037,12 +1037,16 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             vanilla_rect_t old_box;
             cursor_get_rect(old_x, old_y, &old_box);
 
-            vanilla_rect_t win_frame;
-            vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
-            if (under && !(under->flags & WINDOW_FLAG_BORDERLESS)) {
-                wm_get_frame_rect(under, &win_frame);
-                cursor_select_for_hit_region(srv->cursor_x, srv->cursor_y, &win_frame,
-                                             g_theme->border_width, g_theme->titlebar_height);
+            if (!srv->is_dragging) {
+                vanilla_rect_t win_frame;
+                vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
+                if (under && !(under->flags & WINDOW_FLAG_BORDERLESS)) {
+                    wm_get_frame_rect(under, &win_frame);
+                    cursor_select_for_hit_region(srv->cursor_x, srv->cursor_y, &win_frame,
+                                                 g_theme->border_width, g_theme->titlebar_height);
+                } else {
+                    cursor_set_active(CURSOR_ARROW);
+                }
             } else {
                 cursor_set_active(CURSOR_ARROW);
             }
@@ -1204,6 +1208,19 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     }
                     srv->is_dragging = 0;
                     srv->drag_window_id = 0;
+
+                    vanilla_rect_t win_frame;
+                    vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
+                    if (under && !(under->flags & WINDOW_FLAG_BORDERLESS)) {
+                        wm_get_frame_rect(under, &win_frame);
+                        cursor_select_for_hit_region(srv->cursor_x, srv->cursor_y, &win_frame,
+                                                     g_theme->border_width, g_theme->titlebar_height);
+                    } else {
+                        cursor_set_active(CURSOR_ARROW);
+                    }
+                    vanilla_rect_t cur_box;
+                    cursor_get_rect(srv->cursor_x, srv->cursor_y, &cur_box);
+                    compositor_add_damage(&srv->compositor, &cur_box);
                     return 0;
                 }
 

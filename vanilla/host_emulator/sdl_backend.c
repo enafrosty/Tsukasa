@@ -208,8 +208,25 @@ int sdl_backend_poll_events(vanilla_sdl_backend_t *backend, vanilla_server_t *sr
                 srv->cursor_y = (int32_t)backend->height - 1;
 
             if (srv->cursor_x != old_x || srv->cursor_y != old_y) {
-                vanilla_rect_t old_box = { old_x, old_y, 16, 16 };
-                vanilla_rect_t new_box = { srv->cursor_x, srv->cursor_y, 16, 16 };
+                vanilla_rect_t old_box;
+                cursor_get_rect(old_x, old_y, &old_box);
+
+                if (!srv->is_dragging) {
+                    vanilla_rect_t win_frame;
+                    vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
+                    if (under && !(under->flags & WINDOW_FLAG_BORDERLESS)) {
+                        wm_get_frame_rect(under, &win_frame);
+                        cursor_select_for_hit_region(srv->cursor_x, srv->cursor_y, &win_frame,
+                                                     g_theme->border_width, g_theme->titlebar_height);
+                    } else {
+                        cursor_set_active(CURSOR_ARROW);
+                    }
+                } else {
+                    cursor_set_active(CURSOR_ARROW);
+                }
+
+                vanilla_rect_t new_box;
+                cursor_get_rect(srv->cursor_x, srv->cursor_y, &new_box);
                 compositor_add_damage(&srv->compositor, &old_box);
                 compositor_add_damage(&srv->compositor, &new_box);
 
