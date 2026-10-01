@@ -50,6 +50,7 @@ HOST_SRCS   := $(EMU_DIR)/sdl_backend.c \
                $(VANILLA_DIR)/server/shell.c \
                $(VANILLA_DIR)/server/launcher.c \
                $(VANILLA_DIR)/server/wm.c \
+               $(VANILLA_DIR)/server/theme.c \
                $(VANILLA_DIR)/libvanilla/surface.c \
                $(VANILLA_DIR)/input/keymap.c
 

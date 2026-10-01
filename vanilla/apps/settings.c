@@ -55,11 +55,11 @@ static unsigned long read_key_val(const char *filename, const char *key)
 
 static void settings_render(vanilla_surface_t *surf, settings_state_t *st)
 {
-    app_fill_rect(surf, 0, 0, SETTINGS_WIDTH, SETTINGS_HEIGHT, APP_COLOR_BG);
+    app_fill_rect(surf, 0, 0, SETTINGS_WIDTH, SETTINGS_HEIGHT, g_theme->bg_base);
 
     /* Top Tabs Header */
-    app_fill_rect(surf, 0, 0, SETTINGS_WIDTH, TAB_HEIGHT, APP_COLOR_SURFACE);
-    app_fill_rect(surf, 0, TAB_HEIGHT - 1, SETTINGS_WIDTH, 1, APP_COLOR_BORDER);
+    app_fill_rect(surf, 0, 0, SETTINGS_WIDTH, TAB_HEIGHT, g_theme->bg_elevated);
+    app_fill_rect(surf, 0, TAB_HEIGHT - 1, SETTINGS_WIDTH, 1, g_theme->border);
 
     /* Tab buttons */
     app_draw_button(surf, 12, 6, 110, 24, "System Info", st->current_tab == 0);
@@ -69,21 +69,21 @@ static void settings_render(vanilla_surface_t *surf, settings_state_t *st)
 
     if (st->current_tab == 0) {
         /* Section card 1: OS Information */
-        app_fill_rect(surf, 16, content_y, SETTINGS_WIDTH - 32, 120, APP_COLOR_CARD);
-        app_draw_rect(surf, 16, content_y, SETTINGS_WIDTH - 32, 120, APP_COLOR_BORDER);
+        app_fill_rect(surf, 16, content_y, SETTINGS_WIDTH - 32, 120, g_theme->bg_elevated);
+        app_draw_rect(surf, 16, content_y, SETTINGS_WIDTH - 32, 120, g_theme->border);
 
-        app_draw_text(surf, 28, content_y + 12, "Operating System", APP_COLOR_PRIMARY);
-        app_draw_text(surf, 28, content_y + 34, "Distribution:  Project Tsukasa OS (x86_64 Long Mode)", APP_COLOR_TEXT);
-        app_draw_text(surf, 28, content_y + 54, "Architecture:  x86_64 (SMP, SSE2, Ring 3 Isolated)", APP_COLOR_TEXT);
-        app_draw_text(surf, 28, content_y + 74, "Display Server: Project Vanilla 1.0 (Zero-Copy SHM)", APP_COLOR_TEXT);
-        app_draw_text(surf, 28, content_y + 94, "Kernel ABI:    SPEC-C01 Linux-Compatible Fast Syscalls", APP_COLOR_TEXT);
+        app_draw_text(surf, 28, content_y + 12, "Operating System", g_theme->accent);
+        app_draw_text(surf, 28, content_y + 34, "Distribution:  Project Tsukasa OS (x86_64 Long Mode)", g_theme->fg_primary);
+        app_draw_text(surf, 28, content_y + 54, "Architecture:  x86_64 (SMP, SSE2, Ring 3 Isolated)", g_theme->fg_primary);
+        app_draw_text(surf, 28, content_y + 74, "Display Server: Project Vanilla 1.0 (Zero-Copy SHM)", g_theme->fg_primary);
+        app_draw_text(surf, 28, content_y + 94, "Kernel ABI:    SPEC-C01 Linux-Compatible Fast Syscalls", g_theme->fg_primary);
 
         /* Section card 2: Hardware & Memory */
         int card2_y = content_y + 136;
-        app_fill_rect(surf, 16, card2_y, SETTINGS_WIDTH - 32, 120, APP_COLOR_CARD);
-        app_draw_rect(surf, 16, card2_y, SETTINGS_WIDTH - 32, 120, APP_COLOR_BORDER);
+        app_fill_rect(surf, 16, card2_y, SETTINGS_WIDTH - 32, 120, g_theme->bg_elevated);
+        app_draw_rect(surf, 16, card2_y, SETTINGS_WIDTH - 32, 120, g_theme->border);
 
-        app_draw_text(surf, 28, card2_y + 12, "Hardware & Resources", APP_COLOR_PRIMARY);
+        app_draw_text(surf, 28, card2_y + 12, "Hardware & Resources", g_theme->accent);
 
         unsigned long total_pages = read_key_val("/sys/memory", "pmm_total_pages");
         unsigned long used_pages = read_key_val("/sys/memory", "pmm_used_pages");
@@ -99,36 +99,36 @@ static void settings_render(vanilla_surface_t *surf, settings_state_t *st)
             strcpy(mem_line, "Physical Memory: 256 MB Total (PMM Monitored)");
         }
 
-        app_draw_text(surf, 28, card2_y + 34, mem_line, APP_COLOR_TEXT);
-        app_draw_text(surf, 28, card2_y + 54, "Graphics Output: /dev/fb0 (32 bpp ARGB32 VESA/GOP)", APP_COLOR_TEXT);
-        app_draw_text(surf, 28, card2_y + 74, "Input Device:    /dev/input/events (Unified Evdev)", APP_COLOR_TEXT);
-        app_draw_text(surf, 28, card2_y + 94, "Network NIC:     Intel 8254x / VirtIO-Net Gigabit", APP_COLOR_TEXT);
+        app_draw_text(surf, 28, card2_y + 34, mem_line, g_theme->fg_primary);
+        app_draw_text(surf, 28, card2_y + 54, "Graphics Output: /dev/fb0 (32 bpp ARGB32 VESA/GOP)", g_theme->fg_primary);
+        app_draw_text(surf, 28, card2_y + 74, "Input Device:    /dev/input/events (Unified Evdev)", g_theme->fg_primary);
+        app_draw_text(surf, 28, card2_y + 94, "Network NIC:     Intel 8254x / VirtIO-Net Gigabit", g_theme->fg_primary);
     } else {
         /* Appearance Settings */
-        app_fill_rect(surf, 16, content_y, SETTINGS_WIDTH - 32, 240, APP_COLOR_CARD);
-        app_draw_rect(surf, 16, content_y, SETTINGS_WIDTH - 32, 240, APP_COLOR_BORDER);
+        app_fill_rect(surf, 16, content_y, SETTINGS_WIDTH - 32, 240, g_theme->bg_elevated);
+        app_draw_rect(surf, 16, content_y, SETTINGS_WIDTH - 32, 240, g_theme->border);
 
-        app_draw_text(surf, 28, content_y + 16, "Desktop Theme", APP_COLOR_PRIMARY);
-        app_draw_text(surf, 28, content_y + 40, "Current Theme: Nord Polar Night (Dark Mode)", APP_COLOR_TEXT);
-        app_draw_text(surf, 28, content_y + 60, "Wallpaper:     /assets/wallpaper.bmp", APP_COLOR_TEXT);
-        app_draw_text(surf, 28, content_y + 80, "Font Family:   Roboto Medium / Bitmap 8x8", APP_COLOR_TEXT);
+        app_draw_text(surf, 28, content_y + 16, "Desktop Theme", g_theme->accent);
+        app_draw_text(surf, 28, content_y + 40, "Current Theme: Nord Polar Night (Dark Mode)", g_theme->fg_primary);
+        app_draw_text(surf, 28, content_y + 60, "Wallpaper:     /assets/wallpaper.bmp", g_theme->fg_primary);
+        app_draw_text(surf, 28, content_y + 80, "Font Family:   Roboto Medium / Bitmap 8x8", g_theme->fg_primary);
 
-        app_draw_text(surf, 28, content_y + 120, "Accent Color Swatches:", APP_COLOR_MUTED);
+        app_draw_text(surf, 28, content_y + 120, "Accent Color Swatches:", g_theme->fg_muted);
 
         /* Color Swatches */
-        app_fill_rect(surf, 28, content_y + 146, 44, 28, APP_COLOR_PRIMARY);
-        app_draw_rect(surf, 28, content_y + 146, 44, 28, APP_COLOR_WHITE);
+        app_fill_rect(surf, 28, content_y + 146, 44, 28, g_theme->accent);
+        app_draw_rect(surf, 28, content_y + 146, 44, 28, g_theme->border_focus);
 
-        app_fill_rect(surf, 84, content_y + 146, 44, 28, APP_COLOR_ACCENT);
-        app_draw_rect(surf, 84, content_y + 146, 44, 28, APP_COLOR_BORDER);
+        app_fill_rect(surf, 84, content_y + 146, 44, 28, g_theme->accent_hover);
+        app_draw_rect(surf, 84, content_y + 146, 44, 28, g_theme->border);
 
-        app_fill_rect(surf, 140, content_y + 146, 44, 28, APP_COLOR_SUCCESS);
-        app_draw_rect(surf, 140, content_y + 146, 44, 28, APP_COLOR_BORDER);
+        app_fill_rect(surf, 140, content_y + 146, 44, 28, g_theme->success);
+        app_draw_rect(surf, 140, content_y + 146, 44, 28, g_theme->border);
 
-        app_fill_rect(surf, 196, content_y + 146, 44, 28, APP_COLOR_WARNING);
-        app_draw_rect(surf, 196, content_y + 146, 44, 28, APP_COLOR_BORDER);
+        app_fill_rect(surf, 196, content_y + 146, 44, 28, g_theme->warning);
+        app_draw_rect(surf, 196, content_y + 146, 44, 28, g_theme->border);
 
-        app_draw_text(surf, 28, content_y + 196, "Press Tab or Left/Right arrows to toggle sections.", APP_COLOR_DIM);
+        app_draw_text(surf, 28, content_y + 196, "Press Tab or Left/Right arrows to toggle sections.", g_theme->fg_dim);
     }
 }
 

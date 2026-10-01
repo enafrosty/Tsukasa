@@ -52,6 +52,7 @@
 #define MSG_WINDOW_FOCUS        11
 #define MSG_WINDOW_CLOSE_REQ    12
 #define MSG_WINDOW_CONFIGURE    13
+#define MSG_THEME_CHANGED       14
 
 /* Namespaced aliases */
 #define VANILLA_MSG_HELLO               MSG_HELLO
@@ -67,6 +68,7 @@
 #define VANILLA_MSG_WINDOW_FOCUS        MSG_WINDOW_FOCUS
 #define VANILLA_MSG_WINDOW_CLOSE_REQ    MSG_WINDOW_CLOSE_REQ
 #define VANILLA_MSG_WINDOW_CONFIGURE    MSG_WINDOW_CONFIGURE
+#define VANILLA_MSG_THEME_CHANGED       MSG_THEME_CHANGED
 
 /* Fixed 12-byte header envelope for all IPC messages */
 typedef struct {

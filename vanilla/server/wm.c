@@ -28,6 +28,18 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <signal.h>
+
+static volatile int g_theme_reload_pending = 0;
+
+#ifdef SIGHUP
+static void wm_sighup_handler(int sig)
+{
+    (void)sig;
+    g_theme_reload_pending = 1;
+}
+#endif
+
 
 static const uint16_t cursor_arrow_mask[16] = {
     0b1000000000000000,
@@ -117,16 +129,34 @@ static int exact_read(int fd, void *buf, size_t count)
     return 0;
 }
 
+void vanilla_server_broadcast_theme_changed(vanilla_server_t *srv)
+{
+    if (!srv)
+        return;
+
+    vanilla_msg_hdr_t hdr;
+    hdr.magic = VANILLA_IPC_MAGIC;
+    hdr.msg_type = MSG_THEME_CHANGED;
+    hdr.payload_len = 0;
+    hdr.window_id = 0;
+
+    for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
+        if (srv->clients[i].in_use && srv->clients[i].fd >= 0) {
+            exact_write(srv->clients[i].fd, &hdr, sizeof(hdr));
+        }
+    }
+}
+
 void wm_get_frame_rect(const vanilla_server_window_t *win, vanilla_rect_t *out_frame)
 {
     if (!win || !out_frame)
         return;
 
     if (!(win->flags & WINDOW_FLAG_BORDERLESS)) {
-        out_frame->x = win->x - WINDOW_BORDER_WIDTH;
-        out_frame->y = win->y - TITLEBAR_HEIGHT - WINDOW_BORDER_WIDTH;
-        out_frame->w = (int32_t)win->width + 2 * WINDOW_BORDER_WIDTH;
-        out_frame->h = (int32_t)win->height + TITLEBAR_HEIGHT + 2 * WINDOW_BORDER_WIDTH;
+        out_frame->x = win->x - g_theme->border_width;
+        out_frame->y = win->y - g_theme->titlebar_height - g_theme->border_width;
+        out_frame->w = (int32_t)win->width + 2 * g_theme->border_width;
+        out_frame->h = (int32_t)win->height + g_theme->titlebar_height + 2 * g_theme->border_width;
     } else {
         out_frame->x = win->x;
         out_frame->y = win->y;
@@ -144,10 +174,10 @@ void wm_invalidate_window(vanilla_server_t *srv, const vanilla_server_window_t *
     wm_get_frame_rect(win, &frame);
 
     vanilla_rect_t dirty;
-    dirty.x = frame.x - SHADOW_RADIUS;
-    dirty.y = frame.y - SHADOW_RADIUS;
-    dirty.w = frame.w + 2 * SHADOW_RADIUS;
-    dirty.h = frame.h + 2 * SHADOW_RADIUS + SHADOW_RADIUS / 2;
+    dirty.x = frame.x - g_theme->shadow_radius;
+    dirty.y = frame.y - g_theme->shadow_radius;
+    dirty.w = frame.w + 2 * g_theme->shadow_radius;
+    dirty.h = frame.h + 2 * g_theme->shadow_radius + g_theme->shadow_radius / 2;
 
     compositor_add_damage(&srv->compositor, &dirty);
 }
@@ -243,6 +273,11 @@ int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
 
     for (int i = 0; i < VANILLA_MAX_WINDOWS; i++)
         srv->windows[i].in_use = 0;
+
+    theme_load("/etc/vanilla/themes/nord-dark.ini");
+#ifdef SIGHUP
+    signal(SIGHUP, wm_sighup_handler);
+#endif
 
     compositor_init(&srv->compositor, "/dev/fb0");
 
@@ -729,6 +764,14 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
     if (!srv || srv->listen_fd < 0)
         return -1;
 
+    if (g_theme_reload_pending) {
+        g_theme_reload_pending = 0;
+        theme_reload();
+        srv->compositor.bg_color = g_theme->bg_base;
+        compositor_damage_all(&srv->compositor);
+        vanilla_server_broadcast_theme_changed(srv);
+    }
+
     shell_update_clock(&srv->shell, srv);
 
     fds[0].fd = srv->listen_fd;
@@ -946,10 +989,10 @@ void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
         }
 
         if (!(w->flags & WINDOW_FLAG_BORDERLESS)) {
-            w->x = target_fx + WINDOW_BORDER_WIDTH;
-            w->y = target_fy + TITLEBAR_HEIGHT + WINDOW_BORDER_WIDTH;
-            w->width = (uint32_t)(target_fw - 2 * WINDOW_BORDER_WIDTH);
-            w->height = (uint32_t)(target_fh - TITLEBAR_HEIGHT - 2 * WINDOW_BORDER_WIDTH);
+            w->x = target_fx + g_theme->border_width;
+            w->y = target_fy + g_theme->titlebar_height + g_theme->border_width;
+            w->width = (uint32_t)(target_fw - 2 * g_theme->border_width);
+            w->height = (uint32_t)(target_fh - g_theme->titlebar_height - 2 * g_theme->border_width);
         } else {
             w->x = target_fx;
             w->y = target_fy;
@@ -1094,7 +1137,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
 
                     /* Check titlebar click */
                     if (!(hit->flags & WINDOW_FLAG_BORDERLESS) &&
-                        srv->cursor_y < frame.y + TITLEBAR_HEIGHT + WINDOW_BORDER_WIDTH) {
+                        srv->cursor_y < frame.y + g_theme->titlebar_height + g_theme->border_width) {
 
                         chrome_btn_rects_t btns = chrome_metrics(&frame);
 
@@ -1264,7 +1307,7 @@ void wm_render_cursor(vanilla_server_t *srv, const vanilla_rect_t *dirty)
             uint16_t mask_bit = (cursor_arrow_mask[cy] >> (15 - cx)) & 1;
             if (mask_bit) {
                 uint16_t body_bit = (cursor_arrow_body[cy] >> (15 - cx)) & 1;
-                uint32_t col = body_bit ? 0xFFFFFFFF : 0xFF000000;
+                uint32_t col = body_bit ? g_theme->fg_primary : g_theme->bg_base;
                 comp->backbuffer[py * comp->pitch_px + px] = col;
             }
         }

@@ -20,22 +20,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "../include/vanilla.h"
-
-/* Nord Polar Night & Frost Palette */
-#define APP_COLOR_BG        0xFF2E3440u
-#define APP_COLOR_SURFACE   0xFF3B4252u
-#define APP_COLOR_CARD      0xFF434C5Eu
-#define APP_COLOR_BORDER    0xFF4C566Au
-#define APP_COLOR_TEXT      0xFFECEFF4u
-#define APP_COLOR_MUTED     0xFFD8DEE9u
-#define APP_COLOR_DIM       0xFF98A2B3u
-#define APP_COLOR_PRIMARY   0xFF88C0D0u
-#define APP_COLOR_ACCENT    0xFF81A1C1u
-#define APP_COLOR_SUCCESS   0xFFA3BE8Cu
-#define APP_COLOR_WARNING   0xFFEBCB8Bu
-#define APP_COLOR_DANGER    0xFFBF616Au
-#define APP_COLOR_BLACK     0xFF000000u
-#define APP_COLOR_WHITE     0xFFFFFFFFu
+#include "../include/theme.h"
 
 /* 2D Drawing Primitives */
 void app_fill_rect(vanilla_surface_t *surf, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color);

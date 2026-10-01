@@ -419,17 +419,16 @@ static int test_drop_shadow_and_decorations(void)
     uint32_t *fb = srv.compositor.backbuffer;
     uint32_t pitch = srv.compositor.pitch_px;
 
-    /* Titlebar check: y in [100 - TITLEBAR_HEIGHT - 1, 100 - 1], x in [100, 170] */
-    /* Focused titlebar color: 0xFF3B4252 */
+    /* Titlebar check: y in [100 - g_theme->titlebar_height - 1, 100 - 1], x in [100, 170] */
     uint32_t tb_pixel = fb[(100 - 10) * pitch + 120];
-    TEST_ASSERT(tb_pixel == 0xFF3B4252, "focused titlebar color mismatch");
+    TEST_ASSERT(tb_pixel == g_theme->titlebar_active, "focused titlebar color mismatch");
 
     /* Client surface interior check: (120, 120) */
     TEST_ASSERT(fb[120 * pitch + 120] == 0xFFEEEEEE, "client surface interior color mismatch");
 
     /* Drop shadow check: immediately below window frame, background was 0xFFFFFFFF */
     /* Shadow should have darkened the background */
-    int32_t shadow_y = 100 + 60 + WINDOW_BORDER_WIDTH + 2;
+    int32_t shadow_y = 100 + 60 + g_theme->border_width + 2;
     uint32_t shadow_p = fb[shadow_y * pitch + 120];
     uint32_t sr = (shadow_p >> 16) & 0xFF;
     TEST_ASSERT(sr < 255, "drop shadow did not darken background below window");

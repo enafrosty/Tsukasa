@@ -44,6 +44,7 @@ LIB_DIR = lib
 
 LIBVANILLA_OBJS = libvanilla/client.o \
                   libvanilla/surface.o \
+                  server/theme.o \
                   input/keymap.o
 
 SERVER_OBJS     = server/main.o \
@@ -54,7 +55,8 @@ SERVER_OBJS     = server/main.o \
                   server/default_font.o \
                   server/image.o \
                   server/shell.o \
-                  server/launcher.o
+                  server/launcher.o \
+                  server/theme.o
 
 TEST_IPC_OBJS   = tests/test_ipc.o \
                   server/wm.o \
@@ -64,7 +66,8 @@ TEST_IPC_OBJS   = tests/test_ipc.o \
                   server/default_font.o \
                   server/image.o \
                   server/shell.o \
-                  server/launcher.o
+                  server/launcher.o \
+                  server/theme.o
 
 TEST_COMP_OBJS  = tests/test_compositor.o \
                   server/wm.o \
@@ -74,7 +77,8 @@ TEST_COMP_OBJS  = tests/test_compositor.o \
                   server/default_font.o \
                   server/image.o \
                   server/shell.o \
-                  server/launcher.o
+                  server/launcher.o \
+                  server/theme.o
 
 TEST_TYPO_OBJS  = tests/test_typography.o \
                   server/blitter.o \
@@ -90,7 +94,8 @@ TEST_SHELL_OBJS = tests/test_shell.o \
                   server/default_font.o \
                   server/image.o \
                   server/shell.o \
-                  server/launcher.o
+                  server/launcher.o \
+                  server/theme.o
 
 LIBVANILLA_A    = $(LIB_DIR)/libvanilla.a
 SERVER_BIN      = $(BIN_DIR)/vanilla_srv.elf

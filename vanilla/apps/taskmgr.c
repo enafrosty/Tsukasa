@@ -139,30 +139,30 @@ static void tm_refresh(taskmgr_state_t *st)
 
 static void tm_render(vanilla_surface_t *surf, taskmgr_state_t *st)
 {
-    app_fill_rect(surf, 0, 0, TM_WIDTH, TM_HEIGHT, APP_COLOR_BG);
+    app_fill_rect(surf, 0, 0, TM_WIDTH, TM_HEIGHT, g_theme->bg_base);
 
     /* Telemetry Header */
-    app_fill_rect(surf, 0, 0, TM_WIDTH, TM_HEADER_H, APP_COLOR_SURFACE);
-    app_fill_rect(surf, 0, TM_HEADER_H - 1, TM_WIDTH, 1, APP_COLOR_BORDER);
+    app_fill_rect(surf, 0, 0, TM_WIDTH, TM_HEADER_H, g_theme->bg_elevated);
+    app_fill_rect(surf, 0, TM_HEADER_H - 1, TM_WIDTH, 1, g_theme->border);
 
     char mem_str[64];
     snprintf(mem_str, sizeof(mem_str), "Physical Memory: %lu MB / %lu MB (%d%%)",
              st->mem_used_mb, st->mem_total_mb, st->mem_pct);
-    app_draw_text(surf, 16, 12, mem_str, APP_COLOR_TEXT);
-    app_draw_progress_bar(surf, 16, 28, TM_WIDTH - 32, 12, st->mem_pct, APP_COLOR_PRIMARY, APP_COLOR_CARD);
+    app_draw_text(surf, 16, 12, mem_str, g_theme->fg_primary);
+    app_draw_progress_bar(surf, 16, 28, TM_WIDTH - 32, 12, st->mem_pct, g_theme->accent, g_theme->bg_elevated);
 
-    app_draw_text(surf, 16, 48, "CPU Utilization: 18% (Estimated)", APP_COLOR_TEXT);
-    app_draw_progress_bar(surf, 16, 62, TM_WIDTH - 32, 8, 18, APP_COLOR_SUCCESS, APP_COLOR_CARD);
+    app_draw_text(surf, 16, 48, "CPU Utilization: 18% (Estimated)", g_theme->fg_primary);
+    app_draw_progress_bar(surf, 16, 62, TM_WIDTH - 32, 8, 18, g_theme->success, g_theme->bg_elevated);
 
     /* Process Table Header */
     int tbl_y = TM_HEADER_H;
-    app_fill_rect(surf, 0, tbl_y, TM_WIDTH, 24, APP_COLOR_CARD);
-    app_fill_rect(surf, 0, tbl_y + 23, TM_WIDTH, 1, APP_COLOR_BORDER);
+    app_fill_rect(surf, 0, tbl_y, TM_WIDTH, 24, g_theme->bg_elevated);
+    app_fill_rect(surf, 0, tbl_y + 23, TM_WIDTH, 1, g_theme->border);
 
-    app_draw_text(surf, 16, tbl_y + 8, "PID", APP_COLOR_MUTED);
-    app_draw_text(surf, 80, tbl_y + 8, "PPID", APP_COLOR_MUTED);
-    app_draw_text(surf, 150, tbl_y + 8, "STATE", APP_COLOR_MUTED);
-    app_draw_text(surf, 260, tbl_y + 8, "PROCESS NAME", APP_COLOR_MUTED);
+    app_draw_text(surf, 16, tbl_y + 8, "PID", g_theme->fg_muted);
+    app_draw_text(surf, 80, tbl_y + 8, "PPID", g_theme->fg_muted);
+    app_draw_text(surf, 150, tbl_y + 8, "STATE", g_theme->fg_muted);
+    app_draw_text(surf, 260, tbl_y + 8, "PROCESS NAME", g_theme->fg_muted);
 
     /* Process Table Rows */
     int content_y = tbl_y + 24;
@@ -173,28 +173,28 @@ static void tm_render(vanilla_surface_t *surf, taskmgr_state_t *st)
         int ry = content_y + i * TM_ROW_H;
 
         if (i == st->selected_idx) {
-            app_fill_rect(surf, 0, ry, TM_WIDTH, TM_ROW_H, APP_COLOR_BORDER);
+            app_fill_rect(surf, 0, ry, TM_WIDTH, TM_ROW_H, g_theme->selection);
         } else if (i % 2 == 1) {
-            app_fill_rect(surf, 0, ry, TM_WIDTH, TM_ROW_H, 0xFF323946u);
+            app_fill_rect(surf, 0, ry, TM_WIDTH, TM_ROW_H, g_theme->bg_base);
         }
 
         char buf[32];
         snprintf(buf, sizeof(buf), "%d", t->pid);
-        app_draw_text(surf, 16, ry + 6, buf, APP_COLOR_TEXT);
+        app_draw_text(surf, 16, ry + 6, buf, g_theme->fg_primary);
 
         snprintf(buf, sizeof(buf), "%d", t->ppid);
-        app_draw_text(surf, 80, ry + 6, buf, APP_COLOR_DIM);
+        app_draw_text(surf, 80, ry + 6, buf, g_theme->fg_dim);
 
-        app_draw_text(surf, 150, ry + 6, t->state, APP_COLOR_PRIMARY);
-        app_draw_text(surf, 260, ry + 6, t->name, APP_COLOR_TEXT);
+        app_draw_text(surf, 150, ry + 6, t->state, g_theme->accent);
+        app_draw_text(surf, 260, ry + 6, t->name, g_theme->fg_primary);
 
-        app_fill_rect(surf, 0, ry + TM_ROW_H - 1, TM_WIDTH, 1, 0xFF3B4252u);
+        app_fill_rect(surf, 0, ry + TM_ROW_H - 1, TM_WIDTH, 1, g_theme->border);
     }
 
     /* Bottom Action Bar */
     int bot_y = TM_HEIGHT - 36;
-    app_fill_rect(surf, 0, bot_y, TM_WIDTH, 36, APP_COLOR_SURFACE);
-    app_fill_rect(surf, 0, bot_y, TM_WIDTH, 1, APP_COLOR_BORDER);
+    app_fill_rect(surf, 0, bot_y, TM_WIDTH, 36, g_theme->bg_elevated);
+    app_fill_rect(surf, 0, bot_y, TM_WIDTH, 1, g_theme->border);
 
     app_draw_button(surf, TM_WIDTH - 110, bot_y + 6, 96, 24, "End Task", 0);
     app_draw_button(surf, TM_WIDTH - 216, bot_y + 6, 96, 24, "Refresh", 0);
@@ -204,7 +204,7 @@ static void tm_render(vanilla_surface_t *surf, taskmgr_state_t *st)
         snprintf(sel_info, sizeof(sel_info), "Selected: PID %d (%s)",
                  st->tasks[st->selected_idx].pid,
                  st->tasks[st->selected_idx].name);
-        app_draw_text(surf, 16, bot_y + 14, sel_info, APP_COLOR_MUTED);
+        app_draw_text(surf, 16, bot_y + 14, sel_info, g_theme->fg_muted);
     }
 }
 

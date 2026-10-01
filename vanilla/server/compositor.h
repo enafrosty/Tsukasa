@@ -20,19 +20,11 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "../include/surface.h"
+#include "../include/theme.h"
 #include "font.h"
 #include "image.h"
 
 #define MAX_DIRTY_RECTS 32
-
-/* Server-side decoration dimensions */
-#define TITLEBAR_HEIGHT 24
-#define WINDOW_BORDER_WIDTH 1
-#define SHADOW_RADIUS 6
-#define SHADOW_ALPHA 70
-#define TITLEBAR_BTN_SIZE 12
-#define TITLEBAR_BTN_PAD  4
-#define TITLEBAR_FONT_SIZE 13.0f
 
 typedef struct {
     uint32_t         width;

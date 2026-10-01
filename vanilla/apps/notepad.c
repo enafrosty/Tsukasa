@@ -159,20 +159,20 @@ static void note_insert_char(notepad_state_t *st, char c)
 static void note_render(vanilla_surface_t *surf, notepad_state_t *st)
 {
     /* Background */
-    app_fill_rect(surf, 0, 0, NOTE_WIDTH, NOTE_HEIGHT, APP_COLOR_BG);
+    app_fill_rect(surf, 0, 0, NOTE_WIDTH, NOTE_HEIGHT, g_theme->bg_base);
 
     /* Toolbar header */
-    app_fill_rect(surf, 0, 0, NOTE_WIDTH, TOOLBAR_HEIGHT, APP_COLOR_SURFACE);
-    app_fill_rect(surf, 0, TOOLBAR_HEIGHT - 1, NOTE_WIDTH, 1, APP_COLOR_BORDER);
+    app_fill_rect(surf, 0, 0, NOTE_WIDTH, TOOLBAR_HEIGHT, g_theme->bg_elevated);
+    app_fill_rect(surf, 0, TOOLBAR_HEIGHT - 1, NOTE_WIDTH, 1, g_theme->border);
     app_draw_button(surf, 8, 4, 52, 20, "New", 0);
     app_draw_button(surf, 66, 4, 52, 20, "Save", 0);
-    app_draw_text(surf, 130, 10, st->filename, APP_COLOR_MUTED);
+    app_draw_text(surf, 130, 10, st->filename, g_theme->fg_muted);
 
     /* Gutter */
     int content_y = TOOLBAR_HEIGHT;
     int content_h = NOTE_HEIGHT - TOOLBAR_HEIGHT - STATUS_HEIGHT;
-    app_fill_rect(surf, 0, content_y, GUTTER_WIDTH, content_h, 0xFF242933u);
-    app_fill_rect(surf, GUTTER_WIDTH - 1, content_y, 1, content_h, APP_COLOR_BORDER);
+    app_fill_rect(surf, 0, content_y, GUTTER_WIDTH, content_h, g_theme->taskbar_bg);
+    app_fill_rect(surf, GUTTER_WIDTH - 1, content_y, 1, content_h, g_theme->border);
 
     int visible_lines = content_h / LINE_HEIGHT;
     if (st->cursor_line < st->scroll_line)
@@ -190,22 +190,22 @@ static void note_render(vanilla_surface_t *surf, notepad_state_t *st)
         /* Line number */
         char lno[8];
         snprintf(lno, sizeof(lno), "%3d", l_idx + 1);
-        app_draw_text(surf, 6, line_y, lno, APP_COLOR_DIM);
+        app_draw_text(surf, 6, line_y, lno, g_theme->fg_dim);
 
         /* Text */
-        app_draw_text(surf, GUTTER_WIDTH + 8, line_y, st->lines[l_idx], APP_COLOR_TEXT);
+        app_draw_text(surf, GUTTER_WIDTH + 8, line_y, st->lines[l_idx], g_theme->fg_primary);
 
         /* Cursor */
         if (l_idx == st->cursor_line) {
             int cx = GUTTER_WIDTH + 8 + st->cursor_col * 8;
-            app_fill_rect(surf, cx, line_y - 1, 2, 10, APP_COLOR_PRIMARY);
+            app_fill_rect(surf, cx, line_y - 1, 2, 10, g_theme->accent);
         }
     }
 
     /* Status bar */
     int status_y = NOTE_HEIGHT - STATUS_HEIGHT;
-    app_fill_rect(surf, 0, status_y, NOTE_WIDTH, STATUS_HEIGHT, APP_COLOR_SURFACE);
-    app_fill_rect(surf, 0, status_y, NOTE_WIDTH, 1, APP_COLOR_BORDER);
+    app_fill_rect(surf, 0, status_y, NOTE_WIDTH, STATUS_HEIGHT, g_theme->bg_elevated);
+    app_fill_rect(surf, 0, status_y, NOTE_WIDTH, 1, g_theme->border);
 
     int total_chars = 0;
     for (int i = 0; i < st->num_lines; i++)
@@ -214,7 +214,7 @@ static void note_render(vanilla_surface_t *surf, notepad_state_t *st)
     char status[64];
     snprintf(status, sizeof(status), "Ln %d, Col %d  |  %d chars  |  UTF-8",
              st->cursor_line + 1, st->cursor_col + 1, total_chars);
-    app_draw_text(surf, 12, status_y + 7, status, APP_COLOR_MUTED);
+    app_draw_text(surf, 12, status_y + 7, status, g_theme->fg_muted);
 }
 
 int main(int argc, char **argv)

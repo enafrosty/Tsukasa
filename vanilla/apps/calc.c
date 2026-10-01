@@ -226,7 +226,7 @@ static void calc_handle_input(calc_state_t *st, const char *token)
 
 static void calc_render(vanilla_surface_t *surf, calc_state_t *st)
 {
-    app_fill_rect(surf, 0, 0, CALC_WIDTH, CALC_HEIGHT, APP_COLOR_BG);
+    app_fill_rect(surf, 0, 0, CALC_WIDTH, CALC_HEIGHT, g_theme->bg_base);
 
     /* LCD Screen Display */
     int lcd_x = 16;
@@ -234,15 +234,15 @@ static void calc_render(vanilla_surface_t *surf, calc_state_t *st)
     int lcd_w = CALC_WIDTH - 32;
     int lcd_h = 56;
 
-    app_fill_rect(surf, lcd_x, lcd_y, lcd_w, lcd_h, 0xFF1E222Bu);
-    app_draw_rect(surf, lcd_x, lcd_y, lcd_w, lcd_h, APP_COLOR_BORDER);
+    app_fill_rect(surf, lcd_x, lcd_y, lcd_w, lcd_h, g_theme->taskbar_bg);
+    app_draw_rect(surf, lcd_x, lcd_y, lcd_w, lcd_h, g_theme->border);
 
     /* Right-aligned text */
     int text_len = (int)strlen(st->display);
     int text_w = text_len * 16; /* scale 2 */
     int tx = lcd_x + lcd_w - text_w - 12;
     int ty = lcd_y + (lcd_h - 16) / 2;
-    app_draw_text_scale(surf, tx, ty, st->display, 2, APP_COLOR_PRIMARY);
+    app_draw_text_scale(surf, tx, ty, st->display, 2, g_theme->accent);
 
     /* Button matrix */
     for (int i = 0; i < st->num_buttons; i++) {
