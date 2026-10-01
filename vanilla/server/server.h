@@ -25,6 +25,7 @@
 #include "compositor.h"
 #include "shell.h"
 #include "launcher.h"
+#include "cursor.h"
 
 #if defined(_WIN32)
 #ifndef O_NONBLOCK
@@ -133,10 +134,10 @@ void wm_get_frame_rect(const vanilla_server_window_t *win, vanilla_rect_t *out_f
 void wm_invalidate_window(vanilla_server_t *srv, const vanilla_server_window_t *win);
 void vanilla_server_broadcast_theme_changed(vanilla_server_t *srv);
 
-/* Window tiling, input dispatch, and cursor rendering */
+/* Window tiling, input dispatch, and hit testing */
 void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type);
 void wm_unsnap_window(vanilla_server_t *srv, uint32_t window_id);
 int  wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev);
-void wm_render_cursor(vanilla_server_t *srv, const vanilla_rect_t *dirty);
+vanilla_server_window_t *wm_window_at(vanilla_server_t *srv, int32_t x, int32_t y);
 
 #endif /* _VANILLA_SERVER_H */

@@ -70,7 +70,8 @@ SERVER_OBJS     = server/main.o \
                   server/image.o \
                   server/shell.o \
                   server/launcher.o \
-                  server/theme.o
+                  server/theme.o \
+                  server/cursor.o
 
 TEST_IPC_OBJS   = tests/test_ipc.o \
                   server/wm.o \
@@ -81,7 +82,8 @@ TEST_IPC_OBJS   = tests/test_ipc.o \
                   server/image.o \
                   server/shell.o \
                   server/launcher.o \
-                  server/theme.o
+                  server/theme.o \
+                  server/cursor.o
 
 TEST_COMP_OBJS  = tests/test_compositor.o \
                   server/wm.o \
@@ -92,7 +94,8 @@ TEST_COMP_OBJS  = tests/test_compositor.o \
                   server/image.o \
                   server/shell.o \
                   server/launcher.o \
-                  server/theme.o
+                  server/theme.o \
+                  server/cursor.o
 
 TEST_TYPO_OBJS  = tests/test_typography.o \
                   server/blitter.o \
@@ -109,7 +112,8 @@ TEST_SHELL_OBJS = tests/test_shell.o \
                   server/image.o \
                   server/shell.o \
                   server/launcher.o \
-                  server/theme.o
+                  server/theme.o \
+                  server/cursor.o
 
 TEST_LAYOUT_OBJS = layout/test_layout.o \
                    apps/app_common.o
