@@ -78,8 +78,9 @@ typedef struct {
 } vanilla_server_window_t;
 
 typedef struct {
-    int in_use;
-    int fd;
+    int      in_use;
+    int      fd;
+    uint32_t version;
 } vanilla_client_conn_t;
 
 typedef struct vanilla_server {

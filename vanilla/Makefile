@@ -140,9 +140,17 @@ APP_TARGETS     = $(TERMINAL_BIN) $(NOTEPAD_BIN) $(CALC_BIN) $(FILEMGR_BIN) $(SE
 
 ALL_TARGETS     = $(LIBVANILLA_A) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(SERVER_BIN) $(TEST_IPC_BIN) $(TEST_COMP_BIN) $(TEST_TYPO_BIN) $(TEST_SHELL_BIN) $(TEST_LAYOUT_BIN) $(APP_TARGETS)
 
-.PHONY: all clean check host host-run host-clean layout ui
+PYTHON ?= python3
 
-all: $(ALL_TARGETS)
+.PHONY: all clean check host host-run host-clean layout ui gen-protocol
+
+gen-protocol:
+	$(PYTHON) tools/gen_protocol.py \
+		--yaml-dir protocol/ \
+		--out-header include/protocol_generated.h \
+		--out-doc ../docs/agent/phase-2-protocol-motion/wire-format.md
+
+all: gen-protocol $(ALL_TARGETS)
 
 ui: $(LIBVANILLA_UI_A)
 
@@ -241,10 +249,10 @@ check: all
 clean:
 	rm -rf libvanilla/*.o libvanilla-ui/*.o server/*.o tests/*.o apps/*.o input/*.o layout/*.o $(BIN_DIR) $(LIB_DIR) host_emulator/*.host.o server/*.host.o libvanilla/*.host.o input/*.host.o host_emulator/bin build
 
-host:
+host: gen-protocol
 	$(MAKE) -f host_emulator/Makefile.host all
 
-host-run:
+host-run: gen-protocol
 	$(MAKE) -f host_emulator/Makefile.host run
 
 host-clean:

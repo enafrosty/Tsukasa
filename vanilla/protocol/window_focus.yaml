@@ -1,0 +1,10 @@
+id: 11
+name: MSG_WINDOW_FOCUS
+direction: server_to_client
+version: 1
+v1_compat: true
+description: "Notify window when it gains or loses input focus."
+fields:
+  - name: focused
+    type: uint32_t
+    description: "Non-zero if window gained focus, 0 if focus lost"

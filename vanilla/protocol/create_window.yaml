@@ -1,0 +1,25 @@
+id: 3
+name: MSG_CREATE_WINDOW
+direction: client_to_server
+version: 1
+v1_compat: true
+description: "Request creation of a new window surface."
+fields:
+  - name: title
+    type: char[64]
+    description: "Window title string (truncated to 64 bytes including NUL terminator)"
+  - name: x
+    type: int32_t
+    description: "Initial requested horizontal coordinate in screen space"
+  - name: y
+    type: int32_t
+    description: "Initial requested vertical coordinate in screen space"
+  - name: width
+    type: uint32_t
+    description: "Requested client surface width in pixels"
+  - name: height
+    type: uint32_t
+    description: "Requested client surface height in pixels"
+  - name: flags
+    type: uint32_t
+    description: "Window configuration and behavior bitmask flags"

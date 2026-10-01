@@ -1,0 +1,19 @@
+id: 13
+name: MSG_WINDOW_CONFIGURE
+direction: server_to_client
+version: 1
+v1_compat: true
+description: "Server notification informing client of updated window geometry."
+fields:
+  - name: x
+    type: int32_t
+    description: "New horizontal screen position"
+  - name: y
+    type: int32_t
+    description: "New vertical screen position"
+  - name: width
+    type: uint32_t
+    description: "New width in pixels"
+  - name: height
+    type: uint32_t
+    description: "New height in pixels"

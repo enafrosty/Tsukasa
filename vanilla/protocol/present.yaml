@@ -1,0 +1,19 @@
+id: 9
+name: MSG_PRESENT
+direction: client_to_server
+version: 1
+v1_compat: true
+description: "Notify server of client-side damage region ready for compositing."
+fields:
+  - name: x
+    type: int32_t
+    description: "Horizontal damage rectangle offset within window"
+  - name: y
+    type: int32_t
+    description: "Vertical damage rectangle offset within window"
+  - name: w
+    type: int32_t
+    description: "Width of damaged region in pixels"
+  - name: h
+    type: int32_t
+    description: "Height of damaged region in pixels"

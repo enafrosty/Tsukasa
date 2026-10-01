@@ -14,6 +14,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
+#define VANILLA_DISPATCH_TABLE_IMPL
 #include "server.h"
 #include "blitter.h"
 #include "font.h"
@@ -26,6 +27,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <signal.h>
@@ -259,6 +261,7 @@ int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
     for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
         srv->clients[i].in_use = 0;
         srv->clients[i].fd = -1;
+        srv->clients[i].version = 1;
     }
 
     for (int i = 0; i < VANILLA_MAX_WINDOWS; i++)
@@ -345,6 +348,7 @@ int vanilla_server_accept(vanilla_server_t *srv)
 
     srv->clients[slot].in_use = 1;
     srv->clients[slot].fd = cfd;
+    srv->clients[slot].version = 1;
     printf("[vanilla] Accepted client connection (slot=%d, fd=%d)\n", slot, cfd);
 
     return slot;
@@ -381,6 +385,7 @@ void vanilla_server_remove_client(vanilla_server_t *srv, int client_idx)
 
     srv->clients[client_idx].in_use = 0;
     srv->clients[client_idx].fd = -1;
+    srv->clients[client_idx].version = 0;
 
     shell_invalidate(srv);
 }
@@ -415,6 +420,239 @@ static void wm_send_configure(vanilla_server_window_t *w)
     exact_write(w->client_fd, &cfg, sizeof(cfg));
 }
 
+int handle_msg_hello(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    (void)hdr;
+    const vanilla_msg_hello_t *hello = (const vanilla_msg_hello_t *)payload;
+    int cfd = srv->clients[client_idx].fd;
+    vanilla_msg_hdr_t ack_hdr;
+    vanilla_msg_hello_ack_t ack;
+
+    srv->clients[client_idx].version = hello->client_version;
+
+    ack_hdr.magic = VANILLA_IPC_MAGIC;
+    ack_hdr.msg_type = MSG_HELLO_ACK;
+    ack_hdr.payload_len = (uint16_t)sizeof(ack);
+    ack_hdr.window_id = 0;
+
+    ack.server_version = VANILLA_IPC_VERSION;
+    ack.status = 0;
+
+    if (exact_write(cfd, &ack_hdr, sizeof(ack_hdr)) < 0 ||
+        exact_write(cfd, &ack, sizeof(ack)) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+int handle_msg_create_window(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    (void)hdr;
+    const vanilla_msg_create_window_t *req = (const vanilla_msg_create_window_t *)payload;
+    int cfd = srv->clients[client_idx].fd;
+    vanilla_msg_hdr_t ack_hdr;
+    vanilla_msg_create_window_ack_t ack;
+    int win_slot = -1;
+
+    ack_hdr.magic = VANILLA_IPC_MAGIC;
+    ack_hdr.msg_type = MSG_CREATE_WINDOW_ACK;
+    ack_hdr.payload_len = (uint16_t)sizeof(ack);
+    ack_hdr.window_id = 0;
+
+    memset(&ack, 0, sizeof(ack));
+
+    if (req->width == 0 || req->height == 0 ||
+        req->width > VANILLA_MAX_WIDTH || req->height > VANILLA_MAX_HEIGHT) {
+        ack.status = -22;
+        exact_write(cfd, &ack_hdr, sizeof(ack_hdr));
+        exact_write(cfd, &ack, sizeof(ack));
+        return 0;
+    }
+
+    for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+        if (!srv->windows[i].in_use) {
+            win_slot = i;
+            break;
+        }
+    }
+
+    if (win_slot < 0) {
+        ack.status = -28;
+        exact_write(cfd, &ack_hdr, sizeof(ack_hdr));
+        exact_write(cfd, &ack, sizeof(ack));
+        return 0;
+    }
+
+    vanilla_server_window_t *w = &srv->windows[win_slot];
+    if (surface_create_shm(&w->surface, req->width, req->height) < 0) {
+        ack.status = -12;
+        exact_write(cfd, &ack_hdr, sizeof(ack_hdr));
+        exact_write(cfd, &ack, sizeof(ack));
+        return 0;
+    }
+
+    w->in_use = 1;
+    w->window_id = srv->next_window_id++;
+    w->client_fd = cfd;
+    w->shm_id = w->surface.shm_id;
+    w->x = req->x;
+    w->y = req->y;
+    w->width = req->width;
+    w->height = req->height;
+    w->flags = req->flags;
+    w->is_mapped = 1;
+    w->is_focused = 0;
+    w->z_index = ++srv->next_z_index;
+
+    w->is_snapped = SNAP_NONE;
+    w->restore_x = req->x;
+    w->restore_y = req->y;
+    w->restore_w = req->width;
+    w->restore_h = req->height;
+
+    if (req->flags & WINDOW_FLAG_MODAL)
+        w->layer = LAYER_TOPMOST;
+    else if (req->flags & WINDOW_FLAG_ALWAYS_TOP)
+        w->layer = LAYER_TOPMOST;
+    else
+        w->layer = LAYER_NORMAL;
+
+    snprintf(w->title, sizeof(w->title), "%s", req->title);
+    w->damage.x = 0;
+    w->damage.y = 0;
+    w->damage.w = (int32_t)req->width;
+    w->damage.h = (int32_t)req->height;
+
+    ack_hdr.window_id = w->window_id;
+    ack.window_id = w->window_id;
+    ack.shm_id = w->shm_id;
+    ack.buffer_size = (uint32_t)w->surface.size;
+    ack.pitch = w->surface.pitch;
+    ack.status = 0;
+
+    exact_write(cfd, &ack_hdr, sizeof(ack_hdr));
+    exact_write(cfd, &ack, sizeof(ack));
+
+    wm_raise_window(srv, w->window_id);
+    wm_invalidate_window(srv, w);
+    shell_invalidate(srv);
+    printf("[vanilla] Created window id=%u title='%s' (%ux%u)\n", w->window_id, w->title, req->width, req->height);
+    return 0;
+}
+
+int handle_msg_destroy_window(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    (void)hdr;
+    const vanilla_msg_destroy_window_t *req = (const vanilla_msg_destroy_window_t *)payload;
+    int cfd = srv->clients[client_idx].fd;
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, req->window_id);
+    if (w && w->client_fd == cfd) {
+        if (srv->focused_window_id == w->window_id)
+            srv->focused_window_id = 0;
+        if (srv->is_dragging && srv->drag_window_id == w->window_id) {
+            srv->is_dragging = 0;
+            srv->drag_window_id = 0;
+        }
+        wm_invalidate_window(srv, w);
+        surface_destroy(&w->surface);
+        w->in_use = 0;
+        shell_invalidate(srv);
+    }
+    return 0;
+}
+
+int handle_msg_map_window(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    (void)hdr;
+    const vanilla_msg_map_window_t *req = (const vanilla_msg_map_window_t *)payload;
+    int cfd = srv->clients[client_idx].fd;
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, req->window_id);
+    if (w && w->client_fd == cfd) {
+        w->is_mapped = 1;
+        vanilla_server_focus_window(srv, w->window_id);
+        wm_invalidate_window(srv, w);
+        shell_invalidate(srv);
+    }
+    return 0;
+}
+
+int handle_msg_unmap_window(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    (void)hdr;
+    const vanilla_msg_unmap_window_t *req = (const vanilla_msg_unmap_window_t *)payload;
+    int cfd = srv->clients[client_idx].fd;
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, req->window_id);
+    if (w && w->client_fd == cfd) {
+        wm_invalidate_window(srv, w);
+        w->is_mapped = 0;
+        w->is_focused = 0;
+        if (srv->focused_window_id == w->window_id)
+            srv->focused_window_id = 0;
+        shell_invalidate(srv);
+    }
+    return 0;
+}
+
+int handle_msg_move_resize(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    const vanilla_msg_move_resize_t *req = (const vanilla_msg_move_resize_t *)payload;
+    int cfd = srv->clients[client_idx].fd;
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, hdr->window_id);
+    if (w && w->client_fd == cfd) {
+        wm_invalidate_window(srv, w);
+        w->x = req->x;
+        w->y = req->y;
+        if (req->width > 0 && req->height > 0 &&
+            (req->width != w->width || req->height != w->height)) {
+            w->width = req->width;
+            w->height = req->height;
+            wm_send_configure(w);
+        }
+        wm_invalidate_window(srv, w);
+    }
+    return 0;
+}
+
+int handle_msg_present(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    const vanilla_msg_present_t *req = (const vanilla_msg_present_t *)payload;
+    int cfd = srv->clients[client_idx].fd;
+    if (req->w <= 0 || req->h <= 0)
+        return 0;
+
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, hdr->window_id);
+    if (w && w->client_fd == cfd) {
+        if (w->damage.w == 0 || w->damage.h == 0) {
+            w->damage.x = req->x;
+            w->damage.y = req->y;
+            w->damage.w = req->w;
+            w->damage.h = req->h;
+        } else {
+            int32_t x1 = w->damage.x < req->x ? w->damage.x : req->x;
+            int32_t y1 = w->damage.y < req->y ? w->damage.y : req->y;
+            int32_t x2 = (w->damage.x + w->damage.w) > (req->x + req->w)
+                         ? (w->damage.x + w->damage.w)
+                         : (req->x + req->w);
+            int32_t y2 = (w->damage.y + w->damage.h) > (req->y + req->h)
+                         ? (w->damage.y + w->damage.h)
+                         : (req->y + req->h);
+
+            w->damage.x = x1;
+            w->damage.y = y1;
+            w->damage.w = x2 - x1;
+            w->damage.h = y2 - y1;
+        }
+
+        vanilla_rect_t screen_damage;
+        screen_damage.x = w->x + req->x;
+        screen_damage.y = w->y + req->y;
+        screen_damage.w = req->w;
+        screen_damage.h = req->h;
+        compositor_add_damage(&srv->compositor, &screen_damage);
+    }
+    return 0;
+}
+
 int vanilla_server_dispatch_client(vanilla_server_t *srv, int client_idx)
 {
     vanilla_msg_hdr_t hdr;
@@ -438,299 +676,29 @@ int vanilla_server_dispatch_client(vanilla_server_t *srv, int client_idx)
         return -1;
     }
 
-    switch (hdr.msg_type) {
-    case MSG_HELLO: {
-        vanilla_msg_hello_t hello;
-        vanilla_msg_hdr_t ack_hdr;
-        vanilla_msg_hello_ack_t ack;
-
-        if (hdr.payload_len != sizeof(hello)) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
+    const vanilla_dispatch_entry_t *entry = NULL;
+    for (size_t i = 0; i < g_vanilla_dispatch_table_len; i++) {
+        if (g_vanilla_dispatch_table[i].msg_type == hdr.msg_type) {
+            entry = &g_vanilla_dispatch_table[i];
+            break;
         }
-
-        if (exact_read(cfd, &hello, sizeof(hello)) < 0) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
-        }
-
-        ack_hdr.magic = VANILLA_IPC_MAGIC;
-        ack_hdr.msg_type = MSG_HELLO_ACK;
-        ack_hdr.payload_len = (uint16_t)sizeof(ack);
-        ack_hdr.window_id = 0;
-
-        ack.server_version = VANILLA_IPC_VERSION;
-        ack.status = 0;
-
-        exact_write(cfd, &ack_hdr, sizeof(ack_hdr));
-        exact_write(cfd, &ack, sizeof(ack));
-        return 0;
     }
 
-    case MSG_CREATE_WINDOW: {
-        vanilla_msg_create_window_t req;
-        vanilla_msg_hdr_t ack_hdr;
-        vanilla_msg_create_window_ack_t ack;
-        int win_slot = -1;
-
-        if (hdr.payload_len != sizeof(req)) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
-        }
-
-        if (exact_read(cfd, &req, sizeof(req)) < 0) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
-        }
-
-        ack_hdr.magic = VANILLA_IPC_MAGIC;
-        ack_hdr.msg_type = MSG_CREATE_WINDOW_ACK;
-        ack_hdr.payload_len = (uint16_t)sizeof(ack);
-        ack_hdr.window_id = 0;
-
-        memset(&ack, 0, sizeof(ack));
-
-        if (req.width == 0 || req.height == 0 ||
-            req.width > VANILLA_MAX_WIDTH || req.height > VANILLA_MAX_HEIGHT) {
-            ack.status = -22;
-            exact_write(cfd, &ack_hdr, sizeof(ack_hdr));
-            exact_write(cfd, &ack, sizeof(ack));
-            return 0;
-        }
-
-        for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
-            if (!srv->windows[i].in_use) {
-                win_slot = i;
-                break;
-            }
-        }
-
-        if (win_slot < 0) {
-            ack.status = -28;
-            exact_write(cfd, &ack_hdr, sizeof(ack_hdr));
-            exact_write(cfd, &ack, sizeof(ack));
-            return 0;
-        }
-
-        vanilla_server_window_t *w = &srv->windows[win_slot];
-        if (surface_create_shm(&w->surface, req.width, req.height) < 0) {
-            ack.status = -12;
-            exact_write(cfd, &ack_hdr, sizeof(ack_hdr));
-            exact_write(cfd, &ack, sizeof(ack));
-            return 0;
-        }
-
-        w->in_use = 1;
-        w->window_id = srv->next_window_id++;
-        w->client_fd = cfd;
-        w->shm_id = w->surface.shm_id;
-        w->x = req.x;
-        w->y = req.y;
-        w->width = req.width;
-        w->height = req.height;
-        w->flags = req.flags;
-        w->is_mapped = 1;
-        w->is_focused = 0;
-        w->z_index = ++srv->next_z_index;
-
-        w->is_snapped = SNAP_NONE;
-        w->restore_x = req.x;
-        w->restore_y = req.y;
-        w->restore_w = req.width;
-        w->restore_h = req.height;
-
-        if (req.flags & WINDOW_FLAG_MODAL)
-            w->layer = LAYER_TOPMOST;
-        else if (req.flags & WINDOW_FLAG_ALWAYS_TOP)
-            w->layer = LAYER_TOPMOST;
-        else
-            w->layer = LAYER_NORMAL;
-
-        snprintf(w->title, sizeof(w->title), "%s", req.title);
-        w->damage.x = 0;
-        w->damage.y = 0;
-        w->damage.w = (int32_t)req.width;
-        w->damage.h = (int32_t)req.height;
-
-        ack_hdr.window_id = w->window_id;
-        ack.window_id = w->window_id;
-        ack.shm_id = w->shm_id;
-        ack.buffer_size = (uint32_t)w->surface.size;
-        ack.pitch = w->surface.pitch;
-        ack.status = 0;
-
-        exact_write(cfd, &ack_hdr, sizeof(ack_hdr));
-        exact_write(cfd, &ack, sizeof(ack));
-
-        wm_raise_window(srv, w->window_id);
-        wm_invalidate_window(srv, w);
-        shell_invalidate(srv);
-        printf("[vanilla] Created window id=%u title='%s' (%ux%u)\n", w->window_id, w->title, req.width, req.height);
-        return 0;
+    if (!entry || !entry->handler) {
+        fprintf(stderr, "[vanilla] dispatch: unknown message type %u\n", (unsigned)hdr.msg_type);
+        vanilla_server_remove_client(srv, client_idx);
+        return -1;
     }
 
-    case MSG_DESTROY_WINDOW: {
-        vanilla_msg_destroy_window_t req;
-        vanilla_server_window_t *w;
-
-        if (hdr.payload_len != sizeof(req)) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
-        }
-
-        if (exact_read(cfd, &req, sizeof(req)) < 0) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
-        }
-
-        w = vanilla_server_find_window(srv, req.window_id);
-        if (w && w->client_fd == cfd) {
-            if (srv->focused_window_id == w->window_id)
-                srv->focused_window_id = 0;
-            if (srv->is_dragging && srv->drag_window_id == w->window_id) {
-                srv->is_dragging = 0;
-                srv->drag_window_id = 0;
-            }
-            wm_invalidate_window(srv, w);
-            surface_destroy(&w->surface);
-            w->in_use = 0;
-            shell_invalidate(srv);
-        }
-        return 0;
+    if (entry->payload_size > 0 && hdr.payload_len != entry->payload_size) {
+        fprintf(stderr, "[vanilla] dispatch: payload size mismatch for msg %u: expected %zu, got %u\n",
+                (unsigned)hdr.msg_type, entry->payload_size, (unsigned)hdr.payload_len);
+        vanilla_server_remove_client(srv, client_idx);
+        return -1;
     }
 
-    case MSG_MAP_WINDOW: {
-        vanilla_msg_map_window_t req;
-        vanilla_server_window_t *w;
-
-        if (hdr.payload_len != sizeof(req)) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
-        }
-
-        if (exact_read(cfd, &req, sizeof(req)) < 0) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
-        }
-
-        w = vanilla_server_find_window(srv, req.window_id);
-        if (w && w->client_fd == cfd) {
-            w->is_mapped = 1;
-            /* Automatically focus window upon map so keyboard input is directed immediately */
-            vanilla_server_focus_window(srv, w->window_id);
-            wm_invalidate_window(srv, w);
-            shell_invalidate(srv);
-        }
-        return 0;
-    }
-
-    case MSG_UNMAP_WINDOW: {
-        vanilla_msg_map_window_t req;
-        vanilla_server_window_t *w;
-
-        if (hdr.payload_len != sizeof(req)) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
-        }
-
-        if (exact_read(cfd, &req, sizeof(req)) < 0) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
-        }
-
-        w = vanilla_server_find_window(srv, req.window_id);
-        if (w && w->client_fd == cfd) {
-            wm_invalidate_window(srv, w);
-            w->is_mapped = 0;
-            w->is_focused = 0;
-            if (srv->focused_window_id == w->window_id)
-                srv->focused_window_id = 0;
-            shell_invalidate(srv);
-        }
-        return 0;
-    }
-
-    case MSG_MOVE_RESIZE: {
-        vanilla_msg_move_resize_t req;
-        vanilla_server_window_t *w;
-
-        if (hdr.payload_len != sizeof(req)) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
-        }
-
-        if (exact_read(cfd, &req, sizeof(req)) < 0) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
-        }
-
-        w = vanilla_server_find_window(srv, hdr.window_id);
-        if (w && w->client_fd == cfd) {
-            wm_invalidate_window(srv, w);
-            w->x = req.x;
-            w->y = req.y;
-            if (req.width > 0 && req.height > 0 &&
-                (req.width != w->width || req.height != w->height)) {
-                w->width = req.width;
-                w->height = req.height;
-                wm_send_configure(w);
-            }
-            wm_invalidate_window(srv, w);
-        }
-        return 0;
-    }
-
-    case MSG_PRESENT: {
-        vanilla_msg_present_t req;
-        vanilla_server_window_t *w;
-
-        if (hdr.payload_len != sizeof(req)) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
-        }
-
-        if (exact_read(cfd, &req, sizeof(req)) < 0) {
-            vanilla_server_remove_client(srv, client_idx);
-            return -1;
-        }
-
-        if (req.w <= 0 || req.h <= 0)
-            return 0;
-
-        w = vanilla_server_find_window(srv, hdr.window_id);
-        if (w && w->client_fd == cfd) {
-            if (w->damage.w == 0 || w->damage.h == 0) {
-                w->damage.x = req.x;
-                w->damage.y = req.y;
-                w->damage.w = req.w;
-                w->damage.h = req.h;
-            } else {
-                int32_t x1 = w->damage.x < req.x ? w->damage.x : req.x;
-                int32_t y1 = w->damage.y < req.y ? w->damage.y : req.y;
-                int32_t x2 = (w->damage.x + w->damage.w) > (req.x + req.w)
-                             ? (w->damage.x + w->damage.w)
-                             : (req.x + req.w);
-                int32_t y2 = (w->damage.y + w->damage.h) > (req.y + req.h)
-                             ? (w->damage.y + w->damage.h)
-                             : (req.y + req.h);
-
-                w->damage.x = x1;
-                w->damage.y = y1;
-                w->damage.w = x2 - x1;
-                w->damage.h = y2 - y1;
-            }
-
-            vanilla_rect_t screen_damage;
-            screen_damage.x = w->x + req.x;
-            screen_damage.y = w->y + req.y;
-            screen_damage.w = req.w;
-            screen_damage.h = req.h;
-            compositor_add_damage(&srv->compositor, &screen_damage);
-        }
-        return 0;
-    }
-
-    default: {
+    uint32_t client_ver = srv->clients[client_idx].version;
+    if (hdr.msg_type != MSG_HELLO && client_ver < entry->min_version) {
         if (hdr.payload_len > 0) {
             uint8_t discard[128];
             size_t rem = hdr.payload_len;
@@ -745,7 +713,37 @@ int vanilla_server_dispatch_client(vanilla_server_t *srv, int client_idx)
         }
         return 0;
     }
+
+    size_t needed = entry->payload_size > 0 ? entry->payload_size : (size_t)hdr.payload_len;
+    uint8_t stack_buf[256];
+    uint8_t *payload = stack_buf;
+    if (needed > sizeof(stack_buf)) {
+        payload = (uint8_t *)malloc(needed);
+        if (!payload) {
+            vanilla_server_remove_client(srv, client_idx);
+            return -1;
+        }
     }
+
+    if (needed > 0) {
+        if (exact_read(cfd, payload, needed) < 0) {
+            if (payload != stack_buf)
+                free(payload);
+            vanilla_server_remove_client(srv, client_idx);
+            return -1;
+        }
+    }
+
+    int handler_ret = entry->handler(srv, client_idx, &hdr, payload);
+    if (payload != stack_buf)
+        free(payload);
+
+    if (handler_ret < 0) {
+        vanilla_server_remove_client(srv, client_idx);
+        return -1;
+    }
+
+    return 0;
 }
 
 int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
