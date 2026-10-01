@@ -33,9 +33,15 @@ vanilla_layout_t *vlayout_init(void *arena, size_t arena_size)
     if (!arena || arena_size < sizeof(vanilla_layout_t) + sizeof(vanilla_elem_t))
         return NULL;
 
-    vanilla_layout_t *ctx = (vanilla_layout_t *)arena;
-    ctx->arena_base = (uint8_t *)arena;
-    ctx->arena_size = arena_size;
+    uintptr_t base_addr = (uintptr_t)arena;
+    uintptr_t aligned_base = align_up(base_addr, 8);
+    size_t pad = (size_t)(aligned_base - base_addr);
+    if (arena_size <= pad + sizeof(vanilla_layout_t) + sizeof(vanilla_elem_t))
+        return NULL;
+
+    vanilla_layout_t *ctx = (vanilla_layout_t *)aligned_base;
+    ctx->arena_base = (uint8_t *)aligned_base;
+    ctx->arena_size = arena_size - pad;
     ctx->offset = align_up(sizeof(vanilla_layout_t), 8);
     return ctx;
 }
@@ -75,6 +81,19 @@ vanilla_elem_t *vlayout_box(vanilla_layout_t *ctx)
     elem->h_mode = VSIZE_GROW;
     elem->direction = VDIR_COLUMN;
     elem->align_items = VALIGN_START;
+    elem->clip_children = 0;
+    return elem;
+}
+
+vanilla_elem_t *vlayout_spacer(vanilla_layout_t *ctx)
+{
+    vanilla_elem_t *elem = vlayout_alloc_elem(ctx);
+    if (!elem)
+        return NULL;
+
+    elem->type = VELEM_SPACER;
+    elem->w_mode = VSIZE_GROW;
+    elem->h_mode = VSIZE_GROW;
     return elem;
 }
 
@@ -147,6 +166,10 @@ static void vlayout_measure(vanilla_elem_t *elem)
             lines = 1;
             const char *p = elem->text;
             while (*p) {
+                if (*p == '\r') {
+                    p++;
+                    continue;
+                }
                 if (*p == '\n') {
                     lines++;
                     if (cur_len > max_len)
@@ -312,7 +335,8 @@ static void vlayout_distribute_and_position(vanilla_elem_t *elem)
                     break;
                 case VALIGN_STRETCH:
                     cy = inner_y;
-                    ch = inner_h;
+                    if (c->h_mode != VSIZE_FIXED)
+                        ch = inner_h;
                     break;
                 }
             }
@@ -387,7 +411,8 @@ static void vlayout_distribute_and_position(vanilla_elem_t *elem)
                     break;
                 case VALIGN_STRETCH:
                     cx = inner_x;
-                    cw = inner_w;
+                    if (c->w_mode != VSIZE_FIXED)
+                        cw = inner_w;
                     break;
                 }
             }
@@ -435,11 +460,11 @@ void vlayout_compute(vanilla_layout_t *ctx, vanilla_elem_t *root,
 
 static void vlayout_emit_elem(vanilla_elem_t *elem, vanilla_draw_cmd_array_t *out)
 {
-    if (!elem || !out)
+    if (!elem || !out || !out->cmds || out->capacity <= 0)
         return;
 
     switch (elem->type) {
-    case VELEM_BOX:
+    case VELEM_BOX: {
         if (elem->bg_color != 0) {
             if (out->count < out->capacity) {
                 vanilla_draw_cmd_t cmd;
@@ -475,9 +500,37 @@ static void vlayout_emit_elem(vanilla_elem_t *elem, vanilla_draw_cmd_array_t *ou
             }
         }
 
+        int pushed_clip = 0;
+        if (elem->clip_children && out->count + 1 < out->capacity) {
+            vanilla_draw_cmd_t clip_cmd;
+            memset(&clip_cmd, 0, sizeof(clip_cmd));
+            clip_cmd.type = VCMD_PUSH_CLIP;
+            clip_cmd.bounds.x = elem->computed_x + elem->pad_left;
+            clip_cmd.bounds.y = elem->computed_y + elem->pad_top;
+            clip_cmd.bounds.w = elem->computed_w - (elem->pad_left + elem->pad_right);
+            clip_cmd.bounds.h = elem->computed_h - (elem->pad_top + elem->pad_bottom);
+            if (clip_cmd.bounds.w < 0) clip_cmd.bounds.w = 0;
+            if (clip_cmd.bounds.h < 0) clip_cmd.bounds.h = 0;
+            out->cmds[out->count++] = clip_cmd;
+            pushed_clip = 1;
+        }
+
+        int32_t saved_capacity = out->capacity;
+        if (pushed_clip)
+            out->capacity--; /* Reserve 1 slot for VCMD_POP_CLIP */
+
         for (vanilla_elem_t *c = elem->children; c; c = c->next)
             vlayout_emit_elem(c, out);
+
+        if (pushed_clip) {
+            out->capacity = saved_capacity;
+            vanilla_draw_cmd_t pop_cmd;
+            memset(&pop_cmd, 0, sizeof(pop_cmd));
+            pop_cmd.type = VCMD_POP_CLIP;
+            out->cmds[out->count++] = pop_cmd;
+        }
         break;
+    }
 
     case VELEM_TEXT:
         if (elem->text && elem->text[0] != '\0') {
@@ -537,6 +590,9 @@ void vlayout_emit(vanilla_layout_t *ctx, vanilla_elem_t *root,
             ctx->offset = cur + (size_t)cap * sizeof(vanilla_draw_cmd_t);
         }
     }
+
+    if (!out->cmds || out->capacity <= 0)
+        return;
 
     vlayout_emit_elem(root, out);
 }

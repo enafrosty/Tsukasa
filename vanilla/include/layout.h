@@ -74,6 +74,7 @@ struct vanilla_elem_t {
     int32_t             corner_radius;  /* 0 = square; >0 = rounded (P1-3)   */
     uint32_t            border_color;
     int32_t             border_width;
+    uint8_t             clip_children;  /* 1 = scissor clip children to inner bounds */
 
     /* Content (for VELEM_TEXT) */
     const char         *text;
@@ -118,6 +119,7 @@ void vlayout_emit(vanilla_layout_t *ctx, vanilla_elem_t *root,
 
 /* Builder convenience helpers */
 vanilla_elem_t *vlayout_box(vanilla_layout_t *ctx);
+vanilla_elem_t *vlayout_spacer(vanilla_layout_t *ctx);
 vanilla_elem_t *vlayout_text(vanilla_layout_t *ctx, const char *text, uint32_t color, float font_size);
 vanilla_elem_t *vlayout_image(vanilla_layout_t *ctx, vanilla_surface_t *src, vanilla_draw_rect_t src_rect);
 void vlayout_add_child(vanilla_elem_t *parent, vanilla_elem_t *child);
