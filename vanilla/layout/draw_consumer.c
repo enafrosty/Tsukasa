@@ -160,10 +160,18 @@ void vanilla_execute_draw_commands(vanilla_surface_t *target,
                     dy1 -= cur_src_y;
                     cur_src_y = 0;
                 }
-                if (cur_src_x + cur_w > src_max_w)
-                    cur_w = src_max_w - cur_src_x;
-                if (cur_src_y + cur_h > src_max_h)
-                    cur_h = src_max_h - cur_src_y;
+                int32_t max_src_x = src_max_w;
+                if (c->image.src_rect.w > 0 && sx + c->image.src_rect.w < max_src_x)
+                    max_src_x = sx + c->image.src_rect.w;
+
+                int32_t max_src_y = src_max_h;
+                if (c->image.src_rect.h > 0 && sy + c->image.src_rect.h < max_src_y)
+                    max_src_y = sy + c->image.src_rect.h;
+
+                if (cur_src_x + cur_w > max_src_x)
+                    cur_w = max_src_x - cur_src_x;
+                if (cur_src_y + cur_h > max_src_y)
+                    cur_h = max_src_y - cur_src_y;
 
                 if (cur_w > 0 && cur_h > 0) {
                     uint32_t dst_pitch = target->pitch ? (target->pitch / sizeof(uint32_t)) : target->width;

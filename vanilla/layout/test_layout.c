@@ -389,7 +389,19 @@ static int test_draw_command_execution(void)
     cmd_buffer[cmds.count].image.src_rect = (vanilla_draw_rect_t){0, 0, 16, 16};
     cmds.count++;
     vanilla_execute_draw_commands(&surf, &cmds, NULL);
-    TEST_ASSERT(pixels[0] == 0xFFAABBCC, "negative offset image copy failed");
+    /* Deep Verification: Image sub-rectangle bounds clamping when destination exceeds subrect */
+    memset(pixels, 0, sizeof(pixels));
+    cmds.count = 0;
+    cmd_buffer[cmds.count].type = VCMD_IMAGE;
+    cmd_buffer[cmds.count].bounds = (vanilla_draw_rect_t){10, 10, 8, 8};
+    cmd_buffer[cmds.count].image.src = &src_surf;
+    cmd_buffer[cmds.count].image.src_rect = (vanilla_draw_rect_t){0, 0, 4, 4};
+    cmds.count++;
+    vanilla_execute_draw_commands(&surf, &cmds, NULL);
+    TEST_ASSERT(pixels[10 * 64 + 10] == 0xFFAABBCC, "subrect pixel inside 4x4 must be drawn");
+    TEST_ASSERT(pixels[10 * 64 + 13] == 0xFFAABBCC, "subrect pixel at border of 4x4 must be drawn");
+    TEST_ASSERT(pixels[10 * 64 + 14] == 0x00000000, "pixel beyond 4x4 subrect must not be drawn");
+    TEST_ASSERT(pixels[14 * 64 + 10] == 0x00000000, "pixel vertically beyond 4x4 subrect must not be drawn");
 
     return 0;
 }
