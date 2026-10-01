@@ -192,6 +192,15 @@ void app_draw_char(vanilla_surface_t *surf, int32_t x, int32_t y, char c, uint32
     if (!surf || !surf->pixels)
         return;
 
+    int32_t font_scale = (g_theme && g_theme->scale_factor >= 1.0f) ? (int32_t)g_theme->scale_factor : 1;
+    if (font_scale < 1)
+        font_scale = 1;
+
+    if (font_scale > 1) {
+        app_draw_char_scale(surf, x, y, c, font_scale, color);
+        return;
+    }
+
     uint8_t uc = (uint8_t)c;
     if (uc >= 128)
         uc = '?';
@@ -225,14 +234,18 @@ void app_draw_text(vanilla_surface_t *surf, int32_t x, int32_t y, const char *te
     if (!text)
         return;
 
+    int32_t font_scale = (g_theme && g_theme->scale_factor >= 1.0f) ? (int32_t)g_theme->scale_factor : 1;
+    if (font_scale < 1)
+        font_scale = 1;
+
     int32_t cur_x = x;
     while (*text) {
         if (*text == '\n') {
             cur_x = x;
-            y += 10;
+            y += 8 * font_scale + 2 * font_scale;
         } else {
             app_draw_char(surf, cur_x, y, *text, color);
-            cur_x += 8;
+            cur_x += 8 * font_scale;
         }
         text++;
     }
@@ -287,10 +300,13 @@ void app_draw_button(vanilla_surface_t *surf, int32_t x, int32_t y, int32_t w, i
     app_draw_rect(surf, x, y, w, h, border_col);
 
     if (text) {
+        int32_t font_scale = (g_theme && g_theme->scale_factor >= 1.0f) ? (int32_t)g_theme->scale_factor : 1;
+        if (font_scale < 1)
+            font_scale = 1;
         int len = (int)strlen(text);
-        int text_w = len * 8;
+        int text_w = len * 8 * font_scale;
         int tx = x + (w - text_w) / 2;
-        int ty = y + (h - 8) / 2;
+        int ty = y + (h - 8 * font_scale) / 2;
         if (is_pressed) {
             tx++;
             ty++;

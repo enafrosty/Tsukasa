@@ -273,8 +273,8 @@ chrome_btn_rects_t chrome_metrics(const vanilla_rect_t *frame)
     int32_t pad   = (g_theme->titlebar_height - btn) / 2;
     int32_t gap   = btn + g_theme->space_1;
     int32_t right = frame->x + frame->w;
-
-    r.close_btn.x = right - 18;
+    /* Right button margin matches titlebar vertical padding: right - pad - btn */
+    r.close_btn.x = right - (btn + pad);
     r.close_btn.y = frame->y + pad;
     r.close_btn.w = btn;
     r.close_btn.h = btn;
@@ -386,12 +386,15 @@ void compositor_render_frame(struct vanilla_server *srv)
                     chrome_btn_rects_t btns = chrome_metrics(&frame_rect);
 
                     vanilla_rect_t vis_btn;
+                    int32_t btn_glyph_pad = THEME_PX(2);
+                    int32_t btn_glyph_end = btns.close_btn.w - 1 - btn_glyph_pad;
+
                     if (vanilla_rect_intersect(&btns.close_btn, dirty, &vis_btn)) {
                         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, g_theme->danger);
-                        for (int k = 2; k <= 9; k++) {
+                        for (int k = btn_glyph_pad; k <= btn_glyph_end; k++) {
                             int32_t px1 = btns.close_btn.x + k;
                             int32_t py1 = btns.close_btn.y + k;
-                            int32_t px2 = btns.close_btn.x + (11 - k);
+                            int32_t px2 = btns.close_btn.x + (btns.close_btn.w - 1 - k);
                             int32_t py2 = btns.close_btn.y + k;
                             if (px1 >= dirty->x && px1 < dirty->x + dirty->w &&
                                 py1 >= dirty->y && py1 < dirty->y + dirty->h)
@@ -406,9 +409,11 @@ void compositor_render_frame(struct vanilla_server *srv)
                     if (vanilla_rect_intersect(&btns.max_btn, dirty, &vis_btn)) {
                         uint32_t btn_bg = g_theme->titlebar_btn_bg;
                         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, btn_bg);
-                        for (int k = 2; k <= 9; k++) {
-                            int32_t top_y = btns.max_btn.y + 2;
-                            int32_t bot_y = btns.max_btn.y + 9;
+                        int32_t top_y = btns.max_btn.y + btn_glyph_pad;
+                        int32_t bot_y = btns.max_btn.y + btn_glyph_end;
+                        int32_t left_x = btns.max_btn.x + btn_glyph_pad;
+                        int32_t right_x = btns.max_btn.x + btn_glyph_end;
+                        for (int k = btn_glyph_pad; k <= btn_glyph_end; k++) {
                             int32_t px = btns.max_btn.x + k;
                             if (px >= dirty->x && px < dirty->x + dirty->w) {
                                 if (top_y >= dirty->y && top_y < dirty->y + dirty->h)
@@ -416,8 +421,6 @@ void compositor_render_frame(struct vanilla_server *srv)
                                 if (bot_y >= dirty->y && bot_y < dirty->y + dirty->h)
                                     comp->backbuffer[bot_y * comp->pitch_px + px] = g_theme->titlebar_btn_icon;
                             }
-                            int32_t left_x = btns.max_btn.x + 2;
-                            int32_t right_x = btns.max_btn.x + 9;
                             int32_t py = btns.max_btn.y + k;
                             if (py >= dirty->y && py < dirty->y + dirty->h) {
                                 if (left_x >= dirty->x && left_x < dirty->x + dirty->w)
@@ -432,9 +435,9 @@ void compositor_render_frame(struct vanilla_server *srv)
                     if (vanilla_rect_intersect(&btns.min_btn, dirty, &vis_btn)) {
                         uint32_t btn_bg = g_theme->titlebar_btn_bg;
                         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, btn_bg);
-                        int32_t py = btns.min_btn.y + 9;
+                        int32_t py = btns.min_btn.y + btn_glyph_end;
                         if (py >= dirty->y && py < dirty->y + dirty->h) {
-                            for (int k = 2; k <= 9; k++) {
+                            for (int k = btn_glyph_pad; k <= btn_glyph_end; k++) {
                                 int32_t px = btns.min_btn.x + k;
                                 if (px >= dirty->x && px < dirty->x + dirty->w)
                                     comp->backbuffer[py * comp->pitch_px + px] = g_theme->titlebar_btn_icon;
@@ -445,15 +448,15 @@ void compositor_render_frame(struct vanilla_server *srv)
                     /* Vector text title rendering */
                     if (win->title[0] != '\0' && comp->font.info) {
                         vanilla_rect_t text_clip;
-                        text_clip.x = frame_rect.x + 6;
+                        text_clip.x = frame_rect.x + (g_theme->titlebar_height - g_theme->btn_size) / 2;
                         text_clip.y = frame_rect.y;
-                        text_clip.w = btns.min_btn.x - text_clip.x - 4;
+                        text_clip.w = btns.min_btn.x - text_clip.x - g_theme->space_1;
                         text_clip.h = g_theme->titlebar_height;
 
                         vanilla_rect_t vis_text;
                         if (vanilla_rect_intersect(&text_clip, dirty, &vis_text) && text_clip.w > 0) {
                             uint32_t text_color = win->is_focused ? g_theme->titlebar_text_active : g_theme->titlebar_text_inactive;
-                            int32_t text_y = frame_rect.y + (g_theme->titlebar_height - 13) / 2;
+                            int32_t text_y = frame_rect.y + (g_theme->titlebar_height - (int32_t)g_theme->title_font_size) / 2;
                             font_draw_text(comp->backbuffer, comp->pitch_px, &vis_text,
                                            &comp->font, win->title, text_clip.x, text_y,
                                            g_theme->title_font_size, text_color);

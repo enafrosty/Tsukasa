@@ -20,25 +20,26 @@
 #include <stdint.h>
 #include <time.h>
 #include "../include/surface.h"
+#include "../include/theme.h"
 
 #if defined(_WIN32)
 struct tm *gmtime_r(const time_t *timer, struct tm *result);
 #endif
 
-#define TASKBAR_HEIGHT       36
-#define TASKBAR_START_X      4
-#define TASKBAR_START_W      64
-#define TASKBAR_START_H      28
-#define TASKBAR_PILL_START_X 74
-#define TASKBAR_PILL_W       120
-#define TASKBAR_PILL_H       28
-#define TASKBAR_PILL_GAP     4
-#define TASKBAR_CLOCK_W      72
-#define TASKBAR_CLOCK_H      28
+#define TASKBAR_HEIGHT       THEME_PX(36)
+#define TASKBAR_START_X      THEME_PX(4)
+#define TASKBAR_START_W      THEME_PX(64)
+#define TASKBAR_START_H      THEME_PX(28)
+#define TASKBAR_PILL_START_X THEME_PX(74)
+#define TASKBAR_PILL_W       THEME_PX(120)
+#define TASKBAR_PILL_H       THEME_PX(28)
+#define TASKBAR_PILL_GAP     THEME_PX(4)
+#define TASKBAR_CLOCK_W      THEME_PX(72)
+#define TASKBAR_CLOCK_H      THEME_PX(28)
 
-#define START_MENU_WIDTH     180
-#define START_MENU_HEIGHT    170
-#define START_MENU_ITEM_H    28
+#define START_MENU_WIDTH     THEME_PX(180)
+#define START_MENU_HEIGHT    THEME_PX(170)
+#define START_MENU_ITEM_H    THEME_PX(28)
 #define START_MENU_NUM_ITEMS 5
 
 struct vanilla_server;
