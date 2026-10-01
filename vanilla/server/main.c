@@ -25,9 +25,12 @@ int main(int argc, char **argv)
     if (argc > 1 && argv[1] && argv[1][0] != '\0')
         sock_path = argv[1];
 
+    cursor_manager_init("assets/cursors");
+
     printf("[vanilla] Initializing display server at %s...\n", sock_path);
     if (vanilla_server_init(&srv, sock_path) < 0) {
         printf("[vanilla] Fatal: Failed to initialize display server socket\n");
+        cursor_manager_destroy();
         return 1;
     }
 
@@ -37,6 +40,7 @@ int main(int argc, char **argv)
 
     printf("[vanilla] Shutting down display server...\n");
     vanilla_server_close(&srv);
+    cursor_manager_destroy();
 
     return 0;
 }

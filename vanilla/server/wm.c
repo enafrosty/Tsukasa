@@ -41,44 +41,6 @@ static void wm_sighup_handler(int sig)
 #endif
 
 
-static const uint16_t cursor_arrow_mask[16] = {
-    0b1000000000000000,
-    0b1100000000000000,
-    0b1110000000000000,
-    0b1111000000000000,
-    0b1111100000000000,
-    0b1111110000000000,
-    0b1111111000000000,
-    0b1111111100000000,
-    0b1111111110000000,
-    0b1111111111000000,
-    0b1111110000000000,
-    0b1101111000000000,
-    0b1000111100000000,
-    0b0000011110000000,
-    0b0000001110000000,
-    0b0000000110000000,
-};
-
-static const uint16_t cursor_arrow_body[16] = {
-    0b0000000000000000,
-    0b0100000000000000,
-    0b0110000000000000,
-    0b0111000000000000,
-    0b0111100000000000,
-    0b0111110000000000,
-    0b0111111000000000,
-    0b0111111100000000,
-    0b0111111000000000,
-    0b0111100000000000,
-    0b0110110000000000,
-    0b0100011000000000,
-    0b0000011100000000,
-    0b0000001100000000,
-    0b0000000100000000,
-    0b0000000000000000,
-};
-
 static int exact_write(int fd, const void *buf, size_t count)
 {
     const uint8_t *p = (const uint8_t *)buf;
@@ -163,6 +125,34 @@ void wm_get_frame_rect(const vanilla_server_window_t *win, vanilla_rect_t *out_f
         out_frame->w = (int32_t)win->width;
         out_frame->h = (int32_t)win->height;
     }
+}
+
+vanilla_server_window_t *wm_window_at(vanilla_server_t *srv, int32_t x, int32_t y)
+{
+    if (!srv)
+        return NULL;
+
+    vanilla_server_window_t *hit = NULL;
+    int32_t max_z = -1;
+
+    for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+        vanilla_server_window_t *w = &srv->windows[i];
+        if (!w->in_use || !w->is_mapped)
+            continue;
+
+        vanilla_rect_t frame;
+        wm_get_frame_rect(w, &frame);
+
+        if (x >= frame.x && x < frame.x + frame.w &&
+            y >= frame.y && y < frame.y + frame.h) {
+            if (w->z_index > max_z) {
+                max_z = w->z_index;
+                hit = w;
+            }
+        }
+    }
+
+    return hit;
 }
 
 void wm_invalidate_window(vanilla_server_t *srv, const vanilla_server_window_t *win)
@@ -293,6 +283,9 @@ int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
     shell_init(&srv->shell);
     launcher_init(&srv->launcher);
 
+    cursor_manager_init("assets/cursors");
+    cursor_set_active(CURSOR_ARROW);
+
     /* Open kernel input stream with non-blocking fallback */
     srv->input_fd = open("/dev/input/events", O_RDONLY | O_NONBLOCK);
 
@@ -306,6 +299,8 @@ void vanilla_server_close(vanilla_server_t *srv)
 {
     if (!srv)
         return;
+
+    cursor_manager_destroy();
 
     if (srv->input_fd >= 0) {
         close(srv->input_fd);
@@ -1039,8 +1034,25 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             srv->cursor_y = screen_h - 1;
 
         if (srv->cursor_x != old_x || srv->cursor_y != old_y) {
-            vanilla_rect_t old_box = { old_x, old_y, 16, 16 };
-            vanilla_rect_t new_box = { srv->cursor_x, srv->cursor_y, 16, 16 };
+            vanilla_rect_t old_box;
+            cursor_get_rect(old_x, old_y, &old_box);
+
+            if (!srv->is_dragging) {
+                vanilla_rect_t win_frame;
+                vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
+                if (under && !(under->flags & WINDOW_FLAG_BORDERLESS)) {
+                    wm_get_frame_rect(under, &win_frame);
+                    cursor_select_for_hit_region(srv->cursor_x, srv->cursor_y, &win_frame,
+                                                 g_theme->border_width, g_theme->titlebar_height);
+                } else {
+                    cursor_set_active(CURSOR_ARROW);
+                }
+            } else {
+                cursor_set_active(CURSOR_ARROW);
+            }
+
+            vanilla_rect_t new_box;
+            cursor_get_rect(srv->cursor_x, srv->cursor_y, &new_box);
             compositor_add_damage(&srv->compositor, &old_box);
             compositor_add_damage(&srv->compositor, &new_box);
 
@@ -1108,25 +1120,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 }
 
                 /* 4. Window interaction: hit test top-to-bottom */
-                vanilla_server_window_t *hit = NULL;
-                int32_t max_z = -1;
-
-                for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
-                    vanilla_server_window_t *w = &srv->windows[i];
-                    if (!w->in_use || !w->is_mapped)
-                        continue;
-
-                    vanilla_rect_t frame;
-                    wm_get_frame_rect(w, &frame);
-
-                    if (srv->cursor_x >= frame.x && srv->cursor_x < frame.x + frame.w &&
-                        srv->cursor_y >= frame.y && srv->cursor_y < frame.y + frame.h) {
-                        if (w->z_index > max_z) {
-                            max_z = w->z_index;
-                            hit = w;
-                        }
-                    }
-                }
+                vanilla_server_window_t *hit = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
 
                 if (hit) {
                     vanilla_server_focus_window(srv, hit->window_id);
@@ -1214,6 +1208,19 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     }
                     srv->is_dragging = 0;
                     srv->drag_window_id = 0;
+
+                    vanilla_rect_t win_frame;
+                    vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
+                    if (under && !(under->flags & WINDOW_FLAG_BORDERLESS)) {
+                        wm_get_frame_rect(under, &win_frame);
+                        cursor_select_for_hit_region(srv->cursor_x, srv->cursor_y, &win_frame,
+                                                     g_theme->border_width, g_theme->titlebar_height);
+                    } else {
+                        cursor_set_active(CURSOR_ARROW);
+                    }
+                    vanilla_rect_t cur_box;
+                    cursor_get_rect(srv->cursor_x, srv->cursor_y, &cur_box);
+                    compositor_add_damage(&srv->compositor, &cur_box);
                     return 0;
                 }
 
@@ -1280,36 +1287,4 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
     }
 
     return 0;
-}
-
-void wm_render_cursor(vanilla_server_t *srv, const vanilla_rect_t *dirty)
-{
-    if (!srv || !dirty)
-        return;
-
-    vanilla_compositor_t *comp = &srv->compositor;
-    vanilla_rect_t cursor_rect = { srv->cursor_x, srv->cursor_y, 16, 16 };
-    vanilla_rect_t vis;
-
-    if (!vanilla_rect_intersect(&cursor_rect, dirty, &vis))
-        return;
-
-    for (int cy = 0; cy < 16; cy++) {
-        int32_t py = srv->cursor_y + cy;
-        if (py < dirty->y || py >= dirty->y + dirty->h || py >= (int32_t)comp->height)
-            continue;
-
-        for (int cx = 0; cx < 16; cx++) {
-            int32_t px = srv->cursor_x + cx;
-            if (px < dirty->x || px >= dirty->x + dirty->w || px >= (int32_t)comp->width)
-                continue;
-
-            uint16_t mask_bit = (cursor_arrow_mask[cy] >> (15 - cx)) & 1;
-            if (mask_bit) {
-                uint16_t body_bit = (cursor_arrow_body[cy] >> (15 - cx)) & 1;
-                uint32_t col = body_bit ? g_theme->fg_primary : g_theme->bg_base;
-                comp->backbuffer[py * comp->pitch_px + px] = col;
-            }
-        }
-    }
 }

@@ -528,7 +528,8 @@ void compositor_render_frame(struct vanilla_server *srv)
             launcher_render(srv, dirty);
 
         /* 6. Render Hardware Cursor Overlay */
-        wm_render_cursor(srv, dirty);
+        cursor_render(comp->backbuffer, comp->pitch_px, comp->width, comp->height,
+                      srv->cursor_x, srv->cursor_y, dirty);
 
         /* 7. Copy composited region to mapped framebuffer */
         if (comp->fb_mem && !comp->is_offscreen) {
