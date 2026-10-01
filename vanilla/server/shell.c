@@ -28,16 +28,27 @@ typedef struct {
     const char *title;
     const char *path;
     const char *badge;
-    uint32_t    badge_color;
 } start_menu_item_t;
 
 static const start_menu_item_t g_start_menu_items[START_MENU_NUM_ITEMS] = {
-    { "Terminal",     "/bin/terminal.elf", ">_", 0xFF5E81AC },
-    { "File Manager", "/bin/filemgr.elf",  "FM", 0xFFD08770 },
-    { "Notepad",      "/bin/notepad.elf",  "NP", 0xFFA3BE8C },
-    { "Calculator",   "/bin/calc.elf",     "+-", 0xFFEBCB8B },
-    { "Task Manager", "/bin/taskmgr.elf",  "TM", 0xFF81A1C1 },
+    { "Terminal",     "/bin/terminal.elf", ">_" },
+    { "File Manager", "/bin/filemgr.elf",  "FM" },
+    { "Notepad",      "/bin/notepad.elf",  "NP" },
+    { "Calculator",   "/bin/calc.elf",     "+-" },
+    { "Task Manager", "/bin/taskmgr.elf",  "TM" },
 };
+
+static inline uint32_t shell_get_badge_color(int index)
+{
+    switch (index) {
+    case 0: return g_theme->accent_pressed;
+    case 1: return g_theme->accent;
+    case 2: return g_theme->success;
+    case 3: return g_theme->warning;
+    case 4: return g_theme->accent_hover;
+    default: return g_theme->accent;
+    }
+}
 
 static void shell_spawn_app(const char *path)
 {
@@ -160,18 +171,18 @@ void shell_render_start_menu(vanilla_server_t *srv, const vanilla_rect_t *dirty)
         return;
 
     /* Panel background */
-    blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_panel, 0xFF2E3440);
+    blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_panel, g_theme->bg_base);
 
     /* 1px top border and right border */
     vanilla_rect_t top_border = { sm_x, sm_y, sm_w, 1 };
     vanilla_rect_t vis_top;
     if (vanilla_rect_intersect(&top_border, dirty, &vis_top))
-        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_top, 0xFF4C566A);
+        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_top, g_theme->border);
 
     vanilla_rect_t right_border = { sm_x + sm_w - 1, sm_y, 1, sm_h };
     vanilla_rect_t vis_right;
     if (vanilla_rect_intersect(&right_border, dirty, &vis_right))
-        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_right, 0xFF4C566A);
+        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_right, g_theme->border);
 
     /* Render Start Menu items */
     for (int i = 0; i < START_MENU_NUM_ITEMS; i++) {
@@ -187,17 +198,17 @@ void shell_render_start_menu(vanilla_server_t *srv, const vanilla_rect_t *dirty)
         vanilla_rect_t badge_rect = { item_rect.x + 4, item_rect.y + 3, 18, 18 };
         vanilla_rect_t vis_badge;
         if (vanilla_rect_intersect(&badge_rect, dirty, &vis_badge)) {
-            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_badge, item->badge_color);
+            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_badge, shell_get_badge_color(i));
             if (comp->font.info) {
                 font_draw_text(comp->backbuffer, comp->pitch_px, &vis_badge, &comp->font,
-                               item->badge, badge_rect.x + 2, badge_rect.y + 4, 10, 0xFFECEFF4);
+                               item->badge, badge_rect.x + 2, badge_rect.y + 4, 10, g_theme->fg_primary);
             }
         }
 
         /* Item title text */
         if (comp->font.info) {
             font_draw_text(comp->backbuffer, comp->pitch_px, &vis_item, &comp->font,
-                           item->title, item_rect.x + 28, item_rect.y + 6, 12, 0xFFECEFF4);
+                           item->title, item_rect.x + 28, item_rect.y + 6, 12, g_theme->fg_primary);
         }
     }
 }
@@ -214,24 +225,24 @@ void shell_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
     vanilla_rect_t tb_rect = { 0, screen_h - TASKBAR_HEIGHT, screen_w, TASKBAR_HEIGHT };
     vanilla_rect_t vis_tb;
     if (vanilla_rect_intersect(&tb_rect, dirty, &vis_tb)) {
-        /* Taskbar panel background: Nord Polar Night */
-        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_tb, 0xFF242933);
+        /* Taskbar panel background */
+        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_tb, g_theme->taskbar_bg);
 
         /* 1px top border line */
         vanilla_rect_t border_rect = { 0, screen_h - TASKBAR_HEIGHT, screen_w, 1 };
         vanilla_rect_t vis_border;
         if (vanilla_rect_intersect(&border_rect, dirty, &vis_border))
-            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_border, 0xFF4C566A);
+            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_border, g_theme->border);
 
         /* Start button */
         vanilla_rect_t start_rect = { TASKBAR_START_X, screen_h - TASKBAR_HEIGHT + 4, TASKBAR_START_W, TASKBAR_START_H };
         vanilla_rect_t vis_start;
         if (vanilla_rect_intersect(&start_rect, dirty, &vis_start)) {
-            uint32_t btn_color = srv->shell.start_menu_open ? 0xFF81A1C1 : 0xFF5E81AC;
+            uint32_t btn_color = srv->shell.start_menu_open ? g_theme->accent_hover : g_theme->accent_pressed;
             blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_start, btn_color);
             if (comp->font.info) {
                 font_draw_text(comp->backbuffer, comp->pitch_px, &vis_start, &comp->font,
-                               "Start", start_rect.x + 14, start_rect.y + 7, 13, 0xFFECEFF4);
+                               "Start", start_rect.x + 14, start_rect.y + 7, 13, g_theme->taskbar_text);
             }
         }
 
@@ -249,19 +260,19 @@ void shell_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
             vanilla_rect_t pill_rect = { px, screen_h - TASKBAR_HEIGHT + 4, TASKBAR_PILL_W, TASKBAR_PILL_H };
             vanilla_rect_t vis_pill;
             if (vanilla_rect_intersect(&pill_rect, dirty, &vis_pill)) {
-                uint32_t bg = win->is_focused ? 0xFF4C566A : (win->is_mapped ? 0xFF2E3440 : 0xFF21252B);
+                uint32_t bg = win->is_focused ? g_theme->taskbar_item_open : (win->is_mapped ? g_theme->bg_base : g_theme->taskbar_bg);
                 blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_pill, bg);
 
                 if (win->is_focused) {
                     vanilla_rect_t ind = { pill_rect.x + 2, pill_rect.y + pill_rect.h - 2, pill_rect.w - 4, 2 };
                     vanilla_rect_t vis_ind;
                     if (vanilla_rect_intersect(&ind, dirty, &vis_ind))
-                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_ind, 0xFF88C0D0);
+                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_ind, g_theme->taskbar_item_active);
                 }
 
                 if (comp->font.info) {
                     const char *title = win->title[0] ? win->title : "App";
-                    uint32_t fg = win->is_focused ? 0xFFECEFF4 : (win->is_mapped ? 0xFFD8DEE9 : 0xFF7B88A1);
+                    uint32_t fg = win->is_focused ? g_theme->fg_primary : (win->is_mapped ? g_theme->fg_muted : g_theme->fg_dim);
                     font_draw_text(comp->backbuffer, comp->pitch_px, &vis_pill, &comp->font,
                                    title, pill_rect.x + 8, pill_rect.y + 7, 12, fg);
                 }
@@ -273,10 +284,10 @@ void shell_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
         vanilla_rect_t clock_rect = { screen_w - TASKBAR_CLOCK_W - 4, screen_h - TASKBAR_HEIGHT + 4, TASKBAR_CLOCK_W, TASKBAR_CLOCK_H };
         vanilla_rect_t vis_clock;
         if (vanilla_rect_intersect(&clock_rect, dirty, &vis_clock)) {
-            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_clock, 0xFF2E3440);
+            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_clock, g_theme->bg_base);
             if (comp->font.info) {
                 font_draw_text(comp->backbuffer, comp->pitch_px, &vis_clock, &comp->font,
-                               srv->shell.clock_str, clock_rect.x + 16, clock_rect.y + 7, 12, 0xFFECEFF4);
+                               srv->shell.clock_str, clock_rect.x + 16, clock_rect.y + 7, 12, g_theme->taskbar_text);
             }
         }
     }

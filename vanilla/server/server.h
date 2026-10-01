@@ -131,6 +131,7 @@ void wm_raise_window(vanilla_server_t *srv, uint32_t window_id);
 void wm_lower_window(vanilla_server_t *srv, uint32_t window_id);
 void wm_get_frame_rect(const vanilla_server_window_t *win, vanilla_rect_t *out_frame);
 void wm_invalidate_window(vanilla_server_t *srv, const vanilla_server_window_t *win);
+void vanilla_server_broadcast_theme_changed(vanilla_server_t *srv);
 
 /* Window tiling, input dispatch, and cursor rendering */
 void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type);

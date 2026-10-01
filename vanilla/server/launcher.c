@@ -25,17 +25,33 @@
 #include <stdio.h>
 
 static const vanilla_app_entry_t g_launcher_apps[] = {
-    { "Terminal",        "Tsukasa interactive shell",  "/bin/terminal.elf", 0xFF5E81AC },
-    { "Notepad",         "Simple text editor",         "/bin/notepad.elf",  0xFFA3BE8C },
-    { "Calculator",      "Basic math calculator",      "/bin/calc.elf",     0xFFEBCB8B },
-    { "File Manager",    "Browse directory files",     "/bin/filemgr.elf",  0xFFD08770 },
-    { "Task Manager",    "Inspect and manage processes", "/bin/taskmgr.elf", 0xFF81A1C1 },
-    { "System Fetch",    "Display system information", "/bin/sysfetch",     0xFFB48EAD },
-    { "Settings",        "Desktop and system config",  "/bin/settings.elf", 0xFF88C0D0 },
-    { "Process Viewer",  "Inspect running processes",  "/bin/ps",           0xFF81A1C1 },
-    { "Network Info",    "Network status and sockets", "/bin/net",          0xFF8FBCBB },
+    { "Terminal",        "Tsukasa interactive shell",  "/bin/terminal.elf", 0 },
+    { "Notepad",         "Simple text editor",         "/bin/notepad.elf",  0 },
+    { "Calculator",      "Basic math calculator",      "/bin/calc.elf",     0 },
+    { "File Manager",    "Browse directory files",     "/bin/filemgr.elf",  0 },
+    { "Task Manager",    "Inspect and manage processes", "/bin/taskmgr.elf", 0 },
+    { "System Fetch",    "Display system information", "/bin/sysfetch",     0 },
+    { "Settings",        "Desktop and system config",  "/bin/settings.elf", 0 },
+    { "Process Viewer",  "Inspect running processes",  "/bin/ps",           0 },
+    { "Network Info",    "Network status and sockets", "/bin/net",          0 },
 };
 #define LAUNCHER_NUM_BUILTIN_APPS (int)(sizeof(g_launcher_apps) / sizeof(g_launcher_apps[0]))
+
+static inline uint32_t launcher_get_icon_color(int app_index)
+{
+    switch (app_index) {
+    case 0: return g_theme->accent_pressed;
+    case 1: return g_theme->success;
+    case 2: return g_theme->warning;
+    case 3: return g_theme->accent;
+    case 4: return g_theme->accent_hover;
+    case 5: return g_theme->accent_pressed;
+    case 6: return g_theme->accent;
+    case 7: return g_theme->accent_hover;
+    case 8: return g_theme->accent;
+    default: return g_theme->accent;
+    }
+}
 
 static inline char to_lower(char c)
 {
@@ -354,36 +370,36 @@ void launcher_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
     /* Drop shadow behind modal */
     blt_drop_shadow(comp->backbuffer, comp->pitch_px, comp->width, comp->height, &modal_rect, dirty, 12, 160);
 
-    /* Background panel: Nord Dark */
-    blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_modal, 0xFF2E3440);
+    /* Background panel */
+    blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_modal, g_theme->bg_base);
 
-    /* 2px cyan border */
+    /* 2px border */
     vanilla_rect_t b_top = { lx, ly, LAUNCHER_WIDTH, 2 };
     vanilla_rect_t vis_b;
     if (vanilla_rect_intersect(&b_top, dirty, &vis_b))
-        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, 0xFF88C0D0);
+        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border_focus);
     vanilla_rect_t b_bot = { lx, ly + LAUNCHER_HEIGHT - 2, LAUNCHER_WIDTH, 2 };
     if (vanilla_rect_intersect(&b_bot, dirty, &vis_b))
-        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, 0xFF88C0D0);
+        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border_focus);
     vanilla_rect_t b_left = { lx, ly, 2, LAUNCHER_HEIGHT };
     if (vanilla_rect_intersect(&b_left, dirty, &vis_b))
-        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, 0xFF88C0D0);
+        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border_focus);
     vanilla_rect_t b_right = { lx + LAUNCHER_WIDTH - 2, ly, 2, LAUNCHER_HEIGHT };
     if (vanilla_rect_intersect(&b_right, dirty, &vis_b))
-        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, 0xFF88C0D0);
+        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border_focus);
 
     /* Search input box */
     vanilla_rect_t sbox = { lx + 12, ly + 12, LAUNCHER_WIDTH - 24, 32 };
     vanilla_rect_t vis_sbox;
     if (vanilla_rect_intersect(&sbox, dirty, &vis_sbox)) {
-        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_sbox, 0xFF3B4252);
+        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_sbox, g_theme->bg_elevated);
         if (comp->font.info) {
             if (srv->launcher.query_len > 0) {
                 font_draw_text(comp->backbuffer, comp->pitch_px, &vis_sbox, &comp->font,
-                               srv->launcher.query, sbox.x + 8, sbox.y + 9, 13, 0xFFECEFF4);
+                               srv->launcher.query, sbox.x + 8, sbox.y + 9, 13, g_theme->fg_primary);
             } else {
                 font_draw_text(comp->backbuffer, comp->pitch_px, &vis_sbox, &comp->font,
-                               "Type to search apps...", sbox.x + 8, sbox.y + 9, 13, 0xFF4C566A);
+                               "Type to search apps...", sbox.x + 8, sbox.y + 9, 13, g_theme->fg_muted);
             }
         }
     }
@@ -400,7 +416,7 @@ void launcher_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
         if (!vanilla_rect_intersect(&item_rect, dirty, &vis_item))
             continue;
 
-        uint32_t bg = (i == srv->launcher.selected_idx) ? 0xFF434C5E : 0xFF2E3440;
+        uint32_t bg = (i == srv->launcher.selected_idx) ? g_theme->bg_elevated : g_theme->bg_base;
         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_item, bg);
 
         /* Selection left accent line */
@@ -408,23 +424,23 @@ void launcher_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
             vanilla_rect_t sel_acc = { item_rect.x, item_rect.y, 3, item_rect.h };
             vanilla_rect_t vis_acc;
             if (vanilla_rect_intersect(&sel_acc, dirty, &vis_acc))
-                blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_acc, 0xFF88C0D0);
+                blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_acc, g_theme->accent);
         }
 
         /* App icon badge */
         vanilla_rect_t icon_rect = { item_rect.x + 8, item_rect.y + 8, 16, 16 };
         vanilla_rect_t vis_icon;
         if (vanilla_rect_intersect(&icon_rect, dirty, &vis_icon))
-            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_icon, app->icon_color);
+            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_icon, launcher_get_icon_color(app_idx));
 
         if (comp->font.info) {
             /* App Name */
             font_draw_text(comp->backbuffer, comp->pitch_px, &vis_item, &comp->font,
-                           app->name, item_rect.x + 32, item_rect.y + 9, 13, 0xFFECEFF4);
+                           app->name, item_rect.x + 32, item_rect.y + 9, 13, g_theme->fg_primary);
 
             /* App Description */
             font_draw_text(comp->backbuffer, comp->pitch_px, &vis_item, &comp->font,
-                           app->description, item_rect.x + 140, item_rect.y + 9, 11, 0xFF98A2B3);
+                           app->description, item_rect.x + 140, item_rect.y + 9, 11, g_theme->fg_dim);
         }
     }
 }

@@ -279,9 +279,9 @@ void app_draw_text_scale(vanilla_surface_t *surf, int32_t x, int32_t y, const ch
 void app_draw_button(vanilla_surface_t *surf, int32_t x, int32_t y, int32_t w, int32_t h,
                      const char *text, int is_pressed)
 {
-    uint32_t bg_col = is_pressed ? APP_COLOR_CARD : APP_COLOR_SURFACE;
-    uint32_t border_col = is_pressed ? APP_COLOR_PRIMARY : APP_COLOR_BORDER;
-    uint32_t text_col = is_pressed ? APP_COLOR_WHITE : APP_COLOR_TEXT;
+    uint32_t bg_col = is_pressed ? g_theme->accent_pressed : g_theme->bg_elevated;
+    uint32_t border_col = is_pressed ? g_theme->accent : g_theme->border;
+    uint32_t text_col = g_theme->fg_primary;
 
     app_fill_rect(surf, x, y, w, h, bg_col);
     app_draw_rect(surf, x, y, w, h, border_col);
@@ -306,7 +306,7 @@ void app_draw_progress_bar(vanilla_surface_t *surf, int32_t x, int32_t y, int32_
     if (progress_pct > 100) progress_pct = 100;
 
     app_fill_rect(surf, x, y, w, h, bg_color);
-    app_draw_rect(surf, x, y, w, h, APP_COLOR_BORDER);
+    app_draw_rect(surf, x, y, w, h, g_theme->border);
 
     int fill_w = ((w - 2) * progress_pct) / 100;
     if (fill_w > 0)
