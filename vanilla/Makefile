@@ -164,7 +164,7 @@ $(TEST_LAYOUT_BIN): $(CRT0) $(TEST_LAYOUT_OBJS) $(LIBVANILLALAYOUT_A) $(LIBVANIL
 	@mkdir -p $(BIN_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) $(TEST_LAYOUT_OBJS) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-build/test_layout: layout/test_layout.c layout/layout.c layout/draw_consumer.c apps/app_common.c server/blitter.c
+build/test_layout: layout/test_layout.c layout/layout.c layout/draw_consumer.c apps/app_common.c server/blitter.c server/theme.c
 	@mkdir -p build
 	gcc -O2 -Iinclude -I../tsukasa-libc/include -Iinput -Iserver -Iapps -DVANILLA_HOST -o $@ $^ -lm
 

@@ -325,8 +325,10 @@ static int test_draw_command_execution(void)
 
     /* Verify background filled */
     TEST_ASSERT(pixels[0] == 0xFF112233, "pixel 0 background color mismatch");
-    /* Verify rounded rect painted in clipped area */
-    TEST_ASSERT(pixels[8 * 64 + 8] == 0xFF445566, "rounded rect pixel mismatch");
+    /* Verify rounded rect painted in clipped area (interior pixel at x=12, y=12) */
+    TEST_ASSERT(pixels[12 * 64 + 12] == 0xFF445566, "rounded rect interior pixel mismatch");
+    /* Verify corner pixel (8,8) was anti-aliased/rounded out (not square) */
+    TEST_ASSERT(pixels[8 * 64 + 8] != 0xFF445566, "rounded rect corner was not rounded");
     /* Verify 3-pixel border painted */
     TEST_ASSERT(pixels[8 * 64 + 30] == 0xFF778899, "border pixel outer mismatch");
     TEST_ASSERT(pixels[9 * 64 + 31] == 0xFF778899, "border pixel inner thickness mismatch");
