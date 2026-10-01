@@ -173,13 +173,14 @@ void shell_render_start_menu(vanilla_server_t *srv, const vanilla_rect_t *dirty)
     /* Panel background */
     blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_panel, g_theme->bg_base);
 
-    /* 1px top border and right border */
-    vanilla_rect_t top_border = { sm_x, sm_y, sm_w, 1 };
+    /* Top border and right border */
+    int32_t sm_bw = g_theme->border_width;
+    vanilla_rect_t top_border = { sm_x, sm_y, sm_w, sm_bw };
     vanilla_rect_t vis_top;
     if (vanilla_rect_intersect(&top_border, dirty, &vis_top))
         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_top, g_theme->border);
 
-    vanilla_rect_t right_border = { sm_x + sm_w - 1, sm_y, 1, sm_h };
+    vanilla_rect_t right_border = { sm_x + sm_w - sm_bw, sm_y, sm_bw, sm_h };
     vanilla_rect_t vis_right;
     if (vanilla_rect_intersect(&right_border, dirty, &vis_right))
         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_right, g_theme->border);
@@ -230,8 +231,9 @@ void shell_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
         /* Taskbar panel background */
         blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_tb, g_theme->taskbar_bg);
 
-        /* 1px top border line */
-        vanilla_rect_t border_rect = { 0, screen_h - TASKBAR_HEIGHT, screen_w, 1 };
+        /* Top border line */
+        int32_t tb_bw = g_theme->border_width;
+        vanilla_rect_t border_rect = { 0, screen_h - TASKBAR_HEIGHT, screen_w, tb_bw };
         vanilla_rect_t vis_border;
         if (vanilla_rect_intersect(&border_rect, dirty, &vis_border))
             blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_border, g_theme->border);

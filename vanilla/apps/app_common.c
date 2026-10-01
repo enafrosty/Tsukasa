@@ -280,7 +280,7 @@ void app_draw_text_scale(vanilla_surface_t *surf, int32_t x, int32_t y, const ch
     while (*text) {
         if (*text == '\n') {
             cur_x = x;
-            y += 8 * scale + 2;
+            y += 10 * scale;
         } else {
             app_draw_char_scale(surf, cur_x, y, *text, scale, color);
             cur_x += 8 * scale;

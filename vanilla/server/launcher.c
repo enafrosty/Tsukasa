@@ -335,7 +335,7 @@ int launcher_handle_click(vanilla_server_t *srv, int32_t x, int32_t y, uint32_t 
         return 1;
     }
 
-    int32_t item_start_y = ly + THEME_PX(56);
+    int32_t item_start_y = ly + THEME_PX(54);
     for (int i = 0; i < srv->launcher.match_count && i < 5; i++) {
         int32_t iy = item_start_y + i * LAUNCHER_ITEM_HEIGHT;
         if (x >= lx + THEME_PX(12) && x < lx + LAUNCHER_WIDTH - THEME_PX(12) &&
