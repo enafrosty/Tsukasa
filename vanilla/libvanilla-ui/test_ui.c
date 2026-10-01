@@ -46,10 +46,49 @@ static void on_test_btn_click(ui_widget_t *w, const ui_event_t *ev, void *ud)
 static int s_checkbox_val = -1;
 static void on_test_checkbox(ui_widget_t *w, const ui_event_t *ev, void *ud)
 {
-    (void)w;
-    (void)ud;
+    (void)w; (void)ud;
     if (ev->type == UI_EVENT_VALUE_CHANGED)
         s_checkbox_val = ev->toggle.state;
+}
+
+static int s_tab_val = -1;
+static void on_test_tab(ui_widget_t *w, const ui_event_t *ev, void *ud)
+{
+    (void)w; (void)ud;
+    if (ev->type == UI_EVENT_VALUE_CHANGED)
+        s_tab_val = ev->toggle.state;
+}
+
+static float s_slider_val = -1.0f;
+static void on_test_slider(ui_widget_t *w, const ui_event_t *ev, void *ud)
+{
+    (void)w; (void)ud;
+    if (ev->type == UI_EVENT_VALUE_CHANGED)
+        s_slider_val = ev->slider.value;
+}
+
+static int s_list_val = -1;
+static void on_test_list(ui_widget_t *w, const ui_event_t *ev, void *ud)
+{
+    (void)w; (void)ud;
+    if (ev->type == UI_EVENT_VALUE_CHANGED)
+        s_list_val = ev->toggle.state;
+}
+
+static int s_menu_val = -1;
+static void on_test_menu(ui_widget_t *w, const ui_event_t *ev, void *ud)
+{
+    (void)w; (void)ud;
+    if (ev->type == UI_EVENT_VALUE_CHANGED)
+        s_menu_val = ev->toggle.state;
+}
+
+static int s_modal_clicked = 0;
+static void on_test_modal(ui_widget_t *w, const ui_event_t *ev, void *ud)
+{
+    (void)w; (void)ud;
+    if (ev->type == UI_EVENT_CLICK)
+        s_modal_clicked++;
 }
 
 static int test_ui_tree_and_focus(void)
@@ -117,6 +156,69 @@ static int test_ui_tree_and_focus(void)
     iev.value = 1;
     ui_handle_event(ctx, root, &iev);
     TEST_ASSERT(s_btn_clicked == 1, "space activates focused button");
+
+    /* Enter on focused button */
+    iev.code = KEY_ENTER;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(s_btn_clicked == 2, "enter activates focused button");
+
+    /* Shift+Tab backwards navigation */
+    ctx->shift_down = 1;
+    iev.code = KEY_TAB;
+    ui_handle_event(ctx, root, &iev);
+    ctx->shift_down = 0;
+    TEST_ASSERT(ui_get_focused(ctx) == tf, "shift+tab wraps backward to tf");
+
+    /* Collapsed subtree skipping */
+    ui_widget_t *hidden_box = ui_box(ctx, VDIR_COLUMN);
+    hidden_box->layout_elem->h_mode = VSIZE_FIXED;
+    hidden_box->layout_elem->h_px = 0;
+    hidden_box->layout_elem->clip_children = 1;
+    hidden_box->layout_elem->computed_w = 0;
+    hidden_box->layout_elem->computed_h = 0;
+    ui_widget_t *hidden_btn = ui_button(ctx, "Hidden", NULL, NULL);
+    ui_widget_add_child(hidden_box, hidden_btn);
+    ui_widget_add_child(root, hidden_box);
+
+    ui_widget_set_focus(ctx, tf);
+    ui_focus_next(ctx, root);
+    TEST_ASSERT(ui_get_focused(ctx) == btn1, "tab skips collapsed subtree to btn1");
+
+    /* Tab bar keyboard navigation */
+    const char *test_tabs[] = { "Tab0", "Tab1", "Tab2" };
+    ui_widget_t *tb = ui_tab_bar(ctx, test_tabs, 3, on_test_tab, NULL);
+    ui_widget_add_child(root, tb);
+    ui_widget_set_focus(ctx, tb);
+    s_tab_val = -1;
+    iev.code = KEY_RIGHT;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(tb->tab_bar.active_tab == 1, "tab_bar right arrow moves to tab 1");
+    TEST_ASSERT(s_tab_val == 1, "tab_bar event fired with tab 1");
+    iev.code = KEY_LEFT;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(tb->tab_bar.active_tab == 0, "tab_bar left arrow moves to tab 0");
+    TEST_ASSERT(s_tab_val == 0, "tab_bar event fired with tab 0");
+
+    /* Slider keyboard navigation */
+    ui_widget_t *sl = ui_slider(ctx, 50.0f, 0.0f, 100.0f, on_test_slider, NULL);
+    ui_widget_add_child(root, sl);
+    ui_widget_set_focus(ctx, sl);
+    s_slider_val = -1.0f;
+    iev.code = KEY_RIGHT;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(sl->slider.value > 50.0f, "slider right arrow increments value");
+    TEST_ASSERT(s_slider_val == sl->slider.value, "slider callback received incremented value");
+
+    /* List keyboard navigation */
+    const char *test_items[] = { "A", "B", "C" };
+    ui_widget_t *lst = ui_list(ctx, test_items, 3, on_test_list, NULL);
+    ui_widget_add_child(root, lst);
+    ui_widget_set_focus(ctx, lst);
+    s_list_val = -1;
+    iev.code = KEY_DOWN;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(lst->list.selected == 1, "list down arrow moves selection to 1");
+    TEST_ASSERT(s_list_val == 1, "list callback received selection 1");
 
     PASS("tree_and_focus");
     return 0;
@@ -189,6 +291,53 @@ static int test_ui_text_field(void)
     TEST_ASSERT(strcmp(tf->text_field.buf, "halo") == 0, "typing replaced selection");
     TEST_ASSERT(tf->text_field.sel_start == -1, "selection cleared");
 
+    /* End key moves cursor to length */
+    iev.code = KEY_END;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(tf->text_field.cursor_pos == 4, "end key moves cursor to end");
+
+    /* Delete at end of buffer does not crash */
+    iev.code = KEY_DELETE;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(tf->text_field.cursor_pos == 4, "delete at end keeps cursor");
+    TEST_ASSERT(strcmp(tf->text_field.buf, "halo") == 0, "delete at end preserves content");
+
+    /* Home and Backspace at 0 does not underflow */
+    iev.code = KEY_HOME;
+    ui_handle_event(ctx, root, &iev);
+    iev.code = KEY_BACKSPACE;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(tf->text_field.cursor_pos == 0, "backspace at start keeps cursor at 0");
+    TEST_ASSERT(strcmp(tf->text_field.buf, "halo") == 0, "backspace at start preserves content");
+
+    /* Buffer capacity test: fill buffer to 255 chars */
+    for (int i = (int)strlen(tf->text_field.buf); i < 255; i++) {
+        tf->text_field.buf[i] = 'x';
+        tf->text_field.cursor_pos = i + 1;
+    }
+    tf->text_field.buf[255] = '\0';
+    TEST_ASSERT(strlen(tf->text_field.buf) == 255, "buffer filled to 255 chars");
+
+    /* Attempt inserting 256th char -> must be rejected without buffer overflow */
+    iev.code = KEY_Z;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(strlen(tf->text_field.buf) == 255, "256th char rejected, buffer stayed at 255");
+    TEST_ASSERT(tf->text_field.buf[255] == '\0', "buffer null terminator intact");
+
+    /* Mouse click cursor positioning */
+    tf->text_field.buf[0] = 'A';
+    tf->text_field.buf[1] = 'B';
+    tf->text_field.buf[2] = 'C';
+    tf->text_field.buf[3] = '\0';
+    tf->layout_elem->computed_x = 50;
+    tf->layout_elem->computed_y = 50;
+    tf->layout_elem->computed_w = 200;
+    tf->layout_elem->computed_h = 28;
+    tf->text_field.scroll_x = 0;
+    /* Click near character 2 (inner_x = 56, char 2 is around 56 + 16 = 72) */
+    ui_text_field_handle_click(tf, 73, 55, 0);
+    TEST_ASSERT(tf->text_field.cursor_pos == 2, "click placed cursor at index 2");
+
     PASS("text_field");
     return 0;
 }
@@ -225,16 +374,21 @@ static int test_ui_widgets_and_render(void)
     ui_widget_t *tb = ui_tab_bar(ctx, tabs, 2, NULL, NULL);
     ui_widget_add_child(root, tb);
 
-    ui_widget_t *dlg = ui_modal_dialog(ctx, "Title", "Body", "OK", NULL, NULL);
+    ui_widget_t *dlg = ui_modal_dialog(ctx, "Title", "Body", "OK", on_test_modal, NULL);
+    if (dlg->layout_elem) {
+        dlg->layout_elem->h_mode = VSIZE_FIXED;
+        dlg->layout_elem->h_px = 200;
+    }
     ui_widget_add_child(root, dlg);
 
     ui_widget_t *tst = ui_toast(ctx, "Notice", 5000);
     ui_widget_add_child(root, tst);
 
-    ui_widget_t *mnu = ui_menu(ctx, items, 3, NULL, NULL);
+    ui_widget_t *mnu = ui_menu(ctx, items, 3, on_test_menu, NULL);
     ui_widget_add_child(root, mnu);
 
     ui_widget_t *scv = ui_scroll_view(ctx);
+    scv->scroll_view.content_h = 1000;
     ui_widget_add_child(root, scv);
 
     /* Allocate dummy surface for rendering */
@@ -267,7 +421,7 @@ static int test_ui_widgets_and_render(void)
     ui_widget_t *hit = ui_hit_test(root, cb_x, cb_y);
     TEST_ASSERT(hit == cb, "hit test found checkbox");
 
-    /* Click checkbox */
+    /* Click checkbox (press + release) */
     struct input_event iev;
     memset(&iev, 0, sizeof(iev));
     iev.type = EV_KEY;
@@ -276,8 +430,53 @@ static int test_ui_widgets_and_render(void)
     iev.pad2 = (uint16_t)cb_y;
     iev.value = 1;
     ui_handle_event(ctx, root, &iev);
-    TEST_ASSERT(cb->checkbox.checked == 1, "checkbox checked on click");
+    TEST_ASSERT(cb->checkbox.checked == 1, "checkbox checked on press");
     TEST_ASSERT(s_checkbox_val == 1, "checkbox callback invoked");
+    iev.value = 0;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(cb->checkbox.checked == 1, "checkbox release maintains state");
+
+    /* Radio exclusivity */
+    int32_t rad2_x = rad2->layout_elem->computed_x + 5;
+    int32_t rad2_y = rad2->layout_elem->computed_y + 5;
+    iev.pad1 = (uint16_t)rad2_x;
+    iev.pad2 = (uint16_t)rad2_y;
+    iev.value = 1;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(rad2->radio.checked == 1, "radio 2 checked on click");
+    TEST_ASSERT(rad1->radio.checked == 0, "radio 1 unchecked when radio 2 clicked");
+    iev.value = 0;
+    ui_handle_event(ctx, root, &iev);
+
+    /* Menu item click */
+    int32_t mnu_x = mnu->layout_elem->computed_x + 10;
+    int32_t mnu_y = mnu->layout_elem->computed_y + 24 + 10; /* Item 1 (row 1) */
+    s_menu_val = -1;
+    iev.pad1 = (uint16_t)mnu_x;
+    iev.pad2 = (uint16_t)mnu_y;
+    iev.value = 1;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(mnu->menu.selected == 1, "menu item 1 selected");
+    TEST_ASSERT(s_menu_val == 1, "menu callback received index 1");
+    iev.value = 0;
+    ui_handle_event(ctx, root, &iev);
+
+    /* Modal dialog OK click on release */
+    int32_t dw = dlg->layout_elem->computed_w;
+    int32_t dh = dlg->layout_elem->computed_h;
+    int32_t cx = dlg->layout_elem->computed_x + (dw - 360) / 2;
+    int32_t cy = dlg->layout_elem->computed_y + (dh - 180) / 2;
+    int32_t ok_x = cx + 360 - 96 + 20;
+    int32_t ok_y = cy + 180 - 40 + 10;
+    s_modal_clicked = 0;
+    iev.pad1 = (uint16_t)ok_x;
+    iev.pad2 = (uint16_t)ok_y;
+    iev.value = 1;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(s_modal_clicked == 0, "modal not triggered on press alone");
+    iev.value = 0;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(s_modal_clicked == 1, "modal triggered on OK button release");
 
     PASS("widgets_and_render");
     return 0;

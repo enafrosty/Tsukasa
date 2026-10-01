@@ -101,8 +101,11 @@ ui_widget_t *ui_alloc_widget(ui_ctx_t *ctx, ui_widget_type_t type)
     w->type = type;
     w->dirty = 1;
 
-    if (ctx->layout_ctx)
+    if (ctx->layout_ctx) {
         w->layout_elem = vlayout_alloc_elem(ctx->layout_ctx);
+        if (!w->layout_elem)
+            return NULL;
+    }
 
     switch (type) {
     case UI_WIDGET_BOX:

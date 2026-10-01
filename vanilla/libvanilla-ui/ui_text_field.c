@@ -55,6 +55,11 @@ static void delete_selection(ui_widget_t *w)
     int s1 = w->text_field.sel_end;
     if (s0 < 0) s0 = 0;
     if (s1 > len) s1 = len;
+    if (s0 >= s1) {
+        w->text_field.sel_start = -1;
+        w->text_field.sel_end = -1;
+        return;
+    }
 
     memmove(&w->text_field.buf[s0], &w->text_field.buf[s1], len - s1 + 1);
     w->text_field.cursor_pos = s0;
@@ -70,6 +75,11 @@ void ui_text_field_handle_key(ui_widget_t *w, const struct input_event *ev, int 
 
     int text_changed = 0;
     int len = (int)strlen(w->text_field.buf);
+    if (w->text_field.cursor_pos < 0)
+        w->text_field.cursor_pos = 0;
+    if (w->text_field.cursor_pos > len)
+        w->text_field.cursor_pos = len;
+
     char ch = vanilla_evdev_to_ascii(ev->code, shift);
 
     if (ch >= 0x20 && ch <= 0x7E) {
@@ -335,8 +345,12 @@ void ui_text_field_emit_draw(ui_widget_t *w, vanilla_draw_cmd_array_t *out)
     int len = (int)strlen(w->text_field.buf);
 
     int32_t cursor_px = w->text_field.cursor_pos * char_w;
-    if (cursor_px - w->text_field.scroll_x > inner_w - char_w)
-        w->text_field.scroll_x = cursor_px - inner_w + char_w + 16;
+    if (cursor_px - w->text_field.scroll_x > inner_w - char_w) {
+        if (inner_w > char_w + 16)
+            w->text_field.scroll_x = cursor_px - inner_w + char_w + 16;
+        else
+            w->text_field.scroll_x = cursor_px;
+    }
     if (cursor_px - w->text_field.scroll_x < 0)
         w->text_field.scroll_x = cursor_px;
     if (w->text_field.scroll_x < 0)

@@ -67,8 +67,10 @@ static void update_active_tab(settings_state_t *st, int tab)
 {
     st->current_tab = tab;
     st->card_sys->layout_elem->h_mode = (tab == 0) ? VSIZE_GROW : VSIZE_FIXED;
+    st->card_sys->layout_elem->h_px = 0;
     st->card_sys->layout_elem->clip_children = (tab != 0);
     st->card_app->layout_elem->h_mode = (tab == 1) ? VSIZE_GROW : VSIZE_FIXED;
+    st->card_app->layout_elem->h_px = 0;
     st->card_app->layout_elem->clip_children = (tab != 1);
     ui_widget_invalidate(st->root);
 }
@@ -125,20 +127,15 @@ int main(int argc, char **argv)
     ui_widget_add_child(content, st.card_app);
 
     update_active_tab(&st, 0);
+    ui_widget_set_focus(ctx, tbar);
 
     int running = 1;
     while (running) {
         vanilla_event_t ev;
         while (vanilla_poll_event(client, &ev) > 0) {
             if (ev.type == VANILLA_EVENT_CLOSE_REQ) { running = 0; break; }
-            if (ev.type == VANILLA_EVENT_INPUT) {
+            if (ev.type == VANILLA_EVENT_INPUT)
                 ui_handle_event(ctx, st.root, &ev.input);
-                if (ev.input.type == EV_KEY && ev.input.value == 1 && (ev.input.code == KEY_TAB || ev.input.code == KEY_LEFT || ev.input.code == KEY_RIGHT)) {
-                    update_active_tab(&st, (st.current_tab == 0) ? 1 : 0);
-                    tbar->tab_bar.active_tab = st.current_tab;
-                    ui_widget_invalidate(tbar);
-                }
-            }
         }
         ui_render(ctx, st.root, &win->surface, NULL);
         vanilla_present(win, NULL);

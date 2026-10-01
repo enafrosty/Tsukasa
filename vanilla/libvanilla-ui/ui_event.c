@@ -82,6 +82,12 @@ static void collect_focusable(ui_widget_t *w, ui_widget_t **list, int *count, in
     if (!w || *count >= max_items)
         return;
 
+    /* Skip subtrees that are explicitly collapsed to 0 size with clipping enabled */
+    if (w->layout_elem && w->layout_elem->clip_children &&
+        (w->layout_elem->computed_w <= 0 || w->layout_elem->computed_h <= 0) &&
+        (w->layout_elem->w_mode == VSIZE_FIXED || w->layout_elem->h_mode == VSIZE_FIXED))
+        return;
+
     if (w->focusable)
         list[(*count)++] = w;
 
@@ -98,8 +104,11 @@ void ui_focus_next(ui_ctx_t *ctx, ui_widget_t *root)
     int count = 0;
     collect_focusable(root, list, &count, 128);
 
-    if (count == 0)
+    if (count == 0) {
+        if (ctx->focused_widget)
+            ui_widget_set_focus(ctx, NULL);
         return;
+    }
 
     int current_idx = -1;
     for (int i = 0; i < count; i++) {
@@ -122,8 +131,11 @@ void ui_focus_prev(ui_ctx_t *ctx, ui_widget_t *root)
     int count = 0;
     collect_focusable(root, list, &count, 128);
 
-    if (count == 0)
+    if (count == 0) {
+        if (ctx->focused_widget)
+            ui_widget_set_focus(ctx, NULL);
         return;
+    }
 
     int current_idx = -1;
     for (int i = 0; i < count; i++) {
@@ -303,22 +315,20 @@ void ui_handle_event(ui_ctx_t *ctx, ui_widget_t *root, const struct input_event 
                     break;
                 }
 
-                case UI_WIDGET_MODAL_DIALOG: {
-                    int32_t bx = target->layout_elem ? target->layout_elem->computed_x : 0;
+                case UI_WIDGET_MODAL_DIALOG:
+                    break;
+
+                case UI_WIDGET_MENU: {
                     int32_t by = target->layout_elem ? target->layout_elem->computed_y : 0;
-                    int32_t bw = target->layout_elem ? target->layout_elem->computed_w : 0;
-                    int32_t bh = target->layout_elem ? target->layout_elem->computed_h : 0;
-                    int32_t cw = 360, ch = 180;
-                    int32_t cx = bx + (bw - cw) / 2;
-                    int32_t cy = by + (bh - ch) / 2;
-                    int32_t btn_x = cx + cw - 96;
-                    int32_t btn_y = cy + ch - 40;
-                    if (mx >= btn_x && mx < btn_x + 80 && my >= btn_y && my < btn_y + 28) {
+                    int32_t row_h = 24;
+                    int32_t item_idx = (my - by) / row_h;
+                    if (item_idx >= 0 && item_idx < target->menu.count) {
+                        target->menu.selected = item_idx;
+                        ui_widget_invalidate(target);
                         ui_event_t out_ev;
-                        out_ev.type = UI_EVENT_CLICK;
+                        out_ev.type = UI_EVENT_VALUE_CHANGED;
                         out_ev.source = target;
-                        out_ev.click.x = mx;
-                        out_ev.click.y = my;
+                        out_ev.toggle.state = item_idx;
                         if (target->on_event)
                             target->on_event(target, &out_ev, target->userdata);
                     }
@@ -342,13 +352,34 @@ void ui_handle_event(ui_ctx_t *ctx, ui_widget_t *root, const struct input_event 
 
                 ui_widget_t *up_target = ui_hit_test(root, mx, my);
                 if (up_target == pw) {
-                    ui_event_t out_ev;
-                    out_ev.type = UI_EVENT_CLICK;
-                    out_ev.source = pw;
-                    out_ev.click.x = mx;
-                    out_ev.click.y = my;
-                    if (pw->on_event)
-                        pw->on_event(pw, &out_ev, pw->userdata);
+                    if (pw->type == UI_WIDGET_BUTTON || pw->type == UI_WIDGET_BOX) {
+                        ui_event_t out_ev;
+                        out_ev.type = UI_EVENT_CLICK;
+                        out_ev.source = pw;
+                        out_ev.click.x = mx;
+                        out_ev.click.y = my;
+                        if (pw->on_event)
+                            pw->on_event(pw, &out_ev, pw->userdata);
+                    } else if (pw->type == UI_WIDGET_MODAL_DIALOG) {
+                        int32_t bx = pw->layout_elem ? pw->layout_elem->computed_x : 0;
+                        int32_t by = pw->layout_elem ? pw->layout_elem->computed_y : 0;
+                        int32_t bw = pw->layout_elem ? pw->layout_elem->computed_w : 0;
+                        int32_t bh = pw->layout_elem ? pw->layout_elem->computed_h : 0;
+                        int32_t cw = 360, ch = 180;
+                        int32_t cx = bx + (bw - cw) / 2;
+                        int32_t cy = by + (bh - ch) / 2;
+                        int32_t btn_x = cx + cw - 96;
+                        int32_t btn_y = cy + ch - 40;
+                        if (mx >= btn_x && mx < btn_x + 80 && my >= btn_y && my < btn_y + 28) {
+                            ui_event_t out_ev;
+                            out_ev.type = UI_EVENT_CLICK;
+                            out_ev.source = pw;
+                            out_ev.click.x = mx;
+                            out_ev.click.y = my;
+                            if (pw->on_event)
+                                pw->on_event(pw, &out_ev, pw->userdata);
+                        }
+                    }
                 }
             }
         }
@@ -367,9 +398,11 @@ void ui_handle_event(ui_ctx_t *ctx, ui_widget_t *root, const struct input_event 
         return;
 
     ui_widget_t *fw = ctx->focused_widget;
+    int consumed = 0;
 
     if (fw->type == UI_WIDGET_BUTTON) {
         if (ev->code == KEY_SPACE || ev->code == KEY_ENTER || ev->code == KEY_KPENTER) {
+            consumed = 1;
             if (ev->value == 1) {
                 fw->button.pressed = 1;
                 ui_widget_invalidate(fw);
@@ -387,6 +420,7 @@ void ui_handle_event(ui_ctx_t *ctx, ui_widget_t *root, const struct input_event 
         }
     } else if (fw->type == UI_WIDGET_CHECKBOX) {
         if ((ev->code == KEY_SPACE || ev->code == KEY_ENTER) && ev->value == 1) {
+            consumed = 1;
             fw->checkbox.checked ^= 1;
             ui_widget_invalidate(fw);
             ui_event_t out_ev;
@@ -398,6 +432,7 @@ void ui_handle_event(ui_ctx_t *ctx, ui_widget_t *root, const struct input_event 
         }
     } else if (fw->type == UI_WIDGET_RADIO) {
         if ((ev->code == KEY_SPACE || ev->code == KEY_ENTER) && ev->value == 1) {
+            consumed = 1;
             fw->radio.checked = 1;
             uncheck_radio_group(root, fw->radio.group_id, fw);
             ui_widget_invalidate(fw);
@@ -408,11 +443,62 @@ void ui_handle_event(ui_ctx_t *ctx, ui_widget_t *root, const struct input_event 
             if (fw->on_event)
                 fw->on_event(fw, &out_ev, fw->userdata);
         }
+    } else if (fw->type == UI_WIDGET_TAB_BAR) {
+        if (ev->value == 1 && (ev->code == KEY_LEFT || ev->code == KEY_RIGHT)) {
+            consumed = 1;
+            int count = fw->tab_bar.tab_count > 0 ? fw->tab_bar.tab_count : 1;
+            if (ev->code == KEY_LEFT)
+                fw->tab_bar.active_tab = (fw->tab_bar.active_tab - 1 + count) % count;
+            else
+                fw->tab_bar.active_tab = (fw->tab_bar.active_tab + 1) % count;
+            ui_widget_invalidate(fw);
+            ui_event_t out_ev;
+            out_ev.type = UI_EVENT_VALUE_CHANGED;
+            out_ev.source = fw;
+            out_ev.toggle.state = fw->tab_bar.active_tab;
+            if (fw->on_event)
+                fw->on_event(fw, &out_ev, fw->userdata);
+        }
+    } else if (fw->type == UI_WIDGET_SLIDER) {
+        if (ev->value == 1 && (ev->code == KEY_LEFT || ev->code == KEY_RIGHT || ev->code == KEY_UP || ev->code == KEY_DOWN)) {
+            consumed = 1;
+            float step = (fw->slider.max_val - fw->slider.min_val) * 0.05f;
+            if (step <= 0.0f) step = 1.0f;
+            if (ev->code == KEY_LEFT || ev->code == KEY_DOWN)
+                fw->slider.value -= step;
+            else
+                fw->slider.value += step;
+            if (fw->slider.value < fw->slider.min_val) fw->slider.value = fw->slider.min_val;
+            if (fw->slider.value > fw->slider.max_val) fw->slider.value = fw->slider.max_val;
+            ui_widget_invalidate(fw);
+            ui_event_t out_ev;
+            out_ev.type = UI_EVENT_VALUE_CHANGED;
+            out_ev.source = fw;
+            out_ev.slider.value = fw->slider.value;
+            if (fw->on_event)
+                fw->on_event(fw, &out_ev, fw->userdata);
+        }
+    } else if (fw->type == UI_WIDGET_LIST) {
+        if (ev->value == 1 && (ev->code == KEY_UP || ev->code == KEY_DOWN)) {
+            consumed = 1;
+            if (ev->code == KEY_UP && fw->list.selected > 0)
+                fw->list.selected--;
+            else if (ev->code == KEY_DOWN && fw->list.selected < fw->list.count - 1)
+                fw->list.selected++;
+            ui_widget_invalidate(fw);
+            ui_event_t out_ev;
+            out_ev.type = UI_EVENT_VALUE_CHANGED;
+            out_ev.source = fw;
+            out_ev.toggle.state = fw->list.selected;
+            if (fw->on_event)
+                fw->on_event(fw, &out_ev, fw->userdata);
+        }
     } else if (fw->type == UI_WIDGET_TEXT_FIELD) {
+        consumed = 1;
         ui_text_field_handle_key(fw, ev, ctx->shift_down, ctx->ctrl_down);
     }
 
-    if (ev->value == 1) {
+    if (!consumed && ev->value == 1) {
         ui_event_t kev;
         kev.type = UI_EVENT_KEY_DOWN;
         kev.source = fw;

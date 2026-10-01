@@ -48,8 +48,9 @@ ui_widget_t *ui_button(ui_ctx_t *ctx, const char *label, ui_event_cb_t cb, void 
 
     if (w->layout_elem && label) {
         int len = (int)strlen(label);
+        int calc_w = len * 8 + w->layout_elem->pad_left + w->layout_elem->pad_right;
         w->layout_elem->w_mode = VSIZE_FIXED;
-        w->layout_elem->w_px = len * 8 + w->layout_elem->pad_left + w->layout_elem->pad_right;
+        w->layout_elem->w_px = calc_w > 64 ? calc_w : 64;
     }
 
     return w;
@@ -218,6 +219,22 @@ ui_widget_t *ui_menu(ui_ctx_t *ctx, const char **items, int32_t count,
     w->on_event = cb;
     w->userdata = ud;
 
+    if (w->layout_elem) {
+        int max_len = 0;
+        for (int i = 0; i < count; i++) {
+            if (items && items[i]) {
+                int l = (int)strlen(items[i]);
+                if (l > max_len) max_len = l;
+            }
+        }
+        int menu_w = max_len * 8 + 32;
+        if (menu_w < 120) menu_w = 120;
+        w->layout_elem->w_mode = VSIZE_FIXED;
+        w->layout_elem->w_px = menu_w;
+        w->layout_elem->h_mode = VSIZE_FIXED;
+        w->layout_elem->h_px = count * 24;
+    }
+
     return w;
 }
 
@@ -230,6 +247,9 @@ void ui_widget_emit_draw(ui_widget_t *w, vanilla_draw_cmd_array_t *out)
     int32_t y = w->layout_elem->computed_y;
     int32_t width = w->layout_elem->computed_w;
     int32_t height = w->layout_elem->computed_h;
+
+    if (width <= 0 || height <= 0)
+        return;
 
     uint32_t bg_base = g_theme ? g_theme->bg_base : 0xFF2E3440u;
     uint32_t bg_elevated = g_theme ? g_theme->bg_elevated : 0xFF3B4252u;
@@ -565,6 +585,26 @@ void ui_widget_emit_draw(ui_widget_t *w, vanilla_draw_cmd_array_t *out)
     }
 
     case UI_WIDGET_SCROLL_VIEW:
+        if (w->scroll_view.content_h > height && height > 16) {
+            int32_t sb_w = 4;
+            int32_t sb_x = x + width - sb_w - 2;
+            int32_t thumb_h = (height * height) / w->scroll_view.content_h;
+            if (thumb_h < 12) thumb_h = 12;
+            int32_t max_scroll = w->scroll_view.content_h - height;
+            int32_t scroll_y = w->scroll_view.scroll_y;
+            if (scroll_y < 0) scroll_y = 0;
+            if (scroll_y > max_scroll) scroll_y = max_scroll;
+            int32_t thumb_y = y + (scroll_y * (height - thumb_h)) / (max_scroll > 0 ? max_scroll : 1);
+            memset(&cmd, 0, sizeof(cmd));
+            cmd.type = VCMD_ROUNDED_RECT;
+            cmd.bounds.x = sb_x;
+            cmd.bounds.y = thumb_y;
+            cmd.bounds.w = sb_w;
+            cmd.bounds.h = thumb_h;
+            cmd.rounded_rect.color = border_col;
+            cmd.rounded_rect.radius = 2;
+            push_cmd(out, cmd);
+        }
         break;
 
     case UI_WIDGET_TAB_BAR: {
@@ -779,6 +819,16 @@ void ui_widget_emit_draw(ui_widget_t *w, vanilla_draw_cmd_array_t *out)
         int32_t row_h = 24;
         for (int i = 0; i < w->menu.count; i++) {
             int32_t ry = y + i * row_h;
+            if (i == w->menu.selected) {
+                memset(&cmd, 0, sizeof(cmd));
+                cmd.type = VCMD_FILL_RECT;
+                cmd.bounds.x = x + 2;
+                cmd.bounds.y = ry + 1;
+                cmd.bounds.w = width - 4;
+                cmd.bounds.h = row_h - 2;
+                cmd.fill_rect.color = selection;
+                push_cmd(out, cmd);
+            }
             if (w->menu.items && w->menu.items[i]) {
                 int len = (int)strlen(w->menu.items[i]);
                 memset(&cmd, 0, sizeof(cmd));

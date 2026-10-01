@@ -104,9 +104,7 @@ int main(int argc, char **argv)
 
     vanilla_client_t *client = vanilla_connect(NULL);
     if (!client) return 1;
-
-    vanilla_window_t *win = vanilla_create_window(client, "Calculator", 120, 80,
-                                                  CALC_WIDTH, CALC_HEIGHT, WINDOW_FLAG_NONE);
+    vanilla_window_t *win = vanilla_create_window(client, "Calculator", 120, 80, CALC_WIDTH, CALC_HEIGHT, WINDOW_FLAG_NONE);
     if (!win) { vanilla_disconnect(client); return 1; }
     vanilla_map_window(win);
 
@@ -120,15 +118,12 @@ int main(int argc, char **argv)
     root->layout_elem->bg_color = g_theme ? g_theme->bg_base : 0xFF2E3440u;
 
     ui_widget_t *disp_box = ui_box(ctx, VDIR_ROW);
-    disp_box->layout_elem->w_mode = VSIZE_GROW;
-    disp_box->layout_elem->h_mode = VSIZE_FIXED;
-    disp_box->layout_elem->h_px = 56;
+    disp_box->layout_elem->w_mode = VSIZE_GROW; disp_box->layout_elem->h_mode = VSIZE_FIXED;
+    disp_box->layout_elem->h_px = 56; disp_box->layout_elem->align_items = VALIGN_CENTER;
     disp_box->layout_elem->bg_color = g_theme ? g_theme->taskbar_bg : 0xFF2E3440u;
     disp_box->layout_elem->border_color = g_theme ? g_theme->border : 0xFF4C566Au;
-    disp_box->layout_elem->border_width = 1;
-    disp_box->layout_elem->pad_right = 16;
-    disp_box->layout_elem->pad_top = 14;
-    disp_box->layout_elem->align_items = VALIGN_CENTER;
+    disp_box->layout_elem->border_width = 1; disp_box->layout_elem->clip_children = 1;
+    disp_box->layout_elem->pad_right = 16; disp_box->layout_elem->pad_top = 14;
     ui_widget_add_child(root, disp_box);
 
     ui_widget_t *spacer = ui_box(ctx, VDIR_ROW);
@@ -140,42 +135,50 @@ int main(int argc, char **argv)
     ui_widget_add_child(disp_box, state.label);
 
     static const char *labels[5][4] = {
-        { "C", "+/-", "%", "/" },
-        { "7", "8",   "9", "*" },
-        { "4", "5",   "6", "-" },
-        { "1", "2",   "3", "+" },
+        { "C", "+/-", "%", "/" }, { "7", "8", "9", "*" },
+        { "4", "5",   "6", "-" }, { "1", "2", "3", "+" },
         { "0", "00",  ".", "=" }
     };
 
     for (int r = 0; r < 5; r++) {
         ui_widget_t *row = ui_box(ctx, VDIR_ROW);
-        row->layout_elem->w_mode = VSIZE_GROW;
-        row->layout_elem->h_mode = VSIZE_FIXED;
-        row->layout_elem->h_px = 44;
-        row->layout_elem->gap = 8;
+        row->layout_elem->w_mode = VSIZE_GROW; row->layout_elem->h_mode = VSIZE_FIXED;
+        row->layout_elem->h_px = 44; row->layout_elem->gap = 8;
         for (int c = 0; c < 4; c++) {
             ui_widget_t *b = ui_button(ctx, labels[r][c], on_calc_button, &state);
-            b->layout_elem->w_mode = VSIZE_GROW;
-            b->layout_elem->h_mode = VSIZE_GROW;
+            b->layout_elem->w_mode = b->layout_elem->h_mode = VSIZE_GROW;
             ui_widget_add_child(row, b);
         }
         ui_widget_add_child(root, row);
     }
 
-    int running = 1;
+    int running = 1, shift_down = 0;
     while (running) {
         vanilla_event_t ev;
         while (vanilla_poll_event(client, &ev) > 0) {
             if (ev.type == VANILLA_EVENT_CLOSE_REQ) { running = 0; break; }
             if (ev.type == VANILLA_EVENT_INPUT) {
                 ui_handle_event(ctx, root, &ev.input);
-                if (ev.input.type == EV_KEY && ev.input.value == 1) {
-                    char asc = vanilla_evdev_to_ascii(ev.input.code, 0);
-                    if ((asc >= '0' && asc <= '9') || asc == '+' || asc == '-' ||
-                        asc == '*' || asc == '/' || asc == '=' || asc == '.' ||
-                        asc == 'c' || asc == 'C' || ev.input.code == KEY_ESC) {
-                        char tok[2] = { (asc == 'c' || asc == 'C' || ev.input.code == KEY_ESC) ? 'C' : asc, '\0' };
-                        calc_handle_input(&state, tok);
+                if (ev.input.type == EV_KEY) {
+                    if (ev.input.code == KEY_LEFTSHIFT || ev.input.code == KEY_RIGHTSHIFT) {
+                        shift_down = (ev.input.value != 0);
+                    } else if (ev.input.value == 1) {
+                        char asc = vanilla_evdev_to_ascii(ev.input.code, shift_down);
+                        if ((asc >= '0' && asc <= '9') || asc == '+' || asc == '-' || asc == '*' || asc == '/') {
+                            char tok[2] = { asc, '\0' };
+                            calc_handle_input(&state, tok);
+                        } else if (asc == '\n' || asc == '=' || ev.input.code == KEY_ENTER || ev.input.code == KEY_KPENTER) {
+                            calc_handle_input(&state, "=");
+                        } else if (asc == '.' || asc == ',') {
+                            calc_handle_input(&state, ".");
+                        } else if (asc == 'c' || asc == 'C' || ev.input.code == KEY_ESC) {
+                            calc_handle_input(&state, "C");
+                        } else if (ev.input.code == KEY_BACKSPACE) {
+                            int dlen = (int)strlen(state.display);
+                            state.display[dlen > 1 ? dlen - 1 : 0] = (dlen > 1 ? '\0' : '0');
+                            if (dlen <= 1) state.display[1] = '\0';
+                            state.current = strtod(state.display, NULL);
+                        }
                         state.label->label.text = state.display;
                         ui_widget_invalidate(state.label);
                     }

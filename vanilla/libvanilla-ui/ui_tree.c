@@ -46,6 +46,11 @@ void ui_widget_invalidate(ui_widget_t *w)
 
     w->dirty = 1;
 
+    if (w->type == UI_WIDGET_LABEL && w->layout_elem) {
+        w->layout_elem->text = w->label.text;
+        w->layout_elem->text_color = w->label.color;
+    }
+
     if (w->layout_elem) {
         w->dirty_rect.x = w->layout_elem->computed_x;
         w->dirty_rect.y = w->layout_elem->computed_y;
