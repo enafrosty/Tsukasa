@@ -1,0 +1,22 @@
+id: 4
+name: MSG_CREATE_WINDOW_ACK
+direction: server_to_client
+version: 1
+v1_compat: true
+description: "Server acknowledgement providing window ID and shared memory buffer details."
+fields:
+  - name: window_id
+    type: uint32_t
+    description: "Server-allocated unique window identifier"
+  - name: shm_id
+    type: int32_t
+    description: "Shared memory segment identifier backing the client surface"
+  - name: buffer_size
+    type: uint32_t
+    description: "Total size in bytes of the allocated shared surface buffer"
+  - name: pitch
+    type: uint32_t
+    description: "Row byte stride of the shared memory surface"
+  - name: status
+    type: int32_t
+    description: "Window creation status (0 for success, negative on allocation failure)"

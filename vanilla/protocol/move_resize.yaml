@@ -1,0 +1,19 @@
+id: 8
+name: MSG_MOVE_RESIZE
+direction: client_to_server
+version: 1
+v1_compat: true
+description: "Request repositioning and resizing of a window frame."
+fields:
+  - name: x
+    type: int32_t
+    description: "New horizontal position in screen pixels"
+  - name: y
+    type: int32_t
+    description: "New vertical position in screen pixels"
+  - name: width
+    type: uint32_t
+    description: "New window content width in pixels"
+  - name: height
+    type: uint32_t
+    description: "New window content height in pixels"

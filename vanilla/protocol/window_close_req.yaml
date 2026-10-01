@@ -1,0 +1,10 @@
+id: 12
+name: MSG_WINDOW_CLOSE_REQ
+direction: server_to_client
+version: 1
+v1_compat: true
+description: "Notify client that window close was requested by user."
+fields:
+  - name: reserved
+    type: uint32_t
+    description: "Reserved field for close options or future flags"

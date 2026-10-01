@@ -1,0 +1,13 @@
+id: 1
+name: MSG_HELLO
+direction: client_to_server
+version: 1
+v1_compat: true
+description: "Initial handshake from client. Must be the first message sent."
+fields:
+  - name: client_version
+    type: uint32_t
+    description: "Protocol version the client supports (VANILLA_IPC_VERSION)"
+  - name: client_name
+    type: char[32]
+    description: "Human-readable client identifier for diagnostics"
