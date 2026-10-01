@@ -23,7 +23,7 @@
 typedef enum {
     VCMD_NONE = 0,
     VCMD_FILL_RECT,       /* solid filled rectangle                          */
-    VCMD_ROUNDED_RECT,    /* AA rounded rectangle (added by P1-3)            */
+    VCMD_ROUNDED_RECT,    /* AA rounded rectangle                            */
     VCMD_BORDER,          /* 1-sided or 4-sided border outline               */
     VCMD_TEXT,            /* text string at a position                       */
     VCMD_IMAGE,           /* blit a vanilla_surface_t sub-region             */

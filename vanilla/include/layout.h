@@ -31,7 +31,7 @@ typedef enum {
     VSIZE_GROW,    /* claim available space (flex-grow: 1)       */
 } vanilla_size_mode_t;
 
-/* Element type — determines which draw command(s) are emitted */
+/* Element type: determines which draw command(s) are emitted */
 typedef enum {
     VELEM_BOX,     /* layout container; may have children        */
     VELEM_TEXT,    /* text label                                 */
@@ -71,7 +71,7 @@ struct vanilla_elem_t {
 
     /* Appearance (for VELEM_BOX) */
     uint32_t            bg_color;       /* 0 = transparent                   */
-    int32_t             corner_radius;  /* 0 = square; >0 = rounded (P1-3)   */
+    int32_t             corner_radius;  /* 0 = square; >0 = rounded          */
     uint32_t            border_color;
     int32_t             border_width;
     uint8_t             clip_children;  /* 1 = scissor clip children to inner bounds */
