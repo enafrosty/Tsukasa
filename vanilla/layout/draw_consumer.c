@@ -95,9 +95,10 @@ void vanilla_execute_draw_commands(vanilla_surface_t *target,
             break;
 
         case VCMD_ROUNDED_RECT:
-            /* Stub as fill_rect until blt_rounded_rect is implemented */
-            fill_clipped(target, active_clip, c->bounds.x, c->bounds.y,
-                         c->bounds.w, c->bounds.h, c->rounded_rect.color);
+            blt_rounded_rect_clipped(target->pixels, target->width,
+                                     c->bounds.x, c->bounds.y, c->bounds.w, c->bounds.h,
+                                     c->rounded_rect.radius, c->rounded_rect.color,
+                                     BLT_CORNER_ALL, active_clip);
             break;
 
         case VCMD_BORDER: {

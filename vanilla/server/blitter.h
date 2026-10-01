@@ -21,6 +21,14 @@
 #include <stddef.h>
 #include "../include/surface.h"
 
+/* Corner selection bitmask for blt_rounded_rect_clipped */
+#define BLT_CORNER_TL   (1U << 0)
+#define BLT_CORNER_TR   (1U << 1)
+#define BLT_CORNER_BL   (1U << 2)
+#define BLT_CORNER_BR   (1U << 3)
+#define BLT_CORNER_ALL  (BLT_CORNER_TL | BLT_CORNER_TR | BLT_CORNER_BL | BLT_CORNER_BR)
+#define BLT_CORNER_TOP  (BLT_CORNER_TL | BLT_CORNER_TR)
+
 /* Solid color fill into ARGB32 buffer */
 void blt_fill_rect(uint32_t *dst, uint32_t pitch_px, const vanilla_rect_t *rect, uint32_t color);
 
@@ -41,6 +49,33 @@ void blt_blend_rect(uint32_t *dst, uint32_t dst_pitch, const uint32_t *src, uint
 void blt_blend_subrect(uint32_t *dst, uint32_t dst_pitch, int32_t dst_x, int32_t dst_y,
                        const uint32_t *src, uint32_t src_pitch, int32_t src_x, int32_t src_y,
                        int32_t w, int32_t h, uint8_t global_alpha);
+
+/* Fill a rectangle with anti-aliased rounded corners */
+void blt_rounded_rect(uint32_t *dst, uint32_t dst_pitch,
+                      int32_t x, int32_t y, int32_t w, int32_t h,
+                      int32_t radius, uint32_t color);
+
+/* Fill a rectangle with anti-aliased rounded corners and clipping */
+void blt_rounded_rect_clipped(uint32_t *dst, uint32_t dst_pitch,
+                              int32_t x, int32_t y, int32_t w, int32_t h,
+                              int32_t radius, uint32_t color,
+                              uint32_t corner_mask, const vanilla_rect_t *clip);
+
+/* Opaque shadow texture object */
+typedef struct vanilla_shadow_tex_t vanilla_shadow_tex_t;
+
+/* Return cached shadow texture for (radius, alpha) pair */
+const vanilla_shadow_tex_t *vanilla_shadow_tex_get(int32_t radius, uint8_t alpha);
+
+/* Draw cached drop shadow using precomputed nine-patch texture */
+void blt_draw_shadow_cached(uint32_t *dst, uint32_t dst_pitch,
+                            uint32_t dst_w, uint32_t dst_h,
+                            const vanilla_rect_t *win_rect,
+                            const vanilla_rect_t *clip,
+                            int32_t shadow_radius, uint8_t shadow_alpha);
+
+/* Free all cached shadow textures */
+void vanilla_shadow_cache_clear(void);
 
 /* Ambient soft-edge drop shadow around floating windows */
 void blt_drop_shadow(uint32_t *dst, uint32_t dst_pitch, uint32_t dst_w, uint32_t dst_h,

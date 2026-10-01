@@ -160,6 +160,8 @@ void compositor_destroy(vanilla_compositor_t *comp)
     if (!comp)
         return;
 
+    vanilla_shadow_cache_clear();
+
     font_destroy(&comp->font);
     if (comp->has_wallpaper) {
         image_destroy(&comp->wallpaper);
@@ -188,6 +190,8 @@ void compositor_damage_all(vanilla_compositor_t *comp)
 {
     if (!comp)
         return;
+
+    vanilla_shadow_cache_clear();
 
     vanilla_rect_t full;
     full.x = 0;
@@ -342,12 +346,12 @@ void compositor_render_frame(struct vanilla_server *srv)
             shadow_bounds.x = frame_rect.x - g_theme->shadow_radius;
             shadow_bounds.y = frame_rect.y - g_theme->shadow_radius;
             shadow_bounds.w = frame_rect.w + 2 * g_theme->shadow_radius;
-            shadow_bounds.h = frame_rect.h + 2 * g_theme->shadow_radius + g_theme->shadow_radius / 2;
+            shadow_bounds.h = frame_rect.h + 2 * g_theme->shadow_radius;
 
             vanilla_rect_t dummy;
             if (vanilla_rect_intersect(&shadow_bounds, dirty, &dummy)) {
-                blt_drop_shadow(comp->backbuffer, comp->pitch_px, comp->width, comp->height,
-                                &frame_rect, dirty, g_theme->shadow_radius, g_theme->shadow_alpha);
+                blt_draw_shadow_cached(comp->backbuffer, comp->pitch_px, comp->width, comp->height,
+                                       &frame_rect, dirty, g_theme->shadow_radius, g_theme->shadow_alpha);
             }
         }
 
@@ -373,7 +377,10 @@ void compositor_render_frame(struct vanilla_server *srv)
                 vanilla_rect_t vis_title;
                 if (vanilla_rect_intersect(&title_rect, dirty, &vis_title)) {
                     uint32_t tb_color = win->is_focused ? g_theme->titlebar_active : g_theme->titlebar_inactive;
-                    blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_title, tb_color);
+                    blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
+                                             title_rect.x, title_rect.y, title_rect.w, title_rect.h,
+                                             g_theme->radius_sm, tb_color,
+                                             BLT_CORNER_TOP, dirty);
 
                     /* Titlebar buttons */
                     chrome_btn_rects_t btns = chrome_metrics(&frame_rect);
@@ -455,13 +462,15 @@ void compositor_render_frame(struct vanilla_server *srv)
                 }
 
                 uint32_t border_color = win->is_focused ? g_theme->border_focus : g_theme->border;
+                int32_t content_y = frame_rect.y + g_theme->titlebar_height + g_theme->border_width;
+                int32_t content_h = frame_rect.h - (g_theme->titlebar_height + g_theme->border_width);
 
-                vanilla_rect_t b_left = { frame_rect.x, frame_rect.y, g_theme->border_width, frame_rect.h };
+                vanilla_rect_t b_left = { frame_rect.x, content_y, g_theme->border_width, content_h };
                 vanilla_rect_t vis_b;
                 if (vanilla_rect_intersect(&b_left, dirty, &vis_b))
                     blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, border_color);
 
-                vanilla_rect_t b_right = { frame_rect.x + frame_rect.w - g_theme->border_width, frame_rect.y, g_theme->border_width, frame_rect.h };
+                vanilla_rect_t b_right = { frame_rect.x + frame_rect.w - g_theme->border_width, content_y, g_theme->border_width, content_h };
                 if (vanilla_rect_intersect(&b_right, dirty, &vis_b))
                     blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, border_color);
 
