@@ -297,6 +297,8 @@ void compositor_render_frame(struct vanilla_server *srv)
     if (!srv || srv->compositor.dirty_count <= 0)
         return;
 
+    vanilla_server_send_frame_begin(srv);
+
     vanilla_compositor_t *comp = &srv->compositor;
     compositor_merge_damage(comp);
 
@@ -541,5 +543,6 @@ void compositor_render_frame(struct vanilla_server *srv)
         }
     }
 
+    vanilla_server_release_buffers(srv);
     comp->dirty_count = 0;
 }

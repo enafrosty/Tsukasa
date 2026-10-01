@@ -1,0 +1,13 @@
+id: 20
+name: MSG_DND_OFFER
+direction: client_to_server
+version: 2
+v1_compat: false
+description: "Drag source announces available MIME types."
+fields:
+  - name: window_id
+    type: uint32_t
+    description: "Drag source window ID"
+  - name: mime_count
+    type: uint32_t
+    description: "Number of MIME types offered"

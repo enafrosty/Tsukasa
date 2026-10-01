@@ -1,0 +1,16 @@
+id: 15
+name: MSG_FRAME_BEGIN
+direction: server_to_client
+version: 2
+v1_compat: false
+description: "Server invites client to render the next frame."
+fields:
+  - name: window_id
+    type: uint32_t
+    description: "Target window ID"
+  - name: frame_serial
+    type: uint32_t
+    description: "Monotonic counter; client echoes in MSG_PRESENT"
+  - name: timestamp_ms
+    type: uint32_t
+    description: "Compositor clock in milliseconds"

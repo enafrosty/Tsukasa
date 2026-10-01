@@ -1,0 +1,13 @@
+id: 17
+name: MSG_SET_CURSOR
+direction: client_to_server
+version: 2
+v1_compat: false
+description: "Client requests a named cursor shape for a window."
+fields:
+  - name: window_id
+    type: uint32_t
+    description: "Target window ID"
+  - name: shape
+    type: uint32_t
+    description: "Requested cursor shape identifier"

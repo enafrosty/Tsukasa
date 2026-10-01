@@ -31,6 +31,27 @@
 #include <string.h>
 #include <errno.h>
 #include <signal.h>
+#include <sys/time.h>
+
+static int64_t get_time_ms(void)
+{
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) == 0) {
+        return (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
+    }
+    return 0;
+}
+
+static vanilla_client_conn_t *find_client_by_fd(vanilla_server_t *srv, int fd)
+{
+    if (!srv || fd < 0)
+        return NULL;
+    for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
+        if (srv->clients[i].in_use && srv->clients[i].fd == fd)
+            return &srv->clients[i];
+    }
+    return NULL;
+}
 
 static volatile int g_theme_reload_pending = 0;
 
@@ -99,14 +120,18 @@ void vanilla_server_broadcast_theme_changed(vanilla_server_t *srv)
         return;
 
     vanilla_msg_hdr_t hdr;
+    vanilla_msg_theme_changed_t msg;
+    memset(&msg, 0, sizeof(msg));
     hdr.magic = VANILLA_IPC_MAGIC;
     hdr.msg_type = MSG_THEME_CHANGED;
-    hdr.payload_len = 0;
+    hdr.payload_len = (uint16_t)sizeof(msg);
     hdr.window_id = 0;
 
     for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
-        if (srv->clients[i].in_use && srv->clients[i].fd >= 0) {
+        if (srv->clients[i].in_use && srv->clients[i].fd >= 0 &&
+            srv->clients[i].negotiated_version >= 2) {
             exact_write(srv->clients[i].fd, &hdr, sizeof(hdr));
+            exact_write(srv->clients[i].fd, &msg, sizeof(msg));
         }
     }
 }
@@ -271,6 +296,9 @@ int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
 #ifdef SIGHUP
     signal(SIGHUP, wm_sighup_handler);
 #endif
+#ifdef SIGPIPE
+    signal(SIGPIPE, SIG_IGN);
+#endif
 
     compositor_init(&srv->compositor, "/dev/fb0");
 
@@ -386,6 +414,7 @@ void vanilla_server_remove_client(vanilla_server_t *srv, int client_idx)
     srv->clients[client_idx].in_use = 0;
     srv->clients[client_idx].fd = -1;
     srv->clients[client_idx].version = 0;
+    srv->clients[client_idx].negotiated_version = 0;
 
     shell_invalidate(srv);
 }
@@ -402,22 +431,53 @@ vanilla_server_window_t *vanilla_server_find_window(vanilla_server_t *srv, uint3
     return NULL;
 }
 
-static void wm_send_configure(vanilla_server_window_t *w)
+static void wm_send_configure(vanilla_server_t *srv, vanilla_server_window_t *w)
 {
-    if (!w || w->client_fd < 0)
+    if (!srv || !w || w->client_fd < 0)
         return;
-    vanilla_msg_hdr_t hdr;
-    vanilla_msg_window_configure_t cfg;
-    hdr.magic = VANILLA_IPC_MAGIC;
-    hdr.msg_type = MSG_WINDOW_CONFIGURE;
-    hdr.payload_len = (uint16_t)sizeof(cfg);
-    hdr.window_id = w->window_id;
-    cfg.x = w->x;
-    cfg.y = w->y;
-    cfg.width = w->width;
-    cfg.height = w->height;
-    exact_write(w->client_fd, &hdr, sizeof(hdr));
-    exact_write(w->client_fd, &cfg, sizeof(cfg));
+
+    vanilla_client_conn_t *c = find_client_by_fd(srv, w->client_fd);
+    if (c && c->negotiated_version >= 2) {
+        uint32_t next_serial = w->configure_serial + 1;
+        if (next_serial == 0)
+            next_serial = 1;
+
+        vanilla_msg_hdr_t hdr;
+        vanilla_msg_window_configure_v2_t cfg;
+        hdr.magic = VANILLA_IPC_MAGIC;
+        hdr.msg_type = MSG_WINDOW_CONFIGURE;
+        hdr.payload_len = (uint16_t)sizeof(cfg);
+        hdr.window_id = w->window_id;
+
+        cfg.x = w->pending_x;
+        cfg.y = w->pending_y;
+        cfg.width = w->pending_w;
+        cfg.height = w->pending_h;
+        cfg.serial = next_serial;
+        cfg.flags = w->flags;
+
+        if (exact_write(w->client_fd, &hdr, sizeof(hdr)) == 0 &&
+            exact_write(w->client_fd, &cfg, sizeof(cfg)) == 0) {
+            w->configure_serial = next_serial;
+            w->configure_pending = 1;
+            w->configure_timestamp_ms = (uint32_t)get_time_ms();
+        }
+    } else {
+        vanilla_msg_hdr_t hdr;
+        vanilla_msg_window_configure_t cfg;
+        hdr.magic = VANILLA_IPC_MAGIC;
+        hdr.msg_type = MSG_WINDOW_CONFIGURE;
+        hdr.payload_len = (uint16_t)sizeof(cfg);
+        hdr.window_id = w->window_id;
+
+        cfg.x = w->x;
+        cfg.y = w->y;
+        cfg.width = w->width;
+        cfg.height = w->height;
+
+        exact_write(w->client_fd, &hdr, sizeof(hdr));
+        exact_write(w->client_fd, &cfg, sizeof(cfg));
+    }
 }
 
 int handle_msg_hello(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
@@ -429,6 +489,12 @@ int handle_msg_hello(vanilla_server_t *srv, int client_idx, const vanilla_msg_hd
     vanilla_msg_hello_ack_t ack;
 
     srv->clients[client_idx].version = hello->client_version;
+    uint32_t neg = hello->client_version;
+    if (neg > 2)
+        neg = 2;
+    if (neg < 1)
+        neg = 1;
+    srv->clients[client_idx].negotiated_version = neg;
 
     ack_hdr.magic = VANILLA_IPC_MAGIC;
     ack_hdr.msg_type = MSG_HELLO_ACK;
@@ -510,6 +576,21 @@ int handle_msg_create_window(vanilla_server_t *srv, int client_idx, const vanill
     w->restore_w = req->width;
     w->restore_h = req->height;
 
+    w->configure_serial = 0;
+    w->configure_pending = 0;
+    w->pending_x = req->x;
+    w->pending_y = req->y;
+    w->pending_w = req->width;
+    w->pending_h = req->height;
+    w->configure_timestamp_ms = 0;
+
+    w->frame_serial = 0;
+    w->present_serial = 0;
+    w->buffer_in_use = 0;
+    w->frame_begin_in_flight = 0;
+    w->frame_begin_time_ms = 0;
+    w->cursor_shape = CURSOR_ARROW;
+
     if (req->flags & WINDOW_FLAG_MODAL)
         w->layer = LAYER_TOPMOST;
     else if (req->flags & WINDOW_FLAG_ALWAYS_TOP)
@@ -569,6 +650,7 @@ int handle_msg_map_window(vanilla_server_t *srv, int client_idx, const vanilla_m
     vanilla_server_window_t *w = vanilla_server_find_window(srv, req->window_id);
     if (w && w->client_fd == cfd) {
         w->is_mapped = 1;
+        w->frame_begin_in_flight = 0;
         vanilla_server_focus_window(srv, w->window_id);
         wm_invalidate_window(srv, w);
         shell_invalidate(srv);
@@ -599,57 +681,304 @@ int handle_msg_move_resize(vanilla_server_t *srv, int client_idx, const vanilla_
     int cfd = srv->clients[client_idx].fd;
     vanilla_server_window_t *w = vanilla_server_find_window(srv, hdr->window_id);
     if (w && w->client_fd == cfd) {
-        wm_invalidate_window(srv, w);
-        w->x = req->x;
-        w->y = req->y;
         if (req->width > 0 && req->height > 0 &&
             (req->width != w->width || req->height != w->height)) {
-            w->width = req->width;
-            w->height = req->height;
-            wm_send_configure(w);
+            w->pending_x = req->x;
+            w->pending_y = req->y;
+            w->pending_w = req->width;
+            w->pending_h = req->height;
+            if (srv->clients[client_idx].negotiated_version >= 2) {
+                wm_send_configure(srv, w);
+            } else {
+                wm_invalidate_window(srv, w);
+                w->x = req->x;
+                w->y = req->y;
+                w->width = req->width;
+                w->height = req->height;
+                wm_send_configure(srv, w);
+                wm_invalidate_window(srv, w);
+            }
+        } else {
+            wm_invalidate_window(srv, w);
+            w->x = req->x;
+            w->y = req->y;
+            w->pending_x = req->x;
+            w->pending_y = req->y;
+            wm_invalidate_window(srv, w);
         }
-        wm_invalidate_window(srv, w);
     }
     return 0;
 }
 
 int handle_msg_present(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
 {
-    const vanilla_msg_present_t *req = (const vanilla_msg_present_t *)payload;
+    int32_t dmg_x, dmg_y, dmg_w, dmg_h;
+    uint32_t frame_serial = 0;
+    int is_v2 = 0;
+
+    if (hdr->payload_len >= sizeof(vanilla_msg_present_v2_t)) {
+        const vanilla_msg_present_v2_t *p2 = (const vanilla_msg_present_v2_t *)payload;
+        dmg_x = p2->x;
+        dmg_y = p2->y;
+        dmg_w = p2->w;
+        dmg_h = p2->h;
+        frame_serial = p2->frame_serial;
+        is_v2 = 1;
+    } else {
+        const vanilla_msg_present_t *p1 = (const vanilla_msg_present_t *)payload;
+        dmg_x = p1->x;
+        dmg_y = p1->y;
+        dmg_w = p1->w;
+        dmg_h = p1->h;
+    }
+
     int cfd = srv->clients[client_idx].fd;
-    if (req->w <= 0 || req->h <= 0)
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, hdr->window_id);
+    if (!w || w->client_fd != cfd)
         return 0;
 
-    vanilla_server_window_t *w = vanilla_server_find_window(srv, hdr->window_id);
-    if (w && w->client_fd == cfd) {
-        if (w->damage.w == 0 || w->damage.h == 0) {
-            w->damage.x = req->x;
-            w->damage.y = req->y;
-            w->damage.w = req->w;
-            w->damage.h = req->h;
-        } else {
-            int32_t x1 = w->damage.x < req->x ? w->damage.x : req->x;
-            int32_t y1 = w->damage.y < req->y ? w->damage.y : req->y;
-            int32_t x2 = (w->damage.x + w->damage.w) > (req->x + req->w)
-                         ? (w->damage.x + w->damage.w)
-                         : (req->x + req->w);
-            int32_t y2 = (w->damage.y + w->damage.h) > (req->y + req->h)
-                         ? (w->damage.y + w->damage.h)
-                         : (req->y + req->h);
-
-            w->damage.x = x1;
-            w->damage.y = y1;
-            w->damage.w = x2 - x1;
-            w->damage.h = y2 - y1;
-        }
-
-        vanilla_rect_t screen_damage;
-        screen_damage.x = w->x + req->x;
-        screen_damage.y = w->y + req->y;
-        screen_damage.w = req->w;
-        screen_damage.h = req->h;
-        compositor_add_damage(&srv->compositor, &screen_damage);
+    if (is_v2) {
+        w->present_serial = frame_serial;
+        w->frame_begin_in_flight = 0;
     }
+
+    if (dmg_w <= 0 || dmg_h <= 0) {
+        if (is_v2) {
+            w->buffer_in_use = 1;
+            vanilla_server_release_buffers(srv);
+        }
+        return 0;
+    }
+
+    if (is_v2) {
+        w->buffer_in_use = 1;
+    }
+
+    if (w->damage.w == 0 || w->damage.h == 0) {
+        w->damage.x = dmg_x;
+        w->damage.y = dmg_y;
+        w->damage.w = dmg_w;
+        w->damage.h = dmg_h;
+    } else {
+        int32_t x1 = w->damage.x < dmg_x ? w->damage.x : dmg_x;
+        int32_t y1 = w->damage.y < dmg_y ? w->damage.y : dmg_y;
+        int32_t x2 = (w->damage.x + w->damage.w) > (dmg_x + dmg_w)
+                     ? (w->damage.x + w->damage.w)
+                     : (dmg_x + dmg_w);
+        int32_t y2 = (w->damage.y + w->damage.h) > (dmg_y + dmg_h)
+                     ? (w->damage.y + w->damage.h)
+                     : (dmg_y + dmg_h);
+
+        w->damage.x = x1;
+        w->damage.y = y1;
+        w->damage.w = x2 - x1;
+        w->damage.h = y2 - y1;
+    }
+
+    vanilla_rect_t screen_damage;
+    screen_damage.x = w->x + dmg_x;
+    screen_damage.y = w->y + dmg_y;
+    screen_damage.w = dmg_w;
+    screen_damage.h = dmg_h;
+    compositor_add_damage(&srv->compositor, &screen_damage);
+
+    return 0;
+}
+
+int handle_msg_ack_configure(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    const vanilla_msg_ack_configure_t *ack = (const vanilla_msg_ack_configure_t *)payload;
+    int cfd = srv->clients[client_idx].fd;
+    uint32_t wid = hdr->window_id ? hdr->window_id : ack->window_id;
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, wid);
+    if (!w || w->client_fd != cfd)
+        return 0;
+
+    if (!w->configure_pending)
+        return 0;
+
+    if (w->configure_serial != ack->serial) {
+        fprintf(stderr, "[vanilla] ack_configure: serial mismatch for window %u (expected %u, got %u)\n",
+                w->window_id, w->configure_serial, ack->serial);
+        return 0;
+    }
+
+    w->configure_pending = 0;
+    wm_invalidate_window(srv, w);
+    w->x = w->pending_x;
+    w->y = w->pending_y;
+    w->width = w->pending_w;
+    w->height = w->pending_h;
+    wm_invalidate_window(srv, w);
+    shell_invalidate(srv);
+    printf("[vanilla] ack_configure: window %u serial %u applied\n", w->window_id, ack->serial);
+    return 0;
+}
+
+int handle_msg_set_cursor(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    const vanilla_msg_set_cursor_t *req = (const vanilla_msg_set_cursor_t *)payload;
+    int cfd = srv->clients[client_idx].fd;
+    uint32_t wid = hdr->window_id ? hdr->window_id : req->window_id;
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, wid);
+    if (w && w->client_fd == cfd) {
+        w->cursor_shape = req->shape;
+    }
+    return 0;
+}
+
+int handle_msg_clipboard_offer(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    (void)srv;
+    (void)client_idx;
+    (void)hdr;
+    (void)payload;
+    /* Stub for clipboard data exchange */
+    return 0;
+}
+
+int handle_msg_dnd_offer(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    (void)srv;
+    (void)client_idx;
+    (void)hdr;
+    (void)payload;
+    /* Stub for drag-and-drop protocol */
+    return 0;
+}
+
+void vanilla_server_send_frame_begin(vanilla_server_t *srv)
+{
+    if (!srv)
+        return;
+
+    int64_t now_ms = get_time_ms();
+    for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+        vanilla_server_window_t *w = &srv->windows[i];
+        if (!w->in_use || !w->is_mapped || w->client_fd < 0)
+            continue;
+
+        vanilla_client_conn_t *c = find_client_by_fd(srv, w->client_fd);
+        if (!c || c->negotiated_version < 2)
+            continue;
+
+        if (w->frame_begin_in_flight)
+            continue;
+
+        w->frame_serial++;
+        if (w->frame_serial == 0)
+            w->frame_serial = 1;
+
+        vanilla_msg_hdr_t hdr;
+        vanilla_msg_frame_begin_t fb;
+        hdr.magic = VANILLA_IPC_MAGIC;
+        hdr.msg_type = MSG_FRAME_BEGIN;
+        hdr.payload_len = (uint16_t)sizeof(fb);
+        hdr.window_id = w->window_id;
+
+        fb.window_id = w->window_id;
+        fb.frame_serial = w->frame_serial;
+        fb.timestamp_ms = (uint32_t)now_ms;
+
+        if (exact_write(w->client_fd, &hdr, sizeof(hdr)) == 0 &&
+            exact_write(w->client_fd, &fb, sizeof(fb)) == 0) {
+            w->frame_begin_in_flight = 1;
+            w->frame_begin_time_ms = (uint32_t)now_ms;
+            printf("[vanilla] frame_begin: sent to window %u serial %u\n", w->window_id, w->frame_serial);
+        }
+    }
+}
+
+void vanilla_server_release_buffers(vanilla_server_t *srv)
+{
+    if (!srv)
+        return;
+
+    for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+        vanilla_server_window_t *w = &srv->windows[i];
+        if (!w->in_use || !w->buffer_in_use || w->client_fd < 0)
+            continue;
+
+        vanilla_client_conn_t *c = find_client_by_fd(srv, w->client_fd);
+        if (c && c->negotiated_version >= 2) {
+            vanilla_msg_hdr_t rel_hdr;
+            vanilla_msg_buffer_released_t rel_msg;
+            rel_hdr.magic = VANILLA_IPC_MAGIC;
+            rel_hdr.msg_type = MSG_BUFFER_RELEASED;
+            rel_hdr.payload_len = (uint16_t)sizeof(rel_msg);
+            rel_hdr.window_id = w->window_id;
+
+            rel_msg.window_id = w->window_id;
+            rel_msg.serial = w->present_serial;
+
+            if (exact_write(w->client_fd, &rel_hdr, sizeof(rel_hdr)) == 0 &&
+                exact_write(w->client_fd, &rel_msg, sizeof(rel_msg)) == 0) {
+                printf("[vanilla] buffer_released: window %u serial %u\n", w->window_id, w->present_serial);
+            }
+        }
+        w->buffer_in_use = 0;
+    }
+}
+
+int vanilla_server_send_clipboard_request(vanilla_server_t *srv, uint32_t window_id, uint32_t request_id, const char *mime_type)
+{
+    if (!srv)
+        return -1;
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, window_id);
+    if (!w || w->client_fd < 0)
+        return -1;
+
+    vanilla_client_conn_t *c = find_client_by_fd(srv, w->client_fd);
+    if (!c || c->negotiated_version < 2)
+        return -1;
+
+    vanilla_msg_hdr_t hdr;
+    vanilla_msg_clipboard_request_t req;
+    hdr.magic = VANILLA_IPC_MAGIC;
+    hdr.msg_type = MSG_CLIPBOARD_REQUEST;
+    hdr.payload_len = (uint16_t)sizeof(req);
+    hdr.window_id = window_id;
+
+    memset(&req, 0, sizeof(req));
+    req.window_id = window_id;
+    req.request_id = request_id;
+    if (mime_type)
+        strncpy(req.mime_type, mime_type, sizeof(req.mime_type) - 1);
+
+    if (exact_write(w->client_fd, &hdr, sizeof(hdr)) < 0 ||
+        exact_write(w->client_fd, &req, sizeof(req)) < 0)
+        return -1;
+
+    return 0;
+}
+
+int vanilla_server_send_dnd_drop(vanilla_server_t *srv, uint32_t target_window_id, int32_t x, int32_t y)
+{
+    if (!srv)
+        return -1;
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, target_window_id);
+    if (!w || w->client_fd < 0)
+        return -1;
+
+    vanilla_client_conn_t *c = find_client_by_fd(srv, w->client_fd);
+    if (!c || c->negotiated_version < 2)
+        return -1;
+
+    vanilla_msg_hdr_t hdr;
+    vanilla_msg_dnd_drop_t drop;
+    hdr.magic = VANILLA_IPC_MAGIC;
+    hdr.msg_type = MSG_DND_DROP;
+    hdr.payload_len = (uint16_t)sizeof(drop);
+    hdr.window_id = target_window_id;
+
+    drop.target_window_id = target_window_id;
+    drop.x = x;
+    drop.y = y;
+
+    if (exact_write(w->client_fd, &hdr, sizeof(hdr)) < 0 ||
+        exact_write(w->client_fd, &drop, sizeof(drop)) < 0)
+        return -1;
+
     return 0;
 }
 
@@ -690,7 +1019,15 @@ int vanilla_server_dispatch_client(vanilla_server_t *srv, int client_idx)
         return -1;
     }
 
-    if (entry->payload_size > 0 && hdr.payload_len != entry->payload_size) {
+    if (hdr.msg_type == MSG_PRESENT) {
+        if (hdr.payload_len != sizeof(vanilla_msg_present_t) &&
+            hdr.payload_len != sizeof(vanilla_msg_present_v2_t)) {
+            fprintf(stderr, "[vanilla] dispatch: payload size mismatch for MSG_PRESENT: expected %zu or %zu, got %u\n",
+                    sizeof(vanilla_msg_present_t), sizeof(vanilla_msg_present_v2_t), (unsigned)hdr.payload_len);
+            vanilla_server_remove_client(srv, client_idx);
+            return -1;
+        }
+    } else if (entry->payload_size > 0 && hdr.payload_len != entry->payload_size) {
         fprintf(stderr, "[vanilla] dispatch: payload size mismatch for msg %u: expected %zu, got %u\n",
                 (unsigned)hdr.msg_type, entry->payload_size, (unsigned)hdr.payload_len);
         vanilla_server_remove_client(srv, client_idx);
@@ -714,7 +1051,7 @@ int vanilla_server_dispatch_client(vanilla_server_t *srv, int client_idx)
         return 0;
     }
 
-    size_t needed = entry->payload_size > 0 ? entry->payload_size : (size_t)hdr.payload_len;
+    size_t needed = (size_t)hdr.payload_len;
     uint8_t stack_buf[256];
     uint8_t *payload = stack_buf;
     if (needed > sizeof(stack_buf)) {
@@ -767,6 +1104,23 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
 
     shell_update_clock(&srv->shell, srv);
 
+    int64_t now_ms = get_time_ms();
+    for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+        vanilla_server_window_t *w = &srv->windows[i];
+        if (w->in_use && w->configure_pending && (now_ms - (int64_t)w->configure_timestamp_ms > 500)) {
+            printf("[vanilla] ack_configure: timeout fallback for window %u serial %u\n",
+                   w->window_id, w->configure_serial);
+            w->configure_pending = 0;
+            wm_invalidate_window(srv, w);
+            w->x = w->pending_x;
+            w->y = w->pending_y;
+            w->width = w->pending_w;
+            w->height = w->pending_h;
+            wm_invalidate_window(srv, w);
+            shell_invalidate(srv);
+        }
+    }
+
     fds[0].fd = srv->listen_fd;
     fds[0].events = POLLIN;
     fds[0].revents = 0;
@@ -794,6 +1148,8 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
     if (ret <= 0) {
         if (srv->compositor.dirty_count > 0)
             compositor_render_frame(srv);
+        else
+            vanilla_server_release_buffers(srv);
         return ret;
     }
 
@@ -817,6 +1173,8 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
 
     if (srv->compositor.dirty_count > 0)
         compositor_render_frame(srv);
+    else
+        vanilla_server_release_buffers(srv);
 
     return 0;
 }
@@ -947,12 +1305,17 @@ void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
 
     wm_invalidate_window(srv, w);
 
+    int32_t target_x = w->x;
+    int32_t target_y = w->y;
+    uint32_t target_w = w->width;
+    uint32_t target_h = w->height;
+
     if (snap_type == SNAP_NONE) {
         if (w->is_snapped != SNAP_NONE) {
-            w->x = w->restore_x;
-            w->y = w->restore_y;
-            w->width = w->restore_w;
-            w->height = w->restore_h;
+            target_x = w->restore_x;
+            target_y = w->restore_y;
+            target_w = w->restore_w;
+            target_h = w->restore_h;
             w->is_snapped = SNAP_NONE;
         }
     } else {
@@ -982,22 +1345,37 @@ void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
         }
 
         if (!(w->flags & WINDOW_FLAG_BORDERLESS)) {
-            w->x = target_fx + g_theme->border_width;
-            w->y = target_fy + g_theme->titlebar_height + g_theme->border_width;
-            w->width = (uint32_t)(target_fw - 2 * g_theme->border_width);
-            w->height = (uint32_t)(target_fh - g_theme->titlebar_height - 2 * g_theme->border_width);
+            target_x = target_fx + g_theme->border_width;
+            target_y = target_fy + g_theme->titlebar_height + g_theme->border_width;
+            target_w = (uint32_t)(target_fw - 2 * g_theme->border_width);
+            target_h = (uint32_t)(target_fh - g_theme->titlebar_height - 2 * g_theme->border_width);
         } else {
-            w->x = target_fx;
-            w->y = target_fy;
-            w->width = (uint32_t)target_fw;
-            w->height = (uint32_t)target_fh;
+            target_x = target_fx;
+            target_y = target_fy;
+            target_w = (uint32_t)target_fw;
+            target_h = (uint32_t)target_fh;
         }
 
         w->is_snapped = snap_type;
     }
 
-    wm_send_configure(w);
-    wm_invalidate_window(srv, w);
+    w->pending_x = target_x;
+    w->pending_y = target_y;
+    w->pending_w = target_w;
+    w->pending_h = target_h;
+
+    vanilla_client_conn_t *c = find_client_by_fd(srv, w->client_fd);
+    if (c && c->negotiated_version >= 2) {
+        wm_send_configure(srv, w);
+    } else {
+        wm_invalidate_window(srv, w);
+        w->x = target_x;
+        w->y = target_y;
+        w->width = target_w;
+        w->height = target_h;
+        wm_send_configure(srv, w);
+        wm_invalidate_window(srv, w);
+    }
 }
 
 void wm_unsnap_window(vanilla_server_t *srv, uint32_t window_id)

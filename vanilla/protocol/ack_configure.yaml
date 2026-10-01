@@ -1,0 +1,13 @@
+id: 16
+name: MSG_ACK_CONFIGURE
+direction: client_to_server
+version: 2
+v1_compat: false
+description: "Client acknowledges a configure event from the server."
+fields:
+  - name: window_id
+    type: uint32_t
+    description: "Target window ID"
+  - name: serial
+    type: uint32_t
+    description: "Matches MSG_WINDOW_CONFIGURE serial"

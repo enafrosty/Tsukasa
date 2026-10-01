@@ -1,0 +1,16 @@
+id: 19
+name: MSG_CLIPBOARD_REQUEST
+direction: server_to_client
+version: 2
+v1_compat: false
+description: "Server requests clipboard data from offering client."
+fields:
+  - name: window_id
+    type: uint32_t
+    description: "Target window ID"
+  - name: request_id
+    type: uint32_t
+    description: "Monotonic request identifier"
+  - name: mime_type
+    type: char[32]
+    description: "Requested MIME type string"
