@@ -63,11 +63,21 @@ typedef enum {
     RESIZE_EDGE_BOT_RIGHT = 8,
 } vanilla_resize_edge_t;
 
+typedef enum {
+    ANIM_IDLE       = 0,
+    ANIM_OPENING    = 1,
+    ANIM_CLOSING    = 2,
+    ANIM_MINIMIZING = 3,
+    ANIM_RESTORING  = 4,
+    ANIM_SNAP_PREV  = 5,
+    ANIM_FOCUS      = 6,
+} vanilla_anim_state_t;
+
 #define DRAG_MODE_NONE     0
 #define DRAG_MODE_TITLEBAR 1
 #define DRAG_MODE_RESIZE   2
 
-typedef struct {
+typedef struct vanilla_server_window {
     int               in_use;
     uint32_t          window_id;
     int               client_fd;
@@ -128,6 +138,21 @@ typedef struct {
 
     /* Keyboard focus ring state */
     int               has_keyboard_focus;
+
+    /* Compositor animation state */
+    int               anim_state;
+    uint64_t          anim_start_ticks;
+    uint32_t          anim_dur_ticks;
+    float             anim_scale_start;
+    float             anim_scale_end;
+    float             anim_alpha_start;
+    float             anim_alpha_end;
+    int32_t           anim_origin_x;
+    int32_t           anim_origin_y;
+    int               anim_destroy_on_done;
+    int               anim_unmap_on_done;
+    float             anim_current_scale;
+    float             anim_current_alpha;
 } vanilla_server_window_t;
 
 typedef struct {
@@ -234,6 +259,9 @@ vanilla_server_window_t *wm_window_at(vanilla_server_t *srv, int32_t x, int32_t 
 vanilla_resize_edge_t wm_hit_test_resize_edge(const vanilla_server_window_t *w, int32_t px, int32_t py);
 int  wm_run_resize_selftests(void);
 int  wm_run_input_selftests(void);
+int  wm_run_animation_selftests(void);
+
+void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_window_t *w);
 
 /* Alt+Tab switcher overlay */
 void alttab_get_rect(vanilla_server_t *srv, vanilla_rect_t *out_rect);

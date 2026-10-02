@@ -46,10 +46,18 @@ typedef struct {
     uint64_t         last_frame_ticks;
     uint32_t         frame_target_ticks;
     int              panning_enabled;
+
+    /* Snap preview overlay */
+    int              snap_preview_visible;
+    vanilla_rect_t   snap_preview_rect;
+    float            snap_preview_alpha;
+    uint64_t         snap_preview_start;
+    uint32_t         snap_preview_dur;
 } vanilla_compositor_t;
 
 
 struct vanilla_server;
+struct vanilla_server_window;
 
 /* Compositor lifecycle */
 int  compositor_init(vanilla_compositor_t *comp, const char *fb_dev);
@@ -67,6 +75,25 @@ void compositor_frame_rendered(vanilla_compositor_t *comp);
 
 /* Frame rendering */
 void compositor_render_frame(struct vanilla_server *srv);
+
+/* Animation API */
+void compositor_start_anim(struct vanilla_server_window *w,
+                           int                          state,
+                           uint32_t                     dur_ms,
+                           float                        scale_start,
+                           float                        scale_end,
+                           float                        alpha_start,
+                           float                        alpha_end,
+                           int32_t                      origin_x,
+                           int32_t                      origin_y,
+                           int                          destroy_on_done);
+
+void compositor_animate_windows(struct vanilla_server *srv);
+int  compositor_has_active_animations(struct vanilla_server *srv);
+void compositor_snap_preview_show(vanilla_compositor_t *comp, const vanilla_rect_t *target_rect);
+void compositor_snap_preview_hide(vanilla_compositor_t *comp);
+void compositor_snap_preview_update(vanilla_compositor_t *comp);
+void compositor_paint_animated_window(vanilla_compositor_t *comp, struct vanilla_server_window *w, const vanilla_rect_t *dirty);
 
 /*
  * Button geometry within a frame rect.
