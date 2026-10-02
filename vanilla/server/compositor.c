@@ -31,7 +31,7 @@
 #define FBIOPUT_VSCREENINFO 0x4601
 #endif
 
-#if defined(VANILLA_HOST) || defined(_WIN32)
+#if defined(VANILLA_HOST) || defined(_WIN32) || (defined(__STDC_HOSTED__) && __STDC_HOSTED__ == 1)
 #if defined(_WIN32)
 #include <windows.h>
 __attribute__((weak)) uint64_t pit_ticks(void)
@@ -224,7 +224,7 @@ int compositor_init(vanilla_compositor_t *comp, const char *fb_dev)
     printf("[vanilla] Framebuffer mapped: %ux%u @ %u bpp, pitch=%u px, size=%u bytes\n",
            comp->width, comp->height, comp->bpp, comp->pitch_px, (unsigned)comp->fb_size);
 
-#if !defined(_WIN32) && !defined(VANILLA_HOST)
+#if !defined(_WIN32) && !defined(VANILLA_HOST) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__ == 0)
     struct fb_var_screeninfo pan_vinfo = vinfo;
     pan_vinfo.yres_virtual = vinfo.yres * 2;
     if (ioctl(fd, FBIOPUT_VSCREENINFO, &pan_vinfo) == 0 &&

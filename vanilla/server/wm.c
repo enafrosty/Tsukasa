@@ -1148,10 +1148,12 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
     int frame_ms = (int)(1000 / COMPOSITOR_TARGET_FPS);
     ret = poll(fds, (nfds_t)nfds, frame_ms);
     if (ret <= 0) {
-        if (srv->compositor.dirty_count > 0 && compositor_frame_due(&srv->compositor)) {
-            vanilla_server_send_frame_begin(srv);
-            compositor_render_frame(srv);
-            compositor_frame_rendered(&srv->compositor);
+        if (srv->compositor.dirty_count > 0) {
+            if (compositor_frame_due(&srv->compositor)) {
+                vanilla_server_send_frame_begin(srv);
+                compositor_render_frame(srv);
+                compositor_frame_rendered(&srv->compositor);
+            }
         } else {
             vanilla_server_release_buffers(srv);
         }
@@ -1176,10 +1178,12 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
         }
     }
 
-    if (srv->compositor.dirty_count > 0 && compositor_frame_due(&srv->compositor)) {
-        vanilla_server_send_frame_begin(srv);
-        compositor_render_frame(srv);
-        compositor_frame_rendered(&srv->compositor);
+    if (srv->compositor.dirty_count > 0) {
+        if (compositor_frame_due(&srv->compositor)) {
+            vanilla_server_send_frame_begin(srv);
+            compositor_render_frame(srv);
+            compositor_frame_rendered(&srv->compositor);
+        }
     } else {
         vanilla_server_release_buffers(srv);
     }
