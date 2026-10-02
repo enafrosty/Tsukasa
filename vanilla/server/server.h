@@ -118,6 +118,13 @@ typedef struct {
     uint32_t          max_height;
     uint32_t          aspect_num;
     uint32_t          aspect_den;
+
+    /* Transactional live resize target buffering */
+    int               resize_has_target;
+    int32_t           target_x;
+    int32_t           target_y;
+    uint32_t          target_w;
+    uint32_t          target_h;
 } vanilla_server_window_t;
 
 typedef struct {
@@ -208,5 +215,6 @@ void wm_unsnap_window(vanilla_server_t *srv, uint32_t window_id);
 int  wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev);
 vanilla_server_window_t *wm_window_at(vanilla_server_t *srv, int32_t x, int32_t y);
 vanilla_resize_edge_t wm_hit_test_resize_edge(const vanilla_server_window_t *w, int32_t px, int32_t py);
+int  wm_run_resize_selftests(void);
 
 #endif /* _VANILLA_SERVER_H */
