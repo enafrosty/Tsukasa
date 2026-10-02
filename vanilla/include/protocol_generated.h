@@ -54,6 +54,7 @@ typedef enum {
     MSG_DND_OFFER            = 20,
     MSG_DND_DROP             = 21,
     MSG_THEME_CHANGED        = 22,
+    MSG_SET_SIZE_HINTS       = 23,
 } vanilla_msg_type_t;
 
 /* MSG_HELLO payload (client to server, v1+) */
@@ -263,6 +264,20 @@ typedef struct {
 _Static_assert(sizeof(vanilla_msg_theme_changed_t) == 4,
     "vanilla_msg_theme_changed_t size mismatch; regenerate protocol");
 
+/* MSG_SET_SIZE_HINTS payload (client to server, v2+) */
+typedef struct {
+    uint32_t window_id;
+    uint32_t min_width;
+    uint32_t min_height;
+    uint32_t max_width;
+    uint32_t max_height;
+    uint32_t aspect_num;
+    uint32_t aspect_den;
+} __attribute__((packed)) vanilla_msg_set_size_hints_t;
+
+_Static_assert(sizeof(vanilla_msg_set_size_hints_t) == 28,
+    "vanilla_msg_set_size_hints_t size mismatch; regenerate protocol");
+
 typedef struct vanilla_server vanilla_server_t;
 
 typedef int (*vanilla_dispatch_fn_t)(vanilla_server_t *srv, int client_idx,
@@ -287,6 +302,7 @@ int handle_msg_ack_configure(vanilla_server_t *srv, int client_idx, const vanill
 int handle_msg_set_cursor(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 int handle_msg_clipboard_offer(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 int handle_msg_dnd_offer(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
+int handle_msg_set_size_hints(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 
 #ifdef VANILLA_DISPATCH_TABLE_IMPL
 const vanilla_dispatch_entry_t g_vanilla_dispatch_table[] = {
@@ -301,6 +317,7 @@ const vanilla_dispatch_entry_t g_vanilla_dispatch_table[] = {
     { MSG_SET_CURSOR, 2, sizeof(vanilla_msg_set_cursor_t), handle_msg_set_cursor },
     { MSG_CLIPBOARD_OFFER, 2, sizeof(vanilla_msg_clipboard_offer_t), handle_msg_clipboard_offer },
     { MSG_DND_OFFER, 2, sizeof(vanilla_msg_dnd_offer_t), handle_msg_dnd_offer },
+    { MSG_SET_SIZE_HINTS, 2, sizeof(vanilla_msg_set_size_hints_t), handle_msg_set_size_hints },
 };
 const size_t g_vanilla_dispatch_table_len = sizeof(g_vanilla_dispatch_table) / sizeof(g_vanilla_dispatch_table[0]);
 #else

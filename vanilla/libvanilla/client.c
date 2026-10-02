@@ -232,6 +232,40 @@ int vanilla_ack_configure(vanilla_client_t *client, uint32_t window_id, uint32_t
     return 0;
 }
 
+int vanilla_set_size_hints(vanilla_client_t *client, uint32_t window_id,
+                           uint32_t min_w, uint32_t min_h,
+                           uint32_t max_w, uint32_t max_h,
+                           uint32_t asp_n, uint32_t asp_d)
+{
+    if (!client || client->socket_fd < 0)
+        return -1;
+
+    if (client->server_version < 2)
+        return 0;
+
+    vanilla_msg_hdr_t hdr;
+    vanilla_msg_set_size_hints_t msg;
+
+    hdr.magic = VANILLA_IPC_MAGIC;
+    hdr.msg_type = MSG_SET_SIZE_HINTS;
+    hdr.payload_len = (uint16_t)sizeof(msg);
+    hdr.window_id = window_id;
+
+    msg.window_id = window_id;
+    msg.min_width = min_w;
+    msg.min_height = min_h;
+    msg.max_width = max_w;
+    msg.max_height = max_h;
+    msg.aspect_num = asp_n;
+    msg.aspect_den = asp_d;
+
+    if (exact_write(client->socket_fd, &hdr, sizeof(hdr)) < 0 ||
+        exact_write(client->socket_fd, &msg, sizeof(msg)) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
 void vanilla_disconnect(vanilla_client_t *client)
 {
     if (!client)

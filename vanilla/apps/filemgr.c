@@ -213,6 +213,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    vanilla_set_size_hints(client, win->window_id, 160, 120, 0, 0, 0, 0);
     vanilla_map_window(win);
 
     int running = 1;

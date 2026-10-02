@@ -51,6 +51,22 @@ typedef enum {
     SNAP_RIGHT    = 3,
 } vanilla_snap_t;
 
+typedef enum {
+    RESIZE_EDGE_NONE      = 0,
+    RESIZE_EDGE_TOP       = 1,
+    RESIZE_EDGE_BOTTOM    = 2,
+    RESIZE_EDGE_LEFT      = 3,
+    RESIZE_EDGE_RIGHT     = 4,
+    RESIZE_EDGE_TOP_LEFT  = 5,
+    RESIZE_EDGE_TOP_RIGHT = 6,
+    RESIZE_EDGE_BOT_LEFT  = 7,
+    RESIZE_EDGE_BOT_RIGHT = 8,
+} vanilla_resize_edge_t;
+
+#define DRAG_MODE_NONE     0
+#define DRAG_MODE_TITLEBAR 1
+#define DRAG_MODE_RESIZE   2
+
 typedef struct {
     int               in_use;
     uint32_t          window_id;
@@ -94,6 +110,21 @@ typedef struct {
 
     /* Protocol v2 cursor shape */
     uint32_t          cursor_shape;
+
+    /* Protocol v2 size hints */
+    uint32_t          min_width;
+    uint32_t          min_height;
+    uint32_t          max_width;
+    uint32_t          max_height;
+    uint32_t          aspect_num;
+    uint32_t          aspect_den;
+
+    /* Transactional live resize target buffering */
+    int               resize_has_target;
+    int32_t           target_x;
+    int32_t           target_y;
+    uint32_t          target_w;
+    uint32_t          target_h;
 } vanilla_server_window_t;
 
 typedef struct {
@@ -128,6 +159,25 @@ typedef struct vanilla_server {
     int                     is_dragging;
     int32_t                 drag_offset_x;
     int32_t                 drag_offset_y;
+
+    /* Interactive resize state */
+    int                     is_resizing;
+    uint32_t                resize_window_id;
+    int                     resize_edge;
+    int32_t                 resize_origin_x;
+    int32_t                 resize_origin_y;
+    int32_t                 resize_start_x;
+    int32_t                 resize_start_y;
+    uint32_t                resize_start_w;
+    uint32_t                resize_start_h;
+
+    /* Drag threshold */
+    int                     drag_threshold_pending;
+    int32_t                 drag_threshold_start_x;
+    int32_t                 drag_threshold_start_y;
+    int                     drag_threshold_mode;
+    int                     drag_threshold_edge;
+    uint32_t                drag_threshold_window_id;
 
     /* Desktop shell taskbar and quick launcher */
     vanilla_shell_t         shell;
@@ -164,5 +214,7 @@ void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type);
 void wm_unsnap_window(vanilla_server_t *srv, uint32_t window_id);
 int  wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev);
 vanilla_server_window_t *wm_window_at(vanilla_server_t *srv, int32_t x, int32_t y);
+vanilla_resize_edge_t wm_hit_test_resize_edge(const vanilla_server_window_t *w, int32_t px, int32_t py);
+int  wm_run_resize_selftests(void);
 
 #endif /* _VANILLA_SERVER_H */

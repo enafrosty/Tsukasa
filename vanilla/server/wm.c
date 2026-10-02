@@ -182,6 +182,215 @@ vanilla_server_window_t *wm_window_at(vanilla_server_t *srv, int32_t x, int32_t 
     return hit;
 }
 
+static inline vanilla_cursor_shape_t resize_edge_to_cursor_shape(vanilla_resize_edge_t edge)
+{
+    switch (edge) {
+    case RESIZE_EDGE_TOP:       return CURSOR_RESIZE_N;
+    case RESIZE_EDGE_BOTTOM:    return CURSOR_RESIZE_S;
+    case RESIZE_EDGE_LEFT:      return CURSOR_RESIZE_W;
+    case RESIZE_EDGE_RIGHT:     return CURSOR_RESIZE_E;
+    case RESIZE_EDGE_TOP_LEFT:  return CURSOR_RESIZE_NW;
+    case RESIZE_EDGE_TOP_RIGHT: return CURSOR_RESIZE_NE;
+    case RESIZE_EDGE_BOT_LEFT:  return CURSOR_RESIZE_SW;
+    case RESIZE_EDGE_BOT_RIGHT: return CURSOR_RESIZE_SE;
+    default:                    return CURSOR_ARROW;
+    }
+}
+
+vanilla_resize_edge_t wm_hit_test_resize_edge(const vanilla_server_window_t *w, int32_t px, int32_t py)
+{
+    if (!w || !w->in_use || !w->is_mapped)
+        return RESIZE_EDGE_NONE;
+    if (!(w->flags & WINDOW_FLAG_RESIZABLE))
+        return RESIZE_EDGE_NONE;
+    if (w->is_snapped != SNAP_NONE)
+        return RESIZE_EDGE_NONE;
+
+    vanilla_rect_t frame;
+    wm_get_frame_rect(w, &frame);
+
+    int32_t fx = frame.x;
+    int32_t fy = frame.y;
+    int32_t fw = frame.w;
+    int32_t fh = frame.h;
+
+    if (fw < 24 || fh < 24)
+        return RESIZE_EDGE_NONE;
+
+    if (px < fx || px >= fx + fw || py < fy || py >= fy + fh)
+        return RESIZE_EDGE_NONE;
+
+    /* Chrome buttons on titlebar take precedence over resize zones */
+    if (!(w->flags & WINDOW_FLAG_BORDERLESS)) {
+        chrome_btn_rects_t btns = chrome_metrics(&frame);
+        if (vanilla_rect_contains(&btns.close_btn, px, py) ||
+            vanilla_rect_contains(&btns.max_btn, px, py) ||
+            vanilla_rect_contains(&btns.min_btn, px, py)) {
+            return RESIZE_EDGE_NONE;
+        }
+    }
+
+    /* Corner zones (12x12 px) */
+    if (py < fy + 12) {
+        if (px < fx + 12)
+            return RESIZE_EDGE_TOP_LEFT;
+        if (px >= fx + fw - 12)
+            return RESIZE_EDGE_TOP_RIGHT;
+        if (py < fy + 8)
+            return RESIZE_EDGE_TOP;
+    } else if (py >= fy + fh - 12) {
+        if (px < fx + 12)
+            return RESIZE_EDGE_BOT_LEFT;
+        if (px >= fx + fw - 12)
+            return RESIZE_EDGE_BOT_RIGHT;
+        if (py >= fy + fh - 8)
+            return RESIZE_EDGE_BOTTOM;
+    } else {
+        if (px < fx + 8)
+            return RESIZE_EDGE_LEFT;
+        if (px >= fx + fw - 8)
+            return RESIZE_EDGE_RIGHT;
+    }
+
+    return RESIZE_EDGE_NONE;
+}
+
+static void resize_compute_geometry(const vanilla_server_t *srv,
+                                    const vanilla_server_window_t *w,
+                                    int32_t *out_x, int32_t *out_y,
+                                    uint32_t *out_w, uint32_t *out_h)
+{
+    int32_t dx = srv->cursor_x - srv->resize_origin_x;
+    int32_t dy = srv->cursor_y - srv->resize_origin_y;
+
+    int32_t calc_x = srv->resize_start_x;
+    int32_t calc_y = srv->resize_start_y;
+    int32_t calc_w = (int32_t)srv->resize_start_w;
+    int32_t calc_h = (int32_t)srv->resize_start_h;
+
+    switch (srv->resize_edge) {
+    case RESIZE_EDGE_RIGHT:
+        calc_w += dx;
+        break;
+    case RESIZE_EDGE_BOTTOM:
+        calc_h += dy;
+        break;
+    case RESIZE_EDGE_LEFT:
+        calc_x += dx;
+        calc_w -= dx;
+        break;
+    case RESIZE_EDGE_TOP:
+        calc_y += dy;
+        calc_h -= dy;
+        break;
+    case RESIZE_EDGE_BOT_RIGHT:
+        calc_w += dx;
+        calc_h += dy;
+        break;
+    case RESIZE_EDGE_BOT_LEFT:
+        calc_x += dx;
+        calc_w -= dx;
+        calc_h += dy;
+        break;
+    case RESIZE_EDGE_TOP_RIGHT:
+        calc_w += dx;
+        calc_y += dy;
+        calc_h -= dy;
+        break;
+    case RESIZE_EDGE_TOP_LEFT:
+        calc_x += dx;
+        calc_w -= dx;
+        calc_y += dy;
+        calc_h -= dy;
+        break;
+    default:
+        break;
+    }
+
+    if (w->aspect_num && w->aspect_den) {
+        if (srv->resize_edge == RESIZE_EDGE_TOP || srv->resize_edge == RESIZE_EDGE_BOTTOM) {
+            /* Vertical drag: height is primary driver */
+            if (w->min_height && calc_h < (int32_t)w->min_height)
+                calc_h = (int32_t)w->min_height;
+            if (w->max_height && calc_h > (int32_t)w->max_height)
+                calc_h = (int32_t)w->max_height;
+            if (calc_h < 32)
+                calc_h = 32;
+
+            calc_w = (int32_t)(((uint64_t)calc_h * w->aspect_num + w->aspect_den / 2) / w->aspect_den);
+
+            if (w->min_width && calc_w < (int32_t)w->min_width) {
+                calc_w = (int32_t)w->min_width;
+                calc_h = (int32_t)(((uint64_t)calc_w * w->aspect_den + w->aspect_num / 2) / w->aspect_num);
+            }
+            if (w->max_width && calc_w > (int32_t)w->max_width) {
+                calc_w = (int32_t)w->max_width;
+                calc_h = (int32_t)(((uint64_t)calc_w * w->aspect_den + w->aspect_num / 2) / w->aspect_num);
+            }
+            if (calc_w < 32) {
+                calc_w = 32;
+                calc_h = (int32_t)(((uint64_t)calc_w * w->aspect_den + w->aspect_num / 2) / w->aspect_num);
+            }
+        } else {
+            /* Horizontal or corner drag: width is primary driver */
+            if (w->min_width && calc_w < (int32_t)w->min_width)
+                calc_w = (int32_t)w->min_width;
+            if (w->max_width && calc_w > (int32_t)w->max_width)
+                calc_w = (int32_t)w->max_width;
+            if (calc_w < 32)
+                calc_w = 32;
+
+            calc_h = (int32_t)(((uint64_t)calc_w * w->aspect_den + w->aspect_num / 2) / w->aspect_num);
+
+            if (w->min_height && calc_h < (int32_t)w->min_height) {
+                calc_h = (int32_t)w->min_height;
+                calc_w = (int32_t)(((uint64_t)calc_h * w->aspect_num + w->aspect_den / 2) / w->aspect_den);
+            }
+            if (w->max_height && calc_h > (int32_t)w->max_height) {
+                calc_h = (int32_t)w->max_height;
+                calc_w = (int32_t)(((uint64_t)calc_h * w->aspect_num + w->aspect_den / 2) / w->aspect_den);
+            }
+            if (calc_h < 32) {
+                calc_h = 32;
+                calc_w = (int32_t)(((uint64_t)calc_h * w->aspect_num + w->aspect_den / 2) / w->aspect_den);
+            }
+        }
+    } else {
+        /* Standard min/max clamping */
+        if (w->min_width && calc_w < (int32_t)w->min_width)
+            calc_w = (int32_t)w->min_width;
+        if (w->min_height && calc_h < (int32_t)w->min_height)
+            calc_h = (int32_t)w->min_height;
+        if (w->max_width && calc_w > (int32_t)w->max_width)
+            calc_w = (int32_t)w->max_width;
+        if (w->max_height && calc_h > (int32_t)w->max_height)
+            calc_h = (int32_t)w->max_height;
+    }
+
+    /* Absolute minimum */
+    if (calc_w < 32)
+        calc_w = 32;
+    if (calc_h < 32)
+        calc_h = 32;
+
+    /* Keep opposite corner/edge stationary when resizing top or left edges */
+    if (srv->resize_edge == RESIZE_EDGE_LEFT ||
+        srv->resize_edge == RESIZE_EDGE_BOT_LEFT ||
+        srv->resize_edge == RESIZE_EDGE_TOP_LEFT) {
+        calc_x = (int32_t)(srv->resize_start_x + srv->resize_start_w) - calc_w;
+    }
+    if (srv->resize_edge == RESIZE_EDGE_TOP ||
+        srv->resize_edge == RESIZE_EDGE_TOP_LEFT ||
+        srv->resize_edge == RESIZE_EDGE_TOP_RIGHT) {
+        calc_y = (int32_t)(srv->resize_start_y + srv->resize_start_h) - calc_h;
+    }
+
+    *out_x = calc_x;
+    *out_y = calc_y;
+    *out_w = (uint32_t)calc_w;
+    *out_h = (uint32_t)calc_h;
+}
+
 void wm_invalidate_window(vanilla_server_t *srv, const vanilla_server_window_t *win)
 {
     if (!srv || !win)
@@ -323,6 +532,8 @@ int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
     compositor_damage_all(&srv->compositor);
     compositor_render_frame(srv);
 
+    wm_run_resize_selftests();
+
     return 0;
 }
 
@@ -402,6 +613,15 @@ void vanilla_server_remove_client(vanilla_server_t *srv, int client_idx)
                 srv->is_dragging = 0;
                 srv->drag_window_id = 0;
             }
+            if (srv->is_resizing && srv->resize_window_id == srv->windows[i].window_id) {
+                srv->is_resizing = 0;
+                srv->resize_window_id = 0;
+                srv->resize_edge = RESIZE_EDGE_NONE;
+            }
+            if (srv->drag_threshold_pending && srv->drag_threshold_window_id == srv->windows[i].window_id) {
+                srv->drag_threshold_pending = 0;
+            }
+            srv->windows[i].resize_has_target = 0;
             wm_invalidate_window(srv, &srv->windows[i]);
             surface_destroy(&srv->windows[i].surface);
             srv->windows[i].in_use = 0;
@@ -590,6 +810,17 @@ int handle_msg_create_window(vanilla_server_t *srv, int client_idx, const vanill
     w->frame_begin_in_flight = 0;
     w->frame_begin_time_ms = 0;
     w->cursor_shape = CURSOR_ARROW;
+    w->min_width = 0;
+    w->min_height = 0;
+    w->max_width = 0;
+    w->max_height = 0;
+    w->aspect_num = 0;
+    w->aspect_den = 0;
+    w->resize_has_target = 0;
+    w->target_x = req->x;
+    w->target_y = req->y;
+    w->target_w = req->width;
+    w->target_h = req->height;
 
     if (req->flags & WINDOW_FLAG_MODAL)
         w->layer = LAYER_TOPMOST;
@@ -634,6 +865,15 @@ int handle_msg_destroy_window(vanilla_server_t *srv, int client_idx, const vanil
             srv->is_dragging = 0;
             srv->drag_window_id = 0;
         }
+        if (srv->is_resizing && srv->resize_window_id == w->window_id) {
+            srv->is_resizing = 0;
+            srv->resize_window_id = 0;
+            srv->resize_edge = RESIZE_EDGE_NONE;
+        }
+        if (srv->drag_threshold_pending && srv->drag_threshold_window_id == w->window_id) {
+            srv->drag_threshold_pending = 0;
+        }
+        w->resize_has_target = 0;
         wm_invalidate_window(srv, w);
         surface_destroy(&w->surface);
         w->in_use = 0;
@@ -665,6 +905,19 @@ int handle_msg_unmap_window(vanilla_server_t *srv, int client_idx, const vanilla
     int cfd = srv->clients[client_idx].fd;
     vanilla_server_window_t *w = vanilla_server_find_window(srv, req->window_id);
     if (w && w->client_fd == cfd) {
+        if (srv->is_dragging && srv->drag_window_id == w->window_id) {
+            srv->is_dragging = 0;
+            srv->drag_window_id = 0;
+        }
+        if (srv->is_resizing && srv->resize_window_id == w->window_id) {
+            srv->is_resizing = 0;
+            srv->resize_window_id = 0;
+            srv->resize_edge = RESIZE_EDGE_NONE;
+        }
+        if (srv->drag_threshold_pending && srv->drag_threshold_window_id == w->window_id) {
+            srv->drag_threshold_pending = 0;
+        }
+        w->resize_has_target = 0;
         wm_invalidate_window(srv, w);
         w->is_mapped = 0;
         w->is_focused = 0;
@@ -812,6 +1065,38 @@ int handle_msg_ack_configure(vanilla_server_t *srv, int client_idx, const vanill
     wm_invalidate_window(srv, w);
     shell_invalidate(srv);
     printf("[vanilla] ack_configure: window %u serial %u applied\n", w->window_id, ack->serial);
+
+    /* If a target geometry was queued while configure was in flight, dispatch it now */
+    if (w->resize_has_target) {
+        int32_t tx = w->target_x;
+        int32_t ty = w->target_y;
+        uint32_t tw = w->target_w;
+        uint32_t th = w->target_h;
+        w->resize_has_target = 0;
+
+        if (tx != w->x || ty != w->y || tw != w->width || th != w->height) {
+            w->pending_x = tx;
+            w->pending_y = ty;
+            w->pending_w = tw;
+            w->pending_h = th;
+            wm_send_configure(srv, w);
+            return 0;
+        }
+    }
+
+    if (srv->is_resizing && srv->resize_window_id == w->window_id) {
+        int32_t new_x, new_y;
+        uint32_t new_w, new_h;
+        resize_compute_geometry(srv, w, &new_x, &new_y, &new_w, &new_h);
+        if (new_x != w->x || new_y != w->y || new_w != w->width || new_h != w->height) {
+            w->pending_x = new_x;
+            w->pending_y = new_y;
+            w->pending_w = new_w;
+            w->pending_h = new_h;
+            wm_send_configure(srv, w);
+        }
+    }
+
     return 0;
 }
 
@@ -824,6 +1109,243 @@ int handle_msg_set_cursor(vanilla_server_t *srv, int client_idx, const vanilla_m
     if (w && w->client_fd == cfd) {
         w->cursor_shape = req->shape;
     }
+    return 0;
+}
+
+int handle_msg_set_size_hints(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    const vanilla_msg_set_size_hints_t *hints = (const vanilla_msg_set_size_hints_t *)payload;
+    int cfd = srv->clients[client_idx].fd;
+    uint32_t wid = hdr->window_id ? hdr->window_id : hints->window_id;
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, wid);
+    if (!w || w->client_fd != cfd)
+        return 0;
+
+    w->min_width = hints->min_width;
+    w->min_height = hints->min_height;
+    w->max_width = hints->max_width;
+    w->max_height = hints->max_height;
+    w->aspect_num = hints->aspect_num;
+    w->aspect_den = hints->aspect_den;
+    return 0;
+}
+
+int wm_run_resize_selftests(void)
+{
+    /* 1. Edge hit testing across 8 zones and boundary exclusions */
+    vanilla_server_window_t w;
+    memset(&w, 0, sizeof(w));
+    w.in_use = 1;
+    w.is_mapped = 1;
+    w.flags = WINDOW_FLAG_RESIZABLE;
+    w.is_snapped = SNAP_NONE;
+    w.x = 100;
+    w.y = 100;
+    w.width = 400;
+    w.height = 300;
+
+    vanilla_rect_t frame;
+    wm_get_frame_rect(&w, &frame);
+
+    if (wm_hit_test_resize_edge(&w, frame.x, frame.y) != RESIZE_EDGE_TOP_LEFT) {
+        fprintf(stderr, "[wm_selftest] FAIL: TOP_LEFT corner hit-test\n");
+        return -1;
+    }
+    if (wm_hit_test_resize_edge(&w, frame.x + frame.w - 1, frame.y) != RESIZE_EDGE_TOP_RIGHT) {
+        fprintf(stderr, "[wm_selftest] FAIL: TOP_RIGHT corner hit-test\n");
+        return -1;
+    }
+    if (wm_hit_test_resize_edge(&w, frame.x, frame.y + frame.h - 1) != RESIZE_EDGE_BOT_LEFT) {
+        fprintf(stderr, "[wm_selftest] FAIL: BOT_LEFT corner hit-test\n");
+        return -1;
+    }
+    if (wm_hit_test_resize_edge(&w, frame.x + frame.w - 1, frame.y + frame.h - 1) != RESIZE_EDGE_BOT_RIGHT) {
+        fprintf(stderr, "[wm_selftest] FAIL: BOT_RIGHT corner hit-test\n");
+        return -1;
+    }
+    if (wm_hit_test_resize_edge(&w, frame.x + frame.w / 2, frame.y) != RESIZE_EDGE_TOP) {
+        fprintf(stderr, "[wm_selftest] FAIL: TOP edge hit-test\n");
+        return -1;
+    }
+    if (wm_hit_test_resize_edge(&w, frame.x + frame.w / 2, frame.y + frame.h - 1) != RESIZE_EDGE_BOTTOM) {
+        fprintf(stderr, "[wm_selftest] FAIL: BOTTOM edge hit-test\n");
+        return -1;
+    }
+    if (wm_hit_test_resize_edge(&w, frame.x, frame.y + frame.h / 2) != RESIZE_EDGE_LEFT) {
+        fprintf(stderr, "[wm_selftest] FAIL: LEFT edge hit-test\n");
+        return -1;
+    }
+    if (wm_hit_test_resize_edge(&w, frame.x + frame.w - 1, frame.y + frame.h / 2) != RESIZE_EDGE_RIGHT) {
+        fprintf(stderr, "[wm_selftest] FAIL: RIGHT edge hit-test\n");
+        return -1;
+    }
+    if (wm_hit_test_resize_edge(&w, frame.x + frame.w / 2, frame.y + frame.h / 2) != RESIZE_EDGE_NONE) {
+        fprintf(stderr, "[wm_selftest] FAIL: interior should be RESIZE_EDGE_NONE\n");
+        return -1;
+    }
+    w.flags = 0; /* Not resizable */
+    if (wm_hit_test_resize_edge(&w, frame.x, frame.y) != RESIZE_EDGE_NONE) {
+        fprintf(stderr, "[wm_selftest] FAIL: non-resizable window allowed edge hit\n");
+        return -1;
+    }
+    w.flags = WINDOW_FLAG_RESIZABLE;
+    w.is_snapped = SNAP_MAXIMIZE;
+    if (wm_hit_test_resize_edge(&w, frame.x, frame.y) != RESIZE_EDGE_NONE) {
+        fprintf(stderr, "[wm_selftest] FAIL: snapped window allowed edge hit\n");
+        return -1;
+    }
+    w.is_snapped = SNAP_NONE;
+
+    /* Chrome buttons should not trigger resize edge */
+    chrome_btn_rects_t btns = chrome_metrics(&frame);
+    if (wm_hit_test_resize_edge(&w, btns.close_btn.x + 2, btns.close_btn.y + 2) != RESIZE_EDGE_NONE) {
+        fprintf(stderr, "[wm_selftest] FAIL: close button triggered resize edge\n");
+        return -1;
+    }
+
+    /* 2. Geometry calculation with basic directional dragging */
+    vanilla_server_t srv;
+    memset(&srv, 0, sizeof(srv));
+    srv.resize_start_x = 100;
+    srv.resize_start_y = 100;
+    srv.resize_start_w = 400;
+    srv.resize_start_h = 300;
+    srv.resize_origin_x = 200;
+    srv.resize_origin_y = 200;
+
+    int32_t ox, oy;
+    uint32_t ow, oh;
+
+    /* RIGHT: width expands */
+    srv.resize_edge = RESIZE_EDGE_RIGHT;
+    srv.cursor_x = 250;
+    srv.cursor_y = 200;
+    resize_compute_geometry(&srv, &w, &ox, &oy, &ow, &oh);
+    if (ox != 100 || oy != 100 || ow != 450 || oh != 300) {
+        fprintf(stderr, "[wm_selftest] FAIL: RIGHT drag geometry\n");
+        return -1;
+    }
+
+    /* LEFT: width shrinks, x moves right, right edge fixed at 500 */
+    srv.resize_edge = RESIZE_EDGE_LEFT;
+    srv.cursor_x = 230;
+    srv.cursor_y = 200;
+    resize_compute_geometry(&srv, &w, &ox, &oy, &ow, &oh);
+    if (ox != 130 || oy != 100 || ow != 370 || oh != 300 || (ox + (int32_t)ow != 500)) {
+        fprintf(stderr, "[wm_selftest] FAIL: LEFT drag geometry\n");
+        return -1;
+    }
+
+    /* 3. Min/Max size hints clamping */
+    w.min_width = 300;
+    w.min_height = 200;
+    w.max_width = 600;
+    w.max_height = 500;
+
+    /* Drag past min_width */
+    srv.resize_edge = RESIZE_EDGE_RIGHT;
+    srv.cursor_x = 50; /* dx = -150 -> 400 - 150 = 250 < 300 */
+    srv.cursor_y = 200;
+    resize_compute_geometry(&srv, &w, &ox, &oy, &ow, &oh);
+    if (ow != 300) {
+        fprintf(stderr, "[wm_selftest] FAIL: min_width clamp\n");
+        return -1;
+    }
+
+    /* Drag past max_width */
+    srv.cursor_x = 500; /* dx = +300 -> 400 + 300 = 700 > 600 */
+    resize_compute_geometry(&srv, &w, &ox, &oy, &ow, &oh);
+    if (ow != 600) {
+        fprintf(stderr, "[wm_selftest] FAIL: max_width clamp\n");
+        return -1;
+    }
+
+    /* 4. Aspect ratio locking (16:9) */
+    w.min_width = 0;
+    w.min_height = 0;
+    w.max_width = 0;
+    w.max_height = 0;
+    w.aspect_num = 16;
+    w.aspect_den = 9;
+    srv.resize_start_w = 320;
+    srv.resize_start_h = 180;
+
+    /* Horizontal drag (RIGHT): height derived from width */
+    srv.resize_edge = RESIZE_EDGE_RIGHT;
+    srv.cursor_x = 200 + 160; /* w becomes 320 + 160 = 480 */
+    srv.cursor_y = 200;
+    resize_compute_geometry(&srv, &w, &ox, &oy, &ow, &oh);
+    if (ow != 480 || oh != 270) {
+        fprintf(stderr, "[wm_selftest] FAIL: aspect lock on horizontal drag (got %ux%u, expected 480x270)\n", ow, oh);
+        return -1;
+    }
+
+    /* Vertical drag (BOTTOM): width derived from height */
+    srv.resize_edge = RESIZE_EDGE_BOTTOM;
+    srv.cursor_x = 200;
+    srv.cursor_y = 200 + 90; /* h becomes 180 + 90 = 270 */
+    resize_compute_geometry(&srv, &w, &ox, &oy, &ow, &oh);
+    if (ow != 480 || oh != 270) {
+        fprintf(stderr, "[wm_selftest] FAIL: aspect lock on vertical BOTTOM drag (got %ux%u, expected 480x270)\n", ow, oh);
+        return -1;
+    }
+
+    /* Vertical drag (TOP): width derived from height, bottom edge stationary */
+    srv.resize_edge = RESIZE_EDGE_TOP;
+    srv.cursor_x = 200;
+    srv.cursor_y = 200 - 90; /* dy = -90 -> h becomes 180 + 90 = 270 */
+    resize_compute_geometry(&srv, &w, &ox, &oy, &ow, &oh);
+    if (ow != 480 || oh != 270 || oy != 10 || (oy + (int32_t)oh != 280)) {
+        fprintf(stderr, "[wm_selftest] FAIL: aspect lock on vertical TOP drag (got %ux%u at y=%d)\n", ow, oh, oy);
+        return -1;
+    }
+
+    /* 5. Drag threshold Chebyshev metric */
+    int32_t dx1 = 3, dy1 = 4;
+    int32_t cheb1 = (dx1 < 0 ? -dx1 : dx1) > (dy1 < 0 ? -dy1 : dy1) ? (dx1 < 0 ? -dx1 : dx1) : (dy1 < 0 ? -dy1 : dy1);
+    if (cheb1 > 4) {
+        fprintf(stderr, "[wm_selftest] FAIL: Chebyshev threshold false positive at (3,4)\n");
+        return -1;
+    }
+    int32_t dx2 = -5, dy2 = 2;
+    int32_t cheb2 = (dx2 < 0 ? -dx2 : dx2) > (dy2 < 0 ? -dy2 : dy2) ? (dx2 < 0 ? -dx2 : dx2) : (dy2 < 0 ? -dy2 : dy2);
+    if (cheb2 <= 4) {
+        fprintf(stderr, "[wm_selftest] FAIL: Chebyshev threshold false negative at (-5,2)\n");
+        return -1;
+    }
+
+    /* 6. Protocol message MSG_SET_SIZE_HINTS dispatch */
+    vanilla_msg_hdr_t hints_hdr;
+    memset(&hints_hdr, 0, sizeof(hints_hdr));
+    hints_hdr.magic = VANILLA_IPC_MAGIC;
+    hints_hdr.msg_type = MSG_SET_SIZE_HINTS;
+    hints_hdr.payload_len = sizeof(vanilla_msg_set_size_hints_t);
+    hints_hdr.window_id = 1;
+
+    vanilla_msg_set_size_hints_t hints_msg;
+    hints_msg.window_id = 1;
+    hints_msg.min_width = 160;
+    hints_msg.min_height = 120;
+    hints_msg.max_width = 1920;
+    hints_msg.max_height = 1080;
+    hints_msg.aspect_num = 16;
+    hints_msg.aspect_den = 9;
+
+    srv.clients[0].in_use = 1;
+    srv.clients[0].fd = 10;
+    srv.windows[0] = w;
+    srv.windows[0].window_id = 1;
+    srv.windows[0].client_fd = 10;
+
+    handle_msg_set_size_hints(&srv, 0, &hints_hdr, (const uint8_t *)&hints_msg);
+    if (srv.windows[0].min_width != 160 || srv.windows[0].min_height != 120 ||
+        srv.windows[0].max_width != 1920 || srv.windows[0].max_height != 1080 ||
+        srv.windows[0].aspect_num != 16 || srv.windows[0].aspect_den != 9) {
+        fprintf(stderr, "[wm_selftest] FAIL: handle_msg_set_size_hints dispatch\n");
+        return -1;
+    }
+
+    printf("[vanilla] wm resize & size hints self-tests passed (6/6)\n");
     return 0;
 }
 
@@ -1118,6 +1640,21 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
             w->height = w->pending_h;
             wm_invalidate_window(srv, w);
             shell_invalidate(srv);
+
+            if (w->resize_has_target) {
+                int32_t tx = w->target_x;
+                int32_t ty = w->target_y;
+                uint32_t tw = w->target_w;
+                uint32_t th = w->target_h;
+                w->resize_has_target = 0;
+                if (tx != w->x || ty != w->y || tw != w->width || th != w->height) {
+                    w->pending_x = tx;
+                    w->pending_y = ty;
+                    w->pending_w = tw;
+                    w->pending_h = th;
+                    wm_send_configure(srv, w);
+                }
+            }
         }
     }
 
@@ -1425,13 +1962,52 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             vanilla_rect_t old_box;
             cursor_get_rect(old_x, old_y, &old_box);
 
-            if (!srv->is_dragging) {
-                vanilla_rect_t win_frame;
+            if (srv->drag_threshold_pending) {
+                int32_t dx = srv->cursor_x - srv->drag_threshold_start_x;
+                int32_t dy = srv->cursor_y - srv->drag_threshold_start_y;
+                int32_t dist_x = dx < 0 ? -dx : dx;
+                int32_t dist_y = dy < 0 ? -dy : dy;
+                int32_t chebyshev = dist_x > dist_y ? dist_x : dist_y;
+
+                if (chebyshev > 4) {
+                    srv->drag_threshold_pending = 0;
+                    vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->drag_threshold_window_id);
+                    if (w && !srv->is_dragging && !srv->is_resizing) {
+                        if (srv->drag_threshold_mode == DRAG_MODE_TITLEBAR) {
+                            if (w->is_snapped != SNAP_NONE) {
+                                wm_unsnap_window(srv, w->window_id);
+                                w->x = srv->drag_threshold_start_x - (int32_t)w->width / 2;
+                                w->y = srv->drag_threshold_start_y - g_theme->titlebar_height / 2;
+                            }
+                            srv->is_dragging = 1;
+                            srv->drag_window_id = w->window_id;
+                            srv->drag_offset_x = srv->drag_threshold_start_x - w->x;
+                            srv->drag_offset_y = srv->drag_threshold_start_y - w->y;
+                        } else if (srv->drag_threshold_mode == DRAG_MODE_RESIZE) {
+                            srv->is_resizing = 1;
+                            srv->resize_window_id = w->window_id;
+                            srv->resize_edge = srv->drag_threshold_edge;
+                            srv->resize_origin_x = srv->drag_threshold_start_x;
+                            srv->resize_origin_y = srv->drag_threshold_start_y;
+                            srv->resize_start_x = w->x;
+                            srv->resize_start_y = w->y;
+                            srv->resize_start_w = w->width;
+                            srv->resize_start_h = w->height;
+                        }
+                    }
+                }
+            }
+
+            if (srv->is_resizing) {
+                cursor_set_active(resize_edge_to_cursor_shape((vanilla_resize_edge_t)srv->resize_edge));
+            } else if (!srv->is_dragging) {
                 vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
-                if (under && !(under->flags & WINDOW_FLAG_BORDERLESS)) {
-                    wm_get_frame_rect(under, &win_frame);
-                    cursor_select_for_hit_region(srv->cursor_x, srv->cursor_y, &win_frame,
-                                                 g_theme->border_width, g_theme->titlebar_height);
+                if (under && (under->flags & WINDOW_FLAG_RESIZABLE) && under->is_snapped == SNAP_NONE) {
+                    vanilla_resize_edge_t edge = wm_hit_test_resize_edge(under, srv->cursor_x, srv->cursor_y);
+                    if (edge != RESIZE_EDGE_NONE)
+                        cursor_set_active(resize_edge_to_cursor_shape(edge));
+                    else
+                        cursor_set_active(CURSOR_ARROW);
                 } else {
                     cursor_set_active(CURSOR_ARROW);
                 }
@@ -1451,6 +2027,49 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     w->x = srv->cursor_x - srv->drag_offset_x;
                     w->y = srv->cursor_y - srv->drag_offset_y;
                     wm_invalidate_window(srv, w);
+                }
+            } else if (srv->is_resizing) {
+                vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->resize_window_id);
+                if (w) {
+                    int32_t new_x, new_y;
+                    uint32_t new_w, new_h;
+                    resize_compute_geometry(srv, w, &new_x, &new_y, &new_w, &new_h);
+
+                    vanilla_client_conn_t *c = find_client_by_fd(srv, w->client_fd);
+                    if (c && c->negotiated_version >= 2) {
+                        if (!w->configure_pending) {
+                            if (new_x != w->x || new_y != w->y || new_w != w->width || new_h != w->height) {
+                                w->pending_x = new_x;
+                                w->pending_y = new_y;
+                                w->pending_w = new_w;
+                                w->pending_h = new_h;
+                                wm_send_configure(srv, w);
+                            }
+                        } else {
+                            if (new_x != w->x || new_y != w->y || new_w != w->width || new_h != w->height) {
+                                w->target_x = new_x;
+                                w->target_y = new_y;
+                                w->target_w = new_w;
+                                w->target_h = new_h;
+                                w->resize_has_target = 1;
+                            }
+                        }
+                    } else {
+                        if (new_x != w->x || new_y != w->y || new_w != w->width || new_h != w->height) {
+                            wm_invalidate_window(srv, w);
+                            w->x = new_x;
+                            w->y = new_y;
+                            w->width = new_w;
+                            w->height = new_h;
+                            w->pending_x = new_x;
+                            w->pending_y = new_y;
+                            w->pending_w = new_w;
+                            w->pending_h = new_h;
+                            wm_send_configure(srv, w);
+                            wm_invalidate_window(srv, w);
+                            shell_invalidate(srv);
+                        }
+                    }
                 }
             }
         }
@@ -1517,7 +2136,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     vanilla_rect_t frame;
                     wm_get_frame_rect(hit, &frame);
 
-                    /* Check titlebar click */
+                    /* Check titlebar chrome buttons */
                     if (!(hit->flags & WINDOW_FLAG_BORDERLESS) &&
                         srv->cursor_y < frame.y + g_theme->titlebar_height + g_theme->border_width) {
 
@@ -1548,18 +2167,29 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                             shell_invalidate(srv);
                             return 0;
                         }
+                    }
 
-                        /* Click on titlebar body: initiate window drag */
-                        if (hit->is_snapped != SNAP_NONE) {
-                            wm_unsnap_window(srv, hit->window_id);
-                            hit->x = srv->cursor_x - (int32_t)hit->width / 2;
-                            hit->y = srv->cursor_y - g_theme->titlebar_height / 2;
-                        }
+                    /* Check resize edge/corner zone if window is resizable */
+                    vanilla_resize_edge_t edge = wm_hit_test_resize_edge(hit, srv->cursor_x, srv->cursor_y);
+                    if (edge != RESIZE_EDGE_NONE) {
+                        srv->drag_threshold_pending = 1;
+                        srv->drag_threshold_start_x = srv->cursor_x;
+                        srv->drag_threshold_start_y = srv->cursor_y;
+                        srv->drag_threshold_mode = DRAG_MODE_RESIZE;
+                        srv->drag_threshold_edge = edge;
+                        srv->drag_threshold_window_id = hit->window_id;
+                        return 0;
+                    }
 
-                        srv->is_dragging = 1;
-                        srv->drag_window_id = hit->window_id;
-                        srv->drag_offset_x = srv->cursor_x - hit->x;
-                        srv->drag_offset_y = srv->cursor_y - hit->y;
+                    /* Click on titlebar body: initiate window drag with threshold */
+                    if (!(hit->flags & WINDOW_FLAG_BORDERLESS) &&
+                        srv->cursor_y < frame.y + g_theme->titlebar_height + g_theme->border_width) {
+                        srv->drag_threshold_pending = 1;
+                        srv->drag_threshold_start_x = srv->cursor_x;
+                        srv->drag_threshold_start_y = srv->cursor_y;
+                        srv->drag_threshold_mode = DRAG_MODE_TITLEBAR;
+                        srv->drag_threshold_edge = RESIZE_EDGE_NONE;
+                        srv->drag_threshold_window_id = hit->window_id;
                         return 0;
                     }
 
@@ -1584,6 +2214,70 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 return 0;
             } else {
                 srv->mouse_buttons &= ~(1u << 0);
+                srv->drag_threshold_pending = 0;
+
+                if (srv->is_resizing) {
+                    vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->resize_window_id);
+                    if (w) {
+                        int32_t new_x, new_y;
+                        uint32_t new_w, new_h;
+                        resize_compute_geometry(srv, w, &new_x, &new_y, &new_w, &new_h);
+
+                        vanilla_client_conn_t *c = find_client_by_fd(srv, w->client_fd);
+                        if (c && c->negotiated_version >= 2) {
+                            if (!w->configure_pending) {
+                                if (new_x != w->x || new_y != w->y || new_w != w->width || new_h != w->height) {
+                                    w->pending_x = new_x;
+                                    w->pending_y = new_y;
+                                    w->pending_w = new_w;
+                                    w->pending_h = new_h;
+                                    wm_send_configure(srv, w);
+                                }
+                            } else {
+                                if (new_x != w->x || new_y != w->y || new_w != w->width || new_h != w->height) {
+                                    w->target_x = new_x;
+                                    w->target_y = new_y;
+                                    w->target_w = new_w;
+                                    w->target_h = new_h;
+                                    w->resize_has_target = 1;
+                                }
+                            }
+                        } else {
+                            if (new_x != w->x || new_y != w->y || new_w != w->width || new_h != w->height) {
+                                wm_invalidate_window(srv, w);
+                                w->x = new_x;
+                                w->y = new_y;
+                                w->width = new_w;
+                                w->height = new_h;
+                                w->pending_x = new_x;
+                                w->pending_y = new_y;
+                                w->pending_w = new_w;
+                                w->pending_h = new_h;
+                                wm_send_configure(srv, w);
+                                wm_invalidate_window(srv, w);
+                                shell_invalidate(srv);
+                            }
+                        }
+                    }
+                    srv->is_resizing = 0;
+                    srv->resize_window_id = 0;
+                    srv->resize_edge = RESIZE_EDGE_NONE;
+
+                    vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
+                    if (under && (under->flags & WINDOW_FLAG_RESIZABLE) && under->is_snapped == SNAP_NONE) {
+                        vanilla_resize_edge_t edge = wm_hit_test_resize_edge(under, srv->cursor_x, srv->cursor_y);
+                        if (edge != RESIZE_EDGE_NONE)
+                            cursor_set_active(resize_edge_to_cursor_shape(edge));
+                        else
+                            cursor_set_active(CURSOR_ARROW);
+                    } else {
+                        cursor_set_active(CURSOR_ARROW);
+                    }
+                    vanilla_rect_t cur_box;
+                    cursor_get_rect(srv->cursor_x, srv->cursor_y, &cur_box);
+                    compositor_add_damage(&srv->compositor, &cur_box);
+                    return 0;
+                }
 
                 if (srv->is_dragging) {
                     /* Evaluate Aero-snap boundary triggers upon release */
@@ -1597,12 +2291,13 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     srv->is_dragging = 0;
                     srv->drag_window_id = 0;
 
-                    vanilla_rect_t win_frame;
                     vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
-                    if (under && !(under->flags & WINDOW_FLAG_BORDERLESS)) {
-                        wm_get_frame_rect(under, &win_frame);
-                        cursor_select_for_hit_region(srv->cursor_x, srv->cursor_y, &win_frame,
-                                                     g_theme->border_width, g_theme->titlebar_height);
+                    if (under && (under->flags & WINDOW_FLAG_RESIZABLE) && under->is_snapped == SNAP_NONE) {
+                        vanilla_resize_edge_t edge = wm_hit_test_resize_edge(under, srv->cursor_x, srv->cursor_y);
+                        if (edge != RESIZE_EDGE_NONE)
+                            cursor_set_active(resize_edge_to_cursor_shape(edge));
+                        else
+                            cursor_set_active(CURSOR_ARROW);
                     } else {
                         cursor_set_active(CURSOR_ARROW);
                     }
