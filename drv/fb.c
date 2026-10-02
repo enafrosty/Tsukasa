@@ -20,16 +20,38 @@
 #include "../include/vfs_abi.h"
 #include "../include/errno.h"
 #include "../include/paging.h"
+#include "../include/kprintf.h"
 #include "../mm/vmm_x64.h"
 #include "../mm/vm_space.h"
 #include "../proc/process.h"
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef VFS_FBIOPUT_VSCREENINFO
+#define VFS_FBIOPUT_VSCREENINFO 0x4601
+#endif
+#ifndef VFS_FBIOPAN_DISPLAY
+#define VFS_FBIOPAN_DISPLAY     0x4606
+#endif
+#ifndef VFS_FBIO_WAITFORVSYNC
+#define VFS_FBIO_WAITFORVSYNC   0x4620
+#endif
+
 #define VFS_FB_USER_BASE 0x0000000030000000ULL
 
 struct fb_info fb_info = { NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 static int g_kd_mode = VFS_KD_TEXT;
+
+/*
+ * Double-buffer panning probe.
+ * The linear framebuffer provided by the bootloader is a single fixed allocation
+ * matching the display mode. Physical memory for a secondary buffer is not allocated
+ * by the firmware/bootloader handoff, so hardware panning is unavailable.
+ */
+int fb_try_enable_panning(void)
+{
+    return 0;
+}
 
 int fb_kd_mode(void)
 {
@@ -64,6 +86,7 @@ int fb_init(const void *mb_info)
         if (!fb_info.addr || fb_info.width == 0 || fb_info.height == 0)
             return -1;
 
+        kprintf("fb: hardware panning %s\n", fb_try_enable_panning() ? "enabled" : "unavailable");
         return 0;
     }
 
@@ -88,6 +111,7 @@ int fb_init(const void *mb_info)
     if (!fb_info.addr || fb_info.width == 0 || fb_info.height == 0)
         return -1;
 
+    kprintf("fb: hardware panning %s\n", fb_try_enable_panning() ? "enabled" : "unavailable");
     return 0;
 }
 
@@ -215,6 +239,26 @@ int fb_ioctl(unsigned long request, void *arg)
         f->line_length = fb_info.pitch;
         return 0;
     }
+    case VFS_FBIOPUT_VSCREENINFO: {
+        if (!arg)
+            return -EFAULT;
+        if (!vmm_validate_user_ptr(arg, sizeof(vfs_fb_var_screeninfo_t), 0))
+            return -EFAULT;
+        const vfs_fb_var_screeninfo_t *v = (const vfs_fb_var_screeninfo_t *)arg;
+        if (v->yres_virtual > fb_info.height || v->xres_virtual > fb_info.width)
+            return -EINVAL;
+        return 0;
+    }
+    case VFS_FBIOPAN_DISPLAY: {
+        if (!arg)
+            return -EFAULT;
+        if (!vmm_validate_user_ptr(arg, sizeof(vfs_fb_var_screeninfo_t), 0))
+            return -EFAULT;
+        return -EINVAL;
+    }
+    case VFS_FBIO_WAITFORVSYNC:
+        /* FBIO_WAITFORVSYNC not verified in Tsukasa devfs */
+        return -EINVAL;
     default:
         return -EINVAL;
     }

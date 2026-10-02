@@ -1087,7 +1087,7 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
 {
     struct pollfd fds[2 + VANILLA_MAX_CLIENTS];
     int nfds = 0;
-    int client_map[VANILLA_MAX_CLIENTS];
+    int client_map[2 + VANILLA_MAX_CLIENTS];
     int input_poll_idx = -1;
     int ret;
 
@@ -1144,12 +1144,19 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
         }
     }
 
-    ret = poll(fds, (nfds_t)nfds, timeout_ms);
+    (void)timeout_ms;
+    int frame_ms = (int)(1000 / COMPOSITOR_TARGET_FPS);
+    ret = poll(fds, (nfds_t)nfds, frame_ms);
     if (ret <= 0) {
-        if (srv->compositor.dirty_count > 0)
-            compositor_render_frame(srv);
-        else
+        if (srv->compositor.dirty_count > 0) {
+            if (compositor_frame_due(&srv->compositor)) {
+                vanilla_server_send_frame_begin(srv);
+                compositor_render_frame(srv);
+                compositor_frame_rendered(&srv->compositor);
+            }
+        } else {
             vanilla_server_release_buffers(srv);
+        }
         return ret;
     }
 
@@ -1171,10 +1178,15 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
         }
     }
 
-    if (srv->compositor.dirty_count > 0)
-        compositor_render_frame(srv);
-    else
+    if (srv->compositor.dirty_count > 0) {
+        if (compositor_frame_due(&srv->compositor)) {
+            vanilla_server_send_frame_begin(srv);
+            compositor_render_frame(srv);
+            compositor_frame_rendered(&srv->compositor);
+        }
+    } else {
         vanilla_server_release_buffers(srv);
+    }
 
     return 0;
 }

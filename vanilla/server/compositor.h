@@ -25,6 +25,7 @@
 #include "image.h"
 
 #define MAX_DIRTY_RECTS 32
+#define COMPOSITOR_TARGET_FPS 60
 
 typedef struct {
     uint32_t         width;
@@ -42,6 +43,9 @@ typedef struct {
     vanilla_font_t   font;
     vanilla_image_t  wallpaper;
     int              has_wallpaper;
+    uint64_t         last_frame_ticks;
+    uint32_t         frame_target_ticks;
+    int              panning_enabled;
 } vanilla_compositor_t;
 
 
@@ -56,6 +60,10 @@ void compositor_destroy(vanilla_compositor_t *comp);
 void compositor_add_damage(vanilla_compositor_t *comp, const vanilla_rect_t *rect);
 void compositor_merge_damage(vanilla_compositor_t *comp);
 void compositor_damage_all(vanilla_compositor_t *comp);
+
+/* Frame pacing */
+int  compositor_frame_due(vanilla_compositor_t *comp);
+void compositor_frame_rendered(vanilla_compositor_t *comp);
 
 /* Frame rendering */
 void compositor_render_frame(struct vanilla_server *srv);
