@@ -75,12 +75,32 @@ typedef struct {
     int32_t           restore_y;
     uint32_t          restore_w;
     uint32_t          restore_h;
+
+    /* Protocol v2 configure/ack */
+    uint32_t          configure_serial;
+    int               configure_pending;
+    int32_t           pending_x;
+    int32_t           pending_y;
+    uint32_t          pending_w;
+    uint32_t          pending_h;
+    uint32_t          configure_timestamp_ms;
+
+    /* Protocol v2 frame pacing */
+    uint32_t          frame_serial;
+    uint32_t          present_serial;
+    int               buffer_in_use;
+    int               frame_begin_in_flight;
+    uint32_t          frame_begin_time_ms;
+
+    /* Protocol v2 cursor shape */
+    uint32_t          cursor_shape;
 } vanilla_server_window_t;
 
 typedef struct {
     int      in_use;
     int      fd;
     uint32_t version;
+    uint32_t negotiated_version;
 } vanilla_client_conn_t;
 
 typedef struct vanilla_server {
@@ -134,6 +154,10 @@ void wm_lower_window(vanilla_server_t *srv, uint32_t window_id);
 void wm_get_frame_rect(const vanilla_server_window_t *win, vanilla_rect_t *out_frame);
 void wm_invalidate_window(vanilla_server_t *srv, const vanilla_server_window_t *win);
 void vanilla_server_broadcast_theme_changed(vanilla_server_t *srv);
+void vanilla_server_send_frame_begin(vanilla_server_t *srv);
+void vanilla_server_release_buffers(vanilla_server_t *srv);
+int  vanilla_server_send_clipboard_request(vanilla_server_t *srv, uint32_t window_id, uint32_t request_id, const char *mime_type);
+int  vanilla_server_send_dnd_drop(vanilla_server_t *srv, uint32_t target_window_id, int32_t x, int32_t y);
 
 /* Window tiling, input dispatch, and hit testing */
 void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type);

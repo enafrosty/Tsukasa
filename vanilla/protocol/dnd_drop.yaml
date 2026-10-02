@@ -1,0 +1,16 @@
+id: 21
+name: MSG_DND_DROP
+direction: server_to_client
+version: 2
+v1_compat: false
+description: "Server notifies target window of drop action."
+fields:
+  - name: target_window_id
+    type: uint32_t
+    description: "Target window ID"
+  - name: x
+    type: int32_t
+    description: "Drop position X relative to target window"
+  - name: y
+    type: int32_t
+    description: "Drop position Y relative to target window"

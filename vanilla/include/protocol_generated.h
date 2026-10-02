@@ -45,6 +45,15 @@ typedef enum {
     MSG_WINDOW_FOCUS         = 11,
     MSG_WINDOW_CLOSE_REQ     = 12,
     MSG_WINDOW_CONFIGURE     = 13,
+    MSG_BUFFER_RELEASED      = 14,
+    MSG_FRAME_BEGIN          = 15,
+    MSG_ACK_CONFIGURE        = 16,
+    MSG_SET_CURSOR           = 17,
+    MSG_CLIPBOARD_OFFER      = 18,
+    MSG_CLIPBOARD_REQUEST    = 19,
+    MSG_DND_OFFER            = 20,
+    MSG_DND_DROP             = 21,
+    MSG_THEME_CHANGED        = 22,
 } vanilla_msg_type_t;
 
 /* MSG_HELLO payload (client to server, v1+) */
@@ -171,6 +180,89 @@ typedef struct {
 _Static_assert(sizeof(vanilla_msg_window_configure_t) == 16,
     "vanilla_msg_window_configure_t size mismatch; regenerate protocol");
 
+/* MSG_BUFFER_RELEASED payload (server to client, v2+) */
+typedef struct {
+    uint32_t window_id;
+    uint32_t serial;
+} __attribute__((packed)) vanilla_msg_buffer_released_t;
+
+_Static_assert(sizeof(vanilla_msg_buffer_released_t) == 8,
+    "vanilla_msg_buffer_released_t size mismatch; regenerate protocol");
+
+/* MSG_FRAME_BEGIN payload (server to client, v2+) */
+typedef struct {
+    uint32_t window_id;
+    uint32_t frame_serial;
+    uint32_t timestamp_ms;
+} __attribute__((packed)) vanilla_msg_frame_begin_t;
+
+_Static_assert(sizeof(vanilla_msg_frame_begin_t) == 12,
+    "vanilla_msg_frame_begin_t size mismatch; regenerate protocol");
+
+/* MSG_ACK_CONFIGURE payload (client to server, v2+) */
+typedef struct {
+    uint32_t window_id;
+    uint32_t serial;
+} __attribute__((packed)) vanilla_msg_ack_configure_t;
+
+_Static_assert(sizeof(vanilla_msg_ack_configure_t) == 8,
+    "vanilla_msg_ack_configure_t size mismatch; regenerate protocol");
+
+/* MSG_SET_CURSOR payload (client to server, v2+) */
+typedef struct {
+    uint32_t window_id;
+    uint32_t shape;
+} __attribute__((packed)) vanilla_msg_set_cursor_t;
+
+_Static_assert(sizeof(vanilla_msg_set_cursor_t) == 8,
+    "vanilla_msg_set_cursor_t size mismatch; regenerate protocol");
+
+/* MSG_CLIPBOARD_OFFER payload (client to server, v2+) */
+typedef struct {
+    uint32_t window_id;
+    uint32_t mime_count;
+} __attribute__((packed)) vanilla_msg_clipboard_offer_t;
+
+_Static_assert(sizeof(vanilla_msg_clipboard_offer_t) == 8,
+    "vanilla_msg_clipboard_offer_t size mismatch; regenerate protocol");
+
+/* MSG_CLIPBOARD_REQUEST payload (server to client, v2+) */
+typedef struct {
+    uint32_t window_id;
+    uint32_t request_id;
+    char     mime_type[32];
+} __attribute__((packed)) vanilla_msg_clipboard_request_t;
+
+_Static_assert(sizeof(vanilla_msg_clipboard_request_t) == 40,
+    "vanilla_msg_clipboard_request_t size mismatch; regenerate protocol");
+
+/* MSG_DND_OFFER payload (client to server, v2+) */
+typedef struct {
+    uint32_t window_id;
+    uint32_t mime_count;
+} __attribute__((packed)) vanilla_msg_dnd_offer_t;
+
+_Static_assert(sizeof(vanilla_msg_dnd_offer_t) == 8,
+    "vanilla_msg_dnd_offer_t size mismatch; regenerate protocol");
+
+/* MSG_DND_DROP payload (server to client, v2+) */
+typedef struct {
+    uint32_t target_window_id;
+    int32_t  x;
+    int32_t  y;
+} __attribute__((packed)) vanilla_msg_dnd_drop_t;
+
+_Static_assert(sizeof(vanilla_msg_dnd_drop_t) == 12,
+    "vanilla_msg_dnd_drop_t size mismatch; regenerate protocol");
+
+/* MSG_THEME_CHANGED payload (server to client, v2+) */
+typedef struct {
+    uint32_t reserved;
+} __attribute__((packed)) vanilla_msg_theme_changed_t;
+
+_Static_assert(sizeof(vanilla_msg_theme_changed_t) == 4,
+    "vanilla_msg_theme_changed_t size mismatch; regenerate protocol");
+
 typedef struct vanilla_server vanilla_server_t;
 
 typedef int (*vanilla_dispatch_fn_t)(vanilla_server_t *srv, int client_idx,
@@ -191,6 +283,10 @@ int handle_msg_map_window(vanilla_server_t *srv, int client_idx, const vanilla_m
 int handle_msg_unmap_window(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 int handle_msg_move_resize(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 int handle_msg_present(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
+int handle_msg_ack_configure(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
+int handle_msg_set_cursor(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
+int handle_msg_clipboard_offer(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
+int handle_msg_dnd_offer(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 
 #ifdef VANILLA_DISPATCH_TABLE_IMPL
 const vanilla_dispatch_entry_t g_vanilla_dispatch_table[] = {
@@ -201,6 +297,10 @@ const vanilla_dispatch_entry_t g_vanilla_dispatch_table[] = {
     { MSG_UNMAP_WINDOW, 1, sizeof(vanilla_msg_unmap_window_t), handle_msg_unmap_window },
     { MSG_MOVE_RESIZE, 1, sizeof(vanilla_msg_move_resize_t), handle_msg_move_resize },
     { MSG_PRESENT, 1, sizeof(vanilla_msg_present_t), handle_msg_present },
+    { MSG_ACK_CONFIGURE, 2, sizeof(vanilla_msg_ack_configure_t), handle_msg_ack_configure },
+    { MSG_SET_CURSOR, 2, sizeof(vanilla_msg_set_cursor_t), handle_msg_set_cursor },
+    { MSG_CLIPBOARD_OFFER, 2, sizeof(vanilla_msg_clipboard_offer_t), handle_msg_clipboard_offer },
+    { MSG_DND_OFFER, 2, sizeof(vanilla_msg_dnd_offer_t), handle_msg_dnd_offer },
 };
 const size_t g_vanilla_dispatch_table_len = sizeof(g_vanilla_dispatch_table) / sizeof(g_vanilla_dispatch_table[0]);
 #else

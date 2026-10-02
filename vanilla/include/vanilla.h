@@ -28,6 +28,8 @@ typedef enum {
     VANILLA_EVENT_FOCUS = 2,
     VANILLA_EVENT_CLOSE_REQ = 3,
     VANILLA_EVENT_CONFIGURE = 4,
+    VANILLA_EVENT_FRAME_BEGIN = 5,
+    VANILLA_EVENT_BUFFER_RELEASED = 6,
 } vanilla_event_type_t;
 
 typedef struct {
@@ -43,11 +45,23 @@ typedef struct {
             int32_t  y;
             uint32_t width;
             uint32_t height;
+            uint32_t serial;
+            uint32_t flags;
         } configure;
+        struct {
+            uint32_t frame_serial;
+            uint32_t timestamp_ms;
+        } frame_begin;
+        struct {
+            uint32_t serial;
+        } buffer_released;
     };
 } vanilla_event_t;
 
 typedef struct vanilla_client vanilla_client_t;
+
+typedef void (*vanilla_frame_callback_t)(vanilla_client_t *client, uint32_t window_id,
+                                         uint32_t frame_serial, uint32_t timestamp_ms);
 
 typedef struct vanilla_window {
     vanilla_client_t      *client;
@@ -58,12 +72,14 @@ typedef struct vanilla_window {
     uint32_t               width;
     uint32_t               height;
     uint32_t               flags;
+    uint32_t               last_frame_serial;
     struct vanilla_window *next;
 } vanilla_window_t;
 
 /* Client lifecycle management */
 vanilla_client_t *vanilla_connect(const char *socket_path);
 void vanilla_disconnect(vanilla_client_t *client);
+void vanilla_set_frame_callback(vanilla_client_t *client, vanilla_frame_callback_t fn);
 
 /* Window operations */
 vanilla_window_t *vanilla_create_window(vanilla_client_t *client, const char *title,
@@ -73,6 +89,7 @@ int  vanilla_map_window(vanilla_window_t *win);
 int  vanilla_unmap_window(vanilla_window_t *win);
 int  vanilla_move_window(vanilla_window_t *win, int32_t x, int32_t y);
 void vanilla_present(vanilla_window_t *win, const vanilla_rect_t *damage);
+int  vanilla_ack_configure(vanilla_client_t *client, uint32_t window_id, uint32_t serial);
 
 /* Event processing */
 int  vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev);

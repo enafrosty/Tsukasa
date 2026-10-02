@@ -1,0 +1,10 @@
+id: 22
+name: MSG_THEME_CHANGED
+direction: server_to_client
+version: 2
+v1_compat: false
+description: "Broadcast notification that theme tokens have been reloaded."
+fields:
+  - name: reserved
+    type: uint32_t
+    description: "Reserved padding for non-zero payload consistency"

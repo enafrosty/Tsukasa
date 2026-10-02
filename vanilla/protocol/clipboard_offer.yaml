@@ -1,0 +1,13 @@
+id: 18
+name: MSG_CLIPBOARD_OFFER
+direction: client_to_server
+version: 2
+v1_compat: false
+description: "Client announces clipboard data availability."
+fields:
+  - name: window_id
+    type: uint32_t
+    description: "Offering window ID"
+  - name: mime_count
+    type: uint32_t
+    description: "Number of MIME types offered"

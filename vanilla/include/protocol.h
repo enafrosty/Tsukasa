@@ -39,7 +39,29 @@
 #define WINDOW_FLAG_MODAL       (1u << 4)
 #define WINDOW_FLAG_ALWAYS_TOP  (1u << 5)
 
-/* Server theme notification */
-#define MSG_THEME_CHANGED       14
+/* MSG_PRESENT - extended for v2 (client -> server) */
+typedef struct {
+    int32_t  x;
+    int32_t  y;
+    int32_t  w;
+    int32_t  h;
+    uint32_t frame_serial;
+} __attribute__((packed)) vanilla_msg_present_v2_t;
+
+_Static_assert(sizeof(vanilla_msg_present_v2_t) == 20,
+    "vanilla_msg_present_v2_t size mismatch");
+
+/* MSG_WINDOW_CONFIGURE - extended for v2 (server -> client) */
+typedef struct {
+    int32_t  x;
+    int32_t  y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t serial;
+    uint32_t flags;
+} __attribute__((packed)) vanilla_msg_window_configure_v2_t;
+
+_Static_assert(sizeof(vanilla_msg_window_configure_v2_t) == 24,
+    "vanilla_msg_window_configure_v2_t size mismatch");
 
 #endif /* _VANILLA_PROTOCOL_H */

@@ -1,0 +1,13 @@
+id: 14
+name: MSG_BUFFER_RELEASED
+direction: server_to_client
+version: 2
+v1_compat: false
+description: "Server notifies client that buffer read is complete and safe to overwrite."
+fields:
+  - name: window_id
+    type: uint32_t
+    description: "Target window ID"
+  - name: serial
+    type: uint32_t
+    description: "Matches the MSG_PRESENT serial that triggered composite"
