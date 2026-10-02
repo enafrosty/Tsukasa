@@ -22,6 +22,39 @@
 #include <sys/input.h>
 #include "protocol_generated.h"
 
+/* Modifier key bitmasks (MOD_*) */
+#define MOD_LSHIFT    (1u << 0)
+#define MOD_RSHIFT    (1u << 1)
+#define MOD_LCTRL     (1u << 2)
+#define MOD_RCTRL     (1u << 3)
+#define MOD_LALT      (1u << 4)
+#define MOD_RALT      (1u << 5)
+#define MOD_CAPS_LOCK (1u << 6)   /* toggle */
+#define MOD_NUM_LOCK  (1u << 7)   /* toggle */
+#define MOD_SUPER     (1u << 8)   /* left Super / Windows key */
+
+/* Convenience aggregates */
+#define MOD_SHIFT     (MOD_LSHIFT | MOD_RSHIFT)
+#define MOD_CTRL      (MOD_LCTRL  | MOD_RCTRL)
+#define MOD_ALT       (MOD_LALT   | MOD_RALT)
+
+/* Extended evdev keycodes if not provided by libc sys/input.h */
+#ifndef KEY_RIGHTCTRL
+#define KEY_RIGHTCTRL 97
+#endif
+#ifndef KEY_RIGHTALT
+#define KEY_RIGHTALT 100
+#endif
+#ifndef KEY_NUMLOCK
+#define KEY_NUMLOCK 69
+#endif
+#ifndef KEY_LEFTMETA
+#define KEY_LEFTMETA 125
+#endif
+#ifndef KEY_RIGHTMETA
+#define KEY_RIGHTMETA 126
+#endif
+
 #define VANILLA_IPC_MAGIC       0x56414E49u
 #define VANILLA_IPC_VERSION     2
 #define VANILLA_SOCKET_PATH     "/tmp/vanilla.sock"

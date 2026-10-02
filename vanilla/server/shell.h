@@ -46,6 +46,7 @@ struct vanilla_server;
 
 typedef struct vanilla_shell {
     int    start_menu_open;
+    int    selected_idx;
     time_t last_clock_sec;
     char   clock_str[16];
 } vanilla_shell_t;
@@ -55,6 +56,7 @@ void shell_update_clock(vanilla_shell_t *shell, struct vanilla_server *srv);
 void shell_render(struct vanilla_server *srv, const vanilla_rect_t *dirty);
 void shell_render_start_menu(struct vanilla_server *srv, const vanilla_rect_t *dirty);
 int  shell_handle_click(struct vanilla_server *srv, int32_t x, int32_t y, uint32_t button);
+int  shell_handle_key(struct vanilla_server *srv, uint16_t code, int pressed);
 void shell_invalidate(struct vanilla_server *srv);
 void shell_invalidate_start_menu(struct vanilla_server *srv);
 

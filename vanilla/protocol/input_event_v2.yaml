@@ -1,0 +1,13 @@
+id: 24
+name: MSG_INPUT_EVENT_V2
+direction: server_to_client
+version: 2
+v1_compat: false
+description: "Dispatch unified input event with modifier state to focused window"
+fields:
+  - name: event
+    type: struct input_event
+    description: "Standard Linux-compatible input event structure"
+  - name: mod_state
+    type: uint16_t
+    description: "Combined modifier state bitmask"

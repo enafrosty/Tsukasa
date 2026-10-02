@@ -204,7 +204,7 @@ int launcher_handle_key(vanilla_server_t *srv, uint16_t code, int pressed)
         return 0;
 
     if (!srv->launcher.visible) {
-        if (pressed && srv->alt_pressed && code == KEY_SPACE) {
+        if (pressed && (srv->mod_state & MOD_ALT) && code == KEY_SPACE) {
             launcher_set_visible(srv, 1);
             return 1;
         }
@@ -219,7 +219,7 @@ int launcher_handle_key(vanilla_server_t *srv, uint16_t code, int pressed)
         return 1;
     }
 
-    if (code == KEY_ENTER) {
+    if (code == KEY_ENTER || code == KEY_KPENTER) {
         launcher_exec_selected(srv);
         return 1;
     }
@@ -249,7 +249,7 @@ int launcher_handle_key(vanilla_server_t *srv, uint16_t code, int pressed)
         return 1;
     }
 
-    char ch = vanilla_evdev_to_ascii(code, srv->shift_pressed);
+    char ch = vanilla_evdev_to_ascii(code, (srv->mod_state & MOD_SHIFT) ? 1 : 0);
     if (ch != 0 && srv->launcher.query_len < LAUNCHER_SEARCH_MAX - 1) {
         srv->launcher.query[srv->launcher.query_len++] = ch;
         srv->launcher.query[srv->launcher.query_len] = '\0';

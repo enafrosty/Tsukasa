@@ -94,6 +94,7 @@ void shell_init(vanilla_shell_t *shell)
         return;
 
     shell->start_menu_open = 0;
+    shell->selected_idx = 0;
     shell->last_clock_sec = 0;
     strncpy(shell->clock_str, "12:00", sizeof(shell->clock_str) - 1);
     shell->clock_str[sizeof(shell->clock_str) - 1] = '\0';
@@ -194,6 +195,9 @@ void shell_render_start_menu(vanilla_server_t *srv, const vanilla_rect_t *dirty)
         vanilla_rect_t vis_item;
         if (!vanilla_rect_intersect(&item_rect, dirty, &vis_item))
             continue;
+
+        if (i == srv->shell.selected_idx)
+            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_item, g_theme->bg_elevated);
 
         /* Item badge / icon */
         vanilla_rect_t badge_rect = { item_rect.x + THEME_PX(4), item_rect.y + THEME_PX(3), THEME_PX(18), THEME_PX(18) };
@@ -318,6 +322,8 @@ int shell_handle_click(vanilla_server_t *srv, int32_t x, int32_t y, uint32_t but
     if (x >= TASKBAR_START_X && x < TASKBAR_START_X + TASKBAR_START_W &&
         y >= screen_h - TASKBAR_HEIGHT + THEME_PX(4) && y < screen_h - TASKBAR_HEIGHT + THEME_PX(4) + TASKBAR_START_H) {
         srv->shell.start_menu_open = !srv->shell.start_menu_open;
+        if (srv->shell.start_menu_open)
+            srv->shell.selected_idx = 0;
         shell_invalidate_start_menu(srv);
         shell_invalidate(srv);
         return 1;
@@ -381,6 +387,51 @@ int shell_handle_click(vanilla_server_t *srv, int32_t x, int32_t y, uint32_t but
             pill_idx++;
         }
 
+        shell_invalidate(srv);
+        return 1;
+    }
+
+    return 0;
+}
+
+int shell_handle_key(vanilla_server_t *srv, uint16_t code, int pressed)
+{
+    if (!srv || !srv->shell.start_menu_open)
+        return 0;
+
+    if (!pressed)
+        return 1;
+
+    if (code == KEY_ESC) {
+        srv->shell.start_menu_open = 0;
+        shell_invalidate_start_menu(srv);
+        shell_invalidate(srv);
+        return 1;
+    }
+
+    if (code == KEY_UP) {
+        if (srv->shell.selected_idx > 0) {
+            srv->shell.selected_idx--;
+            shell_invalidate_start_menu(srv);
+        }
+        return 1;
+    }
+
+    if (code == KEY_DOWN) {
+        if (srv->shell.selected_idx + 1 < START_MENU_NUM_ITEMS) {
+            srv->shell.selected_idx++;
+            shell_invalidate_start_menu(srv);
+        }
+        return 1;
+    }
+
+    if (code == KEY_ENTER || code == KEY_KPENTER) {
+        int idx = srv->shell.selected_idx;
+        if (idx >= 0 && idx < START_MENU_NUM_ITEMS) {
+            shell_spawn_app(g_start_menu_items[idx].path);
+        }
+        srv->shell.start_menu_open = 0;
+        shell_invalidate_start_menu(srv);
         shell_invalidate(srv);
         return 1;
     }

@@ -733,12 +733,67 @@ int vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev)
 
         out_ev->window_id = hdr.window_id;
 
+        if (hdr.msg_type == MSG_INPUT_EVENT_V2) {
+            vanilla_msg_input_event_v2_t in_msg;
+            if (exact_read(client->socket_fd, &in_msg, sizeof(in_msg)) < 0)
+                return -1;
+            if (hdr.payload_len > sizeof(in_msg)) {
+                uint8_t discard[128];
+                size_t rem = hdr.payload_len - sizeof(in_msg);
+                while (rem > 0) {
+                    size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+                    if (exact_read(client->socket_fd, discard, chunk) < 0)
+                        return -1;
+                    rem -= chunk;
+                }
+            }
+            out_ev->mod_state = in_msg.mod_state;
+            out_ev->input = in_msg.event;
+            if (in_msg.event.type == EV_KEY &&
+                (in_msg.event.code == BTN_LEFT || in_msg.event.code == BTN_RIGHT || in_msg.event.code == BTN_MIDDLE)) {
+                if (in_msg.event.value == 2)
+                    out_ev->type = VANILLA_EVENT_DOUBLE_CLICK;
+                else if (in_msg.event.value == 3)
+                    out_ev->type = VANILLA_EVENT_TRIPLE_CLICK;
+                else if (in_msg.event.value == 4)
+                    out_ev->type = VANILLA_EVENT_LONG_PRESS;
+                else
+                    out_ev->type = VANILLA_EVENT_INPUT;
+            } else {
+                out_ev->type = VANILLA_EVENT_INPUT;
+            }
+            return 1;
+        }
+
         if (hdr.msg_type == MSG_INPUT_EVENT) {
             vanilla_msg_input_event_t in_msg;
             if (exact_read(client->socket_fd, &in_msg, sizeof(in_msg)) < 0)
                 return -1;
-            out_ev->type = VANILLA_EVENT_INPUT;
+            if (hdr.payload_len > sizeof(in_msg)) {
+                uint8_t discard[128];
+                size_t rem = hdr.payload_len - sizeof(in_msg);
+                while (rem > 0) {
+                    size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+                    if (exact_read(client->socket_fd, discard, chunk) < 0)
+                        return -1;
+                    rem -= chunk;
+                }
+            }
+            out_ev->mod_state = 0;
             out_ev->input = in_msg.event;
+            if (in_msg.event.type == EV_KEY &&
+                (in_msg.event.code == BTN_LEFT || in_msg.event.code == BTN_RIGHT || in_msg.event.code == BTN_MIDDLE)) {
+                if (in_msg.event.value == 2)
+                    out_ev->type = VANILLA_EVENT_DOUBLE_CLICK;
+                else if (in_msg.event.value == 3)
+                    out_ev->type = VANILLA_EVENT_TRIPLE_CLICK;
+                else if (in_msg.event.value == 4)
+                    out_ev->type = VANILLA_EVENT_LONG_PRESS;
+                else
+                    out_ev->type = VANILLA_EVENT_INPUT;
+            } else {
+                out_ev->type = VANILLA_EVENT_INPUT;
+            }
             return 1;
         }
 

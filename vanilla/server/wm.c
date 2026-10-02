@@ -453,6 +453,19 @@ void wm_lower_window(vanilla_server_t *srv, uint32_t window_id)
     shell_invalidate(srv);
 }
 
+static void update_mod_state(vanilla_server_t *srv, uint16_t bit, int toggle, int value)
+{
+    if (toggle) {
+        if (value == 1)
+            srv->mod_state ^= bit;
+    } else {
+        if (value)
+            srv->mod_state |= bit;
+        else
+            srv->mod_state &= ~bit;
+    }
+}
+
 int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
 {
     const char *path = socket_path ? socket_path : VANILLA_SOCKET_PATH;
@@ -514,9 +527,7 @@ int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
     srv->cursor_x = (int32_t)srv->compositor.width / 2;
     srv->cursor_y = (int32_t)srv->compositor.height / 2;
     srv->mouse_buttons = 0;
-    srv->shift_pressed = 0;
-    srv->alt_pressed = 0;
-    srv->ctrl_pressed = 0;
+    srv->mod_state = 0;
     srv->is_dragging = 0;
     srv->drag_window_id = 0;
 
@@ -533,6 +544,7 @@ int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
     compositor_render_frame(srv);
 
     wm_run_resize_selftests();
+    wm_run_input_selftests();
 
     return 0;
 }
@@ -921,6 +933,7 @@ int handle_msg_unmap_window(vanilla_server_t *srv, int client_idx, const vanilla
         wm_invalidate_window(srv, w);
         w->is_mapped = 0;
         w->is_focused = 0;
+        w->has_keyboard_focus = 0;
         if (srv->focused_window_id == w->window_id)
             srv->focused_window_id = 0;
         shell_invalidate(srv);
@@ -1349,6 +1362,169 @@ int wm_run_resize_selftests(void)
     return 0;
 }
 
+static void wm_alttab_build_list(vanilla_server_t *srv);
+
+int wm_run_input_selftests(void)
+{
+    /* 1. Modifier bitmask state machine */
+    vanilla_server_t srv;
+    memset(&srv, 0, sizeof(srv));
+
+    update_mod_state(&srv, MOD_LSHIFT, 0, 1);
+    if (!(srv.mod_state & MOD_LSHIFT) || !(srv.mod_state & MOD_SHIFT)) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_LSHIFT press\n");
+        return -1;
+    }
+    update_mod_state(&srv, MOD_RSHIFT, 0, 1);
+    if ((srv.mod_state & MOD_SHIFT) != (MOD_LSHIFT | MOD_RSHIFT)) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_RSHIFT press\n");
+        return -1;
+    }
+    update_mod_state(&srv, MOD_LSHIFT, 0, 0);
+    if ((srv.mod_state & MOD_SHIFT) != MOD_RSHIFT) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_LSHIFT release\n");
+        return -1;
+    }
+    update_mod_state(&srv, MOD_RSHIFT, 0, 0);
+    if (srv.mod_state & MOD_SHIFT) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_RSHIFT release\n");
+        return -1;
+    }
+
+    /* Alt tracking */
+    update_mod_state(&srv, MOD_LALT, 0, 1);
+    if (!(srv.mod_state & MOD_LALT) || !(srv.mod_state & MOD_ALT)) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_LALT press\n");
+        return -1;
+    }
+    update_mod_state(&srv, MOD_RALT, 0, 1);
+    if ((srv.mod_state & MOD_ALT) != (MOD_LALT | MOD_RALT)) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_RALT press\n");
+        return -1;
+    }
+    update_mod_state(&srv, MOD_LALT, 0, 0);
+    update_mod_state(&srv, MOD_RALT, 0, 0);
+    if (srv.mod_state & MOD_ALT) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_ALT release\n");
+        return -1;
+    }
+
+    /* Ctrl tracking */
+    update_mod_state(&srv, MOD_LCTRL, 0, 1);
+    update_mod_state(&srv, MOD_RCTRL, 0, 1);
+    if ((srv.mod_state & MOD_CTRL) != (MOD_LCTRL | MOD_RCTRL)) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_CTRL press\n");
+        return -1;
+    }
+    update_mod_state(&srv, MOD_LCTRL, 0, 0);
+    update_mod_state(&srv, MOD_RCTRL, 0, 0);
+    if (srv.mod_state & MOD_CTRL) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_CTRL release\n");
+        return -1;
+    }
+
+    /* CapsLock and NumLock toggle tracking */
+    update_mod_state(&srv, MOD_CAPS_LOCK, 1, 1);
+    if (!(srv.mod_state & MOD_CAPS_LOCK)) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_CAPS_LOCK toggle ON\n");
+        return -1;
+    }
+    update_mod_state(&srv, MOD_CAPS_LOCK, 1, 0);
+    if (!(srv.mod_state & MOD_CAPS_LOCK)) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_CAPS_LOCK state on release\n");
+        return -1;
+    }
+    update_mod_state(&srv, MOD_CAPS_LOCK, 1, 1);
+    if (srv.mod_state & MOD_CAPS_LOCK) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_CAPS_LOCK toggle OFF\n");
+        return -1;
+    }
+
+    update_mod_state(&srv, MOD_NUM_LOCK, 1, 1);
+    if (!(srv.mod_state & MOD_NUM_LOCK)) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_NUM_LOCK toggle ON\n");
+        return -1;
+    }
+    update_mod_state(&srv, MOD_NUM_LOCK, 1, 1);
+    if (srv.mod_state & MOD_NUM_LOCK) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_NUM_LOCK toggle OFF\n");
+        return -1;
+    }
+
+    /* Super/Meta */
+    update_mod_state(&srv, MOD_SUPER, 0, 1);
+    if (!(srv.mod_state & MOD_SUPER)) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_SUPER press\n");
+        return -1;
+    }
+    update_mod_state(&srv, MOD_SUPER, 0, 0);
+    if (srv.mod_state & MOD_SUPER) {
+        fprintf(stderr, "[input_selftest] FAIL: MOD_SUPER release\n");
+        return -1;
+    }
+
+    /* 2. Alt+Tab MRU window list builder and sorting */
+    memset(&srv, 0, sizeof(srv));
+    srv.compositor.width = 1024;
+    srv.compositor.height = 768;
+
+    srv.windows[0].in_use = 1;
+    srv.windows[0].is_mapped = 1;
+    srv.windows[0].window_id = 10;
+    srv.windows[0].z_index = 5;
+    srv.windows[0].flags = WINDOW_FLAG_NONE;
+
+    srv.windows[1].in_use = 1;
+    srv.windows[1].is_mapped = 1;
+    srv.windows[1].window_id = 20;
+    srv.windows[1].z_index = 15;
+    srv.windows[1].flags = WINDOW_FLAG_NONE;
+
+    srv.windows[2].in_use = 1;
+    srv.windows[2].is_mapped = 1;
+    srv.windows[2].window_id = 30;
+    srv.windows[2].z_index = 10;
+    srv.windows[2].flags = WINDOW_FLAG_NONE;
+
+    srv.windows[3].in_use = 1;
+    srv.windows[3].is_mapped = 1;
+    srv.windows[3].window_id = 40;
+    srv.windows[3].z_index = 25;
+    srv.windows[3].flags = WINDOW_FLAG_POPUP;
+
+    srv.windows[4].in_use = 1;
+    srv.windows[4].is_mapped = 1;
+    srv.windows[4].window_id = 50;
+    srv.windows[4].z_index = 30;
+    srv.windows[4].flags = WINDOW_FLAG_ALWAYS_TOP;
+
+    wm_alttab_build_list(&srv);
+    if (srv.alttab_window_count != 3) {
+        fprintf(stderr, "[input_selftest] FAIL: alttab window count (got %d, expected 3)\n", srv.alttab_window_count);
+        return -1;
+    }
+    if (srv.alttab_window_ids[0] != 20 || srv.alttab_window_ids[1] != 30 || srv.alttab_window_ids[2] != 10) {
+        fprintf(stderr, "[input_selftest] FAIL: alttab z-order sorting: [%u, %u, %u]\n",
+                srv.alttab_window_ids[0], srv.alttab_window_ids[1], srv.alttab_window_ids[2]);
+        return -1;
+    }
+
+    /* 3. Alt+Tab overlay geometry centering */
+    vanilla_rect_t overlay;
+    alttab_get_rect(&srv, &overlay);
+    if (overlay.w != THEME_PX(360)) {
+        fprintf(stderr, "[input_selftest] FAIL: alttab overlay width\n");
+        return -1;
+    }
+    if (overlay.x != (1024 - THEME_PX(360)) / 2) {
+        fprintf(stderr, "[input_selftest] FAIL: alttab overlay horizontal centering\n");
+        return -1;
+    }
+
+    printf("[vanilla] input completeness self-tests passed (3/3)\n");
+    return 0;
+}
+
 int handle_msg_clipboard_offer(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
 {
     (void)srv;
@@ -1658,6 +1834,36 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
         }
     }
 
+    /* Check long-press timers (500ms motionless button down) */
+    uint64_t now_ticks = pit_ticks();
+    uint64_t long_press_ticks = pit_frequency() / 2;
+    for (int b = 0; b < 3; b++) {
+        if ((srv->mouse_buttons >> b) & 1) {
+            uint64_t held = now_ticks - srv->btn_down_ticks[b];
+            int dx = srv->cursor_x - srv->btn_down_x[b];
+            int dy = srv->cursor_y - srv->btn_down_y[b];
+            int chebyshev = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
+            if (chebyshev <= 4 && held >= long_press_ticks && !srv->long_press_fired[b]) {
+                srv->long_press_fired[b] = 1;
+                if (srv->focused_window_id != 0) {
+                    vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->focused_window_id);
+                    if (w) {
+                        int lx = srv->cursor_x - w->x;
+                        int ly = srv->cursor_y - w->y;
+                        struct input_event lp_ev;
+                        memset(&lp_ev, 0, sizeof(lp_ev));
+                        lp_ev.type = EV_KEY;
+                        lp_ev.code = (b == 0) ? BTN_LEFT : ((b == 1) ? BTN_RIGHT : BTN_MIDDLE);
+                        lp_ev.value = 4;
+                        lp_ev.pad1 = (uint16_t)(lx < 0 ? 0 : lx);
+                        lp_ev.pad2 = (uint32_t)(ly < 0 ? 0 : ly);
+                        vanilla_server_send_input(srv, srv->focused_window_id, &lp_ev);
+                    }
+                }
+            }
+        }
+    }
+
     fds[0].fd = srv->listen_fd;
     fds[0].events = POLLIN;
     fds[0].revents = 0;
@@ -1732,7 +1938,6 @@ int vanilla_server_send_input(vanilla_server_t *srv, uint32_t window_id, const s
 {
     vanilla_server_window_t *w;
     vanilla_msg_hdr_t hdr;
-    vanilla_msg_input_event_t msg;
 
     if (!srv || !ev)
         return -1;
@@ -1741,16 +1946,31 @@ int vanilla_server_send_input(vanilla_server_t *srv, uint32_t window_id, const s
     if (!w || !w->in_use || w->client_fd < 0)
         return -1;
 
-    hdr.magic = VANILLA_IPC_MAGIC;
-    hdr.msg_type = MSG_INPUT_EVENT;
-    hdr.payload_len = (uint16_t)sizeof(msg);
-    hdr.window_id = window_id;
+    vanilla_client_conn_t *c = find_client_by_fd(srv, w->client_fd);
+    if (c && c->negotiated_version >= 2) {
+        vanilla_msg_input_event_v2_t msg2;
+        hdr.magic = VANILLA_IPC_MAGIC;
+        hdr.msg_type = MSG_INPUT_EVENT_V2;
+        hdr.payload_len = (uint16_t)sizeof(msg2);
+        hdr.window_id = window_id;
+        msg2.event = *ev;
+        msg2.mod_state = srv->mod_state;
 
-    msg.event = *ev;
+        if (exact_write(w->client_fd, &hdr, sizeof(hdr)) < 0 ||
+            exact_write(w->client_fd, &msg2, sizeof(msg2)) < 0)
+            return -1;
+    } else {
+        vanilla_msg_input_event_t msg;
+        hdr.magic = VANILLA_IPC_MAGIC;
+        hdr.msg_type = MSG_INPUT_EVENT;
+        hdr.payload_len = (uint16_t)sizeof(msg);
+        hdr.window_id = window_id;
+        msg.event = *ev;
 
-    if (exact_write(w->client_fd, &hdr, sizeof(hdr)) < 0 ||
-        exact_write(w->client_fd, &msg, sizeof(msg)) < 0)
-        return -1;
+        if (exact_write(w->client_fd, &hdr, sizeof(hdr)) < 0 ||
+            exact_write(w->client_fd, &msg, sizeof(msg)) < 0)
+            return -1;
+    }
 
     return 0;
 }
@@ -1771,6 +1991,7 @@ int vanilla_server_focus_window(vanilla_server_t *srv, uint32_t window_id)
     old_w = vanilla_server_find_window(srv, srv->focused_window_id);
     if (old_w && old_w->in_use) {
         old_w->is_focused = 0;
+        old_w->has_keyboard_focus = 0;
         if (old_w->client_fd >= 0) {
             hdr.magic = VANILLA_IPC_MAGIC;
             hdr.msg_type = MSG_WINDOW_FOCUS;
@@ -1786,6 +2007,7 @@ int vanilla_server_focus_window(vanilla_server_t *srv, uint32_t window_id)
     new_w = vanilla_server_find_window(srv, window_id);
     if (new_w && new_w->in_use) {
         new_w->is_focused = 1;
+        new_w->has_keyboard_focus = 0;
         srv->focused_window_id = window_id;
         if (new_w->client_fd >= 0) {
             hdr.magic = VANILLA_IPC_MAGIC;
@@ -1932,6 +2154,33 @@ void wm_unsnap_window(vanilla_server_t *srv, uint32_t window_id)
     wm_snap_window(srv, window_id, SNAP_NONE);
 }
 
+static void wm_alttab_build_list(vanilla_server_t *srv)
+{
+    srv->alttab_window_count = 0;
+    for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+        vanilla_server_window_t *w = &srv->windows[i];
+        if (w->in_use && w->is_mapped &&
+            !(w->flags & WINDOW_FLAG_POPUP) &&
+            !(w->flags & WINDOW_FLAG_ALWAYS_TOP)) {
+            srv->alttab_window_ids[srv->alttab_window_count++] = w->window_id;
+        }
+    }
+
+    for (int i = 0; i < srv->alttab_window_count - 1; i++) {
+        for (int j = i + 1; j < srv->alttab_window_count; j++) {
+            vanilla_server_window_t *w_i = vanilla_server_find_window(srv, srv->alttab_window_ids[i]);
+            vanilla_server_window_t *w_j = vanilla_server_find_window(srv, srv->alttab_window_ids[j]);
+            int32_t z_i = w_i ? w_i->z_index : 0;
+            int32_t z_j = w_j ? w_j->z_index : 0;
+            if (z_j > z_i) {
+                uint32_t tmp = srv->alttab_window_ids[i];
+                srv->alttab_window_ids[i] = srv->alttab_window_ids[j];
+                srv->alttab_window_ids[j] = tmp;
+            }
+        }
+    }
+}
+
 int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
 {
     if (!srv || !ev)
@@ -1941,6 +2190,28 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
     int32_t screen_h = (int32_t)srv->compositor.height;
 
     if (ev->type == EV_REL) {
+        if (ev->code == REL_WHEEL) {
+            printf("[wm] scroll: REL_WHEEL delta=%d\n", ev->value);
+            uint32_t target_win_id = srv->focused_window_id;
+            if (target_win_id == 0) {
+                vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
+                if (under)
+                    target_win_id = under->window_id;
+            }
+            if (target_win_id != 0) {
+                vanilla_server_window_t *w = vanilla_server_find_window(srv, target_win_id);
+                if (w) {
+                    int lx = srv->cursor_x - w->x;
+                    int ly = srv->cursor_y - w->y;
+                    struct input_event client_ev = *ev;
+                    client_ev.pad1 = (uint16_t)(lx < 0 ? 0 : lx);
+                    client_ev.pad2 = (uint32_t)(ly < 0 ? 0 : ly);
+                    vanilla_server_send_input(srv, target_win_id, &client_ev);
+                }
+            }
+            return 0;
+        }
+
         int32_t old_x = srv->cursor_x;
         int32_t old_y = srv->cursor_y;
 
@@ -2078,23 +2349,74 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
 
     if (ev->type == EV_KEY) {
         /* Update modifier keys */
-        if (ev->code == KEY_LEFTSHIFT || ev->code == KEY_RIGHTSHIFT) {
-            srv->shift_pressed = (ev->value != 0);
+        int is_mod = 0;
+        switch (ev->code) {
+        case KEY_LEFTSHIFT:   update_mod_state(srv, MOD_LSHIFT,    0, ev->value); is_mod = 1; break;
+        case KEY_RIGHTSHIFT:  update_mod_state(srv, MOD_RSHIFT,    0, ev->value); is_mod = 1; break;
+        case KEY_LEFTCTRL:    update_mod_state(srv, MOD_LCTRL,     0, ev->value); is_mod = 1; break;
+        case KEY_RIGHTCTRL:   update_mod_state(srv, MOD_RCTRL,     0, ev->value); is_mod = 1; break;
+        case KEY_LEFTALT:     update_mod_state(srv, MOD_LALT,      0, ev->value); is_mod = 1; break;
+        case KEY_RIGHTALT:    update_mod_state(srv, MOD_RALT,      0, ev->value); is_mod = 1; break;
+        case KEY_CAPSLOCK:    update_mod_state(srv, MOD_CAPS_LOCK, 1, ev->value); is_mod = 1; break;
+        case KEY_NUMLOCK:     update_mod_state(srv, MOD_NUM_LOCK,  1, ev->value); is_mod = 1; break;
+        case KEY_LEFTMETA:
+            update_mod_state(srv, MOD_SUPER, 0, ev->value);
+            if (ev->value == 1) {
+                srv->shell.start_menu_open = !srv->shell.start_menu_open;
+                if (srv->shell.start_menu_open)
+                    srv->shell.selected_idx = 0;
+                shell_invalidate_start_menu(srv);
+                shell_invalidate(srv);
+            }
             return 0;
+        default: break;
         }
-        if (ev->code == KEY_LEFTALT) {
-            srv->alt_pressed = (ev->value != 0);
+
+        /* Alt release: commit Alt+Tab switcher selection */
+        if (ev->code == KEY_LEFTALT || ev->code == KEY_RIGHTALT) {
+            if (ev->value == 0 && !(srv->mod_state & MOD_ALT)) {
+                if (srv->alttab_visible) {
+                    if (srv->alttab_window_count > 0 && srv->alttab_selection >= 0 &&
+                        srv->alttab_selection < srv->alttab_window_count) {
+                        uint32_t target_win_id = srv->alttab_window_ids[srv->alttab_selection];
+                        vanilla_server_focus_window(srv, target_win_id);
+                        wm_raise_window(srv, target_win_id);
+                    }
+                    srv->alttab_visible = 0;
+                    vanilla_rect_t r;
+                    alttab_get_rect(srv, &r);
+                    compositor_add_damage(&srv->compositor, &r);
+                    return 0;
+                }
+            }
+        }
+
+        if (is_mod)
             return 0;
-        }
-        if (ev->code == KEY_LEFTCTRL) {
-            srv->ctrl_pressed = (ev->value != 0);
-            return 0;
-        }
 
         /* Mouse buttons */
         if (ev->code == BTN_LEFT) {
             if (ev->value == 1) {
                 srv->mouse_buttons |= (1u << 0);
+
+                uint64_t now = pit_ticks();
+                uint64_t click_timeout = pit_frequency() * 3 / 10;
+                int same_pos = (abs(srv->cursor_x - srv->last_click_x[0]) <= 4 &&
+                                abs(srv->cursor_y - srv->last_click_y[0]) <= 4);
+                if (same_pos && (now - srv->last_click_ticks[0]) < click_timeout) {
+                    srv->click_count[0]++;
+                    if (srv->click_count[0] > 3)
+                        srv->click_count[0] = 3;
+                } else {
+                    srv->click_count[0] = 1;
+                }
+                srv->last_click_ticks[0] = now;
+                srv->last_click_x[0] = srv->cursor_x;
+                srv->last_click_y[0] = srv->cursor_y;
+                srv->btn_down_ticks[0] = now;
+                srv->btn_down_x[0] = srv->cursor_x;
+                srv->btn_down_y[0] = srv->cursor_y;
+                srv->long_press_fired[0] = 0;
 
                 /* 1. If Quick Launcher is visible, dispatch to it */
                 if (srv->launcher.visible) {
@@ -2130,6 +2452,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 vanilla_server_window_t *hit = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
 
                 if (hit) {
+                    hit->has_keyboard_focus = 0;
                     vanilla_server_focus_window(srv, hit->window_id);
                     wm_raise_window(srv, hit->window_id);
 
@@ -2181,9 +2504,16 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                         return 0;
                     }
 
-                    /* Click on titlebar body: initiate window drag with threshold */
+                    /* Click on titlebar body: initiate window drag with threshold or toggle maximize on double-click */
                     if (!(hit->flags & WINDOW_FLAG_BORDERLESS) &&
                         srv->cursor_y < frame.y + g_theme->titlebar_height + g_theme->border_width) {
+                        if (srv->click_count[0] == 2) {
+                            if (hit->is_snapped == SNAP_MAXIMIZE)
+                                wm_unsnap_window(srv, hit->window_id);
+                            else
+                                wm_snap_window(srv, hit->window_id, SNAP_MAXIMIZE);
+                            return 0;
+                        }
                         srv->drag_threshold_pending = 1;
                         srv->drag_threshold_start_x = srv->cursor_x;
                         srv->drag_threshold_start_y = srv->cursor_y;
@@ -2199,6 +2529,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                         int lx = srv->cursor_x - hit->x;
                         int ly = srv->cursor_y - hit->y;
                         struct input_event client_ev = *ev;
+                        client_ev.value = srv->click_count[0];
                         client_ev.pad1 = (uint16_t)(lx < 0 ? 0 : lx);
                         client_ev.pad2 = (uint32_t)(ly < 0 ? 0 : ly);
                         vanilla_server_send_input(srv, hit->window_id, &client_ev);
@@ -2215,6 +2546,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             } else {
                 srv->mouse_buttons &= ~(1u << 0);
                 srv->drag_threshold_pending = 0;
+                srv->long_press_fired[0] = 0;
 
                 if (srv->is_resizing) {
                     vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->resize_window_id);
@@ -2323,10 +2655,31 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
         }
 
         if (ev->code == BTN_RIGHT) {
-            if (ev->value == 1)
+            if (ev->value == 1) {
                 srv->mouse_buttons |= (1u << 1);
-            else
+
+                uint64_t now = pit_ticks();
+                uint64_t click_timeout = pit_frequency() * 3 / 10;
+                int same_pos = (abs(srv->cursor_x - srv->last_click_x[1]) <= 4 &&
+                                abs(srv->cursor_y - srv->last_click_y[1]) <= 4);
+                if (same_pos && (now - srv->last_click_ticks[1]) < click_timeout) {
+                    srv->click_count[1]++;
+                    if (srv->click_count[1] > 3)
+                        srv->click_count[1] = 3;
+                } else {
+                    srv->click_count[1] = 1;
+                }
+                srv->last_click_ticks[1] = now;
+                srv->last_click_x[1] = srv->cursor_x;
+                srv->last_click_y[1] = srv->cursor_y;
+                srv->btn_down_ticks[1] = now;
+                srv->btn_down_x[1] = srv->cursor_x;
+                srv->btn_down_y[1] = srv->cursor_y;
+                srv->long_press_fired[1] = 0;
+            } else {
                 srv->mouse_buttons &= ~(1u << 1);
+                srv->long_press_fired[1] = 0;
+            }
 
             if (srv->focused_window_id != 0) {
                 vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->focused_window_id);
@@ -2334,6 +2687,51 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     int lx = srv->cursor_x - w->x;
                     int ly = srv->cursor_y - w->y;
                     struct input_event client_ev = *ev;
+                    if (ev->value == 1)
+                        client_ev.value = srv->click_count[1];
+                    client_ev.pad1 = (uint16_t)(lx < 0 ? 0 : lx);
+                    client_ev.pad2 = (uint32_t)(ly < 0 ? 0 : ly);
+                    vanilla_server_send_input(srv, srv->focused_window_id, &client_ev);
+                }
+            }
+            return 0;
+        }
+
+        if (ev->code == BTN_MIDDLE) {
+            if (ev->value == 1) {
+                srv->mouse_buttons |= (1u << 2);
+
+                uint64_t now = pit_ticks();
+                uint64_t click_timeout = pit_frequency() * 3 / 10;
+                int same_pos = (abs(srv->cursor_x - srv->last_click_x[2]) <= 4 &&
+                                abs(srv->cursor_y - srv->last_click_y[2]) <= 4);
+                if (same_pos && (now - srv->last_click_ticks[2]) < click_timeout) {
+                    srv->click_count[2]++;
+                    if (srv->click_count[2] > 3)
+                        srv->click_count[2] = 3;
+                } else {
+                    srv->click_count[2] = 1;
+                }
+                srv->last_click_ticks[2] = now;
+                srv->last_click_x[2] = srv->cursor_x;
+                srv->last_click_y[2] = srv->cursor_y;
+                srv->btn_down_ticks[2] = now;
+                srv->btn_down_x[2] = srv->cursor_x;
+                srv->btn_down_y[2] = srv->cursor_y;
+                srv->long_press_fired[2] = 0;
+            } else {
+                srv->mouse_buttons &= ~(1u << 2);
+                srv->long_press_fired[2] = 0;
+            }
+
+            if (srv->focused_window_id != 0) {
+                vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->focused_window_id);
+                if (w) {
+                    int lx = srv->cursor_x - w->x;
+                    int ly = srv->cursor_y - w->y;
+                    struct input_event client_ev = *ev;
+                    if (ev->value == 1)
+                        client_ev.value = srv->click_count[2];
                     client_ev.pad1 = (uint16_t)(lx < 0 ? 0 : lx);
                     client_ev.pad2 = (uint32_t)(ly < 0 ? 0 : ly);
                     vanilla_server_send_input(srv, srv->focused_window_id, &client_ev);
@@ -2343,9 +2741,113 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
         }
 
         /* Hotkey: Alt+Space toggles Quick Launcher */
-        if (srv->alt_pressed && ev->code == KEY_SPACE && ev->value == 1) {
+        if ((srv->mod_state & MOD_ALT) && ev->code == KEY_SPACE && ev->value == 1) {
             launcher_toggle(srv);
             return 0;
+        }
+
+        /* Alt+Tab and Tab focus cycling */
+        if (ev->code == KEY_TAB && ev->value == 1) {
+            if (srv->mod_state & MOD_ALT) {
+                if (!srv->alttab_visible) {
+                    wm_alttab_build_list(srv);
+                    if (srv->alttab_window_count > 0) {
+                        srv->alttab_visible = 1;
+                        if (srv->mod_state & MOD_SHIFT)
+                            srv->alttab_selection = srv->alttab_window_count - 1;
+                        else
+                            srv->alttab_selection = (srv->alttab_window_count > 1) ? 1 : 0;
+                        vanilla_rect_t r;
+                        alttab_get_rect(srv, &r);
+                        compositor_add_damage(&srv->compositor, &r);
+                    }
+                } else {
+                    if (srv->alttab_window_count > 0) {
+                        if (srv->mod_state & MOD_SHIFT)
+                            srv->alttab_selection = (srv->alttab_selection - 1 + srv->alttab_window_count) % srv->alttab_window_count;
+                        else
+                            srv->alttab_selection = (srv->alttab_selection + 1) % srv->alttab_window_count;
+                        vanilla_rect_t r;
+                        alttab_get_rect(srv, &r);
+                        compositor_add_damage(&srv->compositor, &r);
+                    }
+                }
+                return 0;
+            } else if (!srv->launcher.visible && !srv->shell.start_menu_open) {
+                uint32_t normal_wins[VANILLA_MAX_WINDOWS];
+                int normal_count = 0;
+                for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+                    vanilla_server_window_t *w = &srv->windows[i];
+                    if (w->in_use && w->is_mapped && w->layer == LAYER_NORMAL && !(w->flags & WINDOW_FLAG_POPUP)) {
+                        normal_wins[normal_count++] = w->window_id;
+                    }
+                }
+                for (int i = 0; i < normal_count - 1; i++) {
+                    for (int j = i + 1; j < normal_count; j++) {
+                        vanilla_server_window_t *w_i = vanilla_server_find_window(srv, normal_wins[i]);
+                        vanilla_server_window_t *w_j = vanilla_server_find_window(srv, normal_wins[j]);
+                        int32_t z_i = w_i ? w_i->z_index : 0;
+                        int32_t z_j = w_j ? w_j->z_index : 0;
+                        if (z_j > z_i) {
+                            uint32_t tmp = normal_wins[i];
+                            normal_wins[i] = normal_wins[j];
+                            normal_wins[j] = tmp;
+                        }
+                    }
+                }
+                if (normal_count > 0) {
+                    int cur_idx = -1;
+                    for (int i = 0; i < normal_count; i++) {
+                        if (normal_wins[i] == srv->focused_window_id) {
+                            cur_idx = i;
+                            break;
+                        }
+                    }
+                    int next_idx;
+                    if (srv->mod_state & MOD_SHIFT) {
+                        if (cur_idx == -1)
+                            next_idx = normal_count - 1;
+                        else
+                            next_idx = (cur_idx - 1 + normal_count) % normal_count;
+                    } else {
+                        if (cur_idx == -1)
+                            next_idx = 0;
+                        else
+                            next_idx = (cur_idx + 1) % normal_count;
+                    }
+                    uint32_t new_id = normal_wins[next_idx];
+                    vanilla_server_focus_window(srv, new_id);
+                    wm_raise_window(srv, new_id);
+                    vanilla_server_window_t *target = vanilla_server_find_window(srv, new_id);
+                    if (target) {
+                        target->has_keyboard_focus = 1;
+                        wm_invalidate_window(srv, target);
+                    }
+                    shell_invalidate(srv);
+                    return 0;
+                }
+            }
+        }
+
+        /* ESC closes overlays */
+        if (ev->code == KEY_ESC && ev->value == 1) {
+            if (srv->alttab_visible) {
+                srv->alttab_visible = 0;
+                vanilla_rect_t r;
+                alttab_get_rect(srv, &r);
+                compositor_add_damage(&srv->compositor, &r);
+                return 0;
+            }
+            if (srv->launcher.visible) {
+                launcher_set_visible(srv, 0);
+                return 0;
+            }
+            if (srv->shell.start_menu_open) {
+                srv->shell.start_menu_open = 0;
+                shell_invalidate_start_menu(srv);
+                shell_invalidate(srv);
+                return 0;
+            }
         }
 
         /* Forward to launcher if active */
@@ -2354,12 +2856,10 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             return 0;
         }
 
-        /* ESC closes Start Menu if open */
-        if (ev->code == KEY_ESC && ev->value == 1 && srv->shell.start_menu_open) {
-            srv->shell.start_menu_open = 0;
-            shell_invalidate_start_menu(srv);
-            shell_invalidate(srv);
-            return 0;
+        /* Forward to shell start menu if open */
+        if (srv->shell.start_menu_open) {
+            if (shell_handle_key(srv, ev->code, ev->value))
+                return 0;
         }
 
         /* Otherwise forward key event to focused window */

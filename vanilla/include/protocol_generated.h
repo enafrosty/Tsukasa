@@ -55,6 +55,7 @@ typedef enum {
     MSG_DND_DROP             = 21,
     MSG_THEME_CHANGED        = 22,
     MSG_SET_SIZE_HINTS       = 23,
+    MSG_INPUT_EVENT_V2       = 24,
 } vanilla_msg_type_t;
 
 /* MSG_HELLO payload (client to server, v1+) */
@@ -277,6 +278,15 @@ typedef struct {
 
 _Static_assert(sizeof(vanilla_msg_set_size_hints_t) == 28,
     "vanilla_msg_set_size_hints_t size mismatch; regenerate protocol");
+
+/* MSG_INPUT_EVENT_V2 payload (server to client, v2+) */
+typedef struct {
+    struct input_event event;
+    uint16_t mod_state;
+} __attribute__((packed)) vanilla_msg_input_event_v2_t;
+
+_Static_assert(sizeof(vanilla_msg_input_event_v2_t) == 26,
+    "vanilla_msg_input_event_v2_t size mismatch; regenerate protocol");
 
 typedef struct vanilla_server vanilla_server_t;
 
