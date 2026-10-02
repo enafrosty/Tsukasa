@@ -2523,8 +2523,12 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             }
         }
 
-        if (is_mod)
+        if (is_mod) {
+            if (srv->focused_window_id != 0) {
+                vanilla_server_send_input(srv, srv->focused_window_id, ev);
+            }
             return 0;
+        }
 
         /* Mouse buttons */
         if (ev->code == BTN_LEFT) {
