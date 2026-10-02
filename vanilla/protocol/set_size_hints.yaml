@@ -1,0 +1,28 @@
+id: 23
+name: MSG_SET_SIZE_HINTS
+direction: client_to_server
+version: 2
+v1_compat: false
+description: "Client declares minimum/maximum size and optional aspect ratio."
+fields:
+  - name: window_id
+    type: uint32_t
+    description: "Target window ID"
+  - name: min_width
+    type: uint32_t
+    description: "Minimum allowed window width (0 = default 32)"
+  - name: min_height
+    type: uint32_t
+    description: "Minimum allowed window height (0 = default 32)"
+  - name: max_width
+    type: uint32_t
+    description: "Maximum allowed window width (0 = no maximum)"
+  - name: max_height
+    type: uint32_t
+    description: "Maximum allowed window height (0 = no maximum)"
+  - name: aspect_num
+    type: uint32_t
+    description: "Aspect ratio numerator (width). 0 = no lock."
+  - name: aspect_den
+    type: uint32_t
+    description: "Aspect ratio denominator (height). 0 = no lock."

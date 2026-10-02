@@ -90,6 +90,10 @@ int  vanilla_unmap_window(vanilla_window_t *win);
 int  vanilla_move_window(vanilla_window_t *win, int32_t x, int32_t y);
 void vanilla_present(vanilla_window_t *win, const vanilla_rect_t *damage);
 int  vanilla_ack_configure(vanilla_client_t *client, uint32_t window_id, uint32_t serial);
+int  vanilla_set_size_hints(vanilla_client_t *client, uint32_t window_id,
+                            uint32_t min_w, uint32_t min_h,
+                            uint32_t max_w, uint32_t max_h,
+                            uint32_t asp_n, uint32_t asp_d);
 
 /* Event processing */
 int  vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev);
