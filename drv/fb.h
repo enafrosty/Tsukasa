@@ -63,4 +63,7 @@ int fb_poll(int events);
 int fb_kd_mode(void);
 void fb_set_kd_mode(int mode);
 
+/* Double-buffer panning probe. */
+int fb_try_enable_panning(void);
+
 #endif /* FB_H */

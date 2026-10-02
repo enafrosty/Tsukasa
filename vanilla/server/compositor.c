@@ -27,6 +27,76 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
+#ifndef FBIOPUT_VSCREENINFO
+#define FBIOPUT_VSCREENINFO 0x4601
+#endif
+
+#if defined(VANILLA_HOST) || defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+__attribute__((weak)) uint64_t pit_ticks(void)
+{
+    return (uint64_t)GetTickCount64();
+}
+#else
+#include <time.h>
+__attribute__((weak)) uint64_t pit_ticks(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000L);
+    return 0;
+}
+#endif
+
+__attribute__((weak)) uint32_t pit_frequency(void)
+{
+    return 1000;
+}
+#else
+#include <sys/syscall.h>
+#ifndef SYS_ticks
+#define SYS_ticks 320
+#endif
+
+__attribute__((weak)) uint64_t pit_ticks(void)
+{
+    long t = __syscall0(SYS_ticks);
+    return (t > 0) ? (uint64_t)t : 0;
+}
+
+__attribute__((weak)) uint32_t pit_frequency(void)
+{
+    return 100;
+}
+#endif
+
+int compositor_frame_due(vanilla_compositor_t *comp)
+{
+    if (!comp)
+        return 0;
+
+    if (comp->last_frame_ticks == 0)
+        return 1;
+
+    uint64_t now = pit_ticks();
+    if (now < comp->last_frame_ticks)
+        return 1;
+
+    uint64_t delta = now - comp->last_frame_ticks;
+    return (delta >= comp->frame_target_ticks) ? 1 : 0;
+}
+
+void compositor_frame_rendered(vanilla_compositor_t *comp)
+{
+    if (!comp)
+        return;
+
+    comp->last_frame_ticks = pit_ticks();
+    if (comp->last_frame_ticks == 0)
+        comp->last_frame_ticks = 1;
+}
+
 int compositor_init_offscreen(vanilla_compositor_t *comp, uint32_t width, uint32_t height)
 {
     if (!comp || width == 0 || height == 0)
@@ -44,6 +114,15 @@ int compositor_init_offscreen(vanilla_compositor_t *comp, uint32_t width, uint32
     comp->bg_color = g_theme->bg_base;
     comp->has_wallpaper = 0;
     font_init(&comp->font, NULL, 0);
+
+    uint32_t freq = pit_frequency();
+    if (freq == 0)
+        freq = 1000;
+    comp->frame_target_ticks = (freq + COMPOSITOR_TARGET_FPS - 1) / COMPOSITOR_TARGET_FPS;
+    if (comp->frame_target_ticks == 0)
+        comp->frame_target_ticks = 1;
+    comp->last_frame_ticks = 0;
+    comp->panning_enabled = 0;
 
     size_t backbuffer_size = (size_t)width * height * sizeof(uint32_t);
     comp->backbuffer = (uint32_t *)malloc(backbuffer_size);
@@ -66,6 +145,15 @@ int compositor_init(vanilla_compositor_t *comp, const char *fb_dev)
     comp->bg_color = g_theme->bg_base;
     comp->has_wallpaper = 0;
     font_init(&comp->font, NULL, 0);
+
+    uint32_t freq = pit_frequency();
+    if (freq == 0)
+        freq = 1000;
+    comp->frame_target_ticks = (freq + COMPOSITOR_TARGET_FPS - 1) / COMPOSITOR_TARGET_FPS;
+    if (comp->frame_target_ticks == 0)
+        comp->frame_target_ticks = 1;
+    comp->last_frame_ticks = 0;
+    comp->panning_enabled = 0;
 
     if (image_load_file(&comp->wallpaper, "/assets/wallpaper.bmp") == 0 ||
         image_load_file(&comp->wallpaper, "assets/wallpaper.bmp") == 0) {
@@ -135,6 +223,16 @@ int compositor_init(vanilla_compositor_t *comp, const char *fb_dev)
 
     printf("[vanilla] Framebuffer mapped: %ux%u @ %u bpp, pitch=%u px, size=%u bytes\n",
            comp->width, comp->height, comp->bpp, comp->pitch_px, (unsigned)comp->fb_size);
+
+#if !defined(_WIN32) && !defined(VANILLA_HOST)
+    struct fb_var_screeninfo pan_vinfo = vinfo;
+    pan_vinfo.yres_virtual = vinfo.yres * 2;
+    if (ioctl(fd, FBIOPUT_VSCREENINFO, &pan_vinfo) == 0 &&
+        pan_vinfo.yres_virtual >= vinfo.yres * 2) {
+        comp->panning_enabled = 1;
+    }
+#endif
+    printf("[vanilla] Hardware panning: %s\n", comp->panning_enabled ? "enabled" : "unavailable");
 
     size_t backbuffer_size = (size_t)comp->pitch_px * comp->height * sizeof(uint32_t);
     comp->backbuffer = (uint32_t *)malloc(backbuffer_size);
@@ -297,7 +395,7 @@ void compositor_render_frame(struct vanilla_server *srv)
     if (!srv || srv->compositor.dirty_count <= 0)
         return;
 
-    vanilla_server_send_frame_begin(srv);
+    printf("[vanilla] compositor: render\n");
 
     vanilla_compositor_t *comp = &srv->compositor;
     compositor_merge_damage(comp);
