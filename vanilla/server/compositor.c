@@ -674,6 +674,11 @@ void alttab_get_rect(vanilla_server_t *srv, vanilla_rect_t *out_rect)
     int32_t ph = THEME_PX(24) + srv->alttab_window_count * item_h;
     if (ph < THEME_PX(64))
         ph = THEME_PX(64);
+    if (srv->compositor.height > 0) {
+        int32_t max_h = (int32_t)srv->compositor.height - THEME_PX(40);
+        if (max_h >= THEME_PX(64) && ph > max_h)
+            ph = max_h;
+    }
     int32_t px = ((int32_t)srv->compositor.width - pw) / 2;
     int32_t py = ((int32_t)srv->compositor.height - ph) / 2;
     out_rect->x = px;
@@ -724,7 +729,7 @@ void alttab_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
     for (int i = 0; i < srv->alttab_window_count; i++) {
         uint32_t wid = srv->alttab_window_ids[i];
         vanilla_server_window_t *w = vanilla_server_find_window(srv, wid);
-        if (!w)
+        if (!w || !w->is_mapped)
             continue;
 
         vanilla_rect_t item_rect = {
@@ -733,6 +738,9 @@ void alttab_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
             overlay.w - THEME_PX(24),
             item_h - THEME_PX(4)
         };
+
+        if (item_rect.y + item_rect.h > overlay.y + overlay.h)
+            break;
 
         vanilla_rect_t vis_item;
         if (!vanilla_rect_intersect(&item_rect, dirty, &vis_item))

@@ -904,6 +904,7 @@ int handle_msg_map_window(vanilla_server_t *srv, int client_idx, const vanilla_m
         w->is_mapped = 1;
         w->frame_begin_in_flight = 0;
         vanilla_server_focus_window(srv, w->window_id);
+        wm_raise_window(srv, w->window_id);
         wm_invalidate_window(srv, w);
         shell_invalidate(srv);
     }
@@ -1521,7 +1522,134 @@ int wm_run_input_selftests(void)
         return -1;
     }
 
-    printf("[vanilla] input completeness self-tests passed (3/3)\n");
+    /* 4. Tab focus cycling without Alt (sequential z-order traversal) */
+    for (int i = 0; i < 3; i++) {
+        srv.windows[i].client_fd = -1;
+        srv.windows[i].layer = LAYER_NORMAL;
+    }
+    srv.focused_window_id = 20;
+    vanilla_server_window_t *w20 = vanilla_server_find_window(&srv, 20);
+    if (w20) w20->is_focused = 1;
+
+    struct input_event tab_ev;
+    memset(&tab_ev, 0, sizeof(tab_ev));
+    tab_ev.type = EV_KEY;
+    tab_ev.code = KEY_TAB;
+    tab_ev.value = 1;
+
+    /* First Tab: moves 20 -> 30 */
+    wm_handle_input_event(&srv, &tab_ev);
+    if (srv.focused_window_id != 30) {
+        fprintf(stderr, "[input_selftest] FAIL: Tab cycle 20->30 (got %u)\n", srv.focused_window_id);
+        return -1;
+    }
+    vanilla_server_window_t *w30 = vanilla_server_find_window(&srv, 30);
+    if (!w30 || !w30->has_keyboard_focus) {
+        fprintf(stderr, "[input_selftest] FAIL: window 30 has_keyboard_focus\n");
+        return -1;
+    }
+
+    /* Second Tab: moves 30 -> 10 */
+    wm_handle_input_event(&srv, &tab_ev);
+    if (srv.focused_window_id != 10) {
+        fprintf(stderr, "[input_selftest] FAIL: Tab cycle 30->10 (got %u)\n", srv.focused_window_id);
+        return -1;
+    }
+
+    /* Third Tab: wraps 10 -> 20 */
+    wm_handle_input_event(&srv, &tab_ev);
+    if (srv.focused_window_id != 20) {
+        fprintf(stderr, "[input_selftest] FAIL: Tab cycle 10->20 wrap (got %u)\n", srv.focused_window_id);
+        return -1;
+    }
+
+    /* Shift+Tab: reverses 20 -> 10 */
+    srv.mod_state |= MOD_LSHIFT;
+    wm_handle_input_event(&srv, &tab_ev);
+    srv.mod_state &= ~MOD_LSHIFT;
+    if (srv.focused_window_id != 10) {
+        fprintf(stderr, "[input_selftest] FAIL: Shift+Tab reverse 20->10 (got %u)\n", srv.focused_window_id);
+        return -1;
+    }
+
+    /* 5. Alt+Tab forward, reverse, and commit */
+    struct input_event alt_down, alt_up;
+    memset(&alt_down, 0, sizeof(alt_down));
+    alt_down.type = EV_KEY;
+    alt_down.code = KEY_LEFTALT;
+    alt_down.value = 1;
+
+    memset(&alt_up, 0, sizeof(alt_up));
+    alt_up.type = EV_KEY;
+    alt_up.code = KEY_LEFTALT;
+    alt_up.value = 0;
+
+    wm_handle_input_event(&srv, &alt_down);
+    /* Tab while Alt held -> opens overlay, selection index 1 */
+    wm_handle_input_event(&srv, &tab_ev);
+    if (!srv.alttab_visible || srv.alttab_selection != 1) {
+        fprintf(stderr, "[input_selftest] FAIL: Alt+Tab initial trigger (vis=%d sel=%d)\n",
+                srv.alttab_visible, srv.alttab_selection);
+        return -1;
+    }
+    /* Subsequent Tab -> index 2 */
+    wm_handle_input_event(&srv, &tab_ev);
+    if (srv.alttab_selection != 2) {
+        fprintf(stderr, "[input_selftest] FAIL: Alt+Tab second Tab (sel=%d)\n", srv.alttab_selection);
+        return -1;
+    }
+    /* Releasing Alt commits selection (index 2 -> window 10) */
+    wm_handle_input_event(&srv, &alt_up);
+    if (srv.alttab_visible || srv.focused_window_id != 10) {
+        fprintf(stderr, "[input_selftest] FAIL: Alt release commit (vis=%d focus=%u)\n",
+                srv.alttab_visible, srv.focused_window_id);
+        return -1;
+    }
+
+    /* 6. Start Menu keyboard navigation */
+    struct input_event super_ev, down_ev, up_ev, esc_ev;
+    memset(&super_ev, 0, sizeof(super_ev));
+    super_ev.type = EV_KEY;
+    super_ev.code = KEY_LEFTMETA;
+    super_ev.value = 1;
+
+    memset(&down_ev, 0, sizeof(down_ev));
+    down_ev.type = EV_KEY;
+    down_ev.code = KEY_DOWN;
+    down_ev.value = 1;
+
+    memset(&up_ev, 0, sizeof(up_ev));
+    up_ev.type = EV_KEY;
+    up_ev.code = KEY_UP;
+    up_ev.value = 1;
+
+    memset(&esc_ev, 0, sizeof(esc_ev));
+    esc_ev.type = EV_KEY;
+    esc_ev.code = KEY_ESC;
+    esc_ev.value = 1;
+
+    wm_handle_input_event(&srv, &super_ev);
+    if (!srv.shell.start_menu_open || srv.shell.selected_idx != 0) {
+        fprintf(stderr, "[input_selftest] FAIL: Super open start menu\n");
+        return -1;
+    }
+    wm_handle_input_event(&srv, &down_ev);
+    if (srv.shell.selected_idx != 1) {
+        fprintf(stderr, "[input_selftest] FAIL: Start menu down arrow (got %d)\n", srv.shell.selected_idx);
+        return -1;
+    }
+    wm_handle_input_event(&srv, &up_ev);
+    if (srv.shell.selected_idx != 0) {
+        fprintf(stderr, "[input_selftest] FAIL: Start menu up arrow (got %d)\n", srv.shell.selected_idx);
+        return -1;
+    }
+    wm_handle_input_event(&srv, &esc_ev);
+    if (srv.shell.start_menu_open) {
+        fprintf(stderr, "[input_selftest] FAIL: ESC start menu close\n");
+        return -1;
+    }
+
+    printf("[vanilla] input completeness self-tests passed (6/6)\n");
     return 0;
 }
 
@@ -2018,7 +2146,7 @@ int vanilla_server_focus_window(vanilla_server_t *srv, uint32_t window_id)
             exact_write(new_w->client_fd, &hdr, sizeof(hdr));
             exact_write(new_w->client_fd, &msg, sizeof(msg));
         }
-        wm_raise_window(srv, window_id);
+        wm_invalidate_window(srv, new_w);
     } else {
         srv->focused_window_id = 0;
     }
@@ -2179,6 +2307,9 @@ static void wm_alttab_build_list(vanilla_server_t *srv)
             }
         }
     }
+
+    if (srv->alttab_window_count > 16)
+        srv->alttab_window_count = 16;
 }
 
 int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
@@ -2360,6 +2491,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
         case KEY_CAPSLOCK:    update_mod_state(srv, MOD_CAPS_LOCK, 1, ev->value); is_mod = 1; break;
         case KEY_NUMLOCK:     update_mod_state(srv, MOD_NUM_LOCK,  1, ev->value); is_mod = 1; break;
         case KEY_LEFTMETA:
+        case KEY_RIGHTMETA:
             update_mod_state(srv, MOD_SUPER, 0, ev->value);
             if (ev->value == 1) {
                 srv->shell.start_menu_open = !srv->shell.start_menu_open;
@@ -2778,7 +2910,9 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 int normal_count = 0;
                 for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
                     vanilla_server_window_t *w = &srv->windows[i];
-                    if (w->in_use && w->is_mapped && w->layer == LAYER_NORMAL && !(w->flags & WINDOW_FLAG_POPUP)) {
+                    if (w->in_use && w->is_mapped && w->layer == LAYER_NORMAL &&
+                        !(w->flags & WINDOW_FLAG_POPUP) &&
+                        !(w->flags & WINDOW_FLAG_ALWAYS_TOP)) {
                         normal_wins[normal_count++] = w->window_id;
                     }
                 }
@@ -2817,7 +2951,6 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     }
                     uint32_t new_id = normal_wins[next_idx];
                     vanilla_server_focus_window(srv, new_id);
-                    wm_raise_window(srv, new_id);
                     vanilla_server_window_t *target = vanilla_server_find_window(srv, new_id);
                     if (target) {
                         target->has_keyboard_focus = 1;

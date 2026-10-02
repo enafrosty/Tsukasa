@@ -425,7 +425,7 @@ int shell_handle_key(vanilla_server_t *srv, uint16_t code, int pressed)
         return 1;
     }
 
-    if (code == KEY_ENTER || code == KEY_KPENTER) {
+    if (code == KEY_ENTER || code == KEY_KPENTER || code == KEY_SPACE) {
         int idx = srv->shell.selected_idx;
         if (idx >= 0 && idx < START_MENU_NUM_ITEMS) {
             shell_spawn_app(g_start_menu_items[idx].path);
