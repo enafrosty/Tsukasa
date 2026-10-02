@@ -165,7 +165,7 @@ vanilla_server_window_t *wm_window_at(vanilla_server_t *srv, int32_t x, int32_t 
 
     for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
         vanilla_server_window_t *w = &srv->windows[i];
-        if (!w->in_use || !w->is_mapped)
+        if (!w->in_use || !w->is_mapped || w->anim_state == ANIM_CLOSING || w->anim_state == ANIM_MINIMIZING)
             continue;
 
         vanilla_rect_t frame;
@@ -978,6 +978,11 @@ int handle_msg_unmap_window(vanilla_server_t *srv, int client_idx, const vanilla
             srv->drag_threshold_pending = 0;
         }
         w->resize_has_target = 0;
+        w->anim_state = ANIM_IDLE;
+        w->anim_destroy_on_done = 0;
+        w->anim_unmap_on_done = 0;
+        w->anim_current_scale = 1.0f;
+        w->anim_current_alpha = 1.0f;
         wm_invalidate_window(srv, w);
         w->is_mapped = 0;
         w->is_focused = 0;
@@ -1801,7 +1806,8 @@ int wm_run_animation_selftests(void)
 
     /* 3. compositor_animate_windows step update and completion to ANIM_IDLE */
     uint64_t now = pit_ticks();
-    while (now < 2) {
+    int retries = 0;
+    while (now < 2 && retries++ < 50) {
         usleep(10000);
         now = pit_ticks();
     }
@@ -1836,6 +1842,7 @@ int wm_run_animation_selftests(void)
     w1->in_use = 1;
     w1->is_mapped = 1;
     w1->window_id = 101;
+    w1->z_index = 10;
     w1->x = 200;
     w1->y = 200;
     w1->width = 300;
@@ -1844,6 +1851,10 @@ int wm_run_animation_selftests(void)
     compositor_start_anim(w1, ANIM_CLOSING, 100, 1.0f, 0.85f, 1.0f, 0.0f, 350, 300, 1);
     if (vanilla_server_find_window(&srv, 101) != NULL) {
         fprintf(stderr, "[anim_selftest] FAIL: find_window did not filter ANIM_CLOSING window\n");
+        return -1;
+    }
+    if (wm_window_at(&srv, 350, 300) == w1) {
+        fprintf(stderr, "[anim_selftest] FAIL: wm_window_at did not filter ANIM_CLOSING window\n");
         return -1;
     }
 
@@ -1863,6 +1874,7 @@ int wm_run_animation_selftests(void)
     w2->is_mapped = 1;
     w2->is_focused = 1;
     w2->window_id = 102;
+    w2->z_index = 20;
     w2->x = 50;
     w2->y = 50;
     w2->width = 200;
@@ -1871,6 +1883,10 @@ int wm_run_animation_selftests(void)
     compositor_start_anim(w2, ANIM_MINIMIZING, 150, 1.0f, 0.1f, 1.0f, 0.0f, 100, 700, 0);
     if (w2->anim_unmap_on_done != 1) {
         fprintf(stderr, "[anim_selftest] FAIL: anim_unmap_on_done not set for ANIM_MINIMIZING\n");
+        return -1;
+    }
+    if (wm_window_at(&srv, 100, 100) == w2) {
+        fprintf(stderr, "[anim_selftest] FAIL: wm_window_at did not filter ANIM_MINIMIZING window\n");
         return -1;
     }
 
@@ -2478,8 +2494,7 @@ int vanilla_server_close_request(vanilla_server_t *srv, uint32_t window_id)
             wm_get_frame_rect(w, &fr);
             int32_t cx = fr.x + fr.w / 2;
             int32_t cy = fr.y + fr.h / 2;
-            compositor_start_anim(w, ANIM_CLOSING, 100, 1.0f, 0.85f, 1.0f, 0.0f, cx, cy, 0);
-            w->anim_unmap_on_done = 1;
+            compositor_start_anim(w, ANIM_CLOSING, 100, 1.0f, 0.85f, 1.0f, 0.0f, cx, cy, 1);
             wm_invalidate_window(srv, w);
         }
     }
@@ -3096,12 +3111,12 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
 
                 if (srv->is_dragging) {
                     compositor_snap_preview_hide(&srv->compositor);
-                    /* Evaluate Aero-snap boundary triggers upon release */
-                    if (srv->cursor_y <= 2) {
+                    /* Evaluate Aero-snap boundary triggers upon release matching preview zone */
+                    if (srv->cursor_y <= 16) {
                         wm_snap_window(srv, srv->drag_window_id, SNAP_MAXIMIZE);
-                    } else if (srv->cursor_x <= 2) {
+                    } else if (srv->cursor_x <= 16) {
                         wm_snap_window(srv, srv->drag_window_id, SNAP_LEFT);
-                    } else if (srv->cursor_x >= screen_w - 3) {
+                    } else if (srv->cursor_x >= screen_w - 16) {
                         wm_snap_window(srv, srv->drag_window_id, SNAP_RIGHT);
                     }
                     srv->is_dragging = 0;

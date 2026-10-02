@@ -570,7 +570,7 @@ int compositor_has_active_animations(vanilla_server_t *srv)
     if (!srv || g_theme->reduce_motion != 0)
         return 0;
 
-    if (srv->compositor.snap_preview_visible)
+    if (srv->compositor.snap_preview_visible && srv->compositor.snap_preview_alpha < 1.0f)
         return 1;
 
     for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
@@ -712,7 +712,8 @@ void compositor_render_frame(struct vanilla_server *srv)
             vanilla_server_window_t *win = sorted[w];
             if ((win->flags & WINDOW_FLAG_BORDERLESS) || win->is_snapped == SNAP_MAXIMIZE)
                 continue;
-            if (win->anim_state != ANIM_IDLE && g_theme->reduce_motion == 0 && win->anim_current_alpha <= 0.05f)
+            if (win->anim_state != ANIM_IDLE && win->anim_state != ANIM_FOCUS &&
+                g_theme->reduce_motion == 0 && win->anim_current_alpha <= 0.05f)
                 continue;
 
             uint8_t sh_alpha = g_theme->shadow_alpha;
@@ -739,7 +740,7 @@ void compositor_render_frame(struct vanilla_server *srv)
         /* 3. Render windows in Z-order */
         for (int w = 0; w < win_count; w++) {
             vanilla_server_window_t *win = sorted[w];
-            if ((win->anim_state == ANIM_CLOSING || win->anim_state == ANIM_MINIMIZING) &&
+            if (win->anim_state != ANIM_IDLE && win->anim_state != ANIM_FOCUS &&
                 g_theme->reduce_motion == 0 && win->anim_current_alpha <= 0.05f)
                 continue;
 
@@ -771,6 +772,9 @@ void compositor_render_frame(struct vanilla_server *srv)
                         if (g > 255) g = 255;
                         if (b > 255) b = 255;
                         tb_color = (a << 24) | (r << 16) | (g << 8) | b;
+                    } else if (win->anim_state != ANIM_IDLE && g_theme->reduce_motion == 0 && win->anim_current_alpha < 1.0f) {
+                        uint32_t a = (uint32_t)(((tb_color >> 24) & 0xFF) * win->anim_current_alpha);
+                        tb_color = (a << 24) | (tb_color & 0x00FFFFFF);
                     }
                     blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
                                              title_rect.x, title_rect.y, title_rect.w, title_rect.h,
@@ -851,6 +855,11 @@ void compositor_render_frame(struct vanilla_server *srv)
                         vanilla_rect_t vis_text;
                         if (vanilla_rect_intersect(&text_clip, dirty, &vis_text) && text_clip.w > 0) {
                             uint32_t text_color = win->is_focused ? g_theme->titlebar_text_active : g_theme->titlebar_text_inactive;
+                            if (win->anim_state != ANIM_IDLE && win->anim_state != ANIM_FOCUS &&
+                                g_theme->reduce_motion == 0 && win->anim_current_alpha < 1.0f) {
+                                uint32_t a = (uint32_t)(((text_color >> 24) & 0xFF) * win->anim_current_alpha);
+                                text_color = (a << 24) | (text_color & 0x00FFFFFF);
+                            }
                             int32_t text_y = frame_rect.y + (g_theme->titlebar_height - (int32_t)g_theme->title_font_size) / 2;
                             font_draw_text(comp->backbuffer, comp->pitch_px, &vis_text,
                                            &comp->font, win->title, text_clip.x, text_y,
@@ -895,7 +904,7 @@ void compositor_render_frame(struct vanilla_server *srv)
 
             /* Render client SHM surface */
             if (win->surface.pixels && win->width > 0 && win->height > 0) {
-                if (win->anim_state != ANIM_IDLE && g_theme->reduce_motion == 0) {
+                if (win->anim_state != ANIM_IDLE && win->anim_state != ANIM_FOCUS && g_theme->reduce_motion == 0) {
                     compositor_paint_animated_window(comp, win, dirty);
                 } else {
                     vanilla_rect_t client_rect;
@@ -995,7 +1004,7 @@ void compositor_render_frame(struct vanilla_server *srv)
             if (srv->windows[i].in_use && srv->windows[i].anim_state != ANIM_IDLE)
                 wm_invalidate_window(srv, &srv->windows[i]);
         }
-        if (srv->compositor.snap_preview_visible)
+        if (srv->compositor.snap_preview_visible && srv->compositor.snap_preview_alpha < 1.0f)
             compositor_add_damage(&srv->compositor, &srv->compositor.snap_preview_rect);
     }
 }
