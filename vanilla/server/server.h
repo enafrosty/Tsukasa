@@ -125,6 +125,9 @@ typedef struct {
     int32_t           target_y;
     uint32_t          target_w;
     uint32_t          target_h;
+
+    /* Keyboard focus ring state */
+    int               has_keyboard_focus;
 } vanilla_server_window_t;
 
 typedef struct {
@@ -150,9 +153,23 @@ typedef struct vanilla_server {
     int32_t                 cursor_x;
     int32_t                 cursor_y;
     uint32_t                mouse_buttons;
-    int                     shift_pressed;
-    int                     alt_pressed;
-    int                     ctrl_pressed;
+    uint16_t                mod_state;
+
+    /* Click gesture detection */
+    uint64_t                last_click_ticks[3];
+    int32_t                 last_click_x[3];
+    int32_t                 last_click_y[3];
+    int                     click_count[3];
+    uint64_t                btn_down_ticks[3];
+    int32_t                 btn_down_x[3];
+    int32_t                 btn_down_y[3];
+    int                     long_press_fired[3];
+
+    /* Alt+Tab window switcher */
+    int                     alttab_visible;
+    int                     alttab_selection;
+    int                     alttab_window_count;
+    uint32_t                alttab_window_ids[VANILLA_MAX_WINDOWS];
 
     /* Window interactive dragging */
     uint32_t                drag_window_id;
@@ -216,5 +233,14 @@ int  wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev);
 vanilla_server_window_t *wm_window_at(vanilla_server_t *srv, int32_t x, int32_t y);
 vanilla_resize_edge_t wm_hit_test_resize_edge(const vanilla_server_window_t *w, int32_t px, int32_t py);
 int  wm_run_resize_selftests(void);
+int  wm_run_input_selftests(void);
+
+/* Alt+Tab switcher overlay */
+void alttab_get_rect(vanilla_server_t *srv, vanilla_rect_t *out_rect);
+void alttab_render(vanilla_server_t *srv, const vanilla_rect_t *dirty);
+
+/* Time and timer primitives */
+uint64_t pit_ticks(void);
+uint32_t pit_frequency(void);
 
 #endif /* _VANILLA_SERVER_H */

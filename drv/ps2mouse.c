@@ -22,12 +22,18 @@
 #include "../input/event.h"
 #include "../gfx/cursor.h"
 #include "../include/vfs_abi.h"
+#include "../include/kprintf.h"
 #include <stdint.h>
+
+#ifndef INPUT_EVENT_SCROLL
+#define INPUT_EVENT_SCROLL INPUT_EVENT_MOUSE_WHEEL
+#endif
 
 /* Mouse packet state machine. */
 static uint8_t mouse_cycle;
-static int8_t  mouse_bytes[3];
+static int8_t  mouse_bytes[4];
 static uint8_t mouse_buttons_prev;
+static int     mouse_has_scroll;
 
 /* Wait for PS/2 controller to be ready for a command byte. */
 static void ps2_wait_write(void)
@@ -65,6 +71,22 @@ static uint8_t ps2_mouse_read(void)
     return inb(PS2_DATA);
 }
 
+/*
+ * Attempt to enable IntelliMouse (4-byte packets with Z axis).
+ * Sequence: set sample rate 200, 100, 80; then read device ID.
+ * If device ID == 0x03, 4-byte mode is active.
+ * Returns 1 if enabled, 0 if standard 3-byte mode.
+ */
+static int ps2mouse_enable_scroll(void)
+{
+    ps2_mouse_write(0xF3); ps2_mouse_read(); ps2_mouse_write(200); ps2_mouse_read();
+    ps2_mouse_write(0xF3); ps2_mouse_read(); ps2_mouse_write(100); ps2_mouse_read();
+    ps2_mouse_write(0xF3); ps2_mouse_read(); ps2_mouse_write(80);  ps2_mouse_read();
+    ps2_mouse_write(0xF2); ps2_mouse_read();
+    uint8_t id = ps2_mouse_read();
+    return (id == 0x03);
+}
+
 void ps2mouse_init(void)
 {
     mouse_cycle = 0;
@@ -85,6 +107,12 @@ void ps2mouse_init(void)
 
     ps2_mouse_write(0xF6);
     ps2_mouse_read();
+
+    mouse_has_scroll = ps2mouse_enable_scroll();
+    if (mouse_has_scroll)
+        kprintf("[ps2mouse] IntelliMouse 4-byte scroll enabled (id=0x03)\n");
+    else
+        kprintf("[ps2mouse] standard 3-byte mode active\n");
 
     ps2_mouse_write(0xF4);
     ps2_mouse_read();
@@ -109,7 +137,7 @@ void ps2mouse_handler(void)
         break;
     case 2:
         mouse_bytes[2] = (int8_t)data;
-        mouse_cycle = 0;
+        mouse_cycle = mouse_has_scroll ? 3 : 0;
 
         {
             uint8_t status = (uint8_t)mouse_bytes[0];
@@ -209,6 +237,35 @@ void ps2mouse_handler(void)
                 event_enqueue(&ev);
             }
             mouse_buttons_prev = buttons;
+        }
+        break;
+    case 3:
+        {
+            int8_t dz;
+            if (data & 0x08)
+                dz = (int8_t)(data | 0xF0);
+            else
+                dz = (int8_t)(data & 0x0F);
+
+            if (dz != 0) {
+                input_dev_push(EV_REL, REL_WHEEL, (int)dz);
+                input_dev_push(EV_SYN, SYN_REPORT, 0);
+
+                struct gui_event ev;
+                ev.event_id = INPUT_EVENT_SCROLL;
+                ev.type = EVENT_MOUSE;
+                ev.subtype = MOUSE_MOVE;
+                ev.keycode = mouse_buttons_prev;
+                ev.x = cursor_x();
+                ev.y = cursor_y();
+                ev.wheel_delta = dz;
+                ev.width = 0;
+                ev.height = 0;
+                ev.modifiers = 0;
+                ev.window_id = -1;
+                event_enqueue(&ev);
+            }
+            mouse_cycle = 0;
         }
         break;
     }

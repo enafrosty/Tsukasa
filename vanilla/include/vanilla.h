@@ -30,11 +30,15 @@ typedef enum {
     VANILLA_EVENT_CONFIGURE = 4,
     VANILLA_EVENT_FRAME_BEGIN = 5,
     VANILLA_EVENT_BUFFER_RELEASED = 6,
+    VANILLA_EVENT_DOUBLE_CLICK = 7,
+    VANILLA_EVENT_TRIPLE_CLICK = 8,
+    VANILLA_EVENT_LONG_PRESS = 9,
 } vanilla_event_type_t;
 
 typedef struct {
     vanilla_event_type_t type;
     uint32_t             window_id;
+    uint16_t             mod_state;
     union {
         struct input_event input;
         struct {

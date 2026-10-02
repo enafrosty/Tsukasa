@@ -580,6 +580,22 @@ void compositor_render_frame(struct vanilla_server *srv)
                 vanilla_rect_t b_bottom = { frame_rect.x, frame_rect.y + frame_rect.h - g_theme->border_width, frame_rect.w, g_theme->border_width };
                 if (vanilla_rect_intersect(&b_bottom, dirty, &vis_b))
                     blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, border_color);
+                if (win->has_keyboard_focus && g_theme->reduce_motion == 0) {
+                    int32_t ring_w = THEME_PX(2);
+                    vanilla_rect_t r_top   = { frame_rect.x, frame_rect.y, frame_rect.w, ring_w };
+                    vanilla_rect_t r_bot   = { frame_rect.x, frame_rect.y + frame_rect.h - ring_w, frame_rect.w, ring_w };
+                    vanilla_rect_t r_left  = { frame_rect.x, frame_rect.y, ring_w, frame_rect.h };
+                    vanilla_rect_t r_right = { frame_rect.x + frame_rect.w - ring_w, frame_rect.y, ring_w, frame_rect.h };
+                    vanilla_rect_t vis_r;
+                    if (vanilla_rect_intersect(&r_top, dirty, &vis_r))
+                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_r, g_theme->accent);
+                    if (vanilla_rect_intersect(&r_bot, dirty, &vis_r))
+                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_r, g_theme->accent);
+                    if (vanilla_rect_intersect(&r_left, dirty, &vis_r))
+                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_r, g_theme->accent);
+                    if (vanilla_rect_intersect(&r_right, dirty, &vis_r))
+                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_r, g_theme->accent);
+                }
             }
 
             /* Render client SHM surface */
@@ -627,11 +643,15 @@ void compositor_render_frame(struct vanilla_server *srv)
         if (srv->launcher.visible)
             launcher_render(srv, dirty);
 
-        /* 6. Render Hardware Cursor Overlay */
+        /* 6. Render Alt+Tab overlay (if active) */
+        if (srv->alttab_visible)
+            alttab_render(srv, dirty);
+
+        /* 7. Render Hardware Cursor Overlay */
         cursor_render(comp->backbuffer, comp->pitch_px, comp->width, comp->height,
                       srv->cursor_x, srv->cursor_y, dirty);
 
-        /* 7. Copy composited region to mapped framebuffer */
+        /* 8. Copy composited region to mapped framebuffer */
         if (comp->fb_mem && !comp->is_offscreen) {
             blt_copy_subrect((uint32_t *)comp->fb_mem, comp->pitch_px,
                              dirty->x, dirty->y,
@@ -643,4 +663,102 @@ void compositor_render_frame(struct vanilla_server *srv)
 
     vanilla_server_release_buffers(srv);
     comp->dirty_count = 0;
+}
+
+void alttab_get_rect(vanilla_server_t *srv, vanilla_rect_t *out_rect)
+{
+    if (!srv || !out_rect)
+        return;
+    int32_t pw = THEME_PX(360);
+    int32_t item_h = THEME_PX(32);
+    int32_t ph = THEME_PX(24) + srv->alttab_window_count * item_h;
+    if (ph < THEME_PX(64))
+        ph = THEME_PX(64);
+    if (srv->compositor.height > 0) {
+        int32_t max_h = (int32_t)srv->compositor.height - THEME_PX(40);
+        if (max_h >= THEME_PX(64) && ph > max_h)
+            ph = max_h;
+    }
+    int32_t px = ((int32_t)srv->compositor.width - pw) / 2;
+    int32_t py = ((int32_t)srv->compositor.height - ph) / 2;
+    out_rect->x = px;
+    out_rect->y = py;
+    out_rect->w = pw;
+    out_rect->h = ph;
+}
+
+void alttab_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
+{
+    if (!srv || !srv->alttab_visible || !dirty)
+        return;
+
+    vanilla_compositor_t *comp = &srv->compositor;
+    vanilla_rect_t overlay;
+    alttab_get_rect(srv, &overlay);
+
+    vanilla_rect_t vis_overlay;
+    if (!vanilla_rect_intersect(&overlay, dirty, &vis_overlay))
+        return;
+
+    /* Background panel with rounded corners */
+    blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
+                             overlay.x, overlay.y, overlay.w, overlay.h,
+                             g_theme->radius_md, g_theme->bg_elevated,
+                             BLT_CORNER_ALL, dirty);
+
+    /* 1px border */
+    int32_t bw = g_theme->border_width;
+    vanilla_rect_t b_top = { overlay.x, overlay.y, overlay.w, bw };
+    vanilla_rect_t b_bot = { overlay.x, overlay.y + overlay.h - bw, overlay.w, bw };
+    vanilla_rect_t b_l   = { overlay.x, overlay.y, bw, overlay.h };
+    vanilla_rect_t b_r   = { overlay.x + overlay.w - bw, overlay.y, bw, overlay.h };
+    vanilla_rect_t vis;
+    if (vanilla_rect_intersect(&b_top, dirty, &vis))
+        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis, g_theme->border);
+    if (vanilla_rect_intersect(&b_bot, dirty, &vis))
+        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis, g_theme->border);
+    if (vanilla_rect_intersect(&b_l, dirty, &vis))
+        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis, g_theme->border);
+    if (vanilla_rect_intersect(&b_r, dirty, &vis))
+        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis, g_theme->border);
+
+    /* Window list */
+    int32_t item_h = THEME_PX(32);
+    int32_t start_y = overlay.y + THEME_PX(12);
+
+    for (int i = 0; i < srv->alttab_window_count; i++) {
+        uint32_t wid = srv->alttab_window_ids[i];
+        vanilla_server_window_t *w = vanilla_server_find_window(srv, wid);
+        if (!w || !w->is_mapped)
+            continue;
+
+        vanilla_rect_t item_rect = {
+            overlay.x + THEME_PX(12),
+            start_y + i * item_h,
+            overlay.w - THEME_PX(24),
+            item_h - THEME_PX(4)
+        };
+
+        if (item_rect.y + item_rect.h > overlay.y + overlay.h)
+            break;
+
+        vanilla_rect_t vis_item;
+        if (!vanilla_rect_intersect(&item_rect, dirty, &vis_item))
+            continue;
+
+        int selected = (i == srv->alttab_selection);
+        if (selected) {
+            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_item, g_theme->accent);
+        } else {
+            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_item, g_theme->bg_base);
+        }
+
+        if (comp->font.info) {
+            const char *title = (w->title[0] != '\0') ? w->title : "Window";
+            uint32_t text_color = selected ? g_theme->titlebar_btn_icon : g_theme->fg_primary;
+            font_draw_text(comp->backbuffer, comp->pitch_px, &vis_item, &comp->font,
+                           title, item_rect.x + THEME_PX(10), item_rect.y + THEME_PX(6),
+                           THEME_F(13.0f), text_color);
+        }
+    }
 }
