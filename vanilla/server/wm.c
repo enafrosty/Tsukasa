@@ -20,6 +20,7 @@
 #include "font.h"
 #include "shell.h"
 #include "launcher.h"
+#include "anim.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -164,7 +165,7 @@ vanilla_server_window_t *wm_window_at(vanilla_server_t *srv, int32_t x, int32_t 
 
     for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
         vanilla_server_window_t *w = &srv->windows[i];
-        if (!w->in_use || !w->is_mapped)
+        if (!w->in_use || !w->is_mapped || w->anim_state == ANIM_CLOSING || w->anim_state == ANIM_MINIMIZING)
             continue;
 
         vanilla_rect_t frame;
@@ -545,6 +546,7 @@ int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
 
     wm_run_resize_selftests();
     wm_run_input_selftests();
+    wm_run_animation_selftests();
 
     return 0;
 }
@@ -605,6 +607,37 @@ int vanilla_server_accept(vanilla_server_t *srv)
     return slot;
 }
 
+void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_window_t *w)
+{
+    if (!srv || !w || !w->in_use)
+        return;
+
+    if (srv->focused_window_id == w->window_id)
+        srv->focused_window_id = 0;
+    if (srv->is_dragging && srv->drag_window_id == w->window_id) {
+        srv->is_dragging = 0;
+        srv->drag_window_id = 0;
+    }
+    if (srv->is_resizing && srv->resize_window_id == w->window_id) {
+        srv->is_resizing = 0;
+        srv->resize_window_id = 0;
+        srv->resize_edge = RESIZE_EDGE_NONE;
+    }
+    if (srv->drag_threshold_pending && srv->drag_threshold_window_id == w->window_id) {
+        srv->drag_threshold_pending = 0;
+    }
+    w->resize_has_target = 0;
+    w->anim_state = ANIM_IDLE;
+    w->anim_destroy_on_done = 0;
+    w->anim_unmap_on_done = 0;
+    w->is_mapped = 0;
+
+    wm_invalidate_window(srv, w);
+    surface_destroy(&w->surface);
+    w->in_use = 0;
+    shell_invalidate(srv);
+}
+
 void vanilla_server_remove_client(vanilla_server_t *srv, int client_idx)
 {
     int cfd;
@@ -619,24 +652,7 @@ void vanilla_server_remove_client(vanilla_server_t *srv, int client_idx)
 
     for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
         if (srv->windows[i].in_use && srv->windows[i].client_fd == cfd) {
-            if (srv->focused_window_id == srv->windows[i].window_id)
-                srv->focused_window_id = 0;
-            if (srv->is_dragging && srv->drag_window_id == srv->windows[i].window_id) {
-                srv->is_dragging = 0;
-                srv->drag_window_id = 0;
-            }
-            if (srv->is_resizing && srv->resize_window_id == srv->windows[i].window_id) {
-                srv->is_resizing = 0;
-                srv->resize_window_id = 0;
-                srv->resize_edge = RESIZE_EDGE_NONE;
-            }
-            if (srv->drag_threshold_pending && srv->drag_threshold_window_id == srv->windows[i].window_id) {
-                srv->drag_threshold_pending = 0;
-            }
-            srv->windows[i].resize_has_target = 0;
-            wm_invalidate_window(srv, &srv->windows[i]);
-            surface_destroy(&srv->windows[i].surface);
-            srv->windows[i].in_use = 0;
+            vanilla_server_destroy_window_record(srv, &srv->windows[i]);
         }
     }
 
@@ -657,7 +673,7 @@ vanilla_server_window_t *vanilla_server_find_window(vanilla_server_t *srv, uint3
         return NULL;
 
     for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
-        if (srv->windows[i].in_use && srv->windows[i].window_id == window_id)
+        if (srv->windows[i].in_use && srv->windows[i].anim_state != ANIM_CLOSING && srv->windows[i].window_id == window_id)
             return &srv->windows[i];
     }
     return NULL;
@@ -834,6 +850,21 @@ int handle_msg_create_window(vanilla_server_t *srv, int client_idx, const vanill
     w->target_w = req->width;
     w->target_h = req->height;
 
+    w->has_keyboard_focus = 0;
+    w->anim_state = ANIM_IDLE;
+    w->anim_start_ticks = 0;
+    w->anim_dur_ticks = 0;
+    w->anim_scale_start = 1.0f;
+    w->anim_scale_end = 1.0f;
+    w->anim_alpha_start = 1.0f;
+    w->anim_alpha_end = 1.0f;
+    w->anim_origin_x = req->x + (int32_t)req->width / 2;
+    w->anim_origin_y = req->y + (int32_t)req->height / 2;
+    w->anim_destroy_on_done = 0;
+    w->anim_unmap_on_done = 0;
+    w->anim_current_scale = 1.0f;
+    w->anim_current_alpha = 1.0f;
+
     if (req->flags & WINDOW_FLAG_MODAL)
         w->layer = LAYER_TOPMOST;
     else if (req->flags & WINDOW_FLAG_ALWAYS_TOP)
@@ -886,10 +917,17 @@ int handle_msg_destroy_window(vanilla_server_t *srv, int client_idx, const vanil
             srv->drag_threshold_pending = 0;
         }
         w->resize_has_target = 0;
-        wm_invalidate_window(srv, w);
-        surface_destroy(&w->surface);
-        w->in_use = 0;
-        shell_invalidate(srv);
+
+        if (g_theme->reduce_motion != 0 || !w->is_mapped) {
+            vanilla_server_destroy_window_record(srv, w);
+        } else {
+            vanilla_rect_t fr;
+            wm_get_frame_rect(w, &fr);
+            int32_t cx = fr.x + fr.w / 2;
+            int32_t cy = fr.y + fr.h / 2;
+            compositor_start_anim(w, ANIM_CLOSING, 100, 1.0f, 0.85f, 1.0f, 0.0f, cx, cy, 1);
+            wm_invalidate_window(srv, w);
+        }
     }
     return 0;
 }
@@ -905,6 +943,15 @@ int handle_msg_map_window(vanilla_server_t *srv, int client_idx, const vanilla_m
         w->frame_begin_in_flight = 0;
         vanilla_server_focus_window(srv, w->window_id);
         wm_raise_window(srv, w->window_id);
+
+        if (g_theme->reduce_motion == 0) {
+            vanilla_rect_t fr;
+            wm_get_frame_rect(w, &fr);
+            int32_t cx = fr.x + fr.w / 2;
+            int32_t cy = fr.y + fr.h / 2;
+            compositor_start_anim(w, ANIM_OPENING, 120, 0.85f, 1.0f, 0.0f, 1.0f, cx, cy, 0);
+        }
+
         wm_invalidate_window(srv, w);
         shell_invalidate(srv);
     }
@@ -931,6 +978,11 @@ int handle_msg_unmap_window(vanilla_server_t *srv, int client_idx, const vanilla
             srv->drag_threshold_pending = 0;
         }
         w->resize_has_target = 0;
+        w->anim_state = ANIM_IDLE;
+        w->anim_destroy_on_done = 0;
+        w->anim_unmap_on_done = 0;
+        w->anim_current_scale = 1.0f;
+        w->anim_current_alpha = 1.0f;
         wm_invalidate_window(srv, w);
         w->is_mapped = 0;
         w->is_focused = 0;
@@ -1653,6 +1705,255 @@ int wm_run_input_selftests(void)
     return 0;
 }
 
+static inline float anim_selftest_fabsf(float v)
+{
+    return v < 0.0f ? -v : v;
+}
+
+int wm_run_animation_selftests(void)
+{
+    /* 1. Easing functions: endpoints, clamping, midpoint formulas, monotonicity */
+    if (anim_ease_out_cubic(-0.5f) != 0.0f || anim_ease_out_cubic(0.0f) != 0.0f) {
+        fprintf(stderr, "[anim_selftest] FAIL: ease_out_cubic lower boundary\n");
+        return -1;
+    }
+    if (anim_ease_out_cubic(1.5f) != 1.0f || anim_ease_out_cubic(1.0f) != 1.0f) {
+        fprintf(stderr, "[anim_selftest] FAIL: ease_out_cubic upper boundary\n");
+        return -1;
+    }
+    if (anim_selftest_fabsf(anim_ease_out_cubic(0.5f) - 0.875f) > 0.001f) {
+        fprintf(stderr, "[anim_selftest] FAIL: ease_out_cubic midpoint\n");
+        return -1;
+    }
+
+    if (anim_ease_out_quad(-0.5f) != 0.0f || anim_ease_out_quad(0.0f) != 0.0f) {
+        fprintf(stderr, "[anim_selftest] FAIL: ease_out_quad lower boundary\n");
+        return -1;
+    }
+    if (anim_ease_out_quad(1.5f) != 1.0f || anim_ease_out_quad(1.0f) != 1.0f) {
+        fprintf(stderr, "[anim_selftest] FAIL: ease_out_quad upper boundary\n");
+        return -1;
+    }
+    if (anim_selftest_fabsf(anim_ease_out_quad(0.5f) - 0.75f) > 0.001f) {
+        fprintf(stderr, "[anim_selftest] FAIL: ease_out_quad midpoint\n");
+        return -1;
+    }
+
+    if (anim_ease_in_out_quad(-0.5f) != 0.0f || anim_ease_in_out_quad(0.0f) != 0.0f) {
+        fprintf(stderr, "[anim_selftest] FAIL: ease_in_out_quad lower boundary\n");
+        return -1;
+    }
+    if (anim_ease_in_out_quad(1.5f) != 1.0f || anim_ease_in_out_quad(1.0f) != 1.0f) {
+        fprintf(stderr, "[anim_selftest] FAIL: ease_in_out_quad upper boundary\n");
+        return -1;
+    }
+    if (anim_selftest_fabsf(anim_ease_in_out_quad(0.5f) - 0.5f) > 0.001f) {
+        fprintf(stderr, "[anim_selftest] FAIL: ease_in_out_quad midpoint\n");
+        return -1;
+    }
+
+    if (anim_selftest_fabsf(anim_lerp(10.0f, 20.0f, 0.0f) - 10.0f) > 0.001f ||
+        anim_selftest_fabsf(anim_lerp(10.0f, 20.0f, 0.5f) - 15.0f) > 0.001f ||
+        anim_selftest_fabsf(anim_lerp(10.0f, 20.0f, 1.0f) - 20.0f) > 0.001f) {
+        fprintf(stderr, "[anim_selftest] FAIL: anim_lerp\n");
+        return -1;
+    }
+
+    float prev_cubic = -1.0f;
+    float prev_quad = -1.0f;
+    for (int i = 0; i <= 10; i++) {
+        float t = (float)i / 10.0f;
+        float c = anim_ease_out_cubic(t);
+        float q = anim_ease_out_quad(t);
+        if (c < prev_cubic || q < prev_quad) {
+            fprintf(stderr, "[anim_selftest] FAIL: easing monotonicity violation\n");
+            return -1;
+        }
+        prev_cubic = c;
+        prev_quad = q;
+    }
+
+    /* 2. compositor_start_anim parameter initialization and active animations flag */
+    vanilla_server_t srv;
+    memset(&srv, 0, sizeof(srv));
+    srv.compositor.width = 1024;
+    srv.compositor.height = 768;
+
+    vanilla_server_window_t *w0 = &srv.windows[0];
+    w0->in_use = 1;
+    w0->is_mapped = 1;
+    w0->window_id = 100;
+    w0->x = 100;
+    w0->y = 100;
+    w0->width = 400;
+    w0->height = 300;
+
+    compositor_start_anim(w0, ANIM_OPENING, 120, 0.85f, 1.0f, 0.0f, 1.0f, 300, 250, 0);
+    if (w0->anim_state != ANIM_OPENING ||
+        w0->anim_scale_start != 0.85f || w0->anim_scale_end != 1.0f ||
+        w0->anim_alpha_start != 0.0f || w0->anim_alpha_end != 1.0f ||
+        w0->anim_current_scale != 0.85f || w0->anim_current_alpha != 0.0f ||
+        w0->anim_origin_x != 300 || w0->anim_origin_y != 250 ||
+        w0->anim_dur_ticks == 0) {
+        fprintf(stderr, "[anim_selftest] FAIL: compositor_start_anim parameter initialization\n");
+        return -1;
+    }
+
+    if (!compositor_has_active_animations(&srv)) {
+        fprintf(stderr, "[anim_selftest] FAIL: compositor_has_active_animations for opening window\n");
+        return -1;
+    }
+
+    /* 3. compositor_animate_windows step update and completion to ANIM_IDLE */
+    uint64_t now = pit_ticks();
+    int retries = 0;
+    while (now < 2 && retries++ < 50) {
+        usleep(10000);
+        now = pit_ticks();
+    }
+
+    uint32_t half = (uint32_t)(now / 2);
+    if (half == 0)
+        half = 1;
+    w0->anim_start_ticks = now - half;
+    w0->anim_dur_ticks = half * 2;
+    compositor_animate_windows(&srv);
+
+    if (w0->anim_state != ANIM_OPENING ||
+        w0->anim_current_scale <= 0.85f || w0->anim_current_scale >= 1.0f ||
+        w0->anim_current_alpha <= 0.0f || w0->anim_current_alpha >= 1.0f) {
+        fprintf(stderr, "[anim_selftest] FAIL: animate_windows midpoint update\n");
+        return -1;
+    }
+
+    now = pit_ticks();
+    w0->anim_start_ticks = 0;
+    w0->anim_dur_ticks = (now > 0) ? (uint32_t)now : 1;
+    compositor_animate_windows(&srv);
+
+    if (w0->anim_state != ANIM_IDLE ||
+        w0->anim_current_scale != 1.0f || w0->anim_current_alpha != 1.0f) {
+        fprintf(stderr, "[anim_selftest] FAIL: animate_windows completion to ANIM_IDLE\n");
+        return -1;
+    }
+
+    /* 4. anim_destroy_on_done path (window close) */
+    vanilla_server_window_t *w1 = &srv.windows[1];
+    w1->in_use = 1;
+    w1->is_mapped = 1;
+    w1->window_id = 101;
+    w1->z_index = 10;
+    w1->x = 200;
+    w1->y = 200;
+    w1->width = 300;
+    w1->height = 200;
+
+    compositor_start_anim(w1, ANIM_CLOSING, 100, 1.0f, 0.85f, 1.0f, 0.0f, 350, 300, 1);
+    if (vanilla_server_find_window(&srv, 101) != NULL) {
+        fprintf(stderr, "[anim_selftest] FAIL: find_window did not filter ANIM_CLOSING window\n");
+        return -1;
+    }
+    if (wm_window_at(&srv, 350, 300) == w1) {
+        fprintf(stderr, "[anim_selftest] FAIL: wm_window_at did not filter ANIM_CLOSING window\n");
+        return -1;
+    }
+
+    now = pit_ticks();
+    w1->anim_start_ticks = 0;
+    w1->anim_dur_ticks = (now > 0) ? (uint32_t)now : 1;
+    compositor_animate_windows(&srv);
+
+    if (w1->in_use != 0) {
+        fprintf(stderr, "[anim_selftest] FAIL: anim_destroy_on_done did not free window record\n");
+        return -1;
+    }
+
+    /* 5. anim_unmap_on_done path (minimize) */
+    vanilla_server_window_t *w2 = &srv.windows[2];
+    w2->in_use = 1;
+    w2->is_mapped = 1;
+    w2->is_focused = 1;
+    w2->window_id = 102;
+    w2->z_index = 20;
+    w2->x = 50;
+    w2->y = 50;
+    w2->width = 200;
+    w2->height = 150;
+
+    compositor_start_anim(w2, ANIM_MINIMIZING, 150, 1.0f, 0.1f, 1.0f, 0.0f, 100, 700, 0);
+    if (w2->anim_unmap_on_done != 1) {
+        fprintf(stderr, "[anim_selftest] FAIL: anim_unmap_on_done not set for ANIM_MINIMIZING\n");
+        return -1;
+    }
+    if (wm_window_at(&srv, 100, 100) == w2) {
+        fprintf(stderr, "[anim_selftest] FAIL: wm_window_at did not filter ANIM_MINIMIZING window\n");
+        return -1;
+    }
+
+    now = pit_ticks();
+    w2->anim_start_ticks = 0;
+    w2->anim_dur_ticks = (now > 0) ? (uint32_t)now : 1;
+    compositor_animate_windows(&srv);
+
+    if (w2->in_use == 0 || w2->is_mapped != 0 || w2->anim_state != ANIM_IDLE) {
+        fprintf(stderr, "[anim_selftest] FAIL: anim_unmap_on_done completion state\n");
+        return -1;
+    }
+
+    /* 6. Snap preview show, update, hide */
+    vanilla_rect_t snap_zone = { 0, 0, 512, 768 };
+    compositor_snap_preview_show(&srv.compositor, &snap_zone);
+    if (!srv.compositor.snap_preview_visible ||
+        srv.compositor.snap_preview_rect.w != 512 || srv.compositor.snap_preview_rect.h != 768) {
+        fprintf(stderr, "[anim_selftest] FAIL: compositor_snap_preview_show\n");
+        return -1;
+    }
+    if (!compositor_has_active_animations(&srv)) {
+        fprintf(stderr, "[anim_selftest] FAIL: compositor_has_active_animations for snap preview\n");
+        return -1;
+    }
+
+    compositor_snap_preview_hide(&srv.compositor);
+    if (srv.compositor.snap_preview_visible) {
+        fprintf(stderr, "[anim_selftest] FAIL: compositor_snap_preview_hide\n");
+        return -1;
+    }
+
+    /* 7. reduce_motion bypass */
+    vanilla_theme_t *m_theme = (vanilla_theme_t *)g_theme;
+    int32_t saved_rm = m_theme->reduce_motion;
+    m_theme->reduce_motion = 1;
+
+    vanilla_server_window_t *w3 = &srv.windows[3];
+    w3->in_use = 1;
+    w3->is_mapped = 1;
+    w3->window_id = 103;
+    compositor_start_anim(w3, ANIM_OPENING, 120, 0.85f, 1.0f, 0.0f, 1.0f, 100, 100, 0);
+    if (w3->anim_state != ANIM_IDLE || w3->anim_current_scale != 1.0f || w3->anim_current_alpha != 1.0f) {
+        m_theme->reduce_motion = saved_rm;
+        fprintf(stderr, "[anim_selftest] FAIL: reduce_motion did not bypass window animation\n");
+        return -1;
+    }
+
+    compositor_snap_preview_show(&srv.compositor, &snap_zone);
+    if (srv.compositor.snap_preview_visible) {
+        m_theme->reduce_motion = saved_rm;
+        fprintf(stderr, "[anim_selftest] FAIL: reduce_motion did not suppress snap preview\n");
+        return -1;
+    }
+
+    if (compositor_has_active_animations(&srv)) {
+        m_theme->reduce_motion = saved_rm;
+        fprintf(stderr, "[anim_selftest] FAIL: compositor_has_active_animations with reduce_motion=1\n");
+        return -1;
+    }
+
+    m_theme->reduce_motion = saved_rm;
+
+    printf("[vanilla] window animation & easing self-tests passed (7/7)\n");
+    return 0;
+}
+
 int handle_msg_clipboard_offer(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
 {
     (void)srv;
@@ -2147,6 +2448,13 @@ int vanilla_server_focus_window(vanilla_server_t *srv, uint32_t window_id)
             exact_write(new_w->client_fd, &msg, sizeof(msg));
         }
         wm_invalidate_window(srv, new_w);
+        if (g_theme->reduce_motion == 0 && new_w->anim_state == ANIM_IDLE) {
+            vanilla_rect_t fr;
+            wm_get_frame_rect(new_w, &fr);
+            int32_t cx = fr.x + fr.w / 2;
+            int32_t cy = fr.y + fr.h / 2;
+            compositor_start_anim(new_w, ANIM_FOCUS, 80, 1.0f, 1.0f, 1.2f, 1.0f, cx, cy, 0);
+        }
     } else {
         srv->focused_window_id = 0;
     }
@@ -2179,12 +2487,16 @@ int vanilla_server_close_request(vanilla_server_t *srv, uint32_t window_id)
             exact_write(w->client_fd, &msg, sizeof(msg)) < 0)
             return -1;
     } else {
-        w->is_mapped = 0;
-        w->is_focused = 0;
-        if (srv->focused_window_id == window_id)
-            srv->focused_window_id = 0;
-        wm_invalidate_window(srv, w);
-        shell_invalidate(srv);
+        if (g_theme->reduce_motion != 0 || !w->is_mapped) {
+            vanilla_server_destroy_window_record(srv, w);
+        } else {
+            vanilla_rect_t fr;
+            wm_get_frame_rect(w, &fr);
+            int32_t cx = fr.x + fr.w / 2;
+            int32_t cy = fr.y + fr.h / 2;
+            compositor_start_anim(w, ANIM_CLOSING, 100, 1.0f, 0.85f, 1.0f, 0.0f, cx, cy, 1);
+            wm_invalidate_window(srv, w);
+        }
     }
 
     return 0;
@@ -2216,6 +2528,12 @@ void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
             target_w = w->restore_w;
             target_h = w->restore_h;
             w->is_snapped = SNAP_NONE;
+
+            if (g_theme->reduce_motion == 0) {
+                int32_t cx = target_x + (int32_t)target_w / 2;
+                int32_t cy = target_y + (int32_t)target_h / 2;
+                compositor_start_anim(w, ANIM_RESTORING, 150, 0.85f, 1.0f, 0.8f, 1.0f, cx, cy, 0);
+            }
         }
     } else {
         if (w->is_snapped == SNAP_NONE) {
@@ -2429,6 +2747,40 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     w->x = srv->cursor_x - srv->drag_offset_x;
                     w->y = srv->cursor_y - srv->drag_offset_y;
                     wm_invalidate_window(srv, w);
+
+                    if (g_theme->reduce_motion == 0) {
+                        vanilla_rect_t preview_zone;
+                        int in_snap_zone = 0;
+                        int32_t work_h = screen_h - TASKBAR_HEIGHT;
+                        if (work_h < 100)
+                            work_h = screen_h;
+
+                        if (srv->cursor_y <= 16) {
+                            preview_zone.x = 0;
+                            preview_zone.y = 0;
+                            preview_zone.w = screen_w;
+                            preview_zone.h = work_h;
+                            in_snap_zone = 1;
+                        } else if (srv->cursor_x <= 16) {
+                            preview_zone.x = 0;
+                            preview_zone.y = 0;
+                            preview_zone.w = screen_w / 2;
+                            preview_zone.h = work_h;
+                            in_snap_zone = 1;
+                        } else if (srv->cursor_x >= screen_w - 16) {
+                            preview_zone.x = screen_w / 2;
+                            preview_zone.y = 0;
+                            preview_zone.w = screen_w - (screen_w / 2);
+                            preview_zone.h = work_h;
+                            in_snap_zone = 1;
+                        }
+
+                        if (in_snap_zone) {
+                            compositor_snap_preview_show(&srv->compositor, &preview_zone);
+                        } else {
+                            compositor_snap_preview_hide(&srv->compositor);
+                        }
+                    }
                 }
             } else if (srv->is_resizing) {
                 vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->resize_window_id);
@@ -2618,12 +2970,22 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
 
                         /* Minimize button [_] */
                         if (vanilla_rect_contains(&btns.min_btn, srv->cursor_x, srv->cursor_y)) {
-                            hit->is_mapped = 0;
-                            hit->is_focused = 0;
-                            if (srv->focused_window_id == hit->window_id)
-                                srv->focused_window_id = 0;
-                            wm_invalidate_window(srv, hit);
-                            shell_invalidate(srv);
+                            if (g_theme->reduce_motion != 0) {
+                                hit->is_mapped = 0;
+                                hit->is_focused = 0;
+                                if (srv->focused_window_id == hit->window_id)
+                                    srv->focused_window_id = 0;
+                                wm_invalidate_window(srv, hit);
+                                shell_invalidate(srv);
+                            } else {
+                                vanilla_rect_t fr;
+                                wm_get_frame_rect(hit, &fr);
+                                int32_t cx = fr.x + fr.w / 2;
+                                int32_t cy = fr.y + fr.h / 2;
+                                compositor_start_anim(hit, ANIM_MINIMIZING, 150, 1.0f, 0.1f, 1.0f, 0.0f, cx, cy, 0);
+                                hit->anim_unmap_on_done = 1;
+                                wm_invalidate_window(srv, hit);
+                            }
                             return 0;
                         }
                     }
@@ -2748,12 +3110,13 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 }
 
                 if (srv->is_dragging) {
-                    /* Evaluate Aero-snap boundary triggers upon release */
-                    if (srv->cursor_y <= 2) {
+                    compositor_snap_preview_hide(&srv->compositor);
+                    /* Evaluate Aero-snap boundary triggers upon release matching preview zone */
+                    if (srv->cursor_y <= 16) {
                         wm_snap_window(srv, srv->drag_window_id, SNAP_MAXIMIZE);
-                    } else if (srv->cursor_x <= 2) {
+                    } else if (srv->cursor_x <= 16) {
                         wm_snap_window(srv, srv->drag_window_id, SNAP_LEFT);
-                    } else if (srv->cursor_x >= screen_w - 3) {
+                    } else if (srv->cursor_x >= screen_w - 16) {
                         wm_snap_window(srv, srv->drag_window_id, SNAP_RIGHT);
                     }
                     srv->is_dragging = 0;

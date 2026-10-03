@@ -17,6 +17,7 @@
 #include "compositor.h"
 #include "server.h"
 #include "blitter.h"
+#include "anim.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -390,10 +391,283 @@ chrome_btn_rects_t chrome_metrics(const vanilla_rect_t *frame)
     return r;
 }
 
+void compositor_start_anim(vanilla_server_window_t *w,
+                           int                      state,
+                           uint32_t                 dur_ms,
+                           float                    scale_start,
+                           float                    scale_end,
+                           float                    alpha_start,
+                           float                    alpha_end,
+                           int32_t                  origin_x,
+                           int32_t                  origin_y,
+                           int                      destroy_on_done)
+{
+    if (!w)
+        return;
+
+    if (g_theme->reduce_motion != 0) {
+        w->anim_state = ANIM_IDLE;
+        w->anim_current_scale = scale_end;
+        w->anim_current_alpha = alpha_end;
+        w->anim_destroy_on_done = 0;
+        w->anim_unmap_on_done = 0;
+        return;
+    }
+
+    uint32_t freq = pit_frequency();
+    if (freq == 0)
+        freq = 1000;
+
+    uint32_t dur_ticks = (dur_ms * freq + 999) / 1000;
+    if (dur_ticks == 0)
+        dur_ticks = 1;
+
+    w->anim_state = state;
+    w->anim_start_ticks = pit_ticks();
+    w->anim_dur_ticks = dur_ticks;
+    w->anim_scale_start = scale_start;
+    w->anim_scale_end = scale_end;
+    w->anim_alpha_start = alpha_start;
+    w->anim_alpha_end = alpha_end;
+    w->anim_origin_x = origin_x;
+    w->anim_origin_y = origin_y;
+    w->anim_destroy_on_done = destroy_on_done;
+    w->anim_unmap_on_done = (state == ANIM_MINIMIZING) ? 1 : 0;
+    w->anim_current_scale = scale_start;
+    w->anim_current_alpha = alpha_start;
+}
+
+void compositor_snap_preview_show(vanilla_compositor_t *comp, const vanilla_rect_t *target_rect)
+{
+    if (!comp || !target_rect || g_theme->reduce_motion != 0)
+        return;
+
+    if (comp->snap_preview_visible &&
+        comp->snap_preview_rect.x == target_rect->x &&
+        comp->snap_preview_rect.y == target_rect->y &&
+        comp->snap_preview_rect.w == target_rect->w &&
+        comp->snap_preview_rect.h == target_rect->h) {
+        return;
+    }
+
+    if (comp->snap_preview_visible)
+        compositor_add_damage(comp, &comp->snap_preview_rect);
+
+    comp->snap_preview_visible = 1;
+    comp->snap_preview_rect = *target_rect;
+    comp->snap_preview_start = pit_ticks();
+
+    uint32_t freq = pit_frequency();
+    if (freq == 0)
+        freq = 1000;
+    comp->snap_preview_dur = (80 * freq + 999) / 1000;
+    if (comp->snap_preview_dur == 0)
+        comp->snap_preview_dur = 1;
+    comp->snap_preview_alpha = 0.0f;
+
+    compositor_add_damage(comp, &comp->snap_preview_rect);
+}
+
+void compositor_snap_preview_hide(vanilla_compositor_t *comp)
+{
+    if (!comp || !comp->snap_preview_visible)
+        return;
+
+    comp->snap_preview_visible = 0;
+    compositor_add_damage(comp, &comp->snap_preview_rect);
+}
+
+void compositor_snap_preview_update(vanilla_compositor_t *comp)
+{
+    if (!comp || !comp->snap_preview_visible)
+        return;
+
+    if (g_theme->reduce_motion != 0) {
+        comp->snap_preview_visible = 0;
+        return;
+    }
+
+    uint64_t now = pit_ticks();
+    uint64_t elapsed = (now >= comp->snap_preview_start) ? (now - comp->snap_preview_start) : 0;
+    float t = (float)elapsed / (float)comp->snap_preview_dur;
+    if (t > 1.0f)
+        t = 1.0f;
+
+    comp->snap_preview_alpha = anim_ease_out_quad(t);
+    if (t < 1.0f)
+        compositor_add_damage(comp, &comp->snap_preview_rect);
+}
+
+void compositor_animate_windows(vanilla_server_t *srv)
+{
+    if (!srv)
+        return;
+
+    compositor_snap_preview_update(&srv->compositor);
+
+    if (g_theme->reduce_motion != 0)
+        return;
+
+    uint64_t now = pit_ticks();
+
+    for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+        vanilla_server_window_t *w = &srv->windows[i];
+        if (!w->in_use || w->anim_state == ANIM_IDLE)
+            continue;
+
+        uint64_t elapsed = (now >= w->anim_start_ticks) ? (now - w->anim_start_ticks) : 0;
+        float t = (float)elapsed / (float)w->anim_dur_ticks;
+        if (t > 1.0f)
+            t = 1.0f;
+
+        float et;
+        switch (w->anim_state) {
+        case ANIM_OPENING:
+        case ANIM_RESTORING:
+            et = anim_ease_out_cubic(t);
+            break;
+        case ANIM_CLOSING:
+        case ANIM_MINIMIZING:
+            et = anim_ease_out_quad(t);
+            break;
+        default:
+            et = t;
+            break;
+        }
+
+        w->anim_current_scale = anim_lerp(w->anim_scale_start, w->anim_scale_end, et);
+        w->anim_current_alpha = anim_lerp(w->anim_alpha_start, w->anim_alpha_end, et);
+
+        wm_invalidate_window(srv, w);
+
+        if (t >= 1.0f) {
+            if (w->anim_destroy_on_done) {
+                vanilla_server_destroy_window_record(srv, w);
+            } else if (w->anim_unmap_on_done) {
+                w->is_mapped = 0;
+                w->is_focused = 0;
+                if (srv->focused_window_id == w->window_id)
+                    srv->focused_window_id = 0;
+                w->anim_state = ANIM_IDLE;
+                w->anim_unmap_on_done = 0;
+                w->anim_current_scale = 1.0f;
+                w->anim_current_alpha = 1.0f;
+                wm_invalidate_window(srv, w);
+                shell_invalidate(srv);
+            } else {
+                w->anim_state = ANIM_IDLE;
+                w->anim_current_scale = w->anim_scale_end;
+                w->anim_current_alpha = w->anim_alpha_end;
+                wm_invalidate_window(srv, w);
+                shell_invalidate(srv);
+            }
+        }
+    }
+}
+
+int compositor_has_active_animations(vanilla_server_t *srv)
+{
+    if (!srv || g_theme->reduce_motion != 0)
+        return 0;
+
+    if (srv->compositor.snap_preview_visible && srv->compositor.snap_preview_alpha < 1.0f)
+        return 1;
+
+    for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+        if (srv->windows[i].in_use && srv->windows[i].anim_state != ANIM_IDLE)
+            return 1;
+    }
+    return 0;
+}
+
+void compositor_paint_animated_window(vanilla_compositor_t *comp, vanilla_server_window_t *w, const vanilla_rect_t *dirty)
+{
+    if (!comp || !w || !w->surface.pixels || w->width == 0 || w->height == 0)
+        return;
+
+    float scale = w->anim_current_scale;
+    float alpha = w->anim_current_alpha;
+
+    if (scale <= 0.01f || alpha <= 0.01f)
+        return;
+
+    if (scale > 2.0f)
+        scale = 2.0f;
+    if (alpha > 1.0f)
+        alpha = 1.0f;
+
+    uint8_t global_alpha = (uint8_t)(alpha * 255.0f);
+    if (global_alpha == 0)
+        return;
+
+    int32_t dest_w = (int32_t)((float)w->width * scale);
+    int32_t dest_h = (int32_t)((float)w->height * scale);
+    if (dest_w < 1) dest_w = 1;
+    if (dest_h < 1) dest_h = 1;
+
+    int32_t dest_x = w->anim_origin_x + (int32_t)((float)(w->x - w->anim_origin_x) * scale);
+    int32_t dest_y = w->anim_origin_y + (int32_t)((float)(w->y - w->anim_origin_y) * scale);
+
+    vanilla_rect_t dest_rect = { dest_x, dest_y, dest_w, dest_h };
+    vanilla_rect_t screen_rect = { 0, 0, (int32_t)comp->width, (int32_t)comp->height };
+    vanilla_rect_t clamped_dest;
+    if (!vanilla_rect_intersect(&dest_rect, &screen_rect, &clamped_dest))
+        return;
+
+    vanilla_rect_t vis_dest;
+    if (dirty) {
+        if (!vanilla_rect_intersect(&clamped_dest, dirty, &vis_dest))
+            return;
+    } else {
+        vis_dest = clamped_dest;
+    }
+
+    int32_t surf_w = (int32_t)w->surface.width;
+    int32_t surf_h = (int32_t)w->surface.height;
+    if (surf_w <= 0 || surf_h <= 0)
+        return;
+
+    int32_t src_sub_w = dest_w > surf_w ? surf_w : dest_w;
+    int32_t src_sub_h = dest_h > surf_h ? surf_h : dest_h;
+    int32_t src_base_x = (surf_w - src_sub_w) / 2;
+    int32_t src_base_y = (surf_h - src_sub_h) / 2;
+    if (src_base_x < 0) src_base_x = 0;
+    if (src_base_y < 0) src_base_y = 0;
+
+    int32_t offset_x = vis_dest.x - dest_rect.x;
+    int32_t offset_y = vis_dest.y - dest_rect.y;
+
+    int32_t src_x = src_base_x + offset_x;
+    int32_t src_y = src_base_y + offset_y;
+
+    if (src_x < 0 || src_y < 0 || src_x >= surf_w || src_y >= surf_h)
+        return;
+
+    if (src_x + vis_dest.w > surf_w)
+        vis_dest.w = surf_w - src_x;
+    if (src_y + vis_dest.h > surf_h)
+        vis_dest.h = surf_h - src_y;
+
+    if (vis_dest.w <= 0 || vis_dest.h <= 0)
+        return;
+
+    uint32_t surf_pitch_px = w->surface.pitch / sizeof(uint32_t);
+    if (surf_pitch_px == 0)
+        surf_pitch_px = (uint32_t)surf_w;
+
+    blt_blend_subrect(comp->backbuffer, comp->pitch_px,
+                      vis_dest.x, vis_dest.y,
+                      w->surface.pixels, surf_pitch_px,
+                      src_x, src_y,
+                      vis_dest.w, vis_dest.h, global_alpha);
+}
+
 void compositor_render_frame(struct vanilla_server *srv)
 {
     if (!srv || srv->compositor.dirty_count <= 0)
         return;
+
+    compositor_animate_windows(srv);
 
     printf("[vanilla] compositor: render\n");
 
@@ -438,6 +712,14 @@ void compositor_render_frame(struct vanilla_server *srv)
             vanilla_server_window_t *win = sorted[w];
             if ((win->flags & WINDOW_FLAG_BORDERLESS) || win->is_snapped == SNAP_MAXIMIZE)
                 continue;
+            if (win->anim_state != ANIM_IDLE && win->anim_state != ANIM_FOCUS &&
+                g_theme->reduce_motion == 0 && win->anim_current_alpha <= 0.05f)
+                continue;
+
+            uint8_t sh_alpha = g_theme->shadow_alpha;
+            if (win->anim_state != ANIM_IDLE && g_theme->reduce_motion == 0) {
+                sh_alpha = (uint8_t)((float)sh_alpha * win->anim_current_alpha);
+            }
 
             vanilla_rect_t frame_rect;
             wm_get_frame_rect(win, &frame_rect);
@@ -451,13 +733,16 @@ void compositor_render_frame(struct vanilla_server *srv)
             vanilla_rect_t dummy;
             if (vanilla_rect_intersect(&shadow_bounds, dirty, &dummy)) {
                 blt_draw_shadow_cached(comp->backbuffer, comp->pitch_px, comp->width, comp->height,
-                                       &frame_rect, dirty, g_theme->shadow_radius, g_theme->shadow_alpha);
+                                       &frame_rect, dirty, g_theme->shadow_radius, sh_alpha);
             }
         }
 
         /* 3. Render windows in Z-order */
         for (int w = 0; w < win_count; w++) {
             vanilla_server_window_t *win = sorted[w];
+            if (win->anim_state != ANIM_IDLE && win->anim_state != ANIM_FOCUS &&
+                g_theme->reduce_motion == 0 && win->anim_current_alpha <= 0.05f)
+                continue;
 
             vanilla_rect_t frame_rect;
             wm_get_frame_rect(win, &frame_rect);
@@ -477,6 +762,20 @@ void compositor_render_frame(struct vanilla_server *srv)
                 vanilla_rect_t vis_title;
                 if (vanilla_rect_intersect(&title_rect, dirty, &vis_title)) {
                     uint32_t tb_color = win->is_focused ? g_theme->titlebar_active : g_theme->titlebar_inactive;
+                    if (win->anim_state == ANIM_FOCUS && g_theme->reduce_motion == 0 && win->anim_current_alpha > 1.0f) {
+                        float boost = win->anim_current_alpha;
+                        uint32_t a = (tb_color >> 24) & 0xFF;
+                        uint32_t r = (uint32_t)(((tb_color >> 16) & 0xFF) * boost);
+                        uint32_t g = (uint32_t)(((tb_color >> 8) & 0xFF) * boost);
+                        uint32_t b = (uint32_t)((tb_color & 0xFF) * boost);
+                        if (r > 255) r = 255;
+                        if (g > 255) g = 255;
+                        if (b > 255) b = 255;
+                        tb_color = (a << 24) | (r << 16) | (g << 8) | b;
+                    } else if (win->anim_state != ANIM_IDLE && g_theme->reduce_motion == 0 && win->anim_current_alpha < 1.0f) {
+                        uint32_t a = (uint32_t)(((tb_color >> 24) & 0xFF) * win->anim_current_alpha);
+                        tb_color = (a << 24) | (tb_color & 0x00FFFFFF);
+                    }
                     blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
                                              title_rect.x, title_rect.y, title_rect.w, title_rect.h,
                                              g_theme->radius_sm, tb_color,
@@ -556,6 +855,11 @@ void compositor_render_frame(struct vanilla_server *srv)
                         vanilla_rect_t vis_text;
                         if (vanilla_rect_intersect(&text_clip, dirty, &vis_text) && text_clip.w > 0) {
                             uint32_t text_color = win->is_focused ? g_theme->titlebar_text_active : g_theme->titlebar_text_inactive;
+                            if (win->anim_state != ANIM_IDLE && win->anim_state != ANIM_FOCUS &&
+                                g_theme->reduce_motion == 0 && win->anim_current_alpha < 1.0f) {
+                                uint32_t a = (uint32_t)(((text_color >> 24) & 0xFF) * win->anim_current_alpha);
+                                text_color = (a << 24) | (text_color & 0x00FFFFFF);
+                            }
                             int32_t text_y = frame_rect.y + (g_theme->titlebar_height - (int32_t)g_theme->title_font_size) / 2;
                             font_draw_text(comp->backbuffer, comp->pitch_px, &vis_text,
                                            &comp->font, win->title, text_clip.x, text_y,
@@ -600,36 +904,40 @@ void compositor_render_frame(struct vanilla_server *srv)
 
             /* Render client SHM surface */
             if (win->surface.pixels && win->width > 0 && win->height > 0) {
-                vanilla_rect_t client_rect;
-                client_rect.x = win->x;
-                client_rect.y = win->y;
-                client_rect.w = (int32_t)win->width;
-                client_rect.h = (int32_t)win->height;
+                if (win->anim_state != ANIM_IDLE && win->anim_state != ANIM_FOCUS && g_theme->reduce_motion == 0) {
+                    compositor_paint_animated_window(comp, win, dirty);
+                } else {
+                    vanilla_rect_t client_rect;
+                    client_rect.x = win->x;
+                    client_rect.y = win->y;
+                    client_rect.w = (int32_t)win->width;
+                    client_rect.h = (int32_t)win->height;
 
-                vanilla_rect_t vis_client;
-                if (vanilla_rect_intersect(&client_rect, dirty, &vis_client)) {
-                    /* Fill client background for areas where surface is smaller than window container */
-                    blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_client, g_theme->bg_base);
+                    vanilla_rect_t vis_client;
+                    if (vanilla_rect_intersect(&client_rect, dirty, &vis_client)) {
+                        /* Fill client background for areas where surface is smaller than window container */
+                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_client, g_theme->bg_base);
 
-                    /* Intersect visible client rectangle with actual allocated surface bounds */
-                    int32_t surf_w = (int32_t)win->surface.width;
-                    int32_t surf_h = (int32_t)win->surface.height;
-                    if (surf_w > 0 && surf_h > 0) {
-                        vanilla_rect_t surf_rect = { win->x, win->y, surf_w, surf_h };
-                        vanilla_rect_t vis_surf;
-                        if (vanilla_rect_intersect(&surf_rect, &vis_client, &vis_surf)) {
-                            int32_t src_x = vis_surf.x - win->x;
-                            int32_t src_y = vis_surf.y - win->y;
+                        /* Intersect visible client rectangle with actual allocated surface bounds */
+                        int32_t surf_w = (int32_t)win->surface.width;
+                        int32_t surf_h = (int32_t)win->surface.height;
+                        if (surf_w > 0 && surf_h > 0) {
+                            vanilla_rect_t surf_rect = { win->x, win->y, surf_w, surf_h };
+                            vanilla_rect_t vis_surf;
+                            if (vanilla_rect_intersect(&surf_rect, &vis_client, &vis_surf)) {
+                                int32_t src_x = vis_surf.x - win->x;
+                                int32_t src_y = vis_surf.y - win->y;
 
-                            uint32_t surf_pitch_px = win->surface.pitch / sizeof(uint32_t);
-                            if (surf_pitch_px == 0)
-                                surf_pitch_px = (uint32_t)surf_w;
+                                uint32_t surf_pitch_px = win->surface.pitch / sizeof(uint32_t);
+                                if (surf_pitch_px == 0)
+                                    surf_pitch_px = (uint32_t)surf_w;
 
-                            blt_blend_subrect(comp->backbuffer, comp->pitch_px,
-                                              vis_surf.x, vis_surf.y,
-                                              win->surface.pixels, surf_pitch_px,
-                                              src_x, src_y,
-                                              vis_surf.w, vis_surf.h, 255);
+                                blt_blend_subrect(comp->backbuffer, comp->pitch_px,
+                                                  vis_surf.x, vis_surf.y,
+                                                  win->surface.pixels, surf_pitch_px,
+                                                  src_x, src_y,
+                                                  vis_surf.w, vis_surf.h, 255);
+                            }
                         }
                     }
                 }
@@ -647,6 +955,32 @@ void compositor_render_frame(struct vanilla_server *srv)
         if (srv->alttab_visible)
             alttab_render(srv, dirty);
 
+        /* 6.5 Render Snap preview overlay (if active and not reduce_motion) */
+        if (comp->snap_preview_visible && g_theme->reduce_motion == 0 && comp->snap_preview_alpha > 0.0f) {
+            vanilla_rect_t vis_preview;
+            if (vanilla_rect_intersect(&comp->snap_preview_rect, dirty, &vis_preview)) {
+                uint8_t alpha = (uint8_t)(comp->snap_preview_alpha * 0.40f * 255.0f);
+                if (alpha > 0) {
+                    uint32_t fill_buf[64];
+                    uint32_t fill_color = 0xFF000000 | (g_theme->accent & 0x00FFFFFF);
+                    for (int k = 0; k < 64; k++)
+                        fill_buf[k] = fill_color;
+
+                    int32_t rem_w = vis_preview.w;
+                    int32_t cur_x = vis_preview.x;
+                    while (rem_w > 0) {
+                        int32_t chunk_w = rem_w > 64 ? 64 : rem_w;
+                        blt_blend_subrect(comp->backbuffer, comp->pitch_px,
+                                          cur_x, vis_preview.y,
+                                          fill_buf, 0, 0, 0,
+                                          chunk_w, vis_preview.h, alpha);
+                        cur_x += chunk_w;
+                        rem_w -= chunk_w;
+                    }
+                }
+            }
+        }
+
         /* 7. Render Hardware Cursor Overlay */
         cursor_render(comp->backbuffer, comp->pitch_px, comp->width, comp->height,
                       srv->cursor_x, srv->cursor_y, dirty);
@@ -663,6 +997,16 @@ void compositor_render_frame(struct vanilla_server *srv)
 
     vanilla_server_release_buffers(srv);
     comp->dirty_count = 0;
+
+    /* If animations are still running, invalidate so the next frame is queued */
+    if (compositor_has_active_animations(srv)) {
+        for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+            if (srv->windows[i].in_use && srv->windows[i].anim_state != ANIM_IDLE)
+                wm_invalidate_window(srv, &srv->windows[i]);
+        }
+        if (srv->compositor.snap_preview_visible && srv->compositor.snap_preview_alpha < 1.0f)
+            compositor_add_damage(&srv->compositor, &srv->compositor.snap_preview_rect);
+    }
 }
 
 void alttab_get_rect(vanilla_server_t *srv, vanilla_rect_t *out_rect)
