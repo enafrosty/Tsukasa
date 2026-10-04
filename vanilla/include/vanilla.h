@@ -103,4 +103,7 @@ int  vanilla_set_size_hints(vanilla_client_t *client, uint32_t window_id,
 int  vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev);
 int  vanilla_wait_event(vanilla_client_t *client, vanilla_event_t *out_ev);
 
+/* Service discovery */
+#include "../libvanilla/service.h"
+
 #endif /* _VANILLA_H */
