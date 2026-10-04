@@ -577,6 +577,11 @@ int compositor_has_active_animations(vanilla_server_t *srv)
         if (srv->windows[i].in_use && srv->windows[i].anim_state != ANIM_IDLE)
             return 1;
     }
+
+    for (int d = 0; d < srv->context_menu_depth; d++) {
+        if (srv->context_menu_stack[d].active && srv->context_menu_stack[d].anim_alpha < 1.0f)
+            return 1;
+    }
     return 0;
 }
 
@@ -981,6 +986,10 @@ void compositor_render_frame(struct vanilla_server *srv)
             }
         }
 
+        /* 6.6 Render Server-Managed Popup Context Menus (if active) */
+        if (srv->context_menu_depth > 0)
+            compositor_paint_context_menus(srv, dirty);
+
         /* 7. Render Hardware Cursor Overlay */
         cursor_render(comp->backbuffer, comp->pitch_px, comp->width, comp->height,
                       srv->cursor_x, srv->cursor_y, dirty);
@@ -1006,6 +1015,17 @@ void compositor_render_frame(struct vanilla_server *srv)
         }
         if (srv->compositor.snap_preview_visible && srv->compositor.snap_preview_alpha < 1.0f)
             compositor_add_damage(&srv->compositor, &srv->compositor.snap_preview_rect);
+        for (int d = 0; d < srv->context_menu_depth; d++) {
+            if (srv->context_menu_stack[d].active && srv->context_menu_stack[d].anim_alpha < 1.0f) {
+                vanilla_rect_t mr = {
+                    srv->context_menu_stack[d].x,
+                    srv->context_menu_stack[d].y,
+                    srv->context_menu_stack[d].width,
+                    srv->context_menu_stack[d].height
+                };
+                compositor_add_damage(&srv->compositor, &mr);
+            }
+        }
     }
 }
 
@@ -1103,6 +1123,124 @@ void alttab_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
             font_draw_text(comp->backbuffer, comp->pitch_px, &vis_item, &comp->font,
                            title, item_rect.x + THEME_PX(10), item_rect.y + THEME_PX(6),
                            THEME_F(13.0f), text_color);
+        }
+    }
+}
+
+void compositor_paint_context_menus(vanilla_server_t *srv, const vanilla_rect_t *dirty)
+{
+    if (!srv || srv->context_menu_depth <= 0 || !dirty)
+        return;
+
+    vanilla_compositor_t *comp = &srv->compositor;
+
+    for (int d = 0; d < srv->context_menu_depth; d++) {
+        vanilla_context_menu_t *m = &srv->context_menu_stack[d];
+        if (!m->active)
+            continue;
+
+        vanilla_rect_t menu_rect = { m->x, m->y, m->width, m->height };
+
+        /* Update animation alpha */
+        if (g_theme->reduce_motion != 0) {
+            m->anim_alpha = 1.0f;
+        } else {
+            uint64_t now = pit_ticks();
+            uint64_t freq = pit_frequency();
+            uint64_t dur_ticks = (freq * 80) / 1000;
+            if (dur_ticks == 0)
+                dur_ticks = 1;
+            uint64_t elapsed = (now >= m->open_ticks) ? (now - m->open_ticks) : 0;
+            float t = (float)elapsed / (float)dur_ticks;
+            if (t >= 1.0f) {
+                m->anim_alpha = 1.0f;
+            } else {
+                m->anim_alpha = anim_ease_out_quad(t);
+            }
+        }
+
+        vanilla_rect_t vis_menu;
+        if (!vanilla_rect_intersect(&menu_rect, dirty, &vis_menu))
+            continue;
+
+        /* Ambient soft drop shadow */
+        blt_draw_shadow_cached(comp->backbuffer, comp->pitch_px,
+                               comp->width, comp->height,
+                               &menu_rect, dirty,
+                               g_theme->shadow_radius, g_theme->shadow_alpha);
+
+        /* Elevated background panel */
+        blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
+                                 menu_rect.x, menu_rect.y, menu_rect.w, menu_rect.h,
+                                 g_theme->radius_sm, g_theme->bg_elevated,
+                                 BLT_CORNER_ALL, dirty);
+
+        /* 1px border */
+        int32_t bw = g_theme->border_width;
+        if (bw < 1) bw = 1;
+        vanilla_rect_t b_top = { menu_rect.x, menu_rect.y, menu_rect.w, bw };
+        vanilla_rect_t b_bot = { menu_rect.x, menu_rect.y + menu_rect.h - bw, menu_rect.w, bw };
+        vanilla_rect_t b_l   = { menu_rect.x, menu_rect.y, bw, menu_rect.h };
+        vanilla_rect_t b_r   = { menu_rect.x + menu_rect.w - bw, menu_rect.y, bw, menu_rect.h };
+        vanilla_rect_t vis_b;
+        if (vanilla_rect_intersect(&b_top, dirty, &vis_b))
+            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border);
+        if (vanilla_rect_intersect(&b_bot, dirty, &vis_b))
+            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border);
+        if (vanilla_rect_intersect(&b_l, dirty, &vis_b))
+            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border);
+        if (vanilla_rect_intersect(&b_r, dirty, &vis_b))
+            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border);
+
+        /* Render menu item rows */
+        int row_h = 24;
+        for (int i = 0; i < m->item_count; i++) {
+            vanilla_menu_item_t *it = &m->items[i];
+            int32_t iy = menu_rect.y + 2 + i * row_h;
+            vanilla_rect_t row_rect = { menu_rect.x + 2, iy, menu_rect.w - 4, row_h };
+
+            if (row_rect.y + row_rect.h > menu_rect.y + menu_rect.h)
+                break;
+
+            if (it->flags & MENU_ITEM_SEPARATOR) {
+                vanilla_rect_t sep_line = { menu_rect.x + 8, iy + row_h / 2, menu_rect.w - 16, 1 };
+                vanilla_rect_t vis_sep;
+                if (vanilla_rect_intersect(&sep_line, dirty, &vis_sep))
+                    blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_sep, g_theme->border);
+                continue;
+            }
+
+            int is_highlighted = (i == m->highlighted) && (it->flags & MENU_ITEM_ENABLED);
+            if (is_highlighted) {
+                vanilla_rect_t vis_row;
+                if (vanilla_rect_intersect(&row_rect, dirty, &vis_row))
+                    blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_row, g_theme->accent);
+            }
+
+            if (comp->font.info) {
+                uint32_t fg = (it->flags & MENU_ITEM_ENABLED) ?
+                              (is_highlighted ? g_theme->titlebar_btn_icon : g_theme->fg_primary) :
+                              g_theme->fg_muted;
+
+                /* Checkmark indicator */
+                if (it->flags & MENU_ITEM_CHECKED) {
+                    font_draw_text(comp->backbuffer, comp->pitch_px, &vis_menu,
+                                   &comp->font, "*", row_rect.x + 4, iy + 4,
+                                   THEME_F(13.0f), fg);
+                }
+
+                /* Item label */
+                font_draw_text(comp->backbuffer, comp->pitch_px, &vis_menu,
+                               &comp->font, it->label, row_rect.x + 14, iy + 4,
+                               THEME_F(13.0f), fg);
+
+                /* Submenu arrow */
+                if (it->submenu_id != 0) {
+                    font_draw_text(comp->backbuffer, comp->pitch_px, &vis_menu,
+                                   &comp->font, ">", menu_rect.x + menu_rect.w - 16, iy + 4,
+                                   THEME_F(13.0f), fg);
+                }
+            }
         }
     }
 }

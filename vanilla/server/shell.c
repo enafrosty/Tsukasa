@@ -50,7 +50,7 @@ static inline uint32_t shell_get_badge_color(int index)
     }
 }
 
-static void shell_spawn_app(const char *path)
+void shell_spawn_app(const char *path)
 {
     char current_path[256];
     strncpy(current_path, path, sizeof(current_path) - 1);

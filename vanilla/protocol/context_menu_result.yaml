@@ -1,0 +1,13 @@
+id: 26
+name: MSG_CONTEXT_MENU_RESULT
+direction: server_to_client
+version: 2
+description: "Server delivers the selected item ID, or 0 if dismissed."
+fields:
+  - name: window_id
+    type: uint32_t
+  - name: menu_id
+    type: uint32_t
+  - name: item_id
+    type: uint32_t
+    description: "Selected item_id from vanilla_menu_item_t; 0 = dismissed"

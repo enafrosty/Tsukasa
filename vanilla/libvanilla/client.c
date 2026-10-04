@@ -514,6 +514,26 @@ vanilla_window_t *vanilla_create_window(vanilla_client_t *client, const char *ti
             ev.type = VANILLA_EVENT_CLOSE_REQ;
             ev.window_id = ack_hdr.window_id;
             event_queue_push(client, &ev);
+        } else if (ack_hdr.msg_type == MSG_CONTEXT_MENU_RESULT) {
+            vanilla_msg_context_menu_result_t res;
+            if (exact_read(client->socket_fd, &res, sizeof(res)) < 0)
+                return NULL;
+            if (ack_hdr.payload_len > sizeof(res)) {
+                uint8_t discard[128];
+                size_t rem = ack_hdr.payload_len - sizeof(res);
+                while (rem > 0) {
+                    size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+                    if (exact_read(client->socket_fd, discard, chunk) < 0)
+                        return NULL;
+                    rem -= chunk;
+                }
+            }
+            vanilla_event_t ev;
+            ev.type = VANILLA_EVENT_CONTEXT_MENU_RESULT;
+            ev.window_id = ack_hdr.window_id ? ack_hdr.window_id : res.window_id;
+            ev.context_menu_result.menu_id = res.menu_id;
+            ev.context_menu_result.item_id = res.item_id;
+            event_queue_push(client, &ev);
         } else {
             if (ack_hdr.payload_len > 0) {
                 uint8_t discard[128];
@@ -984,6 +1004,27 @@ int vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev)
             return 1;
         }
 
+        if (hdr.msg_type == MSG_CONTEXT_MENU_RESULT) {
+            vanilla_msg_context_menu_result_t res;
+            if (exact_read(client->socket_fd, &res, sizeof(res)) < 0)
+                return -1;
+            if (hdr.payload_len > sizeof(res)) {
+                uint8_t discard[128];
+                size_t rem = hdr.payload_len - sizeof(res);
+                while (rem > 0) {
+                    size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+                    if (exact_read(client->socket_fd, discard, chunk) < 0)
+                        return -1;
+                    rem -= chunk;
+                }
+            }
+            out_ev->type = VANILLA_EVENT_CONTEXT_MENU_RESULT;
+            out_ev->window_id = hdr.window_id ? hdr.window_id : res.window_id;
+            out_ev->context_menu_result.menu_id = res.menu_id;
+            out_ev->context_menu_result.item_id = res.item_id;
+            return 1;
+        }
+
         if (hdr.payload_len > 0) {
             uint8_t discard[128];
             size_t rem = hdr.payload_len;
@@ -1018,4 +1059,108 @@ int vanilla_wait_event(vanilla_client_t *client, vanilla_event_t *out_ev)
         return -1;
 
     return vanilla_poll_event(client, out_ev);
+}
+
+int vanilla_show_context_menu(vanilla_client_t *client, vanilla_window_t *win,
+                              uint32_t menu_id, int32_t x, int32_t y,
+                              const vanilla_menu_item_t *items, uint32_t item_count)
+{
+    if (!client || !items || item_count == 0 || item_count > 64)
+        return -1;
+
+    vanilla_msg_hdr_t hdr;
+    vanilla_msg_show_context_menu_t req;
+    size_t items_size = (size_t)item_count * sizeof(vanilla_menu_item_t);
+
+    hdr.magic = VANILLA_IPC_MAGIC;
+    hdr.msg_type = MSG_SHOW_CONTEXT_MENU;
+    hdr.payload_len = (uint16_t)(sizeof(req) + items_size);
+    hdr.window_id = win ? win->window_id : 0;
+
+    req.window_id = hdr.window_id;
+    req.menu_id = menu_id;
+    req.parent_id = 0;
+    req.x = x;
+    req.y = y;
+    req.item_count = item_count;
+
+    if (exact_write(client->socket_fd, &hdr, sizeof(hdr)) < 0)
+        return -1;
+    if (exact_write(client->socket_fd, &req, sizeof(req)) < 0)
+        return -1;
+    if (exact_write(client->socket_fd, items, items_size) < 0)
+        return -1;
+
+    return (int)menu_id;
+}
+
+struct vanilla_menu_builder {
+    vanilla_menu_item_t items[64];
+    uint32_t            count;
+};
+
+vanilla_menu_builder_t *vanilla_menu_builder_new(void)
+{
+    vanilla_menu_builder_t *b = (vanilla_menu_builder_t *)calloc(1, sizeof(vanilla_menu_builder_t));
+    return b;
+}
+
+void vanilla_menu_builder_add_item(vanilla_menu_builder_t *b, uint32_t id, const char *label)
+{
+    if (!b || b->count >= 64)
+        return;
+
+    vanilla_menu_item_t *it = &b->items[b->count++];
+    memset(it, 0, sizeof(*it));
+    it->item_id = id;
+    it->submenu_id = 0;
+    it->flags = MENU_ITEM_ENABLED;
+    if (label) {
+        strncpy(it->label, label, MENU_ITEM_LABEL_MAX - 1);
+        it->label[MENU_ITEM_LABEL_MAX - 1] = '\0';
+    }
+}
+
+void vanilla_menu_builder_add_separator(vanilla_menu_builder_t *b)
+{
+    if (!b || b->count >= 64)
+        return;
+
+    vanilla_menu_item_t *it = &b->items[b->count++];
+    memset(it, 0, sizeof(*it));
+    it->item_id = 0;
+    it->submenu_id = 0;
+    it->flags = MENU_ITEM_SEPARATOR;
+}
+
+void vanilla_menu_builder_add_submenu(vanilla_menu_builder_t *b, uint32_t id,
+                                      const char *label, uint32_t submenu_id)
+{
+    if (!b || b->count >= 64)
+        return;
+
+    vanilla_menu_item_t *it = &b->items[b->count++];
+    memset(it, 0, sizeof(*it));
+    it->item_id = id;
+    it->submenu_id = submenu_id;
+    it->flags = MENU_ITEM_ENABLED;
+    if (label) {
+        strncpy(it->label, label, MENU_ITEM_LABEL_MAX - 1);
+        it->label[MENU_ITEM_LABEL_MAX - 1] = '\0';
+    }
+}
+
+int vanilla_menu_builder_show(vanilla_menu_builder_t *b, vanilla_client_t *c,
+                              vanilla_window_t *w, uint32_t menu_id, int32_t x, int32_t y)
+{
+    if (!b || !c)
+        return -1;
+
+    return vanilla_show_context_menu(c, w, menu_id, x, y, b->items, b->count);
+}
+
+void vanilla_menu_builder_free(vanilla_menu_builder_t *b)
+{
+    if (b)
+        free(b);
 }
