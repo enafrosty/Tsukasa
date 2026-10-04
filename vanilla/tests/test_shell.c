@@ -235,109 +235,110 @@ static void test_input_cursor_tracking_and_damage(void)
     printf("       Passed.\n");
 }
 
-static int shell_test_handle_click(vanilla_server_t *srv, vanilla_shell_t *shell, vanilla_launcher_t *launcher, int32_t x, int32_t y, uint32_t button)
-{
-    if (!srv || button != BTN_LEFT)
-        return 0;
-
-    int32_t screen_w = (int32_t)srv->compositor.width;
-    int32_t screen_h = (int32_t)srv->compositor.height;
-
-    /* Start button on taskbar */
-    if (x >= TASKBAR_START_X && x < TASKBAR_START_X + TASKBAR_START_W &&
-        y >= screen_h - TASKBAR_HEIGHT + THEME_PX(4) && y < screen_h - TASKBAR_HEIGHT + THEME_PX(4) + TASKBAR_START_H) {
-        if (launcher)
-            launcher->visible = !launcher->visible;
-        if (shell)
-            shell->start_menu_open = !shell->start_menu_open;
-        return 1;
-    }
-
-    /* Window pills on taskbar */
-    if (y >= screen_h - TASKBAR_HEIGHT) {
-        int pill_idx = 0;
-        for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
-            vanilla_server_window_t *win = &srv->windows[i];
-            if (!win->in_use || (win->flags & WINDOW_FLAG_BORDERLESS))
-                continue;
-
-            int32_t px = TASKBAR_PILL_START_X + pill_idx * (TASKBAR_PILL_W + TASKBAR_PILL_GAP);
-            if (px + TASKBAR_PILL_W > screen_w - TASKBAR_CLOCK_W - THEME_PX(8))
-                break;
-
-            if (x >= px && x < px + TASKBAR_PILL_W &&
-                y >= screen_h - TASKBAR_HEIGHT + THEME_PX(4) && y < screen_h - TASKBAR_HEIGHT + THEME_PX(4) + TASKBAR_PILL_H) {
-                if (!win->is_mapped) {
-                    win->is_mapped = 1;
-                    vanilla_server_focus_window(srv, win->window_id);
-                    wm_raise_window(srv, win->window_id);
-                } else if (win->is_focused) {
-                    win->is_mapped = 0;
-                    win->is_focused = 0;
-                    if (srv->focused_window_id == win->window_id)
-                        srv->focused_window_id = 0;
-                    wm_invalidate_window(srv, win);
-                } else {
-                    vanilla_server_focus_window(srv, win->window_id);
-                    wm_raise_window(srv, win->window_id);
-                }
-                return 1;
-            }
-            pill_idx++;
-        }
-        return 1;
-    }
-
-    return 0;
-}
-
 static void test_shell_click_and_window_toggle(void)
 {
     printf("[TEST] Taskbar click interaction and window toggle...\n");
 
-    vanilla_server_t srv;
-    memset(&srv, 0, sizeof(srv));
-    compositor_init_offscreen(&srv.compositor, 1024, 768);
-    vanilla_shell_t shell;
-    vanilla_launcher_t launcher;
-    shell_init(&shell);
-    launcher_init(&launcher);
+    shell_state_t state;
+    memset(&state, 0, sizeof(state));
+    state.screen_w = 1024;
+    state.screen_h = 768;
+    state.running = 1;
+    shell_init(&state.shell);
+    launcher_init(&state.launcher);
 
-    /* Click Start button at (10, 750) */
-    int handled = shell_test_handle_click(&srv, &shell, &launcher, 10, 750, BTN_LEFT);
-    ASSERT(handled == 1, "taskbar click consumed");
-    ASSERT(launcher.visible == 1, "start button click opened quick launcher");
+    vanilla_window_t tb_win;
+    memset(&tb_win, 0, sizeof(tb_win));
+    tb_win.window_id = 100;
+    state.taskbar_win = &tb_win;
 
-    /* Click Start button again */
-    handled = shell_test_handle_click(&srv, &shell, &launcher, 10, 750, BTN_LEFT);
-    ASSERT(handled == 1, "taskbar click consumed");
-    ASSERT(launcher.visible == 0, "start button click toggled quick launcher closed");
+    /* 1. Click Start button on taskbar (cx = 10, cy = 10 within taskbar window) */
+    vanilla_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = VANILLA_EVENT_INPUT;
+    ev.window_id = tb_win.window_id;
+    ev.input.type = EV_KEY;
+    ev.input.code = BTN_LEFT;
+    ev.input.value = 1;
+    ev.input.pad1 = TASKBAR_START_X + 6;
+    ev.input.pad2 = THEME_PX(10);
 
-    /* Create test window */
-    vanilla_server_window_t *w = &srv.windows[0];
-    w->in_use = 1;
-    w->window_id = 1;
-    w->x = 50;
-    w->y = 50;
-    w->width = 300;
-    w->height = 200;
-    w->is_mapped = 1;
-    w->is_focused = 1;
-    srv.focused_window_id = 1;
-    strncpy(w->title, "Editor", sizeof(w->title) - 1);
+    shell_handle_event(&state, &ev);
+    ASSERT(state.shell.start_menu_open == 1, "start button click opened start menu");
 
-    /* Click pill 0 at x = 80, y = 750 */
-    handled = shell_test_handle_click(&srv, &shell, &launcher, 80, 750, BTN_LEFT);
-    ASSERT(handled == 1, "pill click consumed");
-    ASSERT(w->is_mapped == 0, "clicking active pill toggles window to minimized");
+    /* Click Start button again to toggle closed */
+    shell_handle_event(&state, &ev);
+    ASSERT(state.shell.start_menu_open == 0, "start button click toggled start menu closed");
+
+    /* 2. Global Alt+Space hotkey opens Quick Launcher */
+    memset(&ev, 0, sizeof(ev));
+    ev.type = VANILLA_EVENT_INPUT;
+    ev.window_id = tb_win.window_id;
+    ev.mod_state = MOD_ALT;
+    ev.input.type = EV_KEY;
+    ev.input.code = KEY_SPACE;
+    ev.input.value = 1;
+
+    shell_handle_event(&state, &ev);
+    ASSERT(state.launcher.visible == 1, "Alt+Space hotkey opened quick launcher");
+
+    /* Dismiss launcher via ESC key */
+    vanilla_window_t launcher_win;
+    memset(&launcher_win, 0, sizeof(launcher_win));
+    launcher_win.window_id = 101;
+    state.launcher.win = &launcher_win;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.type = VANILLA_EVENT_INPUT;
+    ev.window_id = launcher_win.window_id;
+    ev.input.type = EV_KEY;
+    ev.input.code = KEY_ESC;
+    ev.input.value = 1;
+
+    shell_handle_event(&state, &ev);
+    ASSERT(state.launcher.visible == 0, "ESC key dismissed quick launcher");
+
+    /* 3. Window pill tracking and minimize/restore toggle */
+    memset(&ev, 0, sizeof(ev));
+    ev.type = VANILLA_EVENT_CONFIGURE;
+    ev.window_id = 1;
+    ev.configure.x = 50;
+    ev.configure.y = 50;
+    ev.configure.width = 300;
+    ev.configure.height = 200;
+    ev.configure.flags = WINDOW_FLAG_RESIZABLE;
+
+    shell_handle_event(&state, &ev);
+    ASSERT(state.win_list.count == 1, "window registered in shell win_list");
+    ASSERT(state.win_list.windows[0].is_mapped == 1, "registered window is mapped");
+
+    /* Send focus event */
+    memset(&ev, 0, sizeof(ev));
+    ev.type = VANILLA_EVENT_FOCUS;
+    ev.window_id = 1;
+    ev.focus.focused = 1;
+    shell_handle_event(&state, &ev);
+    ASSERT(state.win_list.windows[0].is_focused == 1, "window marked as focused");
+
+    /* Click pill 0 at x = TASKBAR_PILL_START_X + 10, y = 10 to minimize */
+    memset(&ev, 0, sizeof(ev));
+    ev.type = VANILLA_EVENT_INPUT;
+    ev.window_id = tb_win.window_id;
+    ev.input.type = EV_KEY;
+    ev.input.code = BTN_LEFT;
+    ev.input.value = 1;
+    ev.input.pad1 = TASKBAR_PILL_START_X + 10;
+    ev.input.pad2 = THEME_PX(10);
+
+    shell_handle_event(&state, &ev);
+    ASSERT(state.win_list.windows[0].is_mapped == 0, "clicking active pill toggles window to minimized");
+    ASSERT(state.win_list.windows[0].is_focused == 0, "minimized window lost focus");
 
     /* Click pill 0 again to restore */
-    handled = shell_test_handle_click(&srv, &shell, &launcher, 80, 750, BTN_LEFT);
-    ASSERT(handled == 1, "pill click consumed");
-    ASSERT(w->is_mapped == 1, "clicking pill restores minimized window");
-    ASSERT(w->is_focused == 1, "restored window receives focus");
+    shell_handle_event(&state, &ev);
+    ASSERT(state.win_list.windows[0].is_mapped == 1, "clicking pill restores minimized window");
+    ASSERT(state.win_list.windows[0].is_focused == 1, "restored window receives focus");
 
-    compositor_destroy(&srv.compositor);
     printf("       Passed.\n");
 }
 

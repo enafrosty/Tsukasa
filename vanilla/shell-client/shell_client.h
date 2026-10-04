@@ -118,5 +118,6 @@ void launcher_init(vanilla_launcher_t *launcher);
 int  launcher_fuzzy_match(const char *pattern, const char *target);
 void launcher_update_matches(vanilla_launcher_t *launcher);
 int  launcher_handle_key_state(vanilla_launcher_t *launcher, uint16_t code, int pressed, uint16_t mod_state);
+void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev);
 
 #endif /* _VANILLA_SHELL_CLIENT_H */

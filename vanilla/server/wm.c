@@ -3758,7 +3758,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             update_mod_state(srv, MOD_SUPER, 0, ev->value);
             for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
                 vanilla_server_window_t *sw = &srv->windows[i];
-                if (sw->in_use && (sw->flags & WINDOW_FLAG_ALWAYS_TOP) && (sw->flags & WINDOW_FLAG_BORDERLESS)) {
+                if (sw->in_use && (sw->flags & WINDOW_FLAG_ALWAYS_TOP) && (sw->flags & WINDOW_FLAG_BORDERLESS) && !(sw->flags & WINDOW_FLAG_POPUP)) {
                     vanilla_server_send_input(srv, sw->window_id, ev);
                     break;
                 }
@@ -4160,7 +4160,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
         if ((srv->mod_state & MOD_ALT) && ev->code == KEY_SPACE && ev->value == 1) {
             for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
                 vanilla_server_window_t *sw = &srv->windows[i];
-                if (sw->in_use && (sw->flags & WINDOW_FLAG_ALWAYS_TOP) && (sw->flags & WINDOW_FLAG_BORDERLESS)) {
+                if (sw->in_use && (sw->flags & WINDOW_FLAG_ALWAYS_TOP) && (sw->flags & WINDOW_FLAG_BORDERLESS) && !(sw->flags & WINDOW_FLAG_POPUP)) {
                     vanilla_server_send_input(srv, sw->window_id, ev);
                     return 0;
                 }

@@ -132,43 +132,14 @@ static void launcher_exec_selected(vanilla_launcher_t *launcher)
         int app_idx = launcher->matches[sel].app_index;
         const vanilla_app_entry_t *app = &g_launcher_apps[app_idx];
 
-        char current_path[256];
-        strncpy(current_path, app->exec_path, sizeof(current_path) - 1);
-        current_path[sizeof(current_path) - 1] = '\0';
+        shell_spawn_app(app->exec_path);
 
-        char *argv[] = { current_path, NULL };
-        pid_t pid = spawn(current_path, argv, NULL);
-
-        if (pid <= 0) {
-            size_t len = strlen(current_path);
-            if (len < 4 || strcmp(current_path + len - 4, ".elf") != 0) {
-                if (len + 4 < sizeof(current_path)) {
-                    strcat(current_path, ".elf");
-                    pid = spawn(current_path, argv, NULL);
-                }
-            }
+        size_t len = strlen(app->exec_path);
+        if (len < 4 || strcmp(app->exec_path + len - 4, ".elf") != 0) {
+            char elf_path[256];
+            snprintf(elf_path, sizeof(elf_path), "%s.elf", app->exec_path);
+            shell_spawn_app(elf_path);
         }
-
-        if (pid <= 0) {
-            char fat12_path[320];
-            const char *leaf = current_path;
-            if (strncmp(current_path, "/bin/", 5) == 0)
-                leaf = current_path + 5;
-            else if (current_path[0] == '/')
-                leaf = current_path + 1;
-
-            snprintf(fat12_path, sizeof(fat12_path), "/fat12/%s", leaf);
-            char *fat12_argv[] = { fat12_path, NULL };
-            pid = spawn(fat12_path, fat12_argv, NULL);
-
-            if (pid <= 0 && strncmp(app->exec_path, "/bin/", 5) == 0 &&
-                strcmp(app->exec_path, current_path) != 0) {
-                snprintf(fat12_path, sizeof(fat12_path), "/fat12/%s", app->exec_path + 5);
-                char *fat12_argv2[] = { fat12_path, NULL };
-                pid = spawn(fat12_path, fat12_argv2, NULL);
-            }
-        }
-        (void)pid;
     }
 }
 
@@ -512,15 +483,40 @@ static void launcher_render_client(shell_state_t *st)
     }
 }
 
-static void shell_toggle_launcher(shell_state_t *st)
+static void shell_close_launcher(shell_state_t *st)
 {
-    if (st->launcher.visible) {
-        st->launcher.visible = 0;
-        if (st->launcher.win) {
-            vanilla_destroy_window(st->launcher.win);
-            st->launcher.win = NULL;
-        }
-    } else {
+    st->launcher.visible = 0;
+    if (st->launcher.win) {
+        vanilla_destroy_window(st->launcher.win);
+        st->launcher.win = NULL;
+    }
+}
+
+static void shell_close_start_menu(shell_state_t *st)
+{
+    st->shell.start_menu_open = 0;
+    if (st->shell.start_menu_win) {
+        vanilla_destroy_window(st->shell.start_menu_win);
+        st->shell.start_menu_win = NULL;
+    }
+    st->taskbar_dirty = 1;
+}
+
+static void shell_open_launcher(shell_state_t *st)
+{
+    if (st->launcher.visible && st->launcher.win)
+        return;
+
+    if (st->shell.start_menu_open)
+        shell_close_start_menu(st);
+
+    st->launcher.visible = 1;
+    st->launcher.query[0] = '\0';
+    st->launcher.query_len = 0;
+    st->launcher.selected_idx = 0;
+    launcher_update_matches(&st->launcher);
+
+    if (st->client) {
         int32_t lx = (st->screen_w - LAUNCHER_WIDTH) / 2;
         int32_t ly = (st->screen_h - TASKBAR_HEIGHT - LAUNCHER_HEIGHT) / 2;
         if (ly < THEME_PX(20))
@@ -528,30 +524,36 @@ static void shell_toggle_launcher(shell_state_t *st)
 
         st->launcher.win = vanilla_create_window(st->client, "Quick Launcher", lx, ly,
                                                  LAUNCHER_WIDTH, LAUNCHER_HEIGHT,
-                                                 WINDOW_FLAG_POPUP | WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_TRANSPARENT);
+                                                 WINDOW_FLAG_POPUP | WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_TRANSPARENT);
         if (st->launcher.win) {
             vanilla_map_window(st->launcher.win);
-            st->launcher.visible = 1;
-            st->launcher.query[0] = '\0';
-            st->launcher.query_len = 0;
-            st->launcher.selected_idx = 0;
-            launcher_update_matches(&st->launcher);
             launcher_render_client(st);
             vanilla_present(st->launcher.win, NULL);
         }
     }
 }
 
-static void shell_toggle_start_menu(shell_state_t *st)
+static void shell_toggle_launcher(shell_state_t *st)
 {
-    if (st->shell.start_menu_open) {
-        st->shell.start_menu_open = 0;
-        if (st->shell.start_menu_win) {
-            vanilla_destroy_window(st->shell.start_menu_win);
-            st->shell.start_menu_win = NULL;
-        }
-        st->taskbar_dirty = 1;
+    if (st->launcher.visible) {
+        shell_close_launcher(st);
     } else {
+        shell_open_launcher(st);
+    }
+}
+
+static void shell_open_start_menu(shell_state_t *st)
+{
+    if (st->shell.start_menu_open && st->shell.start_menu_win)
+        return;
+
+    if (st->launcher.visible)
+        shell_close_launcher(st);
+
+    st->shell.start_menu_open = 1;
+    st->shell.selected_idx = 0;
+
+    if (st->client) {
         int32_t sm_x = 0;
         int32_t sm_y = st->screen_h - TASKBAR_HEIGHT - START_MENU_HEIGHT;
 
@@ -560,16 +562,23 @@ static void shell_toggle_start_menu(shell_state_t *st)
                                                          WINDOW_FLAG_POPUP | WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_TRANSPARENT);
         if (st->shell.start_menu_win) {
             vanilla_map_window(st->shell.start_menu_win);
-            st->shell.start_menu_open = 1;
-            st->shell.selected_idx = 0;
             start_menu_render_client(st);
             vanilla_present(st->shell.start_menu_win, NULL);
         }
-        st->taskbar_dirty = 1;
+    }
+    st->taskbar_dirty = 1;
+}
+
+static void shell_toggle_start_menu(shell_state_t *st)
+{
+    if (st->shell.start_menu_open) {
+        shell_close_start_menu(st);
+    } else {
+        shell_open_start_menu(st);
     }
 }
 
-static void __attribute__((unused)) shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
+void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
 {
     if (!st || !ev)
         return;
@@ -580,9 +589,9 @@ static void __attribute__((unused)) shell_handle_event(shell_state_t *st, const 
         if (st->taskbar_win && ev->window_id == st->taskbar_win->window_id) {
             st->running = 0;
         } else if (st->launcher.win && ev->window_id == st->launcher.win->window_id) {
-            shell_toggle_launcher(st);
+            shell_close_launcher(st);
         } else if (st->shell.start_menu_win && ev->window_id == st->shell.start_menu_win->window_id) {
-            shell_toggle_start_menu(st);
+            shell_close_start_menu(st);
         }
         return;
     }
@@ -613,7 +622,6 @@ static void __attribute__((unused)) shell_handle_event(shell_state_t *st, const 
                 int found = 0;
                 for (int i = 0; i < st->win_list.count; i++) {
                     if (st->win_list.windows[i].window_id == ev->window_id) {
-                        st->win_list.windows[i].is_mapped = 1;
                         st->win_list.windows[i].flags = ev->configure.flags;
                         found = 1;
                         break;
@@ -638,18 +646,25 @@ static void __attribute__((unused)) shell_handle_event(shell_state_t *st, const 
         for (int i = 0; i < st->win_list.count; i++) {
             if (st->win_list.windows[i].window_id == ev->window_id) {
                 st->win_list.windows[i].is_focused = ev->focus.focused;
+                if (ev->focus.focused)
+                    st->win_list.windows[i].is_mapped = 1;
             } else if (ev->focus.focused) {
                 st->win_list.windows[i].is_focused = 0;
             }
         }
         st->taskbar_dirty = 1;
 
-        /* Dismiss popups if focus shifted to a different window */
+        /* Dismiss popups when focus changes */
         if (ev->focus.focused) {
             if (st->launcher.visible && st->launcher.win && ev->window_id != st->launcher.win->window_id)
-                shell_toggle_launcher(st);
+                shell_close_launcher(st);
             if (st->shell.start_menu_open && st->shell.start_menu_win && ev->window_id != st->shell.start_menu_win->window_id)
-                shell_toggle_start_menu(st);
+                shell_close_start_menu(st);
+        } else {
+            if (st->launcher.visible && st->launcher.win && ev->window_id == st->launcher.win->window_id)
+                shell_close_launcher(st);
+            if (st->shell.start_menu_open && st->shell.start_menu_win && ev->window_id == st->shell.start_menu_win->window_id)
+                shell_close_start_menu(st);
         }
         return;
     }
@@ -660,6 +675,12 @@ static void __attribute__((unused)) shell_handle_event(shell_state_t *st, const 
         /* Global Alt+Space launcher toggle */
         if (iev->type == EV_KEY && iev->code == KEY_SPACE && iev->value == 1 && (st->mod_state & MOD_ALT)) {
             shell_toggle_launcher(st);
+            return;
+        }
+
+        /* Super / Windows key Start Menu toggle */
+        if (iev->type == EV_KEY && (iev->code == KEY_LEFTMETA || iev->code == KEY_RIGHTMETA) && iev->value == 1) {
+            shell_toggle_start_menu(st);
             return;
         }
 
@@ -690,7 +711,9 @@ static void __attribute__((unused)) shell_handle_event(shell_state_t *st, const 
                     if (cx >= px && cx < px + TASKBAR_PILL_W &&
                         cy >= THEME_PX(4) && cy < THEME_PX(4) + TASKBAR_PILL_H) {
                         if (st->shell.start_menu_open)
-                            shell_toggle_start_menu(st);
+                            shell_close_start_menu(st);
+                        if (st->launcher.visible)
+                            shell_close_launcher(st);
 
                         int sfd = vanilla_client_get_fd(st->client);
                         vanilla_msg_hdr_t hdr;
@@ -738,7 +761,7 @@ static void __attribute__((unused)) shell_handle_event(shell_state_t *st, const 
                 }
 
                 if (st->shell.start_menu_open)
-                    shell_toggle_start_menu(st);
+                    shell_close_start_menu(st);
             }
             return;
         }
@@ -752,13 +775,13 @@ static void __attribute__((unused)) shell_handle_event(shell_state_t *st, const 
                     int item_idx = rel_y / START_MENU_ITEM_H;
                     if (item_idx >= 0 && item_idx < START_MENU_NUM_ITEMS) {
                         shell_spawn_app(g_start_menu_items[item_idx].path);
-                        shell_toggle_start_menu(st);
+                        shell_close_start_menu(st);
                         return;
                     }
                 }
             } else if (iev->type == EV_KEY && iev->value == 1) {
                 if (iev->code == KEY_ESC) {
-                    shell_toggle_start_menu(st);
+                    shell_close_start_menu(st);
                 } else if (iev->code == KEY_UP) {
                     if (st->shell.selected_idx > 0) {
                         st->shell.selected_idx--;
@@ -773,7 +796,7 @@ static void __attribute__((unused)) shell_handle_event(shell_state_t *st, const 
                     int idx = st->shell.selected_idx;
                     if (idx >= 0 && idx < START_MENU_NUM_ITEMS)
                         shell_spawn_app(g_start_menu_items[idx].path);
-                    shell_toggle_start_menu(st);
+                    shell_close_start_menu(st);
                 }
             }
             return;
@@ -792,14 +815,14 @@ static void __attribute__((unused)) shell_handle_event(shell_state_t *st, const 
                         cy >= iy && cy < iy + LAUNCHER_ITEM_HEIGHT) {
                         st->launcher.selected_idx = i;
                         launcher_exec_selected(&st->launcher);
-                        shell_toggle_launcher(st);
+                        shell_close_launcher(st);
                         return;
                     }
                 }
             } else if (iev->type == EV_KEY) {
                 launcher_handle_key_state(&st->launcher, iev->code, iev->value, st->mod_state);
                 if (!st->launcher.visible) {
-                    shell_toggle_launcher(st);
+                    shell_close_launcher(st);
                 }
             }
             return;
