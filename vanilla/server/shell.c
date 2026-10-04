@@ -102,6 +102,10 @@ void shell_init(vanilla_shell_t *shell)
 
 void shell_update_clock(vanilla_shell_t *shell, vanilla_server_t *srv)
 {
+    if (srv) {
+        wm_context_menu_check_timers(srv);
+    }
+
     if (!shell)
         return;
 

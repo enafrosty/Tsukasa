@@ -1017,11 +1017,12 @@ void compositor_render_frame(struct vanilla_server *srv)
             compositor_add_damage(&srv->compositor, &srv->compositor.snap_preview_rect);
         for (int d = 0; d < srv->context_menu_depth; d++) {
             if (srv->context_menu_stack[d].active && srv->context_menu_stack[d].anim_alpha < 1.0f) {
+                int32_t sr = (g_theme && g_theme->shadow_radius > 0) ? g_theme->shadow_radius : 16;
                 vanilla_rect_t mr = {
-                    srv->context_menu_stack[d].x,
-                    srv->context_menu_stack[d].y,
-                    srv->context_menu_stack[d].width,
-                    srv->context_menu_stack[d].height
+                    srv->context_menu_stack[d].x - sr,
+                    srv->context_menu_stack[d].y - sr,
+                    srv->context_menu_stack[d].width + sr * 2,
+                    srv->context_menu_stack[d].height + sr * 2
                 };
                 compositor_add_damage(&srv->compositor, &mr);
             }
@@ -1127,6 +1128,16 @@ void alttab_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
     }
 }
 
+static inline uint32_t color_modulate_alpha(uint32_t color, float alpha)
+{
+    if (alpha >= 1.0f)
+        return color;
+    if (alpha <= 0.0f)
+        return color & 0x00FFFFFF;
+    uint32_t a = (uint32_t)(((color >> 24) & 0xFF) * alpha);
+    return (a << 24) | (color & 0x00FFFFFF);
+}
+
 void compositor_paint_context_menus(vanilla_server_t *srv, const vanilla_rect_t *dirty)
 {
     if (!srv || srv->context_menu_depth <= 0 || !dirty)
@@ -1159,20 +1170,31 @@ void compositor_paint_context_menus(vanilla_server_t *srv, const vanilla_rect_t 
             }
         }
 
+        if (m->anim_alpha <= 0.01f && g_theme->reduce_motion == 0)
+            continue;
+
+        float alpha = m->anim_alpha;
+        uint8_t sh_alpha = (uint8_t)((float)g_theme->shadow_alpha * alpha);
+        uint32_t bg_col = color_modulate_alpha(g_theme->bg_elevated, alpha);
+        uint32_t border_col = color_modulate_alpha(g_theme->border, alpha);
+        uint32_t accent_col = color_modulate_alpha(g_theme->accent, alpha);
+
         vanilla_rect_t vis_menu;
         if (!vanilla_rect_intersect(&menu_rect, dirty, &vis_menu))
             continue;
 
         /* Ambient soft drop shadow */
-        blt_draw_shadow_cached(comp->backbuffer, comp->pitch_px,
-                               comp->width, comp->height,
-                               &menu_rect, dirty,
-                               g_theme->shadow_radius, g_theme->shadow_alpha);
+        if (sh_alpha > 0) {
+            blt_draw_shadow_cached(comp->backbuffer, comp->pitch_px,
+                                   comp->width, comp->height,
+                                   &menu_rect, dirty,
+                                   g_theme->shadow_radius, sh_alpha);
+        }
 
         /* Elevated background panel */
         blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
                                  menu_rect.x, menu_rect.y, menu_rect.w, menu_rect.h,
-                                 g_theme->radius_sm, g_theme->bg_elevated,
+                                 g_theme->radius_sm, bg_col,
                                  BLT_CORNER_ALL, dirty);
 
         /* 1px border */
@@ -1182,15 +1204,10 @@ void compositor_paint_context_menus(vanilla_server_t *srv, const vanilla_rect_t 
         vanilla_rect_t b_bot = { menu_rect.x, menu_rect.y + menu_rect.h - bw, menu_rect.w, bw };
         vanilla_rect_t b_l   = { menu_rect.x, menu_rect.y, bw, menu_rect.h };
         vanilla_rect_t b_r   = { menu_rect.x + menu_rect.w - bw, menu_rect.y, bw, menu_rect.h };
-        vanilla_rect_t vis_b;
-        if (vanilla_rect_intersect(&b_top, dirty, &vis_b))
-            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border);
-        if (vanilla_rect_intersect(&b_bot, dirty, &vis_b))
-            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border);
-        if (vanilla_rect_intersect(&b_l, dirty, &vis_b))
-            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border);
-        if (vanilla_rect_intersect(&b_r, dirty, &vis_b))
-            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, g_theme->border);
+        blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px, b_top.x, b_top.y, b_top.w, b_top.h, 0, border_col, 0, dirty);
+        blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px, b_bot.x, b_bot.y, b_bot.w, b_bot.h, 0, border_col, 0, dirty);
+        blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px, b_l.x, b_l.y, b_l.w, b_l.h, 0, border_col, 0, dirty);
+        blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px, b_r.x, b_r.y, b_r.w, b_r.h, 0, border_col, 0, dirty);
 
         /* Render menu item rows */
         int row_h = 24;
@@ -1204,23 +1221,25 @@ void compositor_paint_context_menus(vanilla_server_t *srv, const vanilla_rect_t 
 
             if (it->flags & MENU_ITEM_SEPARATOR) {
                 vanilla_rect_t sep_line = { menu_rect.x + 8, iy + row_h / 2, menu_rect.w - 16, 1 };
-                vanilla_rect_t vis_sep;
-                if (vanilla_rect_intersect(&sep_line, dirty, &vis_sep))
-                    blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_sep, g_theme->border);
+                blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
+                                         sep_line.x, sep_line.y, sep_line.w, sep_line.h,
+                                         0, border_col, 0, dirty);
                 continue;
             }
 
             int is_highlighted = (i == m->highlighted) && (it->flags & MENU_ITEM_ENABLED);
             if (is_highlighted) {
-                vanilla_rect_t vis_row;
-                if (vanilla_rect_intersect(&row_rect, dirty, &vis_row))
-                    blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_row, g_theme->accent);
+                blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
+                                         row_rect.x, row_rect.y, row_rect.w, row_rect.h,
+                                         g_theme->radius_sm > 4 ? 4 : g_theme->radius_sm,
+                                         accent_col, BLT_CORNER_ALL, dirty);
             }
 
             if (comp->font.info) {
-                uint32_t fg = (it->flags & MENU_ITEM_ENABLED) ?
+                uint32_t base_fg = (it->flags & MENU_ITEM_ENABLED) ?
                               (is_highlighted ? g_theme->titlebar_btn_icon : g_theme->fg_primary) :
                               g_theme->fg_muted;
+                uint32_t fg = color_modulate_alpha(base_fg, alpha);
 
                 /* Checkmark indicator */
                 if (it->flags & MENU_ITEM_CHECKED) {

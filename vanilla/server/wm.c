@@ -1980,7 +1980,7 @@ int handle_msg_dnd_offer(vanilla_server_t *srv, int client_idx, const vanilla_ms
     return 0;
 }
 
-static void menu_compute_size(vanilla_compositor_t *comp, vanilla_context_menu_t *m)
+static void menu_compute_size(vanilla_compositor_t *comp, vanilla_context_menu_t *m, const vanilla_context_menu_t *parent)
 {
     int row_h = 24;
     int pad_x = 8;
@@ -2004,7 +2004,11 @@ static void menu_compute_size(vanilla_compositor_t *comp, vanilla_context_menu_t
     int screen_h = comp ? (int)comp->height : 600;
 
     /* If a submenu would go off-screen to the right, open it to the left of the parent item */
-    if (m->parent_id != 0 && m->x + m->width > screen_w) {
+    if (parent && (m->x + m->width > screen_w)) {
+        int new_x = parent->x - m->width;
+        if (new_x >= 0)
+            m->x = new_x;
+    } else if (m->parent_id != 0 && (m->x + m->width > screen_w)) {
         int new_x = m->x - m->width;
         if (new_x >= 0)
             m->x = new_x;
@@ -2021,6 +2025,21 @@ static void menu_compute_size(vanilla_compositor_t *comp, vanilla_context_menu_t
         m->y = 0;
 }
 
+static void wm_context_menu_damage(vanilla_server_t *srv, const vanilla_context_menu_t *m)
+{
+    if (!srv || !m || !m->active)
+        return;
+
+    int32_t sr = (g_theme && g_theme->shadow_radius > 0) ? g_theme->shadow_radius : 16;
+    vanilla_rect_t mr = {
+        m->x - sr,
+        m->y - sr,
+        m->width + sr * 2,
+        m->height + sr * 2
+    };
+    compositor_add_damage(&srv->compositor, &mr);
+}
+
 static int wm_context_menu_open_submenu(vanilla_server_t *srv, vanilla_context_menu_t *parent, int item_idx)
 {
     if (!srv || !parent || srv->context_menu_depth >= CONTEXT_MENU_MAX_DEPTH)
@@ -2032,6 +2051,15 @@ static int wm_context_menu_open_submenu(vanilla_server_t *srv, vanilla_context_m
     vanilla_menu_item_t *it = &parent->items[item_idx];
     if (it->submenu_id == 0 || !(it->flags & MENU_ITEM_ENABLED))
         return -1;
+
+    /* If this child submenu is already open, do not reopen */
+    if (parent->open_submenu_idx == item_idx && srv->context_menu_depth > 1)
+        return 0;
+
+    int parent_depth = (int)(parent - srv->context_menu_stack);
+    while (srv->context_menu_depth > parent_depth + 1) {
+        wm_context_menu_pop(srv);
+    }
 
     /* Look for submenu matching it->submenu_id in pool */
     vanilla_context_menu_t *sub = NULL;
@@ -2069,17 +2097,18 @@ static int wm_context_menu_open_submenu(vanilla_server_t *srv, vanilla_context_m
     dest->anim_alpha = (g_theme->reduce_motion != 0) ? 1.0f : 0.0f;
     dest->hover_timer_start = 0;
     dest->hover_item_idx = -1;
+    dest->open_submenu_idx = -1;
 
     int row_h = 24;
     dest->x = parent->x + parent->width;
     dest->y = parent->y + 2 + item_idx * row_h;
 
-    menu_compute_size(&srv->compositor, dest);
+    menu_compute_size(&srv->compositor, dest, parent);
 
+    parent->open_submenu_idx = item_idx;
     srv->context_menu_depth++;
-    vanilla_rect_t mr = { dest->x, dest->y, dest->width, dest->height };
-    compositor_add_damage(&srv->compositor, &mr);
 
+    wm_context_menu_damage(srv, dest);
     return 0;
 }
 
@@ -2089,16 +2118,16 @@ void wm_context_menu_pop(vanilla_server_t *srv)
         return;
 
     vanilla_context_menu_t *m = &srv->context_menu_stack[srv->context_menu_depth - 1];
-    vanilla_rect_t mr = { m->x, m->y, m->width, m->height };
-    compositor_add_damage(&srv->compositor, &mr);
+    wm_context_menu_damage(srv, m);
     m->active = 0;
     m->hover_timer_start = 0;
     m->hover_item_idx = -1;
+    m->open_submenu_idx = -1;
     srv->context_menu_depth--;
 
     vanilla_context_menu_t *new_top = &srv->context_menu_stack[srv->context_menu_depth - 1];
-    vanilla_rect_t top_r = { new_top->x, new_top->y, new_top->width, new_top->height };
-    compositor_add_damage(&srv->compositor, &top_r);
+    new_top->open_submenu_idx = -1;
+    wm_context_menu_damage(srv, new_top);
 }
 
 void wm_context_menu_close_stack(vanilla_server_t *srv, uint32_t result_item_id)
@@ -2109,11 +2138,11 @@ void wm_context_menu_close_stack(vanilla_server_t *srv, uint32_t result_item_id)
     for (int d = 0; d < srv->context_menu_depth; d++) {
         vanilla_context_menu_t *m = &srv->context_menu_stack[d];
         if (m->active) {
-            vanilla_rect_t mr = { m->x, m->y, m->width, m->height };
-            compositor_add_damage(&srv->compositor, &mr);
+            wm_context_menu_damage(srv, m);
             m->active = 0;
             m->hover_timer_start = 0;
             m->hover_item_idx = -1;
+            m->open_submenu_idx = -1;
         }
     }
 
@@ -2207,8 +2236,8 @@ int handle_msg_show_context_menu(vanilla_server_t *srv, int client_idx, const va
         return -1;
     }
 
-    if (req->item_count > CONTEXT_MENU_MAX_ITEMS) {
-        fprintf(stderr, "[vanilla] context menu: item count %u exceeds max %d\n",
+    if (req->item_count == 0 || req->item_count > CONTEXT_MENU_MAX_ITEMS) {
+        fprintf(stderr, "[vanilla] context menu: invalid item count %u (max %d)\n",
                 (unsigned)req->item_count, CONTEXT_MENU_MAX_ITEMS);
         vanilla_msg_hdr_t r_hdr;
         vanilla_msg_context_menu_result_t res;
@@ -2249,19 +2278,27 @@ int handle_msg_show_context_menu(vanilla_server_t *srv, int client_idx, const va
         m->anim_alpha = (g_theme->reduce_motion != 0) ? 1.0f : 0.0f;
         m->hover_timer_start = 0;
         m->hover_item_idx = -1;
+        m->open_submenu_idx = -1;
 
-        menu_compute_size(&srv->compositor, m);
+        menu_compute_size(&srv->compositor, m, NULL);
 
         srv->context_menu_depth = 1;
 
         srv->context_menu_pool[0] = *m;
         srv->context_menu_pool_count = 1;
 
-        vanilla_rect_t mr = { m->x, m->y, m->width, m->height };
-        compositor_add_damage(&srv->compositor, &mr);
+        wm_context_menu_damage(srv, m);
     } else {
-        if (srv->context_menu_pool_count < CONTEXT_MENU_POOL_SIZE) {
-            vanilla_context_menu_t *pm = &srv->context_menu_pool[srv->context_menu_pool_count++];
+        int found = -1;
+        for (int p = 0; p < srv->context_menu_pool_count; p++) {
+            if (srv->context_menu_pool[p].menu_id == req->menu_id) {
+                found = p;
+                break;
+            }
+        }
+        int p_idx = (found >= 0) ? found : (srv->context_menu_pool_count < CONTEXT_MENU_POOL_SIZE ? srv->context_menu_pool_count++ : -1);
+        if (p_idx >= 0) {
+            vanilla_context_menu_t *pm = &srv->context_menu_pool[p_idx];
             memset(pm, 0, sizeof(*pm));
             pm->active = 1;
             pm->owning_window_id = req->window_id;
@@ -2277,15 +2314,8 @@ int handle_msg_show_context_menu(vanilla_server_t *srv, int client_idx, const va
             pm->anim_alpha = (g_theme->reduce_motion != 0) ? 1.0f : 0.0f;
             pm->hover_timer_start = 0;
             pm->hover_item_idx = -1;
-            menu_compute_size(&srv->compositor, pm);
-        }
-
-        if (srv->context_menu_depth > 0 && srv->context_menu_depth < CONTEXT_MENU_MAX_DEPTH) {
-            vanilla_context_menu_t *parent = &srv->context_menu_stack[srv->context_menu_depth - 1];
-            if (parent->menu_id == req->parent_id) {
-                int item_idx = parent->highlighted >= 0 ? parent->highlighted : 0;
-                wm_context_menu_open_submenu(srv, parent, item_idx);
-            }
+            pm->open_submenu_idx = -1;
+            menu_compute_size(&srv->compositor, pm, NULL);
         }
     }
 
@@ -2333,15 +2363,15 @@ int wm_context_menu_open_desktop(vanilla_server_t *srv, int32_t x, int32_t y)
     m->anim_alpha = (g_theme->reduce_motion != 0) ? 1.0f : 0.0f;
     m->hover_timer_start = 0;
     m->hover_item_idx = -1;
+    m->open_submenu_idx = -1;
 
-    menu_compute_size(&srv->compositor, m);
+    menu_compute_size(&srv->compositor, m, NULL);
     srv->context_menu_depth = 1;
 
     srv->context_menu_pool[0] = *m;
     srv->context_menu_pool_count = 1;
 
-    vanilla_rect_t mr = { m->x, m->y, m->width, m->height };
-    compositor_add_damage(&srv->compositor, &mr);
+    wm_context_menu_damage(srv, m);
     return 0;
 }
 
@@ -2381,15 +2411,15 @@ int wm_context_menu_open_taskbar(vanilla_server_t *srv, int32_t x, int32_t y, ui
     m->anim_alpha = (g_theme->reduce_motion != 0) ? 1.0f : 0.0f;
     m->hover_timer_start = 0;
     m->hover_item_idx = -1;
+    m->open_submenu_idx = -1;
 
-    menu_compute_size(&srv->compositor, m);
+    menu_compute_size(&srv->compositor, m, NULL);
     srv->context_menu_depth = 1;
 
     srv->context_menu_pool[0] = *m;
     srv->context_menu_pool_count = 1;
 
-    vanilla_rect_t mr = { m->x, m->y, m->width, m->height };
-    compositor_add_damage(&srv->compositor, &mr);
+    wm_context_menu_damage(srv, m);
     return 0;
 }
 
@@ -2450,23 +2480,27 @@ int wm_context_menu_handle_motion(vanilla_server_t *srv, int32_t x, int32_t y)
         if (x >= m->x && x < m->x + m->width &&
             y >= m->y && y < m->y + m->height) {
 
-            while (srv->context_menu_depth > d + 1) {
-                wm_context_menu_pop(srv);
-            }
-
             int row_h = 24;
             int rel_y = y - (m->y + 2);
             int idx = (rel_y >= 0 && rel_y < m->height) ? (rel_y / row_h) : -1;
 
             if (idx >= 0 && idx < m->item_count) {
+                if (m->open_submenu_idx >= 0 && idx != m->open_submenu_idx) {
+                    while (srv->context_menu_depth > d + 1) {
+                        wm_context_menu_pop(srv);
+                    }
+                }
+
                 if (idx != m->highlighted) {
                     m->highlighted = idx;
-                    vanilla_rect_t mr = { m->x, m->y, m->width, m->height };
-                    compositor_add_damage(&srv->compositor, &mr);
+                    wm_context_menu_damage(srv, m);
                 }
 
                 if (m->items[idx].submenu_id != 0 && (m->items[idx].flags & MENU_ITEM_ENABLED)) {
-                    if (m->hover_item_idx != idx) {
+                    if (m->open_submenu_idx == idx) {
+                        m->hover_item_idx = -1;
+                        m->hover_timer_start = 0;
+                    } else if (m->hover_item_idx != idx) {
                         m->hover_item_idx = idx;
                         m->hover_timer_start = pit_ticks();
                     }
@@ -2519,7 +2553,6 @@ int wm_context_menu_handle_key(vanilla_server_t *srv, uint16_t code, int pressed
         return 1;
 
     vanilla_context_menu_t *m = &srv->context_menu_stack[srv->context_menu_depth - 1];
-    vanilla_rect_t mr = { m->x, m->y, m->width, m->height };
 
     if (code == KEY_ESC) {
         if (srv->context_menu_depth > 1) {
@@ -2541,7 +2574,7 @@ int wm_context_menu_handle_key(vanilla_server_t *srv, uint16_t code, int pressed
                 m->highlighted = cur;
                 m->hover_item_idx = -1;
                 m->hover_timer_start = 0;
-                compositor_add_damage(&srv->compositor, &mr);
+                wm_context_menu_damage(srv, m);
                 break;
             }
         }
@@ -2559,7 +2592,7 @@ int wm_context_menu_handle_key(vanilla_server_t *srv, uint16_t code, int pressed
                 m->highlighted = cur;
                 m->hover_item_idx = -1;
                 m->hover_timer_start = 0;
-                compositor_add_damage(&srv->compositor, &mr);
+                wm_context_menu_damage(srv, m);
                 break;
             }
         }
@@ -2614,22 +2647,29 @@ int wm_run_context_menu_selftests(void)
     m.y = 550;
     m.item_count = 5;
     strncpy(m.items[0].label, "File", MENU_ITEM_LABEL_MAX - 1);
-    menu_compute_size(&srv.compositor, &m);
+    menu_compute_size(&srv.compositor, &m, NULL);
     if (m.width < 160 || m.x + m.width > 800 || m.y + m.height > 600) {
         fprintf(stderr, "[context_menu_selftest] FAIL: geometry clamping\n");
         return -1;
     }
 
     /* 2. Submenu positioning flip to left when overflow */
+    vanilla_context_menu_t parent_box;
+    memset(&parent_box, 0, sizeof(parent_box));
+    parent_box.x = 650;
+    parent_box.y = 100;
+    parent_box.width = 160;
+    parent_box.height = 100;
+
     vanilla_context_menu_t sub;
     memset(&sub, 0, sizeof(sub));
     sub.parent_id = 1;
-    sub.x = 750;
+    sub.x = parent_box.x + parent_box.width;
     sub.y = 100;
     sub.item_count = 3;
     strncpy(sub.items[0].label, "Submenu Item", MENU_ITEM_LABEL_MAX - 1);
-    menu_compute_size(&srv.compositor, &sub);
-    if (sub.x + sub.width > 800) {
+    menu_compute_size(&srv.compositor, &sub, &parent_box);
+    if (sub.x + sub.width > 800 || sub.x != parent_box.x - sub.width) {
         fprintf(stderr, "[context_menu_selftest] FAIL: submenu flip\n");
         return -1;
     }
@@ -2659,6 +2699,20 @@ int wm_run_context_menu_selftests(void)
     top->items[2].flags = 0; /* disabled */
     top->items[3].flags = MENU_ITEM_ENABLED;
     top->items[3].submenu_id = 5;
+
+    /* Pre-register submenu 5 in pool */
+    srv.context_menu_pool_count = 1;
+    vanilla_context_menu_t *pool_sub = &srv.context_menu_pool[0];
+    memset(pool_sub, 0, sizeof(*pool_sub));
+    pool_sub->active = 1;
+    pool_sub->menu_id = 5;
+    pool_sub->item_count = 2;
+    pool_sub->items[0].item_id = 51;
+    pool_sub->items[0].flags = MENU_ITEM_ENABLED;
+    strncpy(pool_sub->items[0].label, "Sub Item 1", MENU_ITEM_LABEL_MAX - 1);
+    pool_sub->items[1].item_id = 52;
+    pool_sub->items[1].flags = MENU_ITEM_ENABLED;
+    strncpy(pool_sub->items[1].label, "Sub Item 2", MENU_ITEM_LABEL_MAX - 1);
 
     wm_context_menu_handle_key(&srv, KEY_DOWN, 1);
     if (top->highlighted != 3) {
@@ -2734,7 +2788,29 @@ int wm_run_context_menu_selftests(void)
         return -1;
     }
 
-    printf("[vanilla] context menu & submenu self-tests passed (8/8)\n");
+    /* 9. Motion routing preserves child submenu on parent item, pops on other item */
+    wm_context_menu_open_desktop(&srv, 100, 100);
+    srv.context_menu_stack[0].items[1].submenu_id = 5;
+    wm_context_menu_open_submenu(&srv, &srv.context_menu_stack[0], 1);
+    if (srv.context_menu_depth != 2) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: open child for motion test\n");
+        return -1;
+    }
+    /* Move cursor on row 1 of parent menu (item that opened child) -> child stays open */
+    wm_context_menu_handle_motion(&srv, srv.context_menu_stack[0].x + 10, srv.context_menu_stack[0].y + 2 + 1 * 24 + 4);
+    if (srv.context_menu_depth != 2) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: motion on parent item prematurely closed submenu\n");
+        return -1;
+    }
+    /* Move cursor on row 0 of parent menu (different item) -> child closes */
+    wm_context_menu_handle_motion(&srv, srv.context_menu_stack[0].x + 10, srv.context_menu_stack[0].y + 2 + 0 * 24 + 4);
+    if (srv.context_menu_depth != 1) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: motion to different item did not close child\n");
+        return -1;
+    }
+    wm_context_menu_close_stack(&srv, 0);
+
+    printf("[vanilla] context menu & submenu self-tests passed (9/9)\n");
     return 0;
 }
 
@@ -3083,6 +3159,9 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
     (void)timeout_ms;
     int frame_ms = (int)(1000 / COMPOSITOR_TARGET_FPS);
     ret = poll(fds, (nfds_t)nfds, frame_ms);
+
+    wm_context_menu_check_timers(srv);
+
     if (ret <= 0) {
         if (srv->compositor.dirty_count > 0) {
             if (compositor_frame_due(&srv->compositor)) {
@@ -3484,7 +3563,9 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 }
             }
 
-            if (srv->is_resizing) {
+            if (srv->context_menu_depth > 0) {
+                cursor_set_active(CURSOR_ARROW);
+            } else if (srv->is_resizing) {
                 cursor_set_active(resize_edge_to_cursor_shape((vanilla_resize_edge_t)srv->resize_edge));
             } else if (!srv->is_dragging) {
                 vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);

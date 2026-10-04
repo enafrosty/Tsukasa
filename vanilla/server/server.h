@@ -52,6 +52,7 @@ typedef struct {
     float               anim_alpha;
     uint64_t            hover_timer_start;
     int                 hover_item_idx;
+    int                 open_submenu_idx;
 } vanilla_context_menu_t;
 
 #if defined(_WIN32)

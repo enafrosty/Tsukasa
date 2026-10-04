@@ -1061,6 +1061,39 @@ int vanilla_wait_event(vanilla_client_t *client, vanilla_event_t *out_ev)
     return vanilla_poll_event(client, out_ev);
 }
 
+int vanilla_show_submenu(vanilla_client_t *client, vanilla_window_t *win,
+                         uint32_t menu_id, uint32_t parent_id,
+                         const vanilla_menu_item_t *items, uint32_t item_count)
+{
+    if (!client || !items || item_count == 0 || item_count > 64)
+        return -1;
+
+    vanilla_msg_hdr_t hdr;
+    vanilla_msg_show_context_menu_t req;
+    size_t items_size = (size_t)item_count * sizeof(vanilla_menu_item_t);
+
+    hdr.magic = VANILLA_IPC_MAGIC;
+    hdr.msg_type = MSG_SHOW_CONTEXT_MENU;
+    hdr.payload_len = (uint16_t)(sizeof(req) + items_size);
+    hdr.window_id = win ? win->window_id : 0;
+
+    req.window_id = hdr.window_id;
+    req.menu_id = menu_id;
+    req.parent_id = parent_id;
+    req.x = 0;
+    req.y = 0;
+    req.item_count = item_count;
+
+    if (exact_write(client->socket_fd, &hdr, sizeof(hdr)) < 0)
+        return -1;
+    if (exact_write(client->socket_fd, &req, sizeof(req)) < 0)
+        return -1;
+    if (exact_write(client->socket_fd, items, items_size) < 0)
+        return -1;
+
+    return (int)menu_id;
+}
+
 int vanilla_show_context_menu(vanilla_client_t *client, vanilla_window_t *win,
                               uint32_t menu_id, int32_t x, int32_t y,
                               const vanilla_menu_item_t *items, uint32_t item_count)
@@ -1157,6 +1190,15 @@ int vanilla_menu_builder_show(vanilla_menu_builder_t *b, vanilla_client_t *c,
         return -1;
 
     return vanilla_show_context_menu(c, w, menu_id, x, y, b->items, b->count);
+}
+
+int vanilla_menu_builder_show_sub(vanilla_menu_builder_t *b, vanilla_client_t *c,
+                                  vanilla_window_t *w, uint32_t menu_id, uint32_t parent_id)
+{
+    if (!b || !c)
+        return -1;
+
+    return vanilla_show_submenu(c, w, menu_id, parent_id, b->items, b->count);
 }
 
 void vanilla_menu_builder_free(vanilla_menu_builder_t *b)

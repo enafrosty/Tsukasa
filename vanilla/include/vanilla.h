@@ -129,6 +129,9 @@ int  vanilla_wait_event(vanilla_client_t *client, vanilla_event_t *out_ev);
 int vanilla_show_context_menu(vanilla_client_t *client, vanilla_window_t *win,
                               uint32_t menu_id, int32_t x, int32_t y,
                               const vanilla_menu_item_t *items, uint32_t item_count);
+int vanilla_show_submenu(vanilla_client_t *client, vanilla_window_t *win,
+                         uint32_t menu_id, uint32_t parent_id,
+                         const vanilla_menu_item_t *items, uint32_t item_count);
 
 /* Convenience builder */
 typedef struct vanilla_menu_builder vanilla_menu_builder_t;
@@ -139,6 +142,8 @@ void vanilla_menu_builder_add_submenu(vanilla_menu_builder_t *b, uint32_t id,
                                      const char *label, uint32_t submenu_id);
 int  vanilla_menu_builder_show(vanilla_menu_builder_t *b, vanilla_client_t *c,
                                vanilla_window_t *w, uint32_t menu_id, int32_t x, int32_t y);
+int  vanilla_menu_builder_show_sub(vanilla_menu_builder_t *b, vanilla_client_t *c,
+                                   vanilla_window_t *w, uint32_t menu_id, uint32_t parent_id);
 void vanilla_menu_builder_free(vanilla_menu_builder_t *b);
 
 #endif /* _VANILLA_H */
