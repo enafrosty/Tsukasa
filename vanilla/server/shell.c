@@ -50,7 +50,7 @@ static inline uint32_t shell_get_badge_color(int index)
     }
 }
 
-static void shell_spawn_app(const char *path)
+void shell_spawn_app(const char *path)
 {
     char current_path[256];
     strncpy(current_path, path, sizeof(current_path) - 1);
@@ -102,6 +102,10 @@ void shell_init(vanilla_shell_t *shell)
 
 void shell_update_clock(vanilla_shell_t *shell, vanilla_server_t *srv)
 {
+    if (srv) {
+        wm_context_menu_check_timers(srv);
+    }
+
     if (!shell)
         return;
 

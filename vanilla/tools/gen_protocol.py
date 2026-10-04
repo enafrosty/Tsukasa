@@ -32,7 +32,7 @@ def parse_yaml(path):
                 k, v = [x.strip().strip('"\'') for x in s.split(":", 1)]
                 target = cur if (cur is not None and (raw.startswith(" ") or raw.startswith("\t"))) else msg
                 if k in ("id", "version"): target[k] = int(v)
-                elif k == "v1_compat": target[k] = v.lower() in ("true", "1", "yes")
+                elif k in ("v1_compat", "variable_payload"): target[k] = v.lower() in ("true", "1", "yes")
                 elif k != "fields": target[k] = v
     msg.setdefault("version", 1); msg.setdefault("v1_compat", True)
     return msg
@@ -80,7 +80,9 @@ def emit_header(messages):
                        f"typedef struct {{\n{f_decls}\n}} __attribute__((packed)) {sn};\n\n"
                        f'_Static_assert(sizeof({sn}) == {tot},\n    "{sn} size mismatch; regenerate protocol");\n\n')
     protos = "\n".join(f"int handle_{m['name'].lower()}(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);" for m in c2s)
-    tbl = "\n".join(f"    {{ {m['name']}, {m['version']}, sizeof({struct_name(m['name'])}), handle_{m['name'].lower()} }}," for m in c2s)
+    def get_sz(m):
+        return "0" if m.get("variable_payload") else f"sizeof({struct_name(m['name'])})"
+    tbl = "\n".join(f"    {{ {m['name']}, {m['version']}, {get_sz(m)}, handle_{m['name'].lower()} }}," for m in c2s)
     return (
         f"{GPL}/* Auto-generated - do not edit. Regenerate with: make -C vanilla gen-protocol */\n\n"
         f"#ifndef _VANILLA_PROTOCOL_GENERATED_H\n#define _VANILLA_PROTOCOL_GENERATED_H\n\n"

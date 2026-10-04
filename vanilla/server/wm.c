@@ -535,6 +535,11 @@ int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
     shell_init(&srv->shell);
     launcher_init(&srv->launcher);
 
+    srv->context_menu_depth = 0;
+    srv->context_menu_pool_count = 0;
+    memset(srv->context_menu_stack, 0, sizeof(srv->context_menu_stack));
+    memset(srv->context_menu_pool, 0, sizeof(srv->context_menu_pool));
+
     cursor_manager_init("assets/cursors");
     cursor_set_active(CURSOR_ARROW);
 
@@ -547,6 +552,7 @@ int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
     wm_run_resize_selftests();
     wm_run_input_selftests();
     wm_run_animation_selftests();
+    wm_run_context_menu_selftests();
 
     return 0;
 }
@@ -1974,6 +1980,840 @@ int handle_msg_dnd_offer(vanilla_server_t *srv, int client_idx, const vanilla_ms
     return 0;
 }
 
+static void menu_compute_size(vanilla_compositor_t *comp, vanilla_context_menu_t *m, const vanilla_context_menu_t *parent)
+{
+    int row_h = 24;
+    int pad_x = 8;
+    int min_w = 160;
+
+    int content_w = min_w;
+    for (int i = 0; i < m->item_count; i++) {
+        int tw = (int)strlen(m->items[i].label) * 7 + pad_x * 2;
+        if (m->items[i].submenu_id != 0)
+            tw += 16;
+        if (m->items[i].flags & MENU_ITEM_CHECKED)
+            tw += 12;
+        if (tw > content_w)
+            content_w = tw;
+    }
+
+    m->width = content_w + pad_x * 2;
+    m->height = m->item_count * row_h + 4;
+
+    int screen_w = comp ? (int)comp->width : 800;
+    int screen_h = comp ? (int)comp->height : 600;
+
+    /* If a submenu would go off-screen to the right, open it to the left of the parent item */
+    if (parent && (m->x + m->width > screen_w)) {
+        int new_x = parent->x - m->width;
+        if (new_x >= 0)
+            m->x = new_x;
+    } else if (m->parent_id != 0 && (m->x + m->width > screen_w)) {
+        int new_x = m->x - m->width;
+        if (new_x >= 0)
+            m->x = new_x;
+    }
+
+    /* Clamp to screen bounds */
+    if (m->x + m->width > screen_w)
+        m->x = screen_w - m->width;
+    if (m->y + m->height > screen_h)
+        m->y = screen_h - m->height;
+    if (m->x < 0)
+        m->x = 0;
+    if (m->y < 0)
+        m->y = 0;
+}
+
+static void wm_context_menu_damage(vanilla_server_t *srv, const vanilla_context_menu_t *m)
+{
+    if (!srv || !m || !m->active)
+        return;
+
+    int32_t sr = (g_theme && g_theme->shadow_radius > 0) ? g_theme->shadow_radius : 16;
+    vanilla_rect_t mr = {
+        m->x - sr,
+        m->y - sr,
+        m->width + sr * 2,
+        m->height + sr * 2
+    };
+    compositor_add_damage(&srv->compositor, &mr);
+}
+
+static int wm_context_menu_open_submenu(vanilla_server_t *srv, vanilla_context_menu_t *parent, int item_idx)
+{
+    if (!srv || !parent || srv->context_menu_depth >= CONTEXT_MENU_MAX_DEPTH)
+        return -1;
+
+    if (item_idx < 0 || item_idx >= parent->item_count)
+        return -1;
+
+    vanilla_menu_item_t *it = &parent->items[item_idx];
+    if (it->submenu_id == 0 || !(it->flags & MENU_ITEM_ENABLED))
+        return -1;
+
+    /* If this child submenu is already open, do not reopen */
+    if (parent->open_submenu_idx == item_idx && srv->context_menu_depth > 1)
+        return 0;
+
+    int parent_depth = (int)(parent - srv->context_menu_stack);
+    while (srv->context_menu_depth > parent_depth + 1) {
+        wm_context_menu_pop(srv);
+    }
+
+    /* Look for submenu matching it->submenu_id in pool */
+    vanilla_context_menu_t *sub = NULL;
+    for (int p = 0; p < srv->context_menu_pool_count; p++) {
+        if (srv->context_menu_pool[p].menu_id == it->submenu_id) {
+            sub = &srv->context_menu_pool[p];
+            break;
+        }
+    }
+
+    vanilla_context_menu_t *dest = &srv->context_menu_stack[srv->context_menu_depth];
+    memset(dest, 0, sizeof(*dest));
+
+    if (sub) {
+        *dest = *sub;
+    } else {
+        dest->menu_id = it->submenu_id;
+        dest->parent_id = parent->menu_id;
+        dest->owning_window_id = parent->owning_window_id;
+        dest->client_idx = parent->client_idx;
+        dest->item_count = 2;
+        dest->items[0].item_id = it->submenu_id * 10 + 1;
+        dest->items[0].submenu_id = 0;
+        dest->items[0].flags = MENU_ITEM_ENABLED;
+        strncpy(dest->items[0].label, "Option 1", MENU_ITEM_LABEL_MAX - 1);
+        dest->items[1].item_id = it->submenu_id * 10 + 2;
+        dest->items[1].submenu_id = 0;
+        dest->items[1].flags = MENU_ITEM_ENABLED;
+        strncpy(dest->items[1].label, "Option 2", MENU_ITEM_LABEL_MAX - 1);
+    }
+
+    dest->active = 1;
+    dest->highlighted = -1;
+    dest->open_ticks = pit_ticks();
+    dest->anim_alpha = (g_theme->reduce_motion != 0) ? 1.0f : 0.0f;
+    dest->hover_timer_start = 0;
+    dest->hover_item_idx = -1;
+    dest->open_submenu_idx = -1;
+
+    int row_h = 24;
+    dest->x = parent->x + parent->width;
+    dest->y = parent->y + 2 + item_idx * row_h;
+
+    menu_compute_size(&srv->compositor, dest, parent);
+
+    parent->open_submenu_idx = item_idx;
+    srv->context_menu_depth++;
+
+    wm_context_menu_damage(srv, dest);
+    return 0;
+}
+
+void wm_context_menu_pop(vanilla_server_t *srv)
+{
+    if (!srv || srv->context_menu_depth <= 1)
+        return;
+
+    vanilla_context_menu_t *m = &srv->context_menu_stack[srv->context_menu_depth - 1];
+    wm_context_menu_damage(srv, m);
+    m->active = 0;
+    m->hover_timer_start = 0;
+    m->hover_item_idx = -1;
+    m->open_submenu_idx = -1;
+    srv->context_menu_depth--;
+
+    vanilla_context_menu_t *new_top = &srv->context_menu_stack[srv->context_menu_depth - 1];
+    new_top->open_submenu_idx = -1;
+    wm_context_menu_damage(srv, new_top);
+}
+
+void wm_context_menu_close_stack(vanilla_server_t *srv, uint32_t result_item_id)
+{
+    if (!srv || srv->context_menu_depth <= 0)
+        return;
+
+    for (int d = 0; d < srv->context_menu_depth; d++) {
+        vanilla_context_menu_t *m = &srv->context_menu_stack[d];
+        if (m->active) {
+            wm_context_menu_damage(srv, m);
+            m->active = 0;
+            m->hover_timer_start = 0;
+            m->hover_item_idx = -1;
+            m->open_submenu_idx = -1;
+        }
+    }
+
+    vanilla_context_menu_t *root = &srv->context_menu_stack[0];
+
+    int target_fd = -1;
+    if (root->client_idx >= 0 && root->client_idx < VANILLA_MAX_CLIENTS &&
+        srv->clients[root->client_idx].in_use && srv->clients[root->client_idx].fd >= 0) {
+        target_fd = srv->clients[root->client_idx].fd;
+    } else if (root->owning_window_id != 0) {
+        vanilla_server_window_t *w = vanilla_server_find_window(srv, root->owning_window_id);
+        if (w && w->client_fd >= 0)
+            target_fd = w->client_fd;
+    }
+
+    if (target_fd >= 0) {
+        vanilla_msg_hdr_t r_hdr;
+        vanilla_msg_context_menu_result_t res;
+        r_hdr.magic = VANILLA_IPC_MAGIC;
+        r_hdr.msg_type = MSG_CONTEXT_MENU_RESULT;
+        r_hdr.payload_len = (uint16_t)sizeof(res);
+        r_hdr.window_id = root->owning_window_id;
+        res.window_id = root->owning_window_id;
+        res.menu_id = root->menu_id;
+        res.item_id = result_item_id;
+        exact_write(target_fd, &r_hdr, sizeof(r_hdr));
+        exact_write(target_fd, &res, sizeof(res));
+    } else if (root->client_idx == -1) {
+        if (result_item_id != 0) {
+            if (root->menu_id == SERVER_MENU_DESKTOP) {
+                if (result_item_id == 1) {
+                    srv->compositor.has_wallpaper = !srv->compositor.has_wallpaper;
+                    compositor_damage_all(&srv->compositor);
+                } else if (result_item_id == 2) {
+                    shell_spawn_app("/bin/filemgr.elf");
+                } else if (result_item_id == 3) {
+                    shell_spawn_app("/bin/terminal.elf");
+                }
+            } else if (root->menu_id == SERVER_MENU_TASKBAR) {
+                if (result_item_id == 1) {
+                    if (root->owning_window_id != 0)
+                        vanilla_server_close_request(srv, root->owning_window_id);
+                } else if (result_item_id == 2) {
+                    if (root->owning_window_id != 0) {
+                        vanilla_server_window_t *w = vanilla_server_find_window(srv, root->owning_window_id);
+                        if (w) {
+                            w->is_mapped = 1;
+                            vanilla_server_focus_window(srv, w->window_id);
+                            wm_raise_window(srv, w->window_id);
+                            shell_invalidate(srv);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    srv->context_menu_depth = 0;
+    srv->context_menu_pool_count = 0;
+}
+
+int handle_msg_show_context_menu(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    if (!srv || !hdr || !payload)
+        return -1;
+
+    if (hdr->payload_len < sizeof(vanilla_msg_show_context_menu_t)) {
+        fprintf(stderr, "[vanilla] context menu: payload too short (%u bytes)\n", (unsigned)hdr->payload_len);
+        return -1;
+    }
+
+    const vanilla_msg_show_context_menu_t *req = (const vanilla_msg_show_context_menu_t *)payload;
+    size_t expected_len = sizeof(vanilla_msg_show_context_menu_t) + (size_t)req->item_count * sizeof(vanilla_menu_item_t);
+
+    if (hdr->payload_len < expected_len) {
+        fprintf(stderr, "[vanilla] context menu: payload size mismatch: expected >= %zu, got %u\n",
+                expected_len, (unsigned)hdr->payload_len);
+        vanilla_msg_hdr_t r_hdr;
+        vanilla_msg_context_menu_result_t res;
+        r_hdr.magic = VANILLA_IPC_MAGIC;
+        r_hdr.msg_type = MSG_CONTEXT_MENU_RESULT;
+        r_hdr.payload_len = (uint16_t)sizeof(res);
+        r_hdr.window_id = req->window_id;
+        res.window_id = req->window_id;
+        res.menu_id = req->menu_id;
+        res.item_id = 0;
+        if (client_idx >= 0 && client_idx < VANILLA_MAX_CLIENTS && srv->clients[client_idx].in_use) {
+            exact_write(srv->clients[client_idx].fd, &r_hdr, sizeof(r_hdr));
+            exact_write(srv->clients[client_idx].fd, &res, sizeof(res));
+        }
+        return -1;
+    }
+
+    if (req->item_count == 0 || req->item_count > CONTEXT_MENU_MAX_ITEMS) {
+        fprintf(stderr, "[vanilla] context menu: invalid item count %u (max %d)\n",
+                (unsigned)req->item_count, CONTEXT_MENU_MAX_ITEMS);
+        vanilla_msg_hdr_t r_hdr;
+        vanilla_msg_context_menu_result_t res;
+        r_hdr.magic = VANILLA_IPC_MAGIC;
+        r_hdr.msg_type = MSG_CONTEXT_MENU_RESULT;
+        r_hdr.payload_len = (uint16_t)sizeof(res);
+        r_hdr.window_id = req->window_id;
+        res.window_id = req->window_id;
+        res.menu_id = req->menu_id;
+        res.item_id = 0;
+        if (client_idx >= 0 && client_idx < VANILLA_MAX_CLIENTS && srv->clients[client_idx].in_use) {
+            exact_write(srv->clients[client_idx].fd, &r_hdr, sizeof(r_hdr));
+            exact_write(srv->clients[client_idx].fd, &res, sizeof(res));
+        }
+        return -1;
+    }
+
+    const vanilla_menu_item_t *items = (const vanilla_menu_item_t *)(payload + sizeof(vanilla_msg_show_context_menu_t));
+
+    if (req->parent_id == 0) {
+        if (srv->context_menu_depth > 0)
+            wm_context_menu_close_stack(srv, 0);
+        srv->context_menu_pool_count = 0;
+
+        vanilla_context_menu_t *m = &srv->context_menu_stack[0];
+        memset(m, 0, sizeof(*m));
+        m->active = 1;
+        m->owning_window_id = req->window_id;
+        m->client_idx = client_idx;
+        m->menu_id = req->menu_id;
+        m->parent_id = 0;
+        m->x = req->x;
+        m->y = req->y;
+        m->item_count = (int)req->item_count;
+        memcpy(m->items, items, (size_t)req->item_count * sizeof(vanilla_menu_item_t));
+        m->highlighted = -1;
+        m->open_ticks = pit_ticks();
+        m->anim_alpha = (g_theme->reduce_motion != 0) ? 1.0f : 0.0f;
+        m->hover_timer_start = 0;
+        m->hover_item_idx = -1;
+        m->open_submenu_idx = -1;
+
+        menu_compute_size(&srv->compositor, m, NULL);
+
+        srv->context_menu_depth = 1;
+
+        srv->context_menu_pool[0] = *m;
+        srv->context_menu_pool_count = 1;
+
+        wm_context_menu_damage(srv, m);
+    } else {
+        int found = -1;
+        for (int p = 0; p < srv->context_menu_pool_count; p++) {
+            if (srv->context_menu_pool[p].menu_id == req->menu_id) {
+                found = p;
+                break;
+            }
+        }
+        int p_idx = (found >= 0) ? found : (srv->context_menu_pool_count < CONTEXT_MENU_POOL_SIZE ? srv->context_menu_pool_count++ : -1);
+        if (p_idx >= 0) {
+            vanilla_context_menu_t *pm = &srv->context_menu_pool[p_idx];
+            memset(pm, 0, sizeof(*pm));
+            pm->active = 1;
+            pm->owning_window_id = req->window_id;
+            pm->client_idx = client_idx;
+            pm->menu_id = req->menu_id;
+            pm->parent_id = req->parent_id;
+            pm->x = req->x;
+            pm->y = req->y;
+            pm->item_count = (int)req->item_count;
+            memcpy(pm->items, items, (size_t)req->item_count * sizeof(vanilla_menu_item_t));
+            pm->highlighted = -1;
+            pm->open_ticks = pit_ticks();
+            pm->anim_alpha = (g_theme->reduce_motion != 0) ? 1.0f : 0.0f;
+            pm->hover_timer_start = 0;
+            pm->hover_item_idx = -1;
+            pm->open_submenu_idx = -1;
+            menu_compute_size(&srv->compositor, pm, NULL);
+        }
+    }
+
+    return 0;
+}
+
+int wm_context_menu_open_desktop(vanilla_server_t *srv, int32_t x, int32_t y)
+{
+    if (!srv)
+        return -1;
+
+    if (srv->context_menu_depth > 0)
+        wm_context_menu_close_stack(srv, 0);
+
+    srv->context_menu_pool_count = 0;
+
+    vanilla_context_menu_t *m = &srv->context_menu_stack[0];
+    memset(m, 0, sizeof(*m));
+    m->active = 1;
+    m->owning_window_id = 0;
+    m->client_idx = -1;
+    m->menu_id = SERVER_MENU_DESKTOP;
+    m->parent_id = 0;
+    m->x = x;
+    m->y = y;
+    m->item_count = 3;
+
+    m->items[0].item_id = 1;
+    m->items[0].submenu_id = 0;
+    m->items[0].flags = MENU_ITEM_ENABLED;
+    strncpy(m->items[0].label, "Change Wallpaper", MENU_ITEM_LABEL_MAX - 1);
+
+    m->items[1].item_id = 2;
+    m->items[1].submenu_id = 0;
+    m->items[1].flags = MENU_ITEM_ENABLED;
+    strncpy(m->items[1].label, "Open File Manager", MENU_ITEM_LABEL_MAX - 1);
+
+    m->items[2].item_id = 3;
+    m->items[2].submenu_id = 0;
+    m->items[2].flags = MENU_ITEM_ENABLED;
+    strncpy(m->items[2].label, "Terminal Here", MENU_ITEM_LABEL_MAX - 1);
+
+    m->highlighted = -1;
+    m->open_ticks = pit_ticks();
+    m->anim_alpha = (g_theme->reduce_motion != 0) ? 1.0f : 0.0f;
+    m->hover_timer_start = 0;
+    m->hover_item_idx = -1;
+    m->open_submenu_idx = -1;
+
+    menu_compute_size(&srv->compositor, m, NULL);
+    srv->context_menu_depth = 1;
+
+    srv->context_menu_pool[0] = *m;
+    srv->context_menu_pool_count = 1;
+
+    wm_context_menu_damage(srv, m);
+    return 0;
+}
+
+int wm_context_menu_open_taskbar(vanilla_server_t *srv, int32_t x, int32_t y, uint32_t window_id)
+{
+    if (!srv)
+        return -1;
+
+    if (srv->context_menu_depth > 0)
+        wm_context_menu_close_stack(srv, 0);
+
+    srv->context_menu_pool_count = 0;
+
+    vanilla_context_menu_t *m = &srv->context_menu_stack[0];
+    memset(m, 0, sizeof(*m));
+    m->active = 1;
+    m->owning_window_id = window_id;
+    m->client_idx = -1;
+    m->menu_id = SERVER_MENU_TASKBAR;
+    m->parent_id = 0;
+    m->x = x;
+    m->y = y;
+    m->item_count = 2;
+
+    m->items[0].item_id = 1;
+    m->items[0].submenu_id = 0;
+    m->items[0].flags = MENU_ITEM_ENABLED;
+    strncpy(m->items[0].label, "Close", MENU_ITEM_LABEL_MAX - 1);
+
+    m->items[1].item_id = 2;
+    m->items[1].submenu_id = 0;
+    m->items[1].flags = MENU_ITEM_ENABLED;
+    strncpy(m->items[1].label, "Move to Front", MENU_ITEM_LABEL_MAX - 1);
+
+    m->highlighted = -1;
+    m->open_ticks = pit_ticks();
+    m->anim_alpha = (g_theme->reduce_motion != 0) ? 1.0f : 0.0f;
+    m->hover_timer_start = 0;
+    m->hover_item_idx = -1;
+    m->open_submenu_idx = -1;
+
+    menu_compute_size(&srv->compositor, m, NULL);
+    srv->context_menu_depth = 1;
+
+    srv->context_menu_pool[0] = *m;
+    srv->context_menu_pool_count = 1;
+
+    wm_context_menu_damage(srv, m);
+    return 0;
+}
+
+int wm_context_menu_handle_click(vanilla_server_t *srv, int32_t x, int32_t y, uint32_t button)
+{
+    if (!srv || srv->context_menu_depth <= 0)
+        return 0;
+
+    if (button != BTN_LEFT)
+        return 0;
+
+    for (int d = srv->context_menu_depth - 1; d >= 0; d--) {
+        vanilla_context_menu_t *m = &srv->context_menu_stack[d];
+        if (!m->active)
+            continue;
+
+        if (x >= m->x && x < m->x + m->width &&
+            y >= m->y && y < m->y + m->height) {
+
+            while (srv->context_menu_depth > d + 1) {
+                wm_context_menu_pop(srv);
+            }
+
+            int row_h = 24;
+            int rel_y = y - (m->y + 2);
+            int idx = (rel_y >= 0 && rel_y < m->height) ? (rel_y / row_h) : -1;
+
+            if (idx >= 0 && idx < m->item_count) {
+                vanilla_menu_item_t *it = &m->items[idx];
+                if ((it->flags & MENU_ITEM_ENABLED) && !(it->flags & MENU_ITEM_SEPARATOR)) {
+                    if (it->submenu_id != 0) {
+                        wm_context_menu_open_submenu(srv, m, idx);
+                        return 1;
+                    } else {
+                        wm_context_menu_close_stack(srv, it->item_id);
+                        return 1;
+                    }
+                }
+            }
+            return 1;
+        }
+    }
+
+    wm_context_menu_close_stack(srv, 0);
+    return 1;
+}
+
+int wm_context_menu_handle_motion(vanilla_server_t *srv, int32_t x, int32_t y)
+{
+    if (!srv || srv->context_menu_depth <= 0)
+        return 0;
+
+    for (int d = srv->context_menu_depth - 1; d >= 0; d--) {
+        vanilla_context_menu_t *m = &srv->context_menu_stack[d];
+        if (!m->active)
+            continue;
+
+        if (x >= m->x && x < m->x + m->width &&
+            y >= m->y && y < m->y + m->height) {
+
+            int row_h = 24;
+            int rel_y = y - (m->y + 2);
+            int idx = (rel_y >= 0 && rel_y < m->height) ? (rel_y / row_h) : -1;
+
+            if (idx >= 0 && idx < m->item_count) {
+                if (m->open_submenu_idx >= 0 && idx != m->open_submenu_idx) {
+                    while (srv->context_menu_depth > d + 1) {
+                        wm_context_menu_pop(srv);
+                    }
+                }
+
+                if (idx != m->highlighted) {
+                    m->highlighted = idx;
+                    wm_context_menu_damage(srv, m);
+                }
+
+                if (m->items[idx].submenu_id != 0 && (m->items[idx].flags & MENU_ITEM_ENABLED)) {
+                    if (m->open_submenu_idx == idx) {
+                        m->hover_item_idx = -1;
+                        m->hover_timer_start = 0;
+                    } else if (m->hover_item_idx != idx) {
+                        m->hover_item_idx = idx;
+                        m->hover_timer_start = pit_ticks();
+                    }
+                } else {
+                    m->hover_item_idx = -1;
+                    m->hover_timer_start = 0;
+                }
+            }
+            return 1;
+        }
+    }
+
+    vanilla_context_menu_t *top = &srv->context_menu_stack[srv->context_menu_depth - 1];
+    if (top->hover_item_idx >= 0) {
+        top->hover_item_idx = -1;
+        top->hover_timer_start = 0;
+    }
+
+    return 0;
+}
+
+void wm_context_menu_check_timers(vanilla_server_t *srv)
+{
+    if (!srv || srv->context_menu_depth <= 0)
+        return;
+
+    vanilla_context_menu_t *m = &srv->context_menu_stack[srv->context_menu_depth - 1];
+    if (m->hover_item_idx >= 0 && m->hover_timer_start > 0) {
+        uint64_t now = pit_ticks();
+        uint64_t freq = pit_frequency();
+        uint64_t timeout_ticks = (freq * 300) / 1000;
+        if (now >= m->hover_timer_start && (now - m->hover_timer_start) >= timeout_ticks) {
+            int h_idx = m->hover_item_idx;
+            m->hover_timer_start = 0;
+            m->hover_item_idx = -1;
+            if (h_idx < m->item_count && m->items[h_idx].submenu_id != 0 &&
+                (m->items[h_idx].flags & MENU_ITEM_ENABLED)) {
+                wm_context_menu_open_submenu(srv, m, h_idx);
+            }
+        }
+    }
+}
+
+int wm_context_menu_handle_key(vanilla_server_t *srv, uint16_t code, int pressed)
+{
+    if (!srv || srv->context_menu_depth <= 0)
+        return 0;
+
+    if (!pressed)
+        return 1;
+
+    vanilla_context_menu_t *m = &srv->context_menu_stack[srv->context_menu_depth - 1];
+
+    if (code == KEY_ESC) {
+        if (srv->context_menu_depth > 1) {
+            wm_context_menu_pop(srv);
+        } else {
+            wm_context_menu_close_stack(srv, 0);
+        }
+        return 1;
+    }
+
+    if (code == KEY_UP) {
+        if (m->item_count <= 0)
+            return 1;
+        int start = (m->highlighted >= 0) ? m->highlighted : 0;
+        int cur = start;
+        for (int step = 0; step < m->item_count; step++) {
+            cur = (cur - 1 + m->item_count) % m->item_count;
+            if ((m->items[cur].flags & MENU_ITEM_ENABLED) && !(m->items[cur].flags & MENU_ITEM_SEPARATOR)) {
+                m->highlighted = cur;
+                m->hover_item_idx = -1;
+                m->hover_timer_start = 0;
+                wm_context_menu_damage(srv, m);
+                break;
+            }
+        }
+        return 1;
+    }
+
+    if (code == KEY_DOWN) {
+        if (m->item_count <= 0)
+            return 1;
+        int start = (m->highlighted >= 0) ? m->highlighted : -1;
+        int cur = start;
+        for (int step = 0; step < m->item_count; step++) {
+            cur = (cur + 1) % m->item_count;
+            if ((m->items[cur].flags & MENU_ITEM_ENABLED) && !(m->items[cur].flags & MENU_ITEM_SEPARATOR)) {
+                m->highlighted = cur;
+                m->hover_item_idx = -1;
+                m->hover_timer_start = 0;
+                wm_context_menu_damage(srv, m);
+                break;
+            }
+        }
+        return 1;
+    }
+
+    if (code == KEY_RIGHT) {
+        if (m->highlighted >= 0 && m->highlighted < m->item_count) {
+            vanilla_menu_item_t *it = &m->items[m->highlighted];
+            if (it->submenu_id != 0 && (it->flags & MENU_ITEM_ENABLED)) {
+                wm_context_menu_open_submenu(srv, m, m->highlighted);
+            }
+        }
+        return 1;
+    }
+
+    if (code == KEY_LEFT) {
+        if (srv->context_menu_depth > 1) {
+            wm_context_menu_pop(srv);
+        }
+        return 1;
+    }
+
+    if (code == KEY_ENTER || code == KEY_KPENTER) {
+        if (m->highlighted >= 0 && m->highlighted < m->item_count) {
+            vanilla_menu_item_t *it = &m->items[m->highlighted];
+            if ((it->flags & MENU_ITEM_ENABLED) && !(it->flags & MENU_ITEM_SEPARATOR)) {
+                if (it->submenu_id != 0) {
+                    wm_context_menu_open_submenu(srv, m, m->highlighted);
+                } else {
+                    wm_context_menu_close_stack(srv, it->item_id);
+                }
+            }
+        }
+        return 1;
+    }
+
+    return 1;
+}
+
+int wm_run_context_menu_selftests(void)
+{
+    static vanilla_server_t srv;
+    memset(&srv, 0, sizeof(srv));
+    srv.compositor.width = 800;
+    srv.compositor.height = 600;
+
+    /* 1. Geometry computation and boundary clamping */
+    vanilla_context_menu_t m;
+    memset(&m, 0, sizeof(m));
+    m.x = 750;
+    m.y = 550;
+    m.item_count = 5;
+    strncpy(m.items[0].label, "File", MENU_ITEM_LABEL_MAX - 1);
+    menu_compute_size(&srv.compositor, &m, NULL);
+    if (m.width < 160 || m.x + m.width > 800 || m.y + m.height > 600) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: geometry clamping\n");
+        return -1;
+    }
+
+    /* 2. Submenu positioning flip to left when overflow */
+    vanilla_context_menu_t parent_box;
+    memset(&parent_box, 0, sizeof(parent_box));
+    parent_box.x = 650;
+    parent_box.y = 100;
+    parent_box.width = 160;
+    parent_box.height = 100;
+
+    vanilla_context_menu_t sub;
+    memset(&sub, 0, sizeof(sub));
+    sub.parent_id = 1;
+    sub.x = parent_box.x + parent_box.width;
+    sub.y = 100;
+    sub.item_count = 3;
+    strncpy(sub.items[0].label, "Submenu Item", MENU_ITEM_LABEL_MAX - 1);
+    menu_compute_size(&srv.compositor, &sub, &parent_box);
+    if (sub.x + sub.width > 800 || sub.x != parent_box.x - sub.width) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: submenu flip\n");
+        return -1;
+    }
+
+    /* 3. Stack depth limit */
+    srv.context_menu_depth = CONTEXT_MENU_MAX_DEPTH;
+    vanilla_context_menu_t parent_m;
+    memset(&parent_m, 0, sizeof(parent_m));
+    parent_m.item_count = 1;
+    parent_m.items[0].flags = MENU_ITEM_ENABLED;
+    parent_m.items[0].submenu_id = 99;
+    if (wm_context_menu_open_submenu(&srv, &parent_m, 0) == 0) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: stack depth limit exceeded\n");
+        return -1;
+    }
+    srv.context_menu_depth = 0;
+
+    /* 4. Keyboard navigation Up/Down wrapping and item skipping */
+    srv.context_menu_depth = 1;
+    vanilla_context_menu_t *top = &srv.context_menu_stack[0];
+    memset(top, 0, sizeof(*top));
+    top->active = 1;
+    top->item_count = 4;
+    top->highlighted = 0;
+    top->items[0].flags = MENU_ITEM_ENABLED;
+    top->items[1].flags = MENU_ITEM_SEPARATOR;
+    top->items[2].flags = 0; /* disabled */
+    top->items[3].flags = MENU_ITEM_ENABLED;
+    top->items[3].submenu_id = 5;
+
+    /* Pre-register submenu 5 in pool */
+    srv.context_menu_pool_count = 1;
+    vanilla_context_menu_t *pool_sub = &srv.context_menu_pool[0];
+    memset(pool_sub, 0, sizeof(*pool_sub));
+    pool_sub->active = 1;
+    pool_sub->menu_id = 5;
+    pool_sub->item_count = 2;
+    pool_sub->items[0].item_id = 51;
+    pool_sub->items[0].flags = MENU_ITEM_ENABLED;
+    strncpy(pool_sub->items[0].label, "Sub Item 1", MENU_ITEM_LABEL_MAX - 1);
+    pool_sub->items[1].item_id = 52;
+    pool_sub->items[1].flags = MENU_ITEM_ENABLED;
+    strncpy(pool_sub->items[1].label, "Sub Item 2", MENU_ITEM_LABEL_MAX - 1);
+
+    wm_context_menu_handle_key(&srv, KEY_DOWN, 1);
+    if (top->highlighted != 3) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: down skip separator/disabled (got %d)\n", top->highlighted);
+        return -1;
+    }
+
+    wm_context_menu_handle_key(&srv, KEY_DOWN, 1);
+    if (top->highlighted != 0) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: down wraparound (got %d)\n", top->highlighted);
+        return -1;
+    }
+
+    wm_context_menu_handle_key(&srv, KEY_UP, 1);
+    if (top->highlighted != 3) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: up wraparound (got %d)\n", top->highlighted);
+        return -1;
+    }
+
+    /* 5. Submenu open on Right arrow, pop on Left arrow */
+    wm_context_menu_handle_key(&srv, KEY_RIGHT, 1);
+    if (srv.context_menu_depth != 2 || !srv.context_menu_stack[1].active) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: open submenu via right arrow\n");
+        return -1;
+    }
+
+    wm_context_menu_handle_key(&srv, KEY_LEFT, 1);
+    if (srv.context_menu_depth != 1 || srv.context_menu_stack[1].active) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: pop submenu via left arrow\n");
+        return -1;
+    }
+
+    /* 6. Submenu pop and root dismiss via Escape */
+    wm_context_menu_handle_key(&srv, KEY_RIGHT, 1);
+    if (srv.context_menu_depth != 2) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: reopen submenu\n");
+        return -1;
+    }
+
+    wm_context_menu_handle_key(&srv, KEY_ESC, 1);
+    if (srv.context_menu_depth != 1) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: pop submenu via Escape\n");
+        return -1;
+    }
+
+    wm_context_menu_handle_key(&srv, KEY_ESC, 1);
+    if (srv.context_menu_depth != 0) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: dismiss root via Escape\n");
+        return -1;
+    }
+
+    /* 7. Click outside dismisses stack */
+    wm_context_menu_open_desktop(&srv, 100, 100);
+    if (srv.context_menu_depth != 1) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: open desktop menu\n");
+        return -1;
+    }
+    wm_context_menu_handle_click(&srv, 500, 500, BTN_LEFT);
+    if (srv.context_menu_depth != 0) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: click outside dismiss\n");
+        return -1;
+    }
+
+    /* 8. Server-internal taskbar menu open */
+    wm_context_menu_open_taskbar(&srv, 50, 580, 42);
+    if (srv.context_menu_depth != 1 || srv.context_menu_stack[0].owning_window_id != 42) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: open taskbar menu\n");
+        return -1;
+    }
+    wm_context_menu_close_stack(&srv, 0);
+    if (srv.context_menu_depth != 0) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: close taskbar menu\n");
+        return -1;
+    }
+
+    /* 9. Motion routing preserves child submenu on parent item, pops on other item */
+    wm_context_menu_open_desktop(&srv, 100, 100);
+    srv.context_menu_stack[0].items[1].submenu_id = 5;
+    wm_context_menu_open_submenu(&srv, &srv.context_menu_stack[0], 1);
+    if (srv.context_menu_depth != 2) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: open child for motion test\n");
+        return -1;
+    }
+    /* Move cursor on row 1 of parent menu (item that opened child) -> child stays open */
+    wm_context_menu_handle_motion(&srv, srv.context_menu_stack[0].x + 10, srv.context_menu_stack[0].y + 2 + 1 * 24 + 4);
+    if (srv.context_menu_depth != 2) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: motion on parent item prematurely closed submenu\n");
+        return -1;
+    }
+    /* Move cursor on row 0 of parent menu (different item) -> child closes */
+    wm_context_menu_handle_motion(&srv, srv.context_menu_stack[0].x + 10, srv.context_menu_stack[0].y + 2 + 0 * 24 + 4);
+    if (srv.context_menu_depth != 1) {
+        fprintf(stderr, "[context_menu_selftest] FAIL: motion to different item did not close child\n");
+        return -1;
+    }
+    wm_context_menu_close_stack(&srv, 0);
+
+    printf("[vanilla] context menu & submenu self-tests passed (9/9)\n");
+    return 0;
+}
+
 void vanilla_server_send_frame_begin(vanilla_server_t *srv)
 {
     if (!srv)
@@ -2319,6 +3159,9 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
     (void)timeout_ms;
     int frame_ms = (int)(1000 / COMPOSITOR_TARGET_FPS);
     ret = poll(fds, (nfds_t)nfds, frame_ms);
+
+    wm_context_menu_check_timers(srv);
+
     if (ret <= 0) {
         if (srv->compositor.dirty_count > 0) {
             if (compositor_frame_due(&srv->compositor)) {
@@ -2349,6 +3192,8 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
             vanilla_server_dispatch_client(srv, c_idx);
         }
     }
+
+    wm_context_menu_check_timers(srv);
 
     if (srv->compositor.dirty_count > 0) {
         if (compositor_frame_due(&srv->compositor)) {
@@ -2718,7 +3563,9 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 }
             }
 
-            if (srv->is_resizing) {
+            if (srv->context_menu_depth > 0) {
+                cursor_set_active(CURSOR_ARROW);
+            } else if (srv->is_resizing) {
                 cursor_set_active(resize_edge_to_cursor_shape((vanilla_resize_edge_t)srv->resize_edge));
             } else if (!srv->is_dragging) {
                 vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
@@ -2739,6 +3586,10 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             cursor_get_rect(srv->cursor_x, srv->cursor_y, &new_box);
             compositor_add_damage(&srv->compositor, &old_box);
             compositor_add_damage(&srv->compositor, &new_box);
+
+            if (srv->context_menu_depth > 0) {
+                wm_context_menu_handle_motion(srv, srv->cursor_x, srv->cursor_y);
+            }
 
             if (srv->is_dragging) {
                 vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->drag_window_id);
@@ -2905,6 +3756,13 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 srv->btn_down_x[0] = srv->cursor_x;
                 srv->btn_down_y[0] = srv->cursor_y;
                 srv->long_press_fired[0] = 0;
+
+                /* 0. If Context Menu is open, dispatch to it */
+                if (srv->context_menu_depth > 0) {
+                    if (wm_context_menu_handle_click(srv, srv->cursor_x, srv->cursor_y, BTN_LEFT)) {
+                        return 0;
+                    }
+                }
 
                 /* 1. If Quick Launcher is visible, dispatch to it */
                 if (srv->launcher.visible) {
@@ -3157,6 +4015,11 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             if (ev->value == 1) {
                 srv->mouse_buttons |= (1u << 1);
 
+                /* Close existing context menu stack first */
+                if (srv->context_menu_depth > 0) {
+                    wm_context_menu_close_stack(srv, 0);
+                }
+
                 uint64_t now = pit_ticks();
                 uint64_t click_timeout = pit_frequency() * 3 / 10;
                 int same_pos = (abs(srv->cursor_x - srv->last_click_x[1]) <= 4 &&
@@ -3175,25 +4038,67 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 srv->btn_down_x[1] = srv->cursor_x;
                 srv->btn_down_y[1] = srv->cursor_y;
                 srv->long_press_fired[1] = 0;
+
+                /* 1. Taskbar right-click: check if clicked on a window pill */
+                if (srv->cursor_y >= screen_h - TASKBAR_HEIGHT) {
+                    int pill_idx = 0;
+                    uint32_t target_pill_win = 0;
+                    for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+                        vanilla_server_window_t *win = &srv->windows[i];
+                        if (!win->in_use || (win->flags & WINDOW_FLAG_BORDERLESS))
+                            continue;
+                        int32_t px = TASKBAR_PILL_START_X + pill_idx * (TASKBAR_PILL_W + TASKBAR_PILL_GAP);
+                        if (px + TASKBAR_PILL_W > screen_w - TASKBAR_CLOCK_W - THEME_PX(8))
+                            break;
+                        if (srv->cursor_x >= px && srv->cursor_x < px + TASKBAR_PILL_W &&
+                            srv->cursor_y >= screen_h - TASKBAR_HEIGHT + THEME_PX(4) &&
+                            srv->cursor_y < screen_h - TASKBAR_HEIGHT + THEME_PX(4) + TASKBAR_PILL_H) {
+                            target_pill_win = win->window_id;
+                            break;
+                        }
+                        pill_idx++;
+                    }
+                    if (target_pill_win != 0) {
+                        wm_context_menu_open_taskbar(srv, srv->cursor_x, srv->cursor_y, target_pill_win);
+                        return 0;
+                    }
+                    return 0;
+                }
+
+                /* 2. Window right-click: hit-test top-to-bottom */
+                vanilla_server_window_t *hit = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
+                if (hit) {
+                    vanilla_server_focus_window(srv, hit->window_id);
+                    wm_raise_window(srv, hit->window_id);
+                    int lx = srv->cursor_x - hit->x;
+                    int ly = srv->cursor_y - hit->y;
+                    struct input_event client_ev = *ev;
+                    client_ev.value = srv->click_count[1];
+                    client_ev.pad1 = (uint16_t)(lx < 0 ? 0 : lx);
+                    client_ev.pad2 = (uint32_t)(ly < 0 ? 0 : ly);
+                    vanilla_server_send_input(srv, hit->window_id, &client_ev);
+                    return 0;
+                }
+
+                /* 3. Empty desktop right-click */
+                wm_context_menu_open_desktop(srv, srv->cursor_x, srv->cursor_y);
+                return 0;
             } else {
                 srv->mouse_buttons &= ~(1u << 1);
                 srv->long_press_fired[1] = 0;
-            }
-
-            if (srv->focused_window_id != 0) {
-                vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->focused_window_id);
-                if (w) {
-                    int lx = srv->cursor_x - w->x;
-                    int ly = srv->cursor_y - w->y;
-                    struct input_event client_ev = *ev;
-                    if (ev->value == 1)
-                        client_ev.value = srv->click_count[1];
-                    client_ev.pad1 = (uint16_t)(lx < 0 ? 0 : lx);
-                    client_ev.pad2 = (uint32_t)(ly < 0 ? 0 : ly);
-                    vanilla_server_send_input(srv, srv->focused_window_id, &client_ev);
+                if (srv->focused_window_id != 0) {
+                    vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->focused_window_id);
+                    if (w) {
+                        int lx = srv->cursor_x - w->x;
+                        int ly = srv->cursor_y - w->y;
+                        struct input_event client_ev = *ev;
+                        client_ev.pad1 = (uint16_t)(lx < 0 ? 0 : lx);
+                        client_ev.pad2 = (uint32_t)(ly < 0 ? 0 : ly);
+                        vanilla_server_send_input(srv, srv->focused_window_id, &client_ev);
+                    }
                 }
+                return 0;
             }
-            return 0;
         }
 
         if (ev->code == BTN_MIDDLE) {
@@ -3237,6 +4142,17 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 }
             }
             return 0;
+        }
+
+        /* Context menu keyboard navigation: Up, Down, Left, Right, Enter, Escape */
+        if (srv->context_menu_depth > 0) {
+            if (ev->code == KEY_UP || ev->code == KEY_DOWN ||
+                ev->code == KEY_LEFT || ev->code == KEY_RIGHT ||
+                ev->code == KEY_ENTER || ev->code == KEY_KPENTER ||
+                ev->code == KEY_ESC) {
+                wm_context_menu_handle_key(srv, ev->code, ev->value);
+                return 0;
+            }
         }
 
         /* Hotkey: Alt+Space toggles Quick Launcher */
