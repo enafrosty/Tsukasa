@@ -83,7 +83,21 @@ static int init_main(int argc, char **argv)
     /* Yield briefly to allow display server socket initialization */
     struct timespec ts_init;
     ts_init.tv_sec = 0;
-    ts_init.tv_nsec = 150000000; /* 150ms */
+    ts_init.tv_nsec = 300000000; /* 300ms */
+    nanosleep(&ts_init, NULL);
+
+    int shell_pid = spawn("/bin/shell.elf");
+    if (shell_pid <= 0)
+        shell_pid = spawn("/fat12/shell.elf");
+    if (shell_pid <= 0)
+        shell_pid = spawn("/bin/SHELL.ELF");
+    if (shell_pid <= 0)
+        shell_pid = spawn("/fat12/SHELL.ELF");
+    if (shell_pid > 0)
+        dprintf(1, "[init] spawned Vanilla desktop shell (pid=%d)\n", shell_pid);
+
+    ts_init.tv_sec = 0;
+    ts_init.tv_nsec = 50000000;
     nanosleep(&ts_init, NULL);
 
     int fm_pid = spawn("/bin/filemgr.elf");

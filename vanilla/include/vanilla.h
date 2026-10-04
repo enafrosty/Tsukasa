@@ -106,6 +106,7 @@ typedef struct vanilla_window {
 vanilla_client_t *vanilla_connect(const char *socket_path);
 void vanilla_disconnect(vanilla_client_t *client);
 void vanilla_set_frame_callback(vanilla_client_t *client, vanilla_frame_callback_t fn);
+int  vanilla_client_get_fd(const vanilla_client_t *client);
 
 /* Window operations */
 vanilla_window_t *vanilla_create_window(vanilla_client_t *client, const char *title,

@@ -27,5 +27,6 @@ int   shm_create(size_t size);
 void *shm_attach(int shm_id);
 int   shm_detach(const void *addr);
 int   shm_destroy(int shm_id);
+pid_t spawn(const char *path, char *const argv[], char *const envp[]);
 
 #endif /* _VANILLA_HOST_COMPAT_H */

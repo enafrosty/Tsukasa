@@ -18,8 +18,6 @@
 #include "server.h"
 #include "blitter.h"
 #include "font.h"
-#include "shell.h"
-#include "launcher.h"
 #include "anim.h"
 
 #include <sys/socket.h>
@@ -173,7 +171,7 @@ vanilla_server_window_t *wm_window_at(vanilla_server_t *srv, int32_t x, int32_t 
 
         if (x >= frame.x && x < frame.x + frame.w &&
             y >= frame.y && y < frame.y + frame.h) {
-            if (w->z_index > max_z) {
+            if (!hit || w->layer > hit->layer || (w->layer == hit->layer && w->z_index > max_z)) {
                 max_z = w->z_index;
                 hit = w;
             }
@@ -429,7 +427,6 @@ void wm_raise_window(vanilla_server_t *srv, uint32_t window_id)
     target->z_index = max_z + 1;
 
     wm_invalidate_window(srv, target);
-    shell_invalidate(srv);
 }
 
 void wm_lower_window(vanilla_server_t *srv, uint32_t window_id)
@@ -451,7 +448,6 @@ void wm_lower_window(vanilla_server_t *srv, uint32_t window_id)
 
     target->z_index = min_z - 1;
     wm_invalidate_window(srv, target);
-    shell_invalidate(srv);
 }
 
 static void update_mod_state(vanilla_server_t *srv, uint16_t bit, int toggle, int value)
@@ -531,9 +527,6 @@ int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
     srv->mod_state = 0;
     srv->is_dragging = 0;
     srv->drag_window_id = 0;
-
-    shell_init(&srv->shell);
-    launcher_init(&srv->launcher);
 
     srv->context_menu_depth = 0;
     srv->context_menu_pool_count = 0;
@@ -638,10 +631,31 @@ void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_
     w->anim_unmap_on_done = 0;
     w->is_mapped = 0;
 
+    for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
+        if (!srv->clients[i].in_use)
+            continue;
+        int other_fd = srv->clients[i].fd;
+        vanilla_msg_hdr_t b_hdr;
+        vanilla_msg_window_configure_v2_t b_cfg;
+        b_hdr.magic = VANILLA_IPC_MAGIC;
+        b_hdr.msg_type = MSG_WINDOW_CONFIGURE;
+        b_hdr.payload_len = (uint16_t)sizeof(b_cfg);
+        b_hdr.window_id = w->window_id;
+
+        b_cfg.x = w->x;
+        b_cfg.y = w->y;
+        b_cfg.width = 0;
+        b_cfg.height = 0;
+        b_cfg.serial = 0;
+        b_cfg.flags = w->flags;
+
+        exact_write(other_fd, &b_hdr, sizeof(b_hdr));
+        exact_write(other_fd, &b_cfg, sizeof(b_cfg));
+    }
+
     wm_invalidate_window(srv, w);
     surface_destroy(&w->surface);
     w->in_use = 0;
-    shell_invalidate(srv);
 }
 
 void vanilla_server_remove_client(vanilla_server_t *srv, int client_idx)
@@ -669,8 +683,6 @@ void vanilla_server_remove_client(vanilla_server_t *srv, int client_idx)
     srv->clients[client_idx].fd = -1;
     srv->clients[client_idx].version = 0;
     srv->clients[client_idx].negotiated_version = 0;
-
-    shell_invalidate(srv);
 }
 
 vanilla_server_window_t *vanilla_server_find_window(vanilla_server_t *srv, uint32_t window_id)
@@ -731,6 +743,28 @@ static void wm_send_configure(vanilla_server_t *srv, vanilla_server_window_t *w)
 
         exact_write(w->client_fd, &hdr, sizeof(hdr));
         exact_write(w->client_fd, &cfg, sizeof(cfg));
+    }
+
+    for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
+        if (!srv->clients[i].in_use || srv->clients[i].fd == w->client_fd)
+            continue;
+        int other_fd = srv->clients[i].fd;
+        vanilla_msg_hdr_t b_hdr;
+        vanilla_msg_window_configure_v2_t b_cfg;
+        b_hdr.magic = VANILLA_IPC_MAGIC;
+        b_hdr.msg_type = MSG_WINDOW_CONFIGURE;
+        b_hdr.payload_len = (uint16_t)sizeof(b_cfg);
+        b_hdr.window_id = w->window_id;
+
+        b_cfg.x = w->pending_x ? w->pending_x : w->x;
+        b_cfg.y = w->pending_y ? w->pending_y : w->y;
+        b_cfg.width = w->pending_w ? w->pending_w : w->width;
+        b_cfg.height = w->pending_h ? w->pending_h : w->height;
+        b_cfg.serial = 0;
+        b_cfg.flags = w->flags;
+
+        exact_write(other_fd, &b_hdr, sizeof(b_hdr));
+        exact_write(other_fd, &b_cfg, sizeof(b_cfg));
     }
 }
 
@@ -871,9 +905,9 @@ int handle_msg_create_window(vanilla_server_t *srv, int client_idx, const vanill
     w->anim_current_scale = 1.0f;
     w->anim_current_alpha = 1.0f;
 
-    if (req->flags & WINDOW_FLAG_MODAL)
-        w->layer = LAYER_TOPMOST;
-    else if (req->flags & WINDOW_FLAG_ALWAYS_TOP)
+    if ((req->flags & WINDOW_FLAG_POPUP) || (req->flags & WINDOW_FLAG_ALWAYS_TOP))
+        w->layer = LAYER_OVERLAY;
+    else if (req->flags & WINDOW_FLAG_MODAL)
         w->layer = LAYER_TOPMOST;
     else
         w->layer = LAYER_NORMAL;
@@ -896,7 +930,9 @@ int handle_msg_create_window(vanilla_server_t *srv, int client_idx, const vanill
 
     wm_raise_window(srv, w->window_id);
     wm_invalidate_window(srv, w);
-    shell_invalidate(srv);
+    if (req->flags & WINDOW_FLAG_POPUP)
+        vanilla_server_focus_window(srv, w->window_id);
+    wm_send_configure(srv, w);
     printf("[vanilla] Created window id=%u title='%s' (%ux%u)\n", w->window_id, w->title, req->width, req->height);
     return 0;
 }
@@ -940,11 +976,11 @@ int handle_msg_destroy_window(vanilla_server_t *srv, int client_idx, const vanil
 
 int handle_msg_map_window(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
 {
+    (void)client_idx;
     (void)hdr;
     const vanilla_msg_map_window_t *req = (const vanilla_msg_map_window_t *)payload;
-    int cfd = srv->clients[client_idx].fd;
     vanilla_server_window_t *w = vanilla_server_find_window(srv, req->window_id);
-    if (w && w->client_fd == cfd) {
+    if (w) {
         w->is_mapped = 1;
         w->frame_begin_in_flight = 0;
         vanilla_server_focus_window(srv, w->window_id);
@@ -959,18 +995,18 @@ int handle_msg_map_window(vanilla_server_t *srv, int client_idx, const vanilla_m
         }
 
         wm_invalidate_window(srv, w);
-        shell_invalidate(srv);
+        wm_send_configure(srv, w);
     }
     return 0;
 }
 
 int handle_msg_unmap_window(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
 {
+    (void)client_idx;
     (void)hdr;
     const vanilla_msg_unmap_window_t *req = (const vanilla_msg_unmap_window_t *)payload;
-    int cfd = srv->clients[client_idx].fd;
     vanilla_server_window_t *w = vanilla_server_find_window(srv, req->window_id);
-    if (w && w->client_fd == cfd) {
+    if (w) {
         if (srv->is_dragging && srv->drag_window_id == w->window_id) {
             srv->is_dragging = 0;
             srv->drag_window_id = 0;
@@ -995,7 +1031,7 @@ int handle_msg_unmap_window(vanilla_server_t *srv, int client_idx, const vanilla
         w->has_keyboard_focus = 0;
         if (srv->focused_window_id == w->window_id)
             srv->focused_window_id = 0;
-        shell_invalidate(srv);
+        wm_send_configure(srv, w);
     }
     return 0;
 }
@@ -1135,7 +1171,6 @@ int handle_msg_ack_configure(vanilla_server_t *srv, int client_idx, const vanill
     w->width = w->pending_w;
     w->height = w->pending_h;
     wm_invalidate_window(srv, w);
-    shell_invalidate(srv);
     printf("[vanilla] ack_configure: window %u serial %u applied\n", w->window_id, ack->serial);
 
     /* If a target geometry was queued while configure was in flight, dispatch it now */
@@ -1664,46 +1699,35 @@ int wm_run_input_selftests(void)
         return -1;
     }
 
-    /* 6. Start Menu keyboard navigation */
-    struct input_event super_ev, down_ev, up_ev, esc_ev;
-    memset(&super_ev, 0, sizeof(super_ev));
-    super_ev.type = EV_KEY;
-    super_ev.code = KEY_LEFTMETA;
-    super_ev.value = 1;
+    /* 6. Window hit testing layer priority */
+    vanilla_server_window_t w_norm, w_over;
+    memset(&w_norm, 0, sizeof(w_norm));
+    memset(&w_over, 0, sizeof(w_over));
+    w_norm.in_use = 1;
+    w_norm.is_mapped = 1;
+    w_norm.window_id = 1;
+    w_norm.x = 100;
+    w_norm.y = 100;
+    w_norm.width = 200;
+    w_norm.height = 200;
+    w_norm.layer = LAYER_NORMAL;
+    w_norm.z_index = 100;
+    srv.windows[0] = w_norm;
 
-    memset(&down_ev, 0, sizeof(down_ev));
-    down_ev.type = EV_KEY;
-    down_ev.code = KEY_DOWN;
-    down_ev.value = 1;
+    w_over.in_use = 1;
+    w_over.is_mapped = 1;
+    w_over.window_id = 2;
+    w_over.x = 150;
+    w_over.y = 150;
+    w_over.width = 100;
+    w_over.height = 100;
+    w_over.layer = LAYER_OVERLAY;
+    w_over.z_index = 1;
+    srv.windows[1] = w_over;
 
-    memset(&up_ev, 0, sizeof(up_ev));
-    up_ev.type = EV_KEY;
-    up_ev.code = KEY_UP;
-    up_ev.value = 1;
-
-    memset(&esc_ev, 0, sizeof(esc_ev));
-    esc_ev.type = EV_KEY;
-    esc_ev.code = KEY_ESC;
-    esc_ev.value = 1;
-
-    wm_handle_input_event(&srv, &super_ev);
-    if (!srv.shell.start_menu_open || srv.shell.selected_idx != 0) {
-        fprintf(stderr, "[input_selftest] FAIL: Super open start menu\n");
-        return -1;
-    }
-    wm_handle_input_event(&srv, &down_ev);
-    if (srv.shell.selected_idx != 1) {
-        fprintf(stderr, "[input_selftest] FAIL: Start menu down arrow (got %d)\n", srv.shell.selected_idx);
-        return -1;
-    }
-    wm_handle_input_event(&srv, &up_ev);
-    if (srv.shell.selected_idx != 0) {
-        fprintf(stderr, "[input_selftest] FAIL: Start menu up arrow (got %d)\n", srv.shell.selected_idx);
-        return -1;
-    }
-    wm_handle_input_event(&srv, &esc_ev);
-    if (srv.shell.start_menu_open) {
-        fprintf(stderr, "[input_selftest] FAIL: ESC start menu close\n");
+    vanilla_server_window_t *h = wm_window_at(&srv, 160, 160);
+    if (!h || h->window_id != 2) {
+        fprintf(stderr, "[input_selftest] FAIL: LAYER_OVERLAY hit test priority\n");
         return -1;
     }
 
@@ -2130,6 +2154,24 @@ void wm_context_menu_pop(vanilla_server_t *srv)
     wm_context_menu_damage(srv, new_top);
 }
 
+static void wm_spawn_app(const char *path)
+{
+    char current_path[256];
+    strncpy(current_path, path, sizeof(current_path) - 1);
+    current_path[sizeof(current_path) - 1] = '\0';
+
+    char *argv[] = { current_path, NULL };
+    pid_t pid = spawn(current_path, argv, NULL);
+
+    if (pid <= 0 && strncmp(current_path, "/bin/", 5) == 0) {
+        char fat_path[320];
+        snprintf(fat_path, sizeof(fat_path), "/fat12/%s", current_path + 5);
+        char *fargv[] = { fat_path, NULL };
+        pid = spawn(fat_path, fargv, NULL);
+    }
+    (void)pid;
+}
+
 void wm_context_menu_close_stack(vanilla_server_t *srv, uint32_t result_item_id)
 {
     if (!srv || srv->context_menu_depth <= 0)
@@ -2177,9 +2219,9 @@ void wm_context_menu_close_stack(vanilla_server_t *srv, uint32_t result_item_id)
                     srv->compositor.has_wallpaper = !srv->compositor.has_wallpaper;
                     compositor_damage_all(&srv->compositor);
                 } else if (result_item_id == 2) {
-                    shell_spawn_app("/bin/filemgr.elf");
+                    wm_spawn_app("/bin/filemgr.elf");
                 } else if (result_item_id == 3) {
-                    shell_spawn_app("/bin/terminal.elf");
+                    wm_spawn_app("/bin/terminal.elf");
                 }
             } else if (root->menu_id == SERVER_MENU_TASKBAR) {
                 if (result_item_id == 1) {
@@ -2192,7 +2234,6 @@ void wm_context_menu_close_stack(vanilla_server_t *srv, uint32_t result_item_id)
                             w->is_mapped = 1;
                             vanilla_server_focus_window(srv, w->window_id);
                             wm_raise_window(srv, w->window_id);
-                            shell_invalidate(srv);
                         }
                     }
                 }
@@ -3069,7 +3110,7 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
         vanilla_server_broadcast_theme_changed(srv);
     }
 
-    shell_update_clock(&srv->shell, srv);
+    wm_context_menu_check_timers(srv);
 
     int64_t now_ms = get_time_ms();
     for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
@@ -3084,7 +3125,6 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
             w->width = w->pending_w;
             w->height = w->pending_h;
             wm_invalidate_window(srv, w);
-            shell_invalidate(srv);
 
             if (w->resize_has_target) {
                 int32_t tx = w->target_x;
@@ -3275,6 +3315,17 @@ int vanilla_server_focus_window(vanilla_server_t *srv, uint32_t window_id)
             exact_write(old_w->client_fd, &hdr, sizeof(hdr));
             exact_write(old_w->client_fd, &msg, sizeof(msg));
         }
+        for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
+            if (srv->clients[i].in_use && srv->clients[i].fd != old_w->client_fd) {
+                hdr.magic = VANILLA_IPC_MAGIC;
+                hdr.msg_type = MSG_WINDOW_FOCUS;
+                hdr.payload_len = (uint16_t)sizeof(msg);
+                hdr.window_id = old_w->window_id;
+                msg.focused = 0;
+                exact_write(srv->clients[i].fd, &hdr, sizeof(hdr));
+                exact_write(srv->clients[i].fd, &msg, sizeof(msg));
+            }
+        }
         wm_invalidate_window(srv, old_w);
     }
 
@@ -3292,6 +3343,17 @@ int vanilla_server_focus_window(vanilla_server_t *srv, uint32_t window_id)
             exact_write(new_w->client_fd, &hdr, sizeof(hdr));
             exact_write(new_w->client_fd, &msg, sizeof(msg));
         }
+        for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
+            if (srv->clients[i].in_use && srv->clients[i].fd != new_w->client_fd) {
+                hdr.magic = VANILLA_IPC_MAGIC;
+                hdr.msg_type = MSG_WINDOW_FOCUS;
+                hdr.payload_len = (uint16_t)sizeof(msg);
+                hdr.window_id = new_w->window_id;
+                msg.focused = 1;
+                exact_write(srv->clients[i].fd, &hdr, sizeof(hdr));
+                exact_write(srv->clients[i].fd, &msg, sizeof(msg));
+            }
+        }
         wm_invalidate_window(srv, new_w);
         if (g_theme->reduce_motion == 0 && new_w->anim_state == ANIM_IDLE) {
             vanilla_rect_t fr;
@@ -3304,7 +3366,6 @@ int vanilla_server_focus_window(vanilla_server_t *srv, uint32_t window_id)
         srv->focused_window_id = 0;
     }
 
-    shell_invalidate(srv);
     return 0;
 }
 
@@ -3672,7 +3733,6 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                             w->pending_h = new_h;
                             wm_send_configure(srv, w);
                             wm_invalidate_window(srv, w);
-                            shell_invalidate(srv);
                         }
                     }
                 }
@@ -3696,12 +3756,12 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
         case KEY_LEFTMETA:
         case KEY_RIGHTMETA:
             update_mod_state(srv, MOD_SUPER, 0, ev->value);
-            if (ev->value == 1) {
-                srv->shell.start_menu_open = !srv->shell.start_menu_open;
-                if (srv->shell.start_menu_open)
-                    srv->shell.selected_idx = 0;
-                shell_invalidate_start_menu(srv);
-                shell_invalidate(srv);
+            for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+                vanilla_server_window_t *sw = &srv->windows[i];
+                if (sw->in_use && (sw->flags & WINDOW_FLAG_ALWAYS_TOP) && (sw->flags & WINDOW_FLAG_BORDERLESS)) {
+                    vanilla_server_send_input(srv, sw->window_id, ev);
+                    break;
+                }
             }
             return 0;
         default: break;
@@ -3764,37 +3824,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     }
                 }
 
-                /* 1. If Quick Launcher is visible, dispatch to it */
-                if (srv->launcher.visible) {
-                    launcher_handle_click(srv, srv->cursor_x, srv->cursor_y, BTN_LEFT);
-                    return 0;
-                }
-
-                /* 2. Start Menu dispatch and click-through prevention */
-                if (srv->shell.start_menu_open) {
-                    int32_t sm_y = screen_h - TASKBAR_HEIGHT - START_MENU_HEIGHT;
-                    if (srv->cursor_x >= 0 && srv->cursor_x < START_MENU_WIDTH &&
-                        srv->cursor_y >= sm_y && srv->cursor_y < sm_y + START_MENU_HEIGHT) {
-                        shell_handle_click(srv, srv->cursor_x, srv->cursor_y, BTN_LEFT);
-                        return 0;
-                    }
-                    if (srv->cursor_x >= TASKBAR_START_X && srv->cursor_x < TASKBAR_START_X + TASKBAR_START_W &&
-                        srv->cursor_y >= screen_h - TASKBAR_HEIGHT + THEME_PX(4) && srv->cursor_y < screen_h - TASKBAR_HEIGHT + THEME_PX(4) + TASKBAR_START_H) {
-                        shell_handle_click(srv, srv->cursor_x, srv->cursor_y, BTN_LEFT);
-                        return 0;
-                    }
-                    srv->shell.start_menu_open = 0;
-                    shell_invalidate_start_menu(srv);
-                    shell_invalidate(srv);
-                }
-
-                /* 3. If Taskbar is clicked, dispatch to shell */
-                if (srv->cursor_y >= screen_h - TASKBAR_HEIGHT) {
-                    shell_handle_click(srv, srv->cursor_x, srv->cursor_y, BTN_LEFT);
-                    return 0;
-                }
-
-                /* 4. Window interaction: hit test top-to-bottom */
+                /* 1. Window interaction: hit test top-to-bottom */
                 vanilla_server_window_t *hit = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
 
                 if (hit) {
@@ -3834,7 +3864,6 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                                 if (srv->focused_window_id == hit->window_id)
                                     srv->focused_window_id = 0;
                                 wm_invalidate_window(srv, hit);
-                                shell_invalidate(srv);
                             } else {
                                 vanilla_rect_t fr;
                                 wm_get_frame_rect(hit, &fr);
@@ -3895,7 +3924,6 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     /* Clicked empty desktop: unfocus windows */
                     if (srv->focused_window_id != 0) {
                         vanilla_server_focus_window(srv, 0);
-                        shell_invalidate(srv);
                     }
                 }
                 return 0;
@@ -3943,7 +3971,6 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                                 w->pending_h = new_h;
                                 wm_send_configure(srv, w);
                                 wm_invalidate_window(srv, w);
-                                shell_invalidate(srv);
                             }
                         }
                     }
@@ -4039,33 +4066,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 srv->btn_down_y[1] = srv->cursor_y;
                 srv->long_press_fired[1] = 0;
 
-                /* 1. Taskbar right-click: check if clicked on a window pill */
-                if (srv->cursor_y >= screen_h - TASKBAR_HEIGHT) {
-                    int pill_idx = 0;
-                    uint32_t target_pill_win = 0;
-                    for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
-                        vanilla_server_window_t *win = &srv->windows[i];
-                        if (!win->in_use || (win->flags & WINDOW_FLAG_BORDERLESS))
-                            continue;
-                        int32_t px = TASKBAR_PILL_START_X + pill_idx * (TASKBAR_PILL_W + TASKBAR_PILL_GAP);
-                        if (px + TASKBAR_PILL_W > screen_w - TASKBAR_CLOCK_W - THEME_PX(8))
-                            break;
-                        if (srv->cursor_x >= px && srv->cursor_x < px + TASKBAR_PILL_W &&
-                            srv->cursor_y >= screen_h - TASKBAR_HEIGHT + THEME_PX(4) &&
-                            srv->cursor_y < screen_h - TASKBAR_HEIGHT + THEME_PX(4) + TASKBAR_PILL_H) {
-                            target_pill_win = win->window_id;
-                            break;
-                        }
-                        pill_idx++;
-                    }
-                    if (target_pill_win != 0) {
-                        wm_context_menu_open_taskbar(srv, srv->cursor_x, srv->cursor_y, target_pill_win);
-                        return 0;
-                    }
-                    return 0;
-                }
-
-                /* 2. Window right-click: hit-test top-to-bottom */
+                /* 1. Window right-click: hit-test top-to-bottom */
                 vanilla_server_window_t *hit = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
                 if (hit) {
                     vanilla_server_focus_window(srv, hit->window_id);
@@ -4155,9 +4156,15 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             }
         }
 
-        /* Hotkey: Alt+Space toggles Quick Launcher */
+        /* Hotkey: Alt+Space forwarded to shell client window to toggle Quick Launcher */
         if ((srv->mod_state & MOD_ALT) && ev->code == KEY_SPACE && ev->value == 1) {
-            launcher_toggle(srv);
+            for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+                vanilla_server_window_t *sw = &srv->windows[i];
+                if (sw->in_use && (sw->flags & WINDOW_FLAG_ALWAYS_TOP) && (sw->flags & WINDOW_FLAG_BORDERLESS)) {
+                    vanilla_server_send_input(srv, sw->window_id, ev);
+                    return 0;
+                }
+            }
             return 0;
         }
 
@@ -4188,7 +4195,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     }
                 }
                 return 0;
-            } else if (!srv->launcher.visible && !srv->shell.start_menu_open) {
+            } else if (!srv->alttab_visible) {
                 uint32_t normal_wins[VANILLA_MAX_WINDOWS];
                 int normal_count = 0;
                 for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
@@ -4239,7 +4246,6 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                         target->has_keyboard_focus = 1;
                         wm_invalidate_window(srv, target);
                     }
-                    shell_invalidate(srv);
                     return 0;
                 }
             }
@@ -4254,31 +4260,9 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 compositor_add_damage(&srv->compositor, &r);
                 return 0;
             }
-            if (srv->launcher.visible) {
-                launcher_set_visible(srv, 0);
-                return 0;
-            }
-            if (srv->shell.start_menu_open) {
-                srv->shell.start_menu_open = 0;
-                shell_invalidate_start_menu(srv);
-                shell_invalidate(srv);
-                return 0;
-            }
         }
 
-        /* Forward to launcher if active */
-        if (srv->launcher.visible) {
-            launcher_handle_key(srv, ev->code, ev->value);
-            return 0;
-        }
-
-        /* Forward to shell start menu if open */
-        if (srv->shell.start_menu_open) {
-            if (shell_handle_key(srv, ev->code, ev->value))
-                return 0;
-        }
-
-        /* Otherwise forward key event to focused window */
+        /* Forward key event to focused window */
         if (srv->focused_window_id != 0) {
             vanilla_server_send_input(srv, srv->focused_window_id, ev);
             return 0;

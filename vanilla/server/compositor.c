@@ -553,13 +553,11 @@ void compositor_animate_windows(vanilla_server_t *srv)
                 w->anim_current_scale = 1.0f;
                 w->anim_current_alpha = 1.0f;
                 wm_invalidate_window(srv, w);
-                shell_invalidate(srv);
             } else {
                 w->anim_state = ANIM_IDLE;
                 w->anim_current_scale = w->anim_scale_end;
                 w->anim_current_alpha = w->anim_alpha_end;
                 wm_invalidate_window(srv, w);
-                shell_invalidate(srv);
             }
         }
     }
@@ -948,13 +946,6 @@ void compositor_render_frame(struct vanilla_server *srv)
                 }
             }
         }
-
-        /* 4. Render Desktop Shell Taskbar */
-        shell_render(srv, dirty);
-
-        /* 5. Render Quick Launcher modal (if active) */
-        if (srv->launcher.visible)
-            launcher_render(srv, dirty);
 
         /* 6. Render Alt+Tab overlay (if active) */
         if (srv->alttab_visible)

@@ -19,8 +19,6 @@
 #include "../server/server.h"
 #include "../server/blitter.h"
 #include "../server/font.h"
-#include "../server/shell.h"
-#include "../server/launcher.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -208,9 +206,6 @@ int main(int argc, char *argv[])
     srv.next_window_id = 3;
     srv.next_z_index = 3;
 
-    shell_init(&srv.shell);
-    launcher_init(&srv.launcher);
-
     vanilla_sdl_backend_t backend;
     if (sdl_backend_init(&backend, SCREEN_WIDTH, SCREEN_HEIGHT,
                          "Project Vanilla Display Server - Host Emulator") < 0) {
@@ -241,7 +236,6 @@ int main(int argc, char *argv[])
     /* Main prototyping event and frame loop */
     while (backend.running && srv.running) {
         sdl_backend_poll_events(&backend, &srv);
-        shell_update_clock(&srv.shell, &srv);
 
         /* Adapt mock surfaces if window dimensions changed (e.g. snapped or maximized) */
         for (int i = 0; i < 2; i++) {
