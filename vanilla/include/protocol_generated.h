@@ -56,6 +56,8 @@ typedef enum {
     MSG_THEME_CHANGED        = 22,
     MSG_SET_SIZE_HINTS       = 23,
     MSG_INPUT_EVENT_V2       = 24,
+    MSG_SHOW_CONTEXT_MENU    = 25,
+    MSG_CONTEXT_MENU_RESULT  = 26,
 } vanilla_msg_type_t;
 
 /* MSG_HELLO payload (client to server, v1+) */
@@ -288,6 +290,29 @@ typedef struct {
 _Static_assert(sizeof(vanilla_msg_input_event_v2_t) == 26,
     "vanilla_msg_input_event_v2_t size mismatch; regenerate protocol");
 
+/* MSG_SHOW_CONTEXT_MENU payload (client to server, v2+) */
+typedef struct {
+    uint32_t window_id;
+    uint32_t menu_id;
+    uint32_t parent_id;
+    int32_t  x;
+    int32_t  y;
+    uint32_t item_count;
+} __attribute__((packed)) vanilla_msg_show_context_menu_t;
+
+_Static_assert(sizeof(vanilla_msg_show_context_menu_t) == 24,
+    "vanilla_msg_show_context_menu_t size mismatch; regenerate protocol");
+
+/* MSG_CONTEXT_MENU_RESULT payload (server to client, v2+) */
+typedef struct {
+    uint32_t window_id;
+    uint32_t menu_id;
+    uint32_t item_id;
+} __attribute__((packed)) vanilla_msg_context_menu_result_t;
+
+_Static_assert(sizeof(vanilla_msg_context_menu_result_t) == 12,
+    "vanilla_msg_context_menu_result_t size mismatch; regenerate protocol");
+
 typedef struct vanilla_server vanilla_server_t;
 
 typedef int (*vanilla_dispatch_fn_t)(vanilla_server_t *srv, int client_idx,
@@ -313,6 +338,7 @@ int handle_msg_set_cursor(vanilla_server_t *srv, int client_idx, const vanilla_m
 int handle_msg_clipboard_offer(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 int handle_msg_dnd_offer(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 int handle_msg_set_size_hints(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
+int handle_msg_show_context_menu(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 
 #ifdef VANILLA_DISPATCH_TABLE_IMPL
 const vanilla_dispatch_entry_t g_vanilla_dispatch_table[] = {
@@ -328,6 +354,7 @@ const vanilla_dispatch_entry_t g_vanilla_dispatch_table[] = {
     { MSG_CLIPBOARD_OFFER, 2, sizeof(vanilla_msg_clipboard_offer_t), handle_msg_clipboard_offer },
     { MSG_DND_OFFER, 2, sizeof(vanilla_msg_dnd_offer_t), handle_msg_dnd_offer },
     { MSG_SET_SIZE_HINTS, 2, sizeof(vanilla_msg_set_size_hints_t), handle_msg_set_size_hints },
+    { MSG_SHOW_CONTEXT_MENU, 2, 0, handle_msg_show_context_menu },
 };
 const size_t g_vanilla_dispatch_table_len = sizeof(g_vanilla_dispatch_table) / sizeof(g_vanilla_dispatch_table[0]);
 #else

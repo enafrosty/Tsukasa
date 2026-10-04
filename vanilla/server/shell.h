@@ -59,5 +59,6 @@ int  shell_handle_click(struct vanilla_server *srv, int32_t x, int32_t y, uint32
 int  shell_handle_key(struct vanilla_server *srv, uint16_t code, int pressed);
 void shell_invalidate(struct vanilla_server *srv);
 void shell_invalidate_start_menu(struct vanilla_server *srv);
+void shell_spawn_app(const char *path);
 
 #endif /* _VANILLA_SHELL_H */

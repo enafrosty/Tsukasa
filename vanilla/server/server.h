@@ -22,10 +22,38 @@
 #include <sys/input.h>
 #include "../include/protocol.h"
 #include "../include/surface.h"
+#include "../include/vanilla.h"
 #include "compositor.h"
 #include "shell.h"
 #include "launcher.h"
 #include "cursor.h"
+
+#define CONTEXT_MENU_MAX_DEPTH  4
+#define CONTEXT_MENU_MAX_ITEMS  64
+#define CONTEXT_MENU_POOL_SIZE  8
+
+#define SERVER_MENU_DESKTOP     0xDE5C0001u
+#define SERVER_MENU_TASKBAR     0x7A5B0002u
+
+typedef struct {
+    int                 active;
+    uint32_t            owning_window_id;
+    int                 client_idx;
+    uint32_t            menu_id;
+    uint32_t            parent_id;
+    int32_t             x;
+    int32_t             y;
+    int32_t             width;
+    int32_t             height;
+    int                 item_count;
+    vanilla_menu_item_t items[CONTEXT_MENU_MAX_ITEMS];
+    int                 highlighted;
+    uint64_t            open_ticks;
+    float               anim_alpha;
+    uint64_t            hover_timer_start;
+    int                 hover_item_idx;
+    int                 open_submenu_idx;
+} vanilla_context_menu_t;
 
 #if defined(_WIN32)
 #ifndef O_NONBLOCK
@@ -63,11 +91,21 @@ typedef enum {
     RESIZE_EDGE_BOT_RIGHT = 8,
 } vanilla_resize_edge_t;
 
+typedef enum {
+    ANIM_IDLE       = 0,
+    ANIM_OPENING    = 1,
+    ANIM_CLOSING    = 2,
+    ANIM_MINIMIZING = 3,
+    ANIM_RESTORING  = 4,
+    ANIM_SNAP_PREV  = 5,
+    ANIM_FOCUS      = 6,
+} vanilla_anim_state_t;
+
 #define DRAG_MODE_NONE     0
 #define DRAG_MODE_TITLEBAR 1
 #define DRAG_MODE_RESIZE   2
 
-typedef struct {
+typedef struct vanilla_server_window {
     int               in_use;
     uint32_t          window_id;
     int               client_fd;
@@ -128,6 +166,21 @@ typedef struct {
 
     /* Keyboard focus ring state */
     int               has_keyboard_focus;
+
+    /* Compositor animation state */
+    int               anim_state;
+    uint64_t          anim_start_ticks;
+    uint32_t          anim_dur_ticks;
+    float             anim_scale_start;
+    float             anim_scale_end;
+    float             anim_alpha_start;
+    float             anim_alpha_end;
+    int32_t           anim_origin_x;
+    int32_t           anim_origin_y;
+    int               anim_destroy_on_done;
+    int               anim_unmap_on_done;
+    float             anim_current_scale;
+    float             anim_current_alpha;
 } vanilla_server_window_t;
 
 typedef struct {
@@ -199,6 +252,12 @@ typedef struct vanilla_server {
     /* Desktop shell taskbar and quick launcher */
     vanilla_shell_t         shell;
     vanilla_launcher_t      launcher;
+
+    /* Server-managed context menus */
+    vanilla_context_menu_t  context_menu_stack[CONTEXT_MENU_MAX_DEPTH];
+    int                     context_menu_depth;
+    vanilla_context_menu_t  context_menu_pool[CONTEXT_MENU_POOL_SIZE];
+    int                     context_menu_pool_count;
 } vanilla_server_t;
 
 /* Server lifecycle */
@@ -234,10 +293,25 @@ vanilla_server_window_t *wm_window_at(vanilla_server_t *srv, int32_t x, int32_t 
 vanilla_resize_edge_t wm_hit_test_resize_edge(const vanilla_server_window_t *w, int32_t px, int32_t py);
 int  wm_run_resize_selftests(void);
 int  wm_run_input_selftests(void);
+int  wm_run_animation_selftests(void);
+
+void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_window_t *w);
 
 /* Alt+Tab switcher overlay */
 void alttab_get_rect(vanilla_server_t *srv, vanilla_rect_t *out_rect);
 void alttab_render(vanilla_server_t *srv, const vanilla_rect_t *dirty);
+
+/* Context menu operations */
+void compositor_paint_context_menus(vanilla_server_t *srv, const vanilla_rect_t *dirty);
+void wm_context_menu_close_stack(vanilla_server_t *srv, uint32_t result_item_id);
+void wm_context_menu_pop(vanilla_server_t *srv);
+int  wm_context_menu_handle_click(vanilla_server_t *srv, int32_t x, int32_t y, uint32_t button);
+int  wm_context_menu_handle_motion(vanilla_server_t *srv, int32_t x, int32_t y);
+int  wm_context_menu_handle_key(vanilla_server_t *srv, uint16_t code, int pressed);
+void wm_context_menu_check_timers(vanilla_server_t *srv);
+int  wm_context_menu_open_desktop(vanilla_server_t *srv, int32_t x, int32_t y);
+int  wm_context_menu_open_taskbar(vanilla_server_t *srv, int32_t x, int32_t y, uint32_t window_id);
+int  wm_run_context_menu_selftests(void);
 
 /* Time and timer primitives */
 uint64_t pit_ticks(void);

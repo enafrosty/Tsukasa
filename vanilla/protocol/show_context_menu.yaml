@@ -1,0 +1,25 @@
+id: 25
+name: MSG_SHOW_CONTEXT_MENU
+direction: client_to_server
+version: 2
+variable_payload: true
+description: "Client requests a context menu popup at the given screen position."
+fields:
+  - name: window_id
+    type: uint32_t
+    description: "Requesting window; result is delivered here"
+  - name: menu_id
+    type: uint32_t
+    description: "Client-assigned ID for this menu instance"
+  - name: parent_id
+    type: uint32_t
+    description: "0 for root menu; nonzero to anchor a submenu to a parent menu"
+  - name: x
+    type: int32_t
+    description: "Desired screen X of the menu's top-left corner"
+  - name: y
+    type: int32_t
+    description: "Desired screen Y of the menu's top-left corner"
+  - name: item_count
+    type: uint32_t
+    description: "Number of vanilla_menu_item_t structs that follow in the payload"
