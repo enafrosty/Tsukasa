@@ -138,7 +138,7 @@ static int vreg_client_rpc(const vreg_req_t *req, vreg_resp_t *resp)
 #if defined(_WIN32) && defined(VANILLA_HOST)
         return -ECONNREFUSED;
 #else
-        return -errno;
+        return errno ? -errno : -ECONNREFUSED;
 #endif
     }
 
@@ -197,8 +197,10 @@ int service_register(const char *name, const char *socket_path)
 
     req.magic = VREG_MAGIC;
     req.op = VREG_OP_REGISTER;
-    strncpy(req.name, name, sizeof(req.name) - 1);
-    strncpy(req.path, socket_path, sizeof(req.path) - 1);
+    strncpy(req.name, name, sizeof(req.name));
+    req.name[sizeof(req.name) - 1] = '\0';
+    strncpy(req.path, socket_path, sizeof(req.path));
+    req.path[sizeof(req.path) - 1] = '\0';
 
     int rc = vreg_client_rpc(&req, &resp);
     if (rc < 0)
@@ -224,7 +226,8 @@ int service_unregister(const char *name)
 
     req.magic = VREG_MAGIC;
     req.op = VREG_OP_UNREGISTER;
-    strncpy(req.name, name, sizeof(req.name) - 1);
+    strncpy(req.name, name, sizeof(req.name));
+    req.name[sizeof(req.name) - 1] = '\0';
 
     int rc = vreg_client_rpc(&req, &resp);
     if (rc < 0)
@@ -250,7 +253,8 @@ int service_connect(const char *name, char *path_buf, size_t path_buf_len)
 
     req.magic = VREG_MAGIC;
     req.op = VREG_OP_LOOKUP;
-    strncpy(req.name, name, sizeof(req.name) - 1);
+    strncpy(req.name, name, sizeof(req.name));
+    req.name[sizeof(req.name) - 1] = '\0';
 
     int rc = vreg_client_rpc(&req, &resp);
     if (rc < 0)
@@ -259,12 +263,12 @@ int service_connect(const char *name, char *path_buf, size_t path_buf_len)
     if (resp.status < 0)
         return resp.status;
 
+    resp.path[sizeof(resp.path) - 1] = '\0';
     size_t plen = strlen(resp.path);
     if (plen >= path_buf_len)
         return -ENAMETOOLONG;
 
-    strncpy(path_buf, resp.path, path_buf_len - 1);
-    path_buf[path_buf_len - 1] = '\0';
+    memcpy(path_buf, resp.path, plen + 1);
 
     return 0;
 }

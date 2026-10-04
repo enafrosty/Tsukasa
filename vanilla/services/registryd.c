@@ -176,10 +176,10 @@ static void vreg_handle_one(int client_fd)
         int target_slot = (found_slot >= 0) ? found_slot : free_slot;
         if (target_slot >= 0) {
             g_entries[target_slot].in_use = 1;
-            strncpy(g_entries[target_slot].name, req.name, VREG_NAME_MAX - 1);
-            g_entries[target_slot].name[VREG_NAME_MAX - 1] = '\0';
-            strncpy(g_entries[target_slot].path, req.path, VREG_PATH_MAX - 1);
-            g_entries[target_slot].path[VREG_PATH_MAX - 1] = '\0';
+            strncpy(g_entries[target_slot].name, req.name, sizeof(g_entries[target_slot].name));
+            g_entries[target_slot].name[sizeof(g_entries[target_slot].name) - 1] = '\0';
+            strncpy(g_entries[target_slot].path, req.path, sizeof(g_entries[target_slot].path));
+            g_entries[target_slot].path[sizeof(g_entries[target_slot].path) - 1] = '\0';
             resp.status = 0;
         } else {
             printf("[registryd] WARN: service registry full (max %d)\n", VREG_MAX_SERVICES);
@@ -220,8 +220,8 @@ static void vreg_handle_one(int client_fd)
         for (int i = 0; i < VREG_MAX_SERVICES; i++) {
             if (g_entries[i].in_use &&
                 strncmp(g_entries[i].name, req.name, VREG_NAME_MAX) == 0) {
-                strncpy(resp.path, g_entries[i].path, VREG_PATH_MAX - 1);
-                resp.path[VREG_PATH_MAX - 1] = '\0';
+                strncpy(resp.path, g_entries[i].path, sizeof(resp.path));
+                resp.path[sizeof(resp.path) - 1] = '\0';
                 found = 1;
                 break;
             }

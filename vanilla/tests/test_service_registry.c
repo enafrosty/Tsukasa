@@ -57,6 +57,67 @@ static void *server_thread_func(void *arg)
     return NULL;
 }
 
+static int raw_vreg_rpc(const vreg_req_t *req, vreg_resp_t *resp)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, TEST_VREG_SOCK, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close_socket(fd);
+        return -1;
+    }
+
+    if (send(fd, (const char *)req, (int)sizeof(*req), 0) < 0) {
+        close_socket(fd);
+        return -1;
+    }
+
+    int ret = recv(fd, (char *)resp, (int)sizeof(*resp), 0);
+    close_socket(fd);
+    return ret;
+}
+
+typedef struct {
+    int thread_id;
+    int success;
+} worker_arg_t;
+
+static void *worker_thread_func(void *arg)
+{
+    worker_arg_t *w = (worker_arg_t *)arg;
+    w->success = 1;
+    char path_buf[VREG_PATH_MAX];
+    char name[VREG_NAME_MAX];
+    char path[VREG_PATH_MAX];
+
+    snprintf(name, sizeof(name), "work_%d", w->thread_id);
+    snprintf(path, sizeof(path), "/tmp/work_%d.sock", w->thread_id);
+
+    for (int i = 0; i < 25; i++) {
+        if (service_register(name, path) != 0) {
+            w->success = 0;
+            break;
+        }
+        if (service_connect(name, path_buf, sizeof(path_buf)) != 0 ||
+            strcmp(path_buf, path) != 0) {
+            w->success = 0;
+            break;
+        }
+        if (service_connect("notify", path_buf, sizeof(path_buf)) != 0 ||
+            strcmp(path_buf, "/tmp/notify.sock") != 0) {
+            w->success = 0;
+            break;
+        }
+    }
+    return NULL;
+}
+
 int main(void)
 {
 #if defined(_WIN32)
@@ -249,6 +310,143 @@ int main(void)
         passed_tests++;
     } else {
         TSK_TEST_FAIL("vreg", "capacity_overflow_enospc", "expected -ENOSPC on table overflow");
+    }
+
+    /* 12. Re-register overwrite when table is full */
+    total_tests++;
+    int fto_ok = 1;
+    if (service_register("svc_0", "/tmp/svc_0_updated.sock") != 0)
+        fto_ok = 0;
+    if (service_connect("svc_0", buf, sizeof(buf)) != 0 ||
+        strcmp(buf, "/tmp/svc_0_updated.sock") != 0)
+        fto_ok = 0;
+
+    if (fto_ok) {
+        TSK_TEST_PASS("vreg", "full_table_overwrite");
+        passed_tests++;
+    } else {
+        TSK_TEST_FAIL("vreg", "full_table_overwrite", "overwrite in full table failed");
+    }
+
+    /* 13. Max length name (31 chars) and path (107 chars) */
+    total_tests++;
+    int max_ok = 1;
+    /* Free 1 slot by unregistering svc_29 */
+    if (service_unregister("svc_29") != 0)
+        max_ok = 0;
+
+    char max_name[VREG_NAME_MAX];
+    memset(max_name, 'm', sizeof(max_name) - 1);
+    max_name[sizeof(max_name) - 1] = '\0'; /* 31 chars */
+
+    char max_path[VREG_PATH_MAX];
+    memset(max_path, 'p', sizeof(max_path) - 1);
+    memcpy(max_path, "/tmp/", 5);
+    max_path[sizeof(max_path) - 1] = '\0'; /* 107 chars */
+
+    if (service_register(max_name, max_path) != 0)
+        max_ok = 0;
+    if (service_connect(max_name, buf, sizeof(buf)) != 0 || strcmp(buf, max_path) != 0)
+        max_ok = 0;
+    if (service_unregister(max_name) != 0)
+        max_ok = 0;
+
+    if (max_ok) {
+        TSK_TEST_PASS("vreg", "max_length_name_and_path");
+        passed_tests++;
+    } else {
+        TSK_TEST_FAIL("vreg", "max_length_name_and_path", "max length register/lookup failed");
+    }
+
+    /* 14. Wire protocol validation: bad magic and invalid opcode */
+    total_tests++;
+    int wire_ok = 1;
+    vreg_req_t wreq;
+    vreg_resp_t wresp;
+
+    /* Bad magic */
+    memset(&wreq, 0, sizeof(wreq));
+    memset(&wresp, 0, sizeof(wresp));
+    wreq.magic = 0x12345678;
+    wreq.op = VREG_OP_LOOKUP;
+    strncpy(wreq.name, "notify", sizeof(wreq.name) - 1);
+    if (raw_vreg_rpc(&wreq, &wresp) < (int)sizeof(wresp) || wresp.status != -EINVAL)
+        wire_ok = 0;
+
+    /* Invalid opcode */
+    memset(&wreq, 0, sizeof(wreq));
+    memset(&wresp, 0, sizeof(wresp));
+    wreq.magic = VREG_MAGIC;
+    wreq.op = 99;
+    strncpy(wreq.name, "notify", sizeof(wreq.name) - 1);
+    if (raw_vreg_rpc(&wreq, &wresp) < (int)sizeof(wresp) || wresp.status != -EINVAL)
+        wire_ok = 0;
+
+    if (wire_ok) {
+        TSK_TEST_PASS("vreg", "wire_bad_magic_and_opcode");
+        passed_tests++;
+    } else {
+        TSK_TEST_FAIL("vreg", "wire_bad_magic_and_opcode", "wire validation checks failed");
+    }
+
+    /* 15. Truncated connection recovery */
+    total_tests++;
+    int trunc_ok = 1;
+    int tfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (tfd >= 0) {
+        struct sockaddr_un taddr;
+        memset(&taddr, 0, sizeof(taddr));
+        taddr.sun_family = AF_UNIX;
+        strncpy(taddr.sun_path, TEST_VREG_SOCK, sizeof(taddr.sun_path) - 1);
+        if (connect(tfd, (struct sockaddr *)&taddr, sizeof(taddr)) == 0) {
+            char partial[16] = {0};
+            (void)send(tfd, partial, sizeof(partial), 0);
+        }
+        close_socket(tfd);
+    }
+    sleep_ms(5);
+    /* Verify server is still alive and serving requests */
+    if (service_connect("notify", buf, sizeof(buf)) != 0 ||
+        strcmp(buf, "/tmp/notify.sock") != 0)
+        trunc_ok = 0;
+
+    if (trunc_ok) {
+        TSK_TEST_PASS("vreg", "truncated_request_recovery");
+        passed_tests++;
+    } else {
+        TSK_TEST_FAIL("vreg", "truncated_request_recovery", "server did not recover");
+    }
+
+    /* 16. Multi-client concurrent stress test */
+    total_tests++;
+    int conc_ok = 1;
+    /* Unregister 4 entries (svc_0..svc_3) to make room for 4 worker services */
+    service_unregister("svc_0");
+    service_unregister("svc_1");
+    service_unregister("svc_2");
+    service_unregister("svc_3");
+
+    pthread_t workers[4];
+    worker_arg_t wargs[4];
+    for (int i = 0; i < 4; i++) {
+        wargs[i].thread_id = i;
+        wargs[i].success = 0;
+        if (pthread_create(&workers[i], NULL, worker_thread_func, &wargs[i]) != 0) {
+            conc_ok = 0;
+            break;
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        pthread_join(workers[i], NULL);
+        if (!wargs[i].success)
+            conc_ok = 0;
+    }
+
+    if (conc_ok) {
+        TSK_TEST_PASS("vreg", "concurrent_stress_clients");
+        passed_tests++;
+    } else {
+        TSK_TEST_FAIL("vreg", "concurrent_stress_clients", "concurrent worker failure");
     }
 
     /* Clean shutdown: signal server and wake up accept */
