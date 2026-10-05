@@ -150,4 +150,7 @@ void vanilla_menu_builder_free(vanilla_menu_builder_t *b);
 /* Service discovery */
 #include "../libvanilla/service.h"
 
+/* Clipboard service */
+#include "../libvanilla/clipboard.h"
+
 #endif /* _VANILLA_H */

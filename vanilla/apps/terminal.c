@@ -43,8 +43,40 @@ typedef struct {
     int      out_pipe[2];
     int      shell_pid;
     int      shift_down;
+    int      ctrl_down;
     int      dirty;
 } terminal_state_t;
+
+static void term_copy_last_output(terminal_state_t *st)
+{
+    int target_row = -1;
+    if (st->cursor_row > 0) {
+        int last = TERM_COLS - 1;
+        while (last >= 0 && st->grid[st->cursor_row - 1][last] == ' ')
+            last--;
+        if (last >= 0)
+            target_row = st->cursor_row - 1;
+    }
+    if (target_row < 0) {
+        int last = TERM_COLS - 1;
+        while (last >= 0 && st->grid[st->cursor_row][last] == ' ')
+            last--;
+        if (last >= 0)
+            target_row = st->cursor_row;
+    }
+    if (target_row >= 0) {
+        int last = TERM_COLS - 1;
+        while (last >= 0 && st->grid[target_row][last] == ' ')
+            last--;
+        if (last >= 0) {
+            size_t len = (size_t)(last + 1);
+            char line_buf[TERM_COLS + 1];
+            memcpy(line_buf, st->grid[target_row], len);
+            line_buf[len] = '\0';
+            clipboard_set(line_buf, len);
+        }
+    }
+}
 
 static void term_scroll_up(terminal_state_t *st)
 {
@@ -229,18 +261,44 @@ int main(int argc, char **argv)
                 if (iev->type == EV_KEY) {
                     if (iev->code == KEY_LEFTSHIFT || iev->code == KEY_RIGHTSHIFT) {
                         state.shift_down = (iev->value != 0);
+                    } else if (iev->code == KEY_LEFTCTRL || iev->code == KEY_RIGHTCTRL) {
+                        state.ctrl_down = (iev->value != 0);
                     } else if (iev->value == 1) {
-                        char ascii = vanilla_evdev_to_ascii(iev->code, state.shift_down);
-                        if (ascii != 0) {
-                            write(state.in_pipe[1], &ascii, 1);
-                        } else if (iev->code == KEY_UP) {
-                            write(state.in_pipe[1], "\033[A", 3);
-                        } else if (iev->code == KEY_DOWN) {
-                            write(state.in_pipe[1], "\033[B", 3);
-                        } else if (iev->code == KEY_RIGHT) {
-                            write(state.in_pipe[1], "\033[C", 3);
-                        } else if (iev->code == KEY_LEFT) {
-                            write(state.in_pipe[1], "\033[D", 3);
+                        int is_ctrl = state.ctrl_down || ((ev.mod_state & MOD_CTRL) != 0);
+                        int is_shift = state.shift_down || ((ev.mod_state & MOD_SHIFT) != 0);
+                        if (is_ctrl) {
+                            if (iev->code == KEY_C) {
+                                term_copy_last_output(&state);
+                                if (!is_shift) {
+                                    char c = 3;
+                                    write(state.in_pipe[1], &c, 1);
+                                }
+                            } else if (iev->code == KEY_V) {
+                                char paste_buf[1024];
+                                int n = clipboard_get(paste_buf, sizeof(paste_buf));
+                                if (n > 0) {
+                                    write(state.in_pipe[1], paste_buf, (size_t)n);
+                                }
+                            } else if (iev->code == KEY_D) {
+                                char c = 4;
+                                write(state.in_pipe[1], &c, 1);
+                            } else if (iev->code == KEY_L) {
+                                char c = 12;
+                                write(state.in_pipe[1], &c, 1);
+                            }
+                        } else {
+                            char ascii = vanilla_evdev_to_ascii(iev->code, is_shift);
+                            if (ascii != 0) {
+                                write(state.in_pipe[1], &ascii, 1);
+                            } else if (iev->code == KEY_UP) {
+                                write(state.in_pipe[1], "\033[A", 3);
+                            } else if (iev->code == KEY_DOWN) {
+                                write(state.in_pipe[1], "\033[B", 3);
+                            } else if (iev->code == KEY_RIGHT) {
+                                write(state.in_pipe[1], "\033[C", 3);
+                            } else if (iev->code == KEY_LEFT) {
+                                write(state.in_pipe[1], "\033[D", 3);
+                            }
                         }
                     }
                 }

@@ -39,6 +39,7 @@ typedef struct {
     int  scroll_line;
     char filename[128];
     int  shift_down;
+    int  ctrl_down;
     int  dirty;
 } notepad_state_t;
 
@@ -288,10 +289,29 @@ int main(int argc, char **argv)
                         }
                     } else if (iev->code == KEY_LEFTSHIFT || iev->code == KEY_RIGHTSHIFT) {
                         state->shift_down = (iev->value != 0);
-                    } else if (iev->code == KEY_LEFTCTRL) {
-                        /* Track Ctrl key */
+                    } else if (iev->code == KEY_LEFTCTRL || iev->code == KEY_RIGHTCTRL) {
+                        state->ctrl_down = (iev->value != 0);
                     } else if (iev->value == 1) {
-                        if (iev->code == KEY_F2) {
+                        int is_ctrl = state->ctrl_down || ((ev.mod_state & MOD_CTRL) != 0);
+                        int is_shift = state->shift_down || ((ev.mod_state & MOD_SHIFT) != 0);
+                        (void)is_shift;
+                        if (is_ctrl) {
+                            if (iev->code == KEY_C) {
+                                const char *cur_line = state->lines[state->cursor_line];
+                                clipboard_set(cur_line, strlen(cur_line));
+                            } else if (iev->code == KEY_V) {
+                                char paste_buf[4096];
+                                int n = clipboard_get(paste_buf, sizeof(paste_buf));
+                                if (n > 0) {
+                                    for (int i = 0; i < n; i++) {
+                                        note_insert_char(state, paste_buf[i]);
+                                    }
+                                    state->dirty = 1;
+                                }
+                            } else if (iev->code == KEY_S) {
+                                note_save_file(state);
+                            }
+                        } else if (iev->code == KEY_F2) {
                             note_save_file(state);
                         } else if (iev->code == KEY_UP) {
                             if (state->cursor_line > 0) {
