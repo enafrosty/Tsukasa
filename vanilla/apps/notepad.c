@@ -39,6 +39,7 @@ typedef struct {
     int  scroll_line;
     char filename[128];
     int  shift_down;
+    int  ctrl_down;
     int  dirty;
 } notepad_state_t;
 
@@ -145,6 +146,19 @@ static void note_insert_char(notepad_state_t *st, char c)
                 st->dirty = 1;
             }
         }
+        return;
+    }
+
+    if (c == '\t') {
+        for (int s = 0; s < 4; s++) {
+            if (len < MAX_LINE_LEN - 1) {
+                memmove(l + st->cursor_col + 1, l + st->cursor_col, len - st->cursor_col + 1);
+                l[st->cursor_col] = ' ';
+                st->cursor_col++;
+                len++;
+            }
+        }
+        st->dirty = 1;
         return;
     }
 
@@ -311,10 +325,38 @@ int main(int argc, char **argv)
                         }
                     } else if (iev->code == KEY_LEFTSHIFT || iev->code == KEY_RIGHTSHIFT) {
                         state->shift_down = (iev->value != 0);
-                    } else if (iev->code == KEY_LEFTCTRL) {
-                        /* Track Ctrl key */
+                    } else if (iev->code == KEY_LEFTCTRL || iev->code == KEY_RIGHTCTRL) {
+                        state->ctrl_down = (iev->value != 0);
                     } else if (iev->value == 1) {
-                        if (iev->code == KEY_F2) {
+                        int is_ctrl = state->ctrl_down || ((ev.mod_state & MOD_CTRL) != 0);
+                        int is_shift = state->shift_down || ((ev.mod_state & MOD_SHIFT) != 0);
+                        (void)is_shift;
+                        if (is_ctrl) {
+                            if (iev->code == KEY_C) {
+                                const char *cur_line = state->lines[state->cursor_line];
+                                clipboard_set(cur_line, strlen(cur_line));
+                            } else if (iev->code == KEY_V) {
+                                char *paste_buf = (char *)malloc(VCLIP_TEXT_MAX + 1);
+                                if (paste_buf) {
+                                    int n = clipboard_get(paste_buf, VCLIP_TEXT_MAX + 1);
+                                    if (n > 0) {
+                                        for (int i = 0; i < n; i++) {
+                                            char ch = paste_buf[i];
+                                            if (ch == '\r') {
+                                                if (i + 1 < n && paste_buf[i + 1] == '\n')
+                                                    continue;
+                                                ch = '\n';
+                                            }
+                                            note_insert_char(state, ch);
+                                        }
+                                        state->dirty = 1;
+                                    }
+                                    free(paste_buf);
+                                }
+                            } else if (iev->code == KEY_S) {
+                                note_save_file(state);
+                            }
+                        } else if (iev->code == KEY_F2) {
                             note_save_file(state);
                         } else if (iev->code == KEY_UP) {
                             if (state->cursor_line > 0) {
