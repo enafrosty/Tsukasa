@@ -22,3 +22,7 @@ Clay layout engine
   Commit: b25a31c1a152915cd7dd6796e6592273e5a10aac
   Location: vanilla/layout/clay.h
 
+## Process Lifecycle and Supervisor Architecture
+The Vanilla service supervisor (`vanilla/supervisor/`) manages services using the current `spawn_ex` process model. When copy-on-write `fork()` and `execve()` primitives land in the kernel along with `SIGCHLD` signal notifications, the supervisor will transition to standard fork/exec and replace liveness polling with a `SIGCHLD` signal handler and `waitpid()`.
+
+
