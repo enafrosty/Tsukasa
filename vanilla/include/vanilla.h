@@ -147,4 +147,7 @@ int  vanilla_menu_builder_show_sub(vanilla_menu_builder_t *b, vanilla_client_t *
                                    vanilla_window_t *w, uint32_t menu_id, uint32_t parent_id);
 void vanilla_menu_builder_free(vanilla_menu_builder_t *b);
 
+/* Service discovery */
+#include "../libvanilla/service.h"
+
 #endif /* _VANILLA_H */

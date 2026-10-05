@@ -44,6 +44,7 @@ LIB_DIR = lib
 
 LIBVANILLA_OBJS = libvanilla/client.o \
                   libvanilla/surface.o \
+                  libvanilla/service.o \
                   server/theme.o \
                   input/keymap.o
 
@@ -116,6 +117,7 @@ LIBVANILLA_A       = $(LIB_DIR)/libvanilla.a
 LIBVANILLA_UI_A    = $(LIB_DIR)/libvanilla-ui.a
 LIBVANILLALAYOUT_A = $(LIB_DIR)/libvanillalayout.a
 SERVER_BIN         = $(BIN_DIR)/vanilla_srv.elf
+REGISTRYD_BIN      = $(BIN_DIR)/registryd.elf
 TEST_IPC_BIN       = $(BIN_DIR)/test_ipc.elf
 TEST_COMP_BIN      = $(BIN_DIR)/test_compositor.elf
 TEST_TYPO_BIN      = $(BIN_DIR)/test_typography.elf
@@ -133,7 +135,7 @@ SHELL_BIN       = $(BIN_DIR)/shell.elf
 
 APP_TARGETS     = $(TERMINAL_BIN) $(NOTEPAD_BIN) $(CALC_BIN) $(FILEMGR_BIN) $(SETTINGS_BIN) $(TASKMGR_BIN) $(SHELL_BIN)
 
-ALL_TARGETS     = $(LIBVANILLA_A) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(SERVER_BIN) $(TEST_IPC_BIN) $(TEST_COMP_BIN) $(TEST_TYPO_BIN) $(TEST_SHELL_BIN) $(TEST_LAYOUT_BIN) $(APP_TARGETS)
+ALL_TARGETS     = $(LIBVANILLA_A) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(SERVER_BIN) $(REGISTRYD_BIN) $(TEST_IPC_BIN) $(TEST_COMP_BIN) $(TEST_TYPO_BIN) $(TEST_SHELL_BIN) $(TEST_LAYOUT_BIN) $(APP_TARGETS)
 
 PYTHON ?= python3
 
@@ -167,6 +169,10 @@ $(SERVER_BIN): $(CRT0) $(SERVER_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) $(SERVER_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
+$(REGISTRYD_BIN): $(CRT0) services/registryd.o $(LIBVANILLA_A) $(LIBC_A)
+	@mkdir -p $(BIN_DIR)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) services/registryd.o $(LIBVANILLA_A) $(LIBC_A)
+
 $(TEST_IPC_BIN): $(CRT0) $(TEST_IPC_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) $(TEST_IPC_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
@@ -194,6 +200,14 @@ build/test_layout: layout/test_layout.c layout/layout.c layout/draw_consumer.c a
 build/test_ui: libvanilla-ui/test_ui.c $(LIBVANILLA_UI_SRCS) layout/layout.c layout/draw_consumer.c apps/app_common.c server/blitter.c server/theme.c input/keymap.c
 	@mkdir -p build
 	gcc -O2 -Iinclude -I../tsukasa-libc/include -Iinput -Iserver -Iapps -Ilibvanilla-ui -DVANILLA_HOST -o $@ $^ -lm
+
+build/test_service_registry: tests/test_service_registry.c libvanilla/service.c services/registryd.c
+	@mkdir -p build
+ifeq ($(OS),Windows_NT)
+	gcc -O2 -Iinclude -Iservices -Ilibvanilla -I../scripts/test -DVANILLA_HOST -DVREG_TEST_NO_MAIN -o $@ $^ -lws2_32 -lpthread
+else
+	gcc -O2 -Iinclude -Iservices -Ilibvanilla -I../scripts/test -DVANILLA_HOST -DVREG_TEST_NO_MAIN -o $@ $^ -lpthread
+endif
 
 $(TERMINAL_BIN): $(CRT0) apps/terminal.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
@@ -237,6 +251,7 @@ check: all
 	@echo "     - lib/libvanilla-ui.a"
 	@echo "     - lib/libvanillalayout.a"
 	@echo "     - bin/vanilla_srv.elf"
+	@echo "     - bin/registryd.elf"
 	@echo "     - bin/test_ipc.elf"
 	@echo "     - bin/test_compositor.elf"
 	@echo "     - bin/test_typography.elf"
@@ -251,7 +266,7 @@ check: all
 	@echo "     - bin/shell.elf"
 
 clean:
-	rm -rf libvanilla/*.o libvanilla-ui/*.o server/*.o tests/*.o apps/*.o input/*.o layout/*.o shell-client/*.o $(BIN_DIR) $(LIB_DIR) host_emulator/*.host.o server/*.host.o libvanilla/*.host.o input/*.host.o host_emulator/bin build
+	rm -rf libvanilla/*.o libvanilla-ui/*.o server/*.o services/*.o tests/*.o apps/*.o input/*.o layout/*.o shell-client/*.o $(BIN_DIR) $(LIB_DIR) host_emulator/*.host.o server/*.host.o libvanilla/*.host.o input/*.host.o host_emulator/bin build
 
 host: gen-protocol
 	$(MAKE) -f host_emulator/Makefile.host all

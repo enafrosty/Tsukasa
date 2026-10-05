@@ -68,6 +68,21 @@ static int init_main(int argc, char **argv)
     shell_run_rc_file("/etc/tsukasa.rc", 1, 2);
     shell_run_rc_file("/tmp/.tsukasarc", 1, 2);
 
+    /* Spawn Vanilla service registry daemon */
+    int reg_pid = spawn("/fat12/REGISTRD.ELF");
+    if (reg_pid <= 0)
+        reg_pid = spawn("/bin/REGISTRD.ELF");
+    if (reg_pid <= 0)
+        reg_pid = spawn("/bin/registryd.elf");
+    if (reg_pid <= 0)
+        reg_pid = spawn("/fat12/registryd.elf");
+
+    if (reg_pid > 0) {
+        dprintf(1, "[init] spawned Service Registry (pid=%d)\n", reg_pid);
+        struct timespec ts_reg = { 0, 50000000 };
+        nanosleep(&ts_reg, NULL);
+    }
+
     /* Spawn Project Vanilla display server */
     int vsrv_pid = spawn("/bin/vsrv.elf");
     if (vsrv_pid <= 0)
