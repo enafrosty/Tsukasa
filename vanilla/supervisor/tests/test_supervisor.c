@@ -76,6 +76,11 @@ static void test_config_parsing(void)
 
     svc_entry_t entry;
 
+    /* Null checks */
+    TEST_ASSERT(supervisor_parse_line(NULL, &entry) == -1, "null line returns -1");
+    char dummy_line[] = "a=b";
+    TEST_ASSERT(supervisor_parse_line(dummy_line, NULL) == -1, "null out returns -1");
+
     /* Empty line */
     char line1[] = "   \t  \r\n";
     TEST_ASSERT(supervisor_parse_line(line1, &entry) == 0, "blank line returns 0");
@@ -106,6 +111,9 @@ static void test_config_parsing(void)
     TEST_ASSERT(strcmp(entry.name, "registryd") == 0, "name matches registryd");
     TEST_ASSERT(strcmp(entry.path, "/bin/registryd.elf") == 0, "path matches /bin/registryd.elf");
     TEST_ASSERT(entry.args[0] == '\0', "args empty");
+    TEST_ASSERT(entry.argc == 1, "argc is 1");
+    TEST_ASSERT(entry.argv[0] == entry.path, "argv[0] points to entry.path");
+    TEST_ASSERT(entry.argv[1] == NULL, "argv[1] is NULL");
     TEST_ASSERT(entry.backoff_ms == SUPERVISOR_BACKOFF_INIT_MS, "init backoff is 1000ms");
     TEST_ASSERT(entry.state == SVC_STATE_BACKOFF, "initial state is backoff");
     TEST_ASSERT(entry.pid == -1, "initial pid is -1");
@@ -115,7 +123,21 @@ static void test_config_parsing(void)
     TEST_ASSERT(supervisor_parse_line(line8, &entry) == 1, "valid line with args returns 1");
     TEST_ASSERT(strcmp(entry.name, "shell") == 0, "trimmed name matches shell");
     TEST_ASSERT(strcmp(entry.path, "/bin/shell.elf") == 0, "trimmed path matches /bin/shell.elf");
-    TEST_ASSERT(strcmp(entry.args, "--flag  arg2") == 0, "args parsed correctly");
+    TEST_ASSERT(entry.argc == 3, "argc is 3");
+    TEST_ASSERT(entry.argv[0] == entry.path, "argv[0] points to path");
+    TEST_ASSERT(strcmp(entry.argv[1], "--flag") == 0, "argv[1] matches --flag");
+    TEST_ASSERT(strcmp(entry.argv[2], "arg2") == 0, "argv[2] matches arg2");
+    TEST_ASSERT(entry.argv[3] == NULL, "argv[3] is NULL");
+
+    /* Valid line with multiple flags */
+    char line9[] = "custom = /bin/app -a -b -c 123";
+    TEST_ASSERT(supervisor_parse_line(line9, &entry) == 1, "multiple flags line returns 1");
+    TEST_ASSERT(entry.argc == 5, "argc is 5");
+    TEST_ASSERT(strcmp(entry.argv[1], "-a") == 0, "argv[1] is -a");
+    TEST_ASSERT(strcmp(entry.argv[2], "-b") == 0, "argv[2] is -b");
+    TEST_ASSERT(strcmp(entry.argv[3], "-c") == 0, "argv[3] is -c");
+    TEST_ASSERT(strcmp(entry.argv[4], "123") == 0, "argv[4] is 123");
+    TEST_ASSERT(entry.argv[5] == NULL, "argv[5] is NULL");
 }
 
 static void test_backoff_logic(void)
@@ -151,6 +173,49 @@ static void test_backoff_logic(void)
 
     b = supervisor_compute_next_backoff(32000, 45000);
     TEST_ASSERT(b == SUPERVISOR_BACKOFF_INIT_MS, "runtime 45000ms resets backoff to 1000ms");
+
+    /* Full lifecycle check: initial start -> consecutive crashes -> healthy run -> reset */
+    uint32_t restart_count = 0;
+    uint32_t cur_backoff = SUPERVISOR_BACKOFF_INIT_MS;
+    uint64_t runtime_ms = 2000; /* crashes after 2s */
+
+    /* First crash: restart_count == 0 gives 1000ms */
+    if (restart_count == 0 || runtime_ms >= SUPERVISOR_BACKOFF_RESET_MS) {
+        cur_backoff = SUPERVISOR_BACKOFF_INIT_MS;
+    } else {
+        cur_backoff = supervisor_compute_next_backoff(cur_backoff, runtime_ms);
+    }
+    restart_count++;
+    TEST_ASSERT(cur_backoff == 1000, "first crash uses 1000ms initial backoff");
+
+    /* Second consecutive crash (< 30s) */
+    runtime_ms = 500;
+    if (restart_count == 0 || runtime_ms >= SUPERVISOR_BACKOFF_RESET_MS) {
+        cur_backoff = SUPERVISOR_BACKOFF_INIT_MS;
+    } else {
+        cur_backoff = supervisor_compute_next_backoff(cur_backoff, runtime_ms);
+    }
+    restart_count++;
+    TEST_ASSERT(cur_backoff == 2000, "second crash doubles to 2000ms");
+
+    /* Third consecutive crash (< 30s) */
+    runtime_ms = 1000;
+    if (restart_count == 0 || runtime_ms >= SUPERVISOR_BACKOFF_RESET_MS) {
+        cur_backoff = SUPERVISOR_BACKOFF_INIT_MS;
+    } else {
+        cur_backoff = supervisor_compute_next_backoff(cur_backoff, runtime_ms);
+    }
+    restart_count++;
+    TEST_ASSERT(cur_backoff == 4000, "third crash doubles to 4000ms");
+
+    /* Healthy run (40s >= 30s) resets back to 1000ms */
+    runtime_ms = 40000;
+    if (restart_count == 0 || runtime_ms >= SUPERVISOR_BACKOFF_RESET_MS) {
+        cur_backoff = SUPERVISOR_BACKOFF_INIT_MS;
+    } else {
+        cur_backoff = supervisor_compute_next_backoff(cur_backoff, runtime_ms);
+    }
+    TEST_ASSERT(cur_backoff == 1000, "healthy run >= 30s resets backoff to 1000ms");
 }
 
 int main(void)

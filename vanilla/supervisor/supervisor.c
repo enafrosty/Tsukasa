@@ -57,6 +57,9 @@ static char *trim_whitespace(char *str)
 
 int supervisor_parse_line(char *line, svc_entry_t *out)
 {
+    if (!line || !out)
+        return -1;
+
     line = trim_whitespace(line);
     if (*line == '\0' || *line == '#')
         return 0;
@@ -90,13 +93,29 @@ int supervisor_parse_line(char *line, svc_entry_t *out)
     strncpy(out->path, val, SUPERVISOR_PATH_MAX - 1);
     out->path[SUPERVISOR_PATH_MAX - 1] = '\0';
 
+    out->argv[0] = out->path;
+    out->argc = 1;
+
     if (args && *args != '\0') {
         strncpy(out->args, args, SUPERVISOR_PATH_MAX - 1);
         out->args[SUPERVISOR_PATH_MAX - 1] = '\0';
-    }
 
-    out->argv[0] = out->path;
-    out->argc = 1;
+        char *ap = out->args;
+        while (*ap && out->argc < 15) {
+            while (*ap == ' ' || *ap == '\t')
+                ap++;
+            if (!*ap)
+                break;
+            out->argv[out->argc++] = ap;
+            while (*ap && *ap != ' ' && *ap != '\t')
+                ap++;
+            if (*ap) {
+                *ap++ = '\0';
+            }
+        }
+    }
+    out->argv[out->argc] = NULL;
+
     out->pid = -1;
     out->state = SVC_STATE_BACKOFF;
     out->restart_count = 0;
@@ -120,6 +139,94 @@ uint32_t supervisor_compute_next_backoff(uint32_t current_backoff_ms, uint64_t r
 }
 
 #ifndef SUPERVISOR_TEST_RUNNER
+static int resolve_service_path(const char *path, char *out, size_t out_sz)
+{
+    if (!path || !out || out_sz == 0)
+        return -1;
+
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        close(fd);
+        strncpy(out, path, out_sz - 1);
+        out[out_sz - 1] = '\0';
+        return 0;
+    }
+
+    static const struct {
+        const char *name;
+        const char *target;
+    } s_fallbacks[] = {
+        { "/bin/registryd.elf", "/bin/REGISTRD.ELF" },
+        { "/fat12/registryd.elf", "/fat12/REGISTRD.ELF" },
+        { "registryd.elf", "/bin/REGISTRD.ELF" },
+        { "/bin/shell.elf", "/bin/SHELL.ELF" },
+        { "/fat12/shell.elf", "/fat12/SHELL.ELF" },
+        { "shell.elf", "/bin/SHELL.ELF" },
+        { "/bin/clipboardd.elf", "/bin/CLIPBD.ELF" },
+        { "/bin/clipbd.elf", "/bin/CLIPBD.ELF" },
+        { "/fat12/clipbd.elf", "/fat12/CLIPBD.ELF" },
+        { "/bin/notifyd.elf", "/bin/NOTIFYD.ELF" },
+        { "/fat12/notifyd.elf", "/fat12/NOTIFYD.ELF" },
+    };
+
+    for (size_t i = 0; i < sizeof(s_fallbacks) / sizeof(s_fallbacks[0]); i++) {
+        if (strcmp(path, s_fallbacks[i].name) == 0) {
+            fd = open(s_fallbacks[i].target, O_RDONLY);
+            if (fd >= 0) {
+                close(fd);
+                strncpy(out, s_fallbacks[i].target, out_sz - 1);
+                out[out_sz - 1] = '\0';
+                return 0;
+            }
+        }
+    }
+
+    if (strncmp(path, "/bin/", 5) == 0) {
+        char alt[SUPERVISOR_PATH_MAX];
+        snprintf(alt, sizeof(alt), "/fat12/%s", path + 5);
+        fd = open(alt, O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            strncpy(out, alt, out_sz - 1);
+            out[out_sz - 1] = '\0';
+            return 0;
+        }
+    }
+
+    char upath[SUPERVISOR_PATH_MAX];
+    size_t len = strlen(path);
+    if (len < sizeof(upath)) {
+        for (size_t i = 0; i < len; i++) {
+            char c = path[i];
+            upath[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+        }
+        upath[len] = '\0';
+        fd = open(upath, O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            strncpy(out, upath, out_sz - 1);
+            out[out_sz - 1] = '\0';
+            return 0;
+        }
+
+        if (strncmp(upath, "/BIN/", 5) == 0) {
+            char ufat[SUPERVISOR_PATH_MAX];
+            snprintf(ufat, sizeof(ufat), "/fat12/%s", upath + 5);
+            fd = open(ufat, O_RDONLY);
+            if (fd >= 0) {
+                close(fd);
+                strncpy(out, ufat, out_sz - 1);
+                out[out_sz - 1] = '\0';
+                return 0;
+            }
+        }
+    }
+
+    strncpy(out, path, out_sz - 1);
+    out[out_sz - 1] = '\0';
+    return -1;
+}
+
 static int load_services_file(const char *path)
 {
     int fd = open(path, O_RDONLY);
@@ -141,10 +248,10 @@ static int load_services_file(const char *path)
         if (eol)
             *eol = '\0';
 
-        svc_entry_t entry;
-        int res = supervisor_parse_line(cur, &entry);
+        svc_entry_t *entry = &g_services[g_service_count];
+        int res = supervisor_parse_line(cur, entry);
         if (res > 0) {
-            g_services[g_service_count++] = entry;
+            g_service_count++;
         }
 
         if (!eol)
@@ -186,58 +293,31 @@ static int load_services(const char *specified_path)
 }
 
 /*
- * Future upgrade path:
- * When copy-on-write fork and execve primitives are available,
- * replace spawn_ex with fork() + execve(), and replace kill(pid, 0) status polling
- * with a SIGCHLD signal handler calling waitpid(-1, &status, WNOHANG).
+ * Upgrade path for copy-on-write fork and execve:
+ * When fork/execve and SIGCHLD handling arrive in the kernel:
+ * 1. Replace svc_spawn() using spawn_ex with fork() + execve(svc->path, svc->argv, environ).
+ * 2. Replace the waitpid(..., WNOHANG) and kill(pid, 0) polling in the main loop
+ *    with a SIGCHLD signal handler calling waitpid(-1, &status, WNOHANG).
+ * 3. Replace the 100ms polling nanosleep with blocking poll() or select() on the
+ *    query socket with timeout once non-blocking wait/poll primitives land.
+ * The configuration format and query wire protocol remain unchanged.
  */
-#ifndef SUPERVISOR_TEST_RUNNER
 static pid_t svc_spawn(svc_entry_t *svc)
 {
+    char resolved_path[SUPERVISOR_PATH_MAX];
+    resolve_service_path(svc->path, resolved_path, sizeof(resolved_path));
+
     struct tsukasa_spawn_request req;
     memset(&req, 0, sizeof(req));
-    req.path = svc->path;
-    req.args = (svc->args[0] != '\0') ? svc->args : svc->path;
-    req.stdin_fd = -1;
-    req.stdout_fd = -1;
-    req.stderr_fd = -1;
+    req.path = resolved_path;
+    req.args = (svc->args[0] != '\0') ? svc->args : resolved_path;
+    req.stdin_fd = 0;
+    req.stdout_fd = 1;
+    req.stderr_fd = 2;
     req.tty_id = -1;
-
-    int test_fd = open(req.path, O_RDONLY);
-    if (test_fd >= 0) {
-        close(test_fd);
-    } else {
-        /* Fallback for FAT12 8.3 filename truncation on root ramdisk */
-        if (strcmp(svc->path, "/bin/registryd.elf") == 0) {
-            test_fd = open("/bin/REGISTRD.ELF", O_RDONLY);
-            if (test_fd >= 0) {
-                close(test_fd);
-                req.path = "/bin/REGISTRD.ELF";
-            } else {
-                test_fd = open("/fat12/REGISTRD.ELF", O_RDONLY);
-                if (test_fd >= 0) {
-                    close(test_fd);
-                    req.path = "/fat12/REGISTRD.ELF";
-                }
-            }
-        } else if (strcmp(svc->path, "/bin/shell.elf") == 0) {
-            test_fd = open("/bin/SHELL.ELF", O_RDONLY);
-            if (test_fd >= 0) {
-                close(test_fd);
-                req.path = "/bin/SHELL.ELF";
-            } else {
-                test_fd = open("/fat12/SHELL.ELF", O_RDONLY);
-                if (test_fd >= 0) {
-                    close(test_fd);
-                    req.path = "/fat12/SHELL.ELF";
-                }
-            }
-        }
-    }
 
     return (pid_t)spawn_ex(&req);
 }
-#endif
 
 static int setup_query_socket(void)
 {
@@ -245,6 +325,10 @@ static int setup_query_socket(void)
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
         return -1;
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -269,29 +353,28 @@ static void svc_accept_query(int listen_fd)
     if (listen_fd < 0)
         return;
 
-    int client_fd = accept(listen_fd, NULL, NULL);
-    if (client_fd < 0)
-        return;
+    int client_fd;
+    while ((client_fd = accept(listen_fd, NULL, NULL)) >= 0) {
+        vsup_req_t req;
+        ssize_t n = read(client_fd, &req, sizeof(req));
+        if (n == (ssize_t)sizeof(req) && req.magic == VSUP_MAGIC && req.op == VSUP_OP_LIST) {
+            vsup_resp_hdr_t hdr;
+            hdr.magic = VSUP_MAGIC;
+            hdr.service_count = g_service_count;
+            write(client_fd, &hdr, sizeof(hdr));
 
-    vsup_req_t req;
-    ssize_t n = read(client_fd, &req, sizeof(req));
-    if (n == (ssize_t)sizeof(req) && req.magic == VSUP_MAGIC && req.op == VSUP_OP_LIST) {
-        vsup_resp_hdr_t hdr;
-        hdr.magic = VSUP_MAGIC;
-        hdr.service_count = g_service_count;
-        write(client_fd, &hdr, sizeof(hdr));
-
-        for (int i = 0; i < g_service_count; i++) {
-            vsup_svc_entry_t entry;
-            memset(&entry, 0, sizeof(entry));
-            strncpy(entry.name, g_services[i].name, sizeof(entry.name) - 1);
-            entry.pid = (int32_t)g_services[i].pid;
-            entry.restart_count = g_services[i].restart_count;
-            entry.state = (uint8_t)g_services[i].state;
-            write(client_fd, &entry, sizeof(entry));
+            for (int i = 0; i < g_service_count; i++) {
+                vsup_svc_entry_t entry;
+                memset(&entry, 0, sizeof(entry));
+                strncpy(entry.name, g_services[i].name, sizeof(entry.name) - 1);
+                entry.pid = (int32_t)g_services[i].pid;
+                entry.restart_count = g_services[i].restart_count;
+                entry.state = (uint8_t)g_services[i].state;
+                write(client_fd, &entry, sizeof(entry));
+            }
         }
+        close(client_fd);
     }
-    close(client_fd);
 }
 
 static int run_query_client(void)
@@ -415,8 +498,12 @@ int main(int argc, char **argv)
                 }
 
                 if (is_dead) {
-                    uint64_t runtime_ms = now_ms - s->last_start_ms;
-                    s->backoff_ms = supervisor_compute_next_backoff(s->backoff_ms, runtime_ms);
+                    uint64_t runtime_ms = (now_ms >= s->last_start_ms) ? (now_ms - s->last_start_ms) : 0;
+                    if (s->restart_count == 0 || runtime_ms >= SUPERVISOR_BACKOFF_RESET_MS) {
+                        s->backoff_ms = SUPERVISOR_BACKOFF_INIT_MS;
+                    } else {
+                        s->backoff_ms = supervisor_compute_next_backoff(s->backoff_ms, runtime_ms);
+                    }
                     s->restart_after_ms = now_ms + s->backoff_ms;
                     s->state = SVC_STATE_BACKOFF;
                     s->pid = -1;
@@ -438,10 +525,7 @@ int main(int argc, char **argv)
                                s->name, s->path, (int)s->pid);
                         fflush(stdout);
                     } else {
-                        if (s->backoff_ms < SUPERVISOR_BACKOFF_MAX_MS) {
-                            uint32_t next = s->backoff_ms * 2;
-                            s->backoff_ms = (next < SUPERVISOR_BACKOFF_MAX_MS) ? next : SUPERVISOR_BACKOFF_MAX_MS;
-                        }
+                        s->backoff_ms = supervisor_compute_next_backoff(s->backoff_ms, 0);
                         s->restart_after_ms = now_ms + s->backoff_ms;
                         printf("[supervisord] could not start %s (%s), retry in %us\n",
                                s->name, s->path, s->backoff_ms / 1000u);
