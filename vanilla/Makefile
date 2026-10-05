@@ -132,10 +132,10 @@ FILEMGR_BIN     = $(BIN_DIR)/filemgr.elf
 SETTINGS_BIN    = $(BIN_DIR)/settings.elf
 TASKMGR_BIN     = $(BIN_DIR)/taskmgr.elf
 SHELL_BIN       = $(BIN_DIR)/shell.elf
-
 APP_TARGETS     = $(TERMINAL_BIN) $(NOTEPAD_BIN) $(CALC_BIN) $(FILEMGR_BIN) $(SETTINGS_BIN) $(TASKMGR_BIN) $(SHELL_BIN)
+SUPERVISOR_BIN  = supervisor/SUPERVSD.ELF
 
-ALL_TARGETS     = $(LIBVANILLA_A) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(SERVER_BIN) $(REGISTRYD_BIN) $(TEST_IPC_BIN) $(TEST_COMP_BIN) $(TEST_TYPO_BIN) $(TEST_SHELL_BIN) $(TEST_LAYOUT_BIN) $(APP_TARGETS)
+ALL_TARGETS     = $(LIBVANILLA_A) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(SERVER_BIN) $(REGISTRYD_BIN) $(TEST_IPC_BIN) $(TEST_COMP_BIN) $(TEST_TYPO_BIN) $(TEST_SHELL_BIN) $(TEST_LAYOUT_BIN) $(APP_TARGETS) $(SUPERVISOR_BIN)
 
 PYTHON ?= python3
 
@@ -237,6 +237,11 @@ $(SHELL_BIN): $(CRT0) shell-client/shell_client.o $(APP_COMMON_OBJ) $(LIBVANILLA
 	@mkdir -p $(BIN_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) shell-client/shell_client.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
+$(SUPERVISOR_BIN): supervisor/supervisor.c supervisor/supervisor.h supervisor/Makefile
+	$(MAKE) -C supervisor all
+	@mkdir -p $(BIN_DIR)
+	cp $@ $(BIN_DIR)/supervsd.elf
+
 shell-client/shell_client.test.o: shell-client/shell_client.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -DTEST_SHELL_RUNNER -c -o $@ $<
@@ -264,9 +269,11 @@ check: all
 	@echo "     - bin/settings.elf"
 	@echo "     - bin/taskmgr.elf"
 	@echo "     - bin/shell.elf"
+	@echo "     - supervisor/SUPERVSD.ELF"
 
 clean:
 	rm -rf libvanilla/*.o libvanilla-ui/*.o server/*.o services/*.o tests/*.o apps/*.o input/*.o layout/*.o shell-client/*.o $(BIN_DIR) $(LIB_DIR) host_emulator/*.host.o server/*.host.o libvanilla/*.host.o input/*.host.o host_emulator/bin build
+	$(MAKE) -C supervisor clean
 
 host: gen-protocol
 	$(MAKE) -f host_emulator/Makefile.host all

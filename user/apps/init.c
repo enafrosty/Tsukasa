@@ -68,19 +68,34 @@ static int init_main(int argc, char **argv)
     shell_run_rc_file("/etc/tsukasa.rc", 1, 2);
     shell_run_rc_file("/tmp/.tsukasarc", 1, 2);
 
-    /* Spawn Vanilla service registry daemon */
-    int reg_pid = spawn("/fat12/REGISTRD.ELF");
-    if (reg_pid <= 0)
-        reg_pid = spawn("/bin/REGISTRD.ELF");
-    if (reg_pid <= 0)
-        reg_pid = spawn("/bin/registryd.elf");
-    if (reg_pid <= 0)
-        reg_pid = spawn("/fat12/registryd.elf");
+    /* Spawn Vanilla service supervisor */
+    int sup_pid = spawn("/fat12/SUPERVSD.ELF");
+    if (sup_pid <= 0)
+        sup_pid = spawn("/bin/SUPERVSD.ELF");
+    if (sup_pid <= 0)
+        sup_pid = spawn("/bin/supervsd.elf");
+    if (sup_pid <= 0)
+        sup_pid = spawn("/fat12/supervsd.elf");
 
-    if (reg_pid > 0) {
-        dprintf(1, "[init] spawned Service Registry (pid=%d)\n", reg_pid);
-        struct timespec ts_reg = { 0, 50000000 };
-        nanosleep(&ts_reg, NULL);
+    if (sup_pid > 0) {
+        dprintf(1, "[init] spawned Vanilla service supervisor (pid=%d)\n", sup_pid);
+        struct timespec ts_sup = { 0, 50000000 };
+        nanosleep(&ts_sup, NULL);
+    } else {
+        /* Fallback: Spawn Vanilla service registry daemon directly if supervisor is unavailable */
+        int reg_pid = spawn("/fat12/REGISTRD.ELF");
+        if (reg_pid <= 0)
+            reg_pid = spawn("/bin/REGISTRD.ELF");
+        if (reg_pid <= 0)
+            reg_pid = spawn("/bin/registryd.elf");
+        if (reg_pid <= 0)
+            reg_pid = spawn("/fat12/registryd.elf");
+
+        if (reg_pid > 0) {
+            dprintf(1, "[init] spawned Service Registry (pid=%d)\n", reg_pid);
+            struct timespec ts_reg = { 0, 50000000 };
+            nanosleep(&ts_reg, NULL);
+        }
     }
 
     /* Spawn Project Vanilla display server */
@@ -101,15 +116,18 @@ static int init_main(int argc, char **argv)
     ts_init.tv_nsec = 300000000; /* 300ms */
     nanosleep(&ts_init, NULL);
 
-    int shell_pid = spawn("/bin/shell.elf");
-    if (shell_pid <= 0)
-        shell_pid = spawn("/fat12/shell.elf");
-    if (shell_pid <= 0)
-        shell_pid = spawn("/bin/SHELL.ELF");
-    if (shell_pid <= 0)
-        shell_pid = spawn("/fat12/SHELL.ELF");
-    if (shell_pid > 0)
-        dprintf(1, "[init] spawned Vanilla desktop shell (pid=%d)\n", shell_pid);
+    int shell_pid = 0;
+    if (sup_pid <= 0) {
+        shell_pid = spawn("/bin/shell.elf");
+        if (shell_pid <= 0)
+            shell_pid = spawn("/fat12/shell.elf");
+        if (shell_pid <= 0)
+            shell_pid = spawn("/bin/SHELL.ELF");
+        if (shell_pid <= 0)
+            shell_pid = spawn("/fat12/SHELL.ELF");
+        if (shell_pid > 0)
+            dprintf(1, "[init] spawned Vanilla desktop shell (pid=%d)\n", shell_pid);
+    }
 
     ts_init.tv_sec = 0;
     ts_init.tv_nsec = 50000000;
