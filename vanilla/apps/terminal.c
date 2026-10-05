@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 
 #define TERM_WIDTH   640
 #define TERM_HEIGHT  400
@@ -143,7 +144,15 @@ int main(int argc, char **argv)
             state.colors[r][c] = COLOR_TERM_FG;
     }
 
-    vanilla_client_t *client = vanilla_connect(NULL);
+    const char *sock_path = VANILLA_SOCKET_PATH;
+    vanilla_client_t *client = NULL;
+    for (int retry = 0; retry < 50; retry++) {
+        client = vanilla_connect(sock_path);
+        if (client)
+            break;
+        struct timespec ts = { 0, 10000000 }; /* 10ms */
+        nanosleep(&ts, NULL);
+    }
     if (!client) {
         fprintf(stderr, "terminal: failed to connect to display server\n");
         return 1;

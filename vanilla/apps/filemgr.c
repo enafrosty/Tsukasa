@@ -20,6 +20,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #define FM_WIDTH        600
 #define FM_HEIGHT       420
@@ -199,7 +200,15 @@ int main(int argc, char **argv)
     strcpy(state.cwd, (argc >= 2 && argv[1][0]) ? argv[1] : "/bin");
     fm_scan_dir(&state);
 
-    vanilla_client_t *client = vanilla_connect(NULL);
+    const char *sock_path = VANILLA_SOCKET_PATH;
+    vanilla_client_t *client = NULL;
+    for (int retry = 0; retry < 50; retry++) {
+        client = vanilla_connect(sock_path);
+        if (client)
+            break;
+        struct timespec ts = { 0, 10000000 }; /* 10ms */
+        nanosleep(&ts, NULL);
+    }
     if (!client) {
         fprintf(stderr, "filemgr: failed to connect to display server\n");
         return 1;

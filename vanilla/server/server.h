@@ -19,14 +19,17 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/types.h>
 #include <sys/input.h>
 #include "../include/protocol.h"
 #include "../include/surface.h"
 #include "../include/vanilla.h"
 #include "compositor.h"
-#include "shell.h"
-#include "launcher.h"
 #include "cursor.h"
+
+pid_t spawn(const char *path, char *const argv[], char *const envp[]);
+
+#define TASKBAR_HEIGHT          THEME_PX(36)
 
 #define CONTEXT_MENU_MAX_DEPTH  4
 #define CONTEXT_MENU_MAX_ITEMS  64
@@ -248,10 +251,6 @@ typedef struct vanilla_server {
     int                     drag_threshold_mode;
     int                     drag_threshold_edge;
     uint32_t                drag_threshold_window_id;
-
-    /* Desktop shell taskbar and quick launcher */
-    vanilla_shell_t         shell;
-    vanilla_launcher_t      launcher;
 
     /* Server-managed context menus */
     vanilla_context_menu_t  context_menu_stack[CONTEXT_MENU_MAX_DEPTH];

@@ -69,8 +69,6 @@ SERVER_OBJS     = server/main.o \
                   server/font.o \
                   server/default_font.o \
                   server/image.o \
-                  server/shell.o \
-                  server/launcher.o \
                   server/theme.o \
                   server/cursor.o
 
@@ -81,8 +79,6 @@ TEST_IPC_OBJS   = tests/test_ipc.o \
                   server/font.o \
                   server/default_font.o \
                   server/image.o \
-                  server/shell.o \
-                  server/launcher.o \
                   server/theme.o \
                   server/cursor.o
 
@@ -93,8 +89,6 @@ TEST_COMP_OBJS  = tests/test_compositor.o \
                   server/font.o \
                   server/default_font.o \
                   server/image.o \
-                  server/shell.o \
-                  server/launcher.o \
                   server/theme.o \
                   server/cursor.o
 
@@ -111,10 +105,10 @@ TEST_SHELL_OBJS = tests/test_shell.o \
                   server/font.o \
                   server/default_font.o \
                   server/image.o \
-                  server/shell.o \
-                  server/launcher.o \
                   server/theme.o \
-                  server/cursor.o
+                  server/cursor.o \
+                  shell-client/shell_client.test.o \
+                  apps/app_common.o
 
 TEST_LAYOUT_OBJS = layout/test_layout.o \
                    apps/app_common.o
@@ -137,8 +131,9 @@ CALC_BIN        = $(BIN_DIR)/calc.elf
 FILEMGR_BIN     = $(BIN_DIR)/filemgr.elf
 SETTINGS_BIN    = $(BIN_DIR)/settings.elf
 TASKMGR_BIN     = $(BIN_DIR)/taskmgr.elf
+SHELL_BIN       = $(BIN_DIR)/shell.elf
 
-APP_TARGETS     = $(TERMINAL_BIN) $(NOTEPAD_BIN) $(CALC_BIN) $(FILEMGR_BIN) $(SETTINGS_BIN) $(TASKMGR_BIN)
+APP_TARGETS     = $(TERMINAL_BIN) $(NOTEPAD_BIN) $(CALC_BIN) $(FILEMGR_BIN) $(SETTINGS_BIN) $(TASKMGR_BIN) $(SHELL_BIN)
 
 ALL_TARGETS     = $(LIBVANILLA_A) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(SERVER_BIN) $(REGISTRYD_BIN) $(TEST_IPC_BIN) $(TEST_COMP_BIN) $(TEST_TYPO_BIN) $(TEST_SHELL_BIN) $(TEST_LAYOUT_BIN) $(APP_TARGETS)
 
@@ -238,6 +233,14 @@ $(TASKMGR_BIN): $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $
 	@mkdir -p $(BIN_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
+$(SHELL_BIN): $(CRT0) shell-client/shell_client.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	@mkdir -p $(BIN_DIR)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) shell-client/shell_client.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+
+shell-client/shell_client.test.o: shell-client/shell_client.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DTEST_SHELL_RUNNER -c -o $@ $<
+
 %.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -260,9 +263,10 @@ check: all
 	@echo "     - bin/filemgr.elf"
 	@echo "     - bin/settings.elf"
 	@echo "     - bin/taskmgr.elf"
+	@echo "     - bin/shell.elf"
 
 clean:
-	rm -rf libvanilla/*.o libvanilla-ui/*.o server/*.o services/*.o tests/*.o apps/*.o input/*.o layout/*.o $(BIN_DIR) $(LIB_DIR) host_emulator/*.host.o server/*.host.o libvanilla/*.host.o input/*.host.o host_emulator/bin build
+	rm -rf libvanilla/*.o libvanilla-ui/*.o server/*.o services/*.o tests/*.o apps/*.o input/*.o layout/*.o shell-client/*.o $(BIN_DIR) $(LIB_DIR) host_emulator/*.host.o server/*.host.o libvanilla/*.host.o input/*.host.o host_emulator/bin build
 
 host: gen-protocol
 	$(MAKE) -f host_emulator/Makefile.host all

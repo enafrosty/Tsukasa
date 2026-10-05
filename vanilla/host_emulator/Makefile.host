@@ -47,8 +47,6 @@ HOST_SRCS   := $(EMU_DIR)/sdl_backend.c \
                $(VANILLA_DIR)/server/font.c \
                $(VANILLA_DIR)/server/default_font.c \
                $(VANILLA_DIR)/server/image.c \
-               $(VANILLA_DIR)/server/shell.c \
-               $(VANILLA_DIR)/server/launcher.c \
                $(VANILLA_DIR)/server/wm.c \
                $(VANILLA_DIR)/server/theme.c \
                $(VANILLA_DIR)/server/cursor.c \

@@ -14,6 +14,9 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
+/* Preserved as source-of-truth reference during migration to standalone shell client */
+#if 0
+
 #include "launcher.h"
 #include "server.h"
 #include "blitter.h"
@@ -450,3 +453,4 @@ void launcher_render(vanilla_server_t *srv, const vanilla_rect_t *dirty)
         }
     }
 }
+#endif

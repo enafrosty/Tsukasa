@@ -206,6 +206,11 @@ void vanilla_set_frame_callback(vanilla_client_t *client, vanilla_frame_callback
         client->frame_cb = fn;
 }
 
+int vanilla_client_get_fd(const vanilla_client_t *client)
+{
+    return client ? client->socket_fd : -1;
+}
+
 int vanilla_ack_configure(vanilla_client_t *client, uint32_t window_id, uint32_t serial)
 {
     if (!client || client->socket_fd < 0)

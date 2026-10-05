@@ -14,6 +14,9 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
+/* Preserved as source-of-truth reference during migration to standalone shell client */
+#if 0
+
 #include "shell.h"
 #include "server.h"
 #include "blitter.h"
@@ -442,3 +445,4 @@ int shell_handle_key(vanilla_server_t *srv, uint16_t code, int pressed)
 
     return 0;
 }
+#endif
