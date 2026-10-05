@@ -258,6 +258,7 @@ int shm_detach(void *addr)
     int shm_id;
     int needs_reap = 0;
     int unmap_rc = 0;
+    int remaining = 0;
 
     if (!cur || !addr)
         return -1;
@@ -274,6 +275,12 @@ int shm_detach(void *addr)
     page_count = att->page_count;
     att->in_use = 0;
 
+    for (int i = 0; i < SHM_MAX_ATTACHMENTS; i++) {
+        if (g_attachments[i].in_use && g_attachments[i].pid == cur->pid) {
+            remaining++;
+        }
+    }
+
     r = shm_find_region_locked(shm_id);
     if (r && r->ref_count > 0)
         r->ref_count--;
@@ -283,10 +290,12 @@ int shm_detach(void *addr)
 
     unmap_rc = vm_space_unmap_user_pages(&cur->vm_space, virt_addr, page_count);
     vm_space_note_shm_detach(&cur->vm_space, page_count);
-    if (cur->shm_attachment_count > 0)
-        cur->shm_attachment_count--;
-    if (cur->shm_attachment_count == 0)
+    if (remaining == 0) {
+        cur->shm_attachment_count = 0;
         cur->vm_space.shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE + (((uintptr_t)cur->pid % 64) * 0x01000000ULL);
+    } else {
+        cur->shm_attachment_count = (uint32_t)remaining;
+    }
 
     if (needs_reap) {
         spin_lock(&g_shm_lock);

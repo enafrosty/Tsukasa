@@ -487,8 +487,7 @@ static void shell_close_launcher(shell_state_t *st)
 {
     st->launcher.visible = 0;
     if (st->launcher.win) {
-        vanilla_destroy_window(st->launcher.win);
-        st->launcher.win = NULL;
+        vanilla_unmap_window(st->launcher.win);
     }
 }
 
@@ -496,8 +495,7 @@ static void shell_close_start_menu(shell_state_t *st)
 {
     st->shell.start_menu_open = 0;
     if (st->shell.start_menu_win) {
-        vanilla_destroy_window(st->shell.start_menu_win);
-        st->shell.start_menu_win = NULL;
+        vanilla_unmap_window(st->shell.start_menu_win);
     }
     st->taskbar_dirty = 1;
 }
@@ -517,14 +515,16 @@ static void shell_open_launcher(shell_state_t *st)
     launcher_update_matches(&st->launcher);
 
     if (st->client) {
-        int32_t lx = (st->screen_w - LAUNCHER_WIDTH) / 2;
-        int32_t ly = (st->screen_h - TASKBAR_HEIGHT - LAUNCHER_HEIGHT) / 2;
-        if (ly < THEME_PX(20))
-            ly = THEME_PX(20);
+        if (!st->launcher.win) {
+            int32_t lx = (st->screen_w - LAUNCHER_WIDTH) / 2;
+            int32_t ly = (st->screen_h - TASKBAR_HEIGHT - LAUNCHER_HEIGHT) / 2;
+            if (ly < THEME_PX(20))
+                ly = THEME_PX(20);
 
-        st->launcher.win = vanilla_create_window(st->client, "Quick Launcher", lx, ly,
-                                                 LAUNCHER_WIDTH, LAUNCHER_HEIGHT,
-                                                 WINDOW_FLAG_POPUP | WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_TRANSPARENT);
+            st->launcher.win = vanilla_create_window(st->client, "Quick Launcher", lx, ly,
+                                                     LAUNCHER_WIDTH, LAUNCHER_HEIGHT,
+                                                     WINDOW_FLAG_POPUP | WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_TRANSPARENT);
+        }
         if (st->launcher.win) {
             vanilla_map_window(st->launcher.win);
             launcher_render_client(st);
@@ -554,12 +554,14 @@ static void shell_open_start_menu(shell_state_t *st)
     st->shell.selected_idx = 0;
 
     if (st->client) {
-        int32_t sm_x = 0;
-        int32_t sm_y = st->screen_h - TASKBAR_HEIGHT - START_MENU_HEIGHT;
+        if (!st->shell.start_menu_win) {
+            int32_t sm_x = 0;
+            int32_t sm_y = st->screen_h - TASKBAR_HEIGHT - START_MENU_HEIGHT;
 
-        st->shell.start_menu_win = vanilla_create_window(st->client, "Start Menu", sm_x, sm_y,
-                                                         START_MENU_WIDTH, START_MENU_HEIGHT,
-                                                         WINDOW_FLAG_POPUP | WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_TRANSPARENT);
+            st->shell.start_menu_win = vanilla_create_window(st->client, "Start Menu", sm_x, sm_y,
+                                                             START_MENU_WIDTH, START_MENU_HEIGHT,
+                                                             WINDOW_FLAG_POPUP | WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_TRANSPARENT);
+        }
         if (st->shell.start_menu_win) {
             vanilla_map_window(st->shell.start_menu_win);
             start_menu_render_client(st);
