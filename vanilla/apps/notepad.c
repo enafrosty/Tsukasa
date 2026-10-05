@@ -149,6 +149,19 @@ static void note_insert_char(notepad_state_t *st, char c)
         return;
     }
 
+    if (c == '\t') {
+        for (int s = 0; s < 4; s++) {
+            if (len < MAX_LINE_LEN - 1) {
+                memmove(l + st->cursor_col + 1, l + st->cursor_col, len - st->cursor_col + 1);
+                l[st->cursor_col] = ' ';
+                st->cursor_col++;
+                len++;
+            }
+        }
+        st->dirty = 1;
+        return;
+    }
+
     if (len < MAX_LINE_LEN - 1 && (unsigned char)c >= 32) {
         memmove(l + st->cursor_col + 1, l + st->cursor_col, len - st->cursor_col + 1);
         l[st->cursor_col] = c;
@@ -300,13 +313,22 @@ int main(int argc, char **argv)
                                 const char *cur_line = state->lines[state->cursor_line];
                                 clipboard_set(cur_line, strlen(cur_line));
                             } else if (iev->code == KEY_V) {
-                                char paste_buf[4096];
-                                int n = clipboard_get(paste_buf, sizeof(paste_buf));
-                                if (n > 0) {
-                                    for (int i = 0; i < n; i++) {
-                                        note_insert_char(state, paste_buf[i]);
+                                char *paste_buf = (char *)malloc(VCLIP_TEXT_MAX + 1);
+                                if (paste_buf) {
+                                    int n = clipboard_get(paste_buf, VCLIP_TEXT_MAX + 1);
+                                    if (n > 0) {
+                                        for (int i = 0; i < n; i++) {
+                                            char ch = paste_buf[i];
+                                            if (ch == '\r') {
+                                                if (i + 1 < n && paste_buf[i + 1] == '\n')
+                                                    continue;
+                                                ch = '\n';
+                                            }
+                                            note_insert_char(state, ch);
+                                        }
+                                        state->dirty = 1;
                                     }
-                                    state->dirty = 1;
+                                    free(paste_buf);
                                 }
                             } else if (iev->code == KEY_S) {
                                 note_save_file(state);

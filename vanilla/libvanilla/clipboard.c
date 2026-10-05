@@ -38,19 +38,6 @@
 #define sleep_ms(ms) do { struct timespec ts = { 0, (ms) * 1000000 }; nanosleep(&ts, NULL); } while (0)
 #endif
 
-static const char *get_vclip_socket_path(void)
-{
-    const char *env = getenv("VCLIP_SOCKET_PATH");
-    if (env && env[0] != '\0')
-        return env;
-
-    static char sock_path[108];
-    if (service_connect("clipboard", sock_path, sizeof(sock_path)) == 0)
-        return sock_path;
-
-    return VCLIP_SOCKET_PATH;
-}
-
 static int vclip_write_exact(int fd, const void *buf, size_t count)
 {
     const uint8_t *p = (const uint8_t *)buf;
@@ -62,6 +49,7 @@ static int vclip_write_exact(int fd, const void *buf, size_t count)
         int ret = send(fd, (const char *)(p + written), (int)(count - written), 0);
         if (ret > 0) {
             written += (size_t)ret;
+            retries = 0;
         } else if (ret == 0) {
             return -1;
         } else {
@@ -78,6 +66,7 @@ static int vclip_write_exact(int fd, const void *buf, size_t count)
         ssize_t ret = write(fd, p + written, count - written);
         if (ret > 0) {
             written += (size_t)ret;
+            retries = 0;
         } else if (ret == 0) {
             return -1;
         } else {
@@ -105,6 +94,7 @@ static int vclip_read_exact(int fd, void *buf, size_t count)
         int ret = recv(fd, (char *)(p + received), (int)(count - received), 0);
         if (ret > 0) {
             received += (size_t)ret;
+            retries = 0;
         } else if (ret == 0) {
             return -1;
         } else {
@@ -121,6 +111,7 @@ static int vclip_read_exact(int fd, void *buf, size_t count)
         ssize_t ret = read(fd, p + received, count - received);
         if (ret > 0) {
             received += (size_t)ret;
+            retries = 0;
         } else if (ret == 0) {
             return -1;
         } else {
@@ -139,7 +130,15 @@ static int vclip_read_exact(int fd, void *buf, size_t count)
 
 static int vclip_connect(void)
 {
-    const char *sock_path = get_vclip_socket_path();
+    char sock_buf[108];
+    const char *sock_path = getenv("VCLIP_SOCKET_PATH");
+    if (!sock_path || sock_path[0] == '\0') {
+        if (service_connect("clipboard", sock_buf, sizeof(sock_buf)) == 0 && sock_buf[0] != '\0') {
+            sock_path = sock_buf;
+        } else {
+            sock_path = VCLIP_SOCKET_PATH;
+        }
+    }
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -154,6 +153,7 @@ static int vclip_connect(void)
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+    addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
 
     if (connect(fd, (const struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close_socket(fd);
@@ -239,6 +239,11 @@ int clipboard_get(char *buf, size_t buf_len)
     if (resp.status < 0) {
         close_socket(fd);
         return resp.status;
+    }
+
+    if (resp.text_len > VCLIP_TEXT_MAX) {
+        close_socket(fd);
+        return -EIO;
     }
 
     if (resp.text_len == 0) {

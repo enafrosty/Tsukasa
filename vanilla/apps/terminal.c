@@ -274,10 +274,20 @@ int main(int argc, char **argv)
                                     write(state.in_pipe[1], &c, 1);
                                 }
                             } else if (iev->code == KEY_V) {
-                                char paste_buf[1024];
-                                int n = clipboard_get(paste_buf, sizeof(paste_buf));
-                                if (n > 0) {
-                                    write(state.in_pipe[1], paste_buf, (size_t)n);
+                                char *paste_buf = (char *)malloc(VCLIP_TEXT_MAX + 1);
+                                if (paste_buf) {
+                                    int n = clipboard_get(paste_buf, VCLIP_TEXT_MAX + 1);
+                                    if (n > 0) {
+                                        size_t off = 0;
+                                        while (off < (size_t)n) {
+                                            size_t chunk = (size_t)n - off;
+                                            if (chunk > 512)
+                                                chunk = 512;
+                                            write(state.in_pipe[1], paste_buf + off, chunk);
+                                            off += chunk;
+                                        }
+                                    }
+                                    free(paste_buf);
                                 }
                             } else if (iev->code == KEY_D) {
                                 char c = 4;

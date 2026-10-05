@@ -87,6 +87,46 @@ static void *worker_thread_func(void *arg)
     return NULL;
 }
 
+static int raw_client_rpc(const vclip_req_hdr_t *req, vclip_resp_hdr_t *resp)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, TEST_VCLIP_SOCK, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close_socket(fd);
+        return -1;
+    }
+
+#if defined(_WIN32)
+    if (send(fd, (const char *)req, sizeof(*req), 0) != sizeof(*req)) {
+        close_socket(fd);
+        return -1;
+    }
+    if (recv(fd, (char *)resp, sizeof(*resp), 0) != sizeof(*resp)) {
+        close_socket(fd);
+        return -1;
+    }
+#else
+    if (write(fd, req, sizeof(*req)) != (ssize_t)sizeof(*req)) {
+        close_socket(fd);
+        return -1;
+    }
+    if (read(fd, resp, sizeof(*resp)) != (ssize_t)sizeof(*resp)) {
+        close_socket(fd);
+        return -1;
+    }
+#endif
+
+    close_socket(fd);
+    return 0;
+}
+
 int main(void)
 {
 #if defined(_WIN32)
@@ -308,6 +348,95 @@ int main(void)
         passed_tests++;
     } else {
         TSK_TEST_FAIL("vclip", "concurrent_stress_clients", "concurrent worker failure");
+    }
+
+    /* 11. Wire protocol oversized SET payload (verify no slow blocking drain loop) */
+    total_tests++;
+    vclip_req_hdr_t raw_req;
+    vclip_resp_hdr_t raw_resp;
+    memset(&raw_req, 0, sizeof(raw_req));
+    memset(&raw_resp, 0, sizeof(raw_resp));
+    raw_req.magic = VCLIP_MAGIC;
+    raw_req.op = VCLIP_OP_SET;
+    raw_req.text_len = 70000;
+    if (raw_client_rpc(&raw_req, &raw_resp) == 0 &&
+        raw_resp.magic == VCLIP_MAGIC &&
+        raw_resp.status == -EMSGSIZE) {
+        TSK_TEST_PASS("vclip", "wire_oversized_payload");
+        passed_tests++;
+    } else {
+        TSK_TEST_FAIL("vclip", "wire_oversized_payload", "oversized payload not rejected with -EMSGSIZE");
+    }
+
+    /* 12. Wire protocol invalid magic */
+    total_tests++;
+    memset(&raw_req, 0, sizeof(raw_req));
+    memset(&raw_resp, 0, sizeof(raw_resp));
+    raw_req.magic = 0x11223344u;
+    raw_req.op = VCLIP_OP_GET;
+    if (raw_client_rpc(&raw_req, &raw_resp) == 0 &&
+        raw_resp.magic == VCLIP_MAGIC &&
+        raw_resp.status == -EINVAL) {
+        TSK_TEST_PASS("vclip", "wire_invalid_magic");
+        passed_tests++;
+    } else {
+        TSK_TEST_FAIL("vclip", "wire_invalid_magic", "invalid magic not rejected with -EINVAL");
+    }
+
+    /* 13. Wire protocol invalid opcode */
+    total_tests++;
+    memset(&raw_req, 0, sizeof(raw_req));
+    memset(&raw_resp, 0, sizeof(raw_resp));
+    raw_req.magic = VCLIP_MAGIC;
+    raw_req.op = 99;
+    if (raw_client_rpc(&raw_req, &raw_resp) == 0 &&
+        raw_resp.magic == VCLIP_MAGIC &&
+        raw_resp.status == -EINVAL) {
+        TSK_TEST_PASS("vclip", "wire_invalid_opcode");
+        passed_tests++;
+    } else {
+        TSK_TEST_FAIL("vclip", "wire_invalid_opcode", "invalid opcode not rejected with -EINVAL");
+    }
+
+    /* 14. Wire protocol invalid GET length */
+    total_tests++;
+    memset(&raw_req, 0, sizeof(raw_req));
+    memset(&raw_resp, 0, sizeof(raw_resp));
+    raw_req.magic = VCLIP_MAGIC;
+    raw_req.op = VCLIP_OP_GET;
+    raw_req.text_len = 16;
+    if (raw_client_rpc(&raw_req, &raw_resp) == 0 &&
+        raw_resp.magic == VCLIP_MAGIC &&
+        raw_resp.status == -EINVAL) {
+        TSK_TEST_PASS("vclip", "wire_invalid_get_len");
+        passed_tests++;
+    } else {
+        TSK_TEST_FAIL("vclip", "wire_invalid_get_len", "non-zero text_len on GET not rejected with -EINVAL");
+    }
+
+    /* 15. Single-byte buffer truncation safety (buf_len == 1) */
+    total_tests++;
+    clipboard_set("SampleData", 10);
+    char byte1[1];
+    byte1[0] = 'X';
+    int n1 = clipboard_get(byte1, 1);
+    if (n1 == 0 && byte1[0] == '\0') {
+        TSK_TEST_PASS("vclip", "single_byte_truncation");
+        passed_tests++;
+    } else {
+        TSK_TEST_FAIL("vclip", "single_byte_truncation", "buf_len 1 did not produce empty NUL-terminated string");
+    }
+
+    /* 16. Empty string and NULL with length 0 set */
+    total_tests++;
+    if (clipboard_set("", 0) == 0 &&
+        clipboard_get(test_buf, sizeof(test_buf)) == 0 && test_buf[0] == '\0' &&
+        clipboard_set(NULL, 0) == 0 &&
+        clipboard_get(test_buf, sizeof(test_buf)) == 0 && test_buf[0] == '\0') {
+        TSK_TEST_PASS("vclip", "empty_set_and_clear");
+        passed_tests++;
+    } else {
+        TSK_TEST_FAIL("vclip", "empty_set_and_clear", "empty string set failed or did not clear buffer");
     }
 
     /* Stop daemon */

@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
+#include <signal.h>
 #define close_socket(s) close(s)
 #define unlink_file(p) unlink(p)
 #define sleep_ms(ms) do { struct timespec ts = { 0, (ms) * 1000000 }; nanosleep(&ts, NULL); } while (0)
@@ -54,6 +55,7 @@ static int vclip_write_exact(int fd, const void *buf, size_t count)
         int ret = send(fd, (const char *)(p + written), (int)(count - written), 0);
         if (ret > 0) {
             written += (size_t)ret;
+            retries = 0;
         } else if (ret == 0) {
             return -1;
         } else {
@@ -70,6 +72,7 @@ static int vclip_write_exact(int fd, const void *buf, size_t count)
         ssize_t ret = write(fd, p + written, count - written);
         if (ret > 0) {
             written += (size_t)ret;
+            retries = 0;
         } else if (ret == 0) {
             return -1;
         } else {
@@ -97,6 +100,7 @@ static int vclip_read_exact(int fd, void *buf, size_t count)
         int ret = recv(fd, (char *)(p + received), (int)(count - received), 0);
         if (ret > 0) {
             received += (size_t)ret;
+            retries = 0;
         } else if (ret == 0) {
             return -1;
         } else {
@@ -113,6 +117,7 @@ static int vclip_read_exact(int fd, void *buf, size_t count)
         ssize_t ret = read(fd, p + received, count - received);
         if (ret > 0) {
             received += (size_t)ret;
+            retries = 0;
         } else if (ret == 0) {
             return -1;
         } else {
@@ -151,14 +156,6 @@ static void vclip_handle_one(int client_fd)
     case VCLIP_OP_SET: {
         if (req.text_len > VCLIP_TEXT_MAX) {
             resp.status = -EMSGSIZE;
-            uint8_t discard[256];
-            size_t rem = req.text_len;
-            while (rem > 0) {
-                size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
-                if (vclip_read_exact(client_fd, discard, chunk) < 0)
-                    break;
-                rem -= chunk;
-            }
             (void)vclip_write_exact(client_fd, &resp, sizeof(resp));
             break;
         }
@@ -178,14 +175,6 @@ static void vclip_handle_one(int client_fd)
         char *buf = (char *)malloc(req.text_len + 1);
         if (!buf) {
             resp.status = -ENOMEM;
-            uint8_t discard[256];
-            size_t rem = req.text_len;
-            while (rem > 0) {
-                size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
-                if (vclip_read_exact(client_fd, discard, chunk) < 0)
-                    break;
-                rem -= chunk;
-            }
             (void)vclip_write_exact(client_fd, &resp, sizeof(resp));
             break;
         }
@@ -208,6 +197,11 @@ static void vclip_handle_one(int client_fd)
     }
 
     case VCLIP_OP_GET: {
+        if (req.text_len != 0) {
+            resp.status = -EINVAL;
+            (void)vclip_write_exact(client_fd, &resp, sizeof(resp));
+            break;
+        }
         resp.status = 0;
         resp.text_len = g_clip_len;
         if (vclip_write_exact(client_fd, &resp, sizeof(resp)) < 0)
@@ -219,6 +213,11 @@ static void vclip_handle_one(int client_fd)
     }
 
     case VCLIP_OP_CLEAR: {
+        if (req.text_len != 0) {
+            resp.status = -EINVAL;
+            (void)vclip_write_exact(client_fd, &resp, sizeof(resp));
+            break;
+        }
         if (g_clip_buf) {
             free(g_clip_buf);
             g_clip_buf = NULL;
@@ -242,6 +241,10 @@ int clipboardd_run(const char *sock_path, volatile int *stop_flag)
     volatile int default_stop = 0;
     if (!stop_flag)
         stop_flag = &default_stop;
+
+#ifdef SIGPIPE
+    signal(SIGPIPE, SIG_IGN);
+#endif
 
     unlink_file(sock_path);
 
