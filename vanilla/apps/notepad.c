@@ -255,6 +255,25 @@ int main(int argc, char **argv)
             if (ev.type == VANILLA_EVENT_CLOSE_REQ) {
                 running = 0;
                 break;
+            } else if (ev.type == VANILLA_EVENT_DND_ENTER) {
+                if (strcmp(ev.dnd_enter.mime, "text/uri-list") == 0) {
+                    dnd_set_accept(win, 1);
+                } else {
+                    dnd_set_accept(win, 0);
+                }
+            } else if (ev.type == VANILLA_EVENT_DND_DROP) {
+                const char *path = ev.dnd_drop.data;
+                if (strncmp(path, "file://", 7) == 0) {
+                    path += 7;
+                }
+                note_init(state, path);
+                if (state->num_lines == 1 && state->lines[0][0] == '\0') {
+                    strncpy(state->lines[0], path, MAX_LINE_LEN - 1);
+                    state->lines[0][MAX_LINE_LEN - 1] = '\0';
+                }
+                snprintf(title, sizeof(title), "Notepad - %s", state->filename);
+                state->dirty = 1;
+                dnd_set_accept(win, 1);
             } else if (ev.type == VANILLA_EVENT_INPUT) {
                 struct input_event *iev = &ev.input;
                 if (iev->type == EV_KEY) {

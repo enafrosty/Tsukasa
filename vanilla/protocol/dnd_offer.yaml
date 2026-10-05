@@ -3,11 +3,20 @@ name: MSG_DND_OFFER
 direction: client_to_server
 version: 2
 v1_compat: false
-description: "Drag source announces available MIME types."
+description: "Drag source announces offered data and optional ghost."
 fields:
-  - name: window_id
+  - name: mime
+    type: "char[64]"
+    description: "MIME type of dragged data"
+  - name: data
+    type: "char[256]"
+    description: "Inline data payload"
+  - name: data_len
     type: uint32_t
-    description: "Drag source window ID"
-  - name: mime_count
+    description: "Data length"
+  - name: has_ghost
     type: uint32_t
-    description: "Number of MIME types offered"
+    description: "1 if ghost bitmap present"
+  - name: ghost
+    type: "uint8_t[4096]"
+    description: "32x32 ARGB ghost bitmap"

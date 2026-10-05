@@ -5,12 +5,18 @@ version: 2
 v1_compat: false
 description: "Server notifies target window of drop action."
 fields:
-  - name: target_window_id
-    type: uint32_t
-    description: "Target window ID"
-  - name: x
+  - name: local_x
     type: int32_t
     description: "Drop position X relative to target window"
-  - name: y
+  - name: local_y
     type: int32_t
     description: "Drop position Y relative to target window"
+  - name: mime
+    type: "char[64]"
+    description: "MIME type of dropped data"
+  - name: data
+    type: "char[256]"
+    description: "Inline data payload"
+  - name: data_len
+    type: uint32_t
+    description: "Payload data length"

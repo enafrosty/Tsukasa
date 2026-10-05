@@ -293,6 +293,7 @@ vanilla_resize_edge_t wm_hit_test_resize_edge(const vanilla_server_window_t *w, 
 int  wm_run_resize_selftests(void);
 int  wm_run_input_selftests(void);
 int  wm_run_animation_selftests(void);
+int  dnd_run_selftests(void);
 
 void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_window_t *w);
 
