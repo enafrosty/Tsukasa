@@ -262,6 +262,10 @@ int main(int argc, char **argv)
                     dnd_set_accept(win, 0);
                 }
             } else if (ev.type == VANILLA_EVENT_DND_DROP) {
+                if (strcmp(ev.dnd_drop.mime, "text/uri-list") != 0) {
+                    dnd_set_accept(win, 0);
+                    continue;
+                }
                 const char *path = ev.dnd_drop.data;
                 if (strncmp(path, "file://", 7) == 0) {
                     path += 7;

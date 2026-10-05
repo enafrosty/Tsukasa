@@ -294,6 +294,7 @@ int  wm_run_resize_selftests(void);
 int  wm_run_input_selftests(void);
 int  wm_run_animation_selftests(void);
 int  dnd_run_selftests(void);
+void dnd_check_timeout(vanilla_server_t *srv);
 
 void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_window_t *w);
 

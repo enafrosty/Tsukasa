@@ -46,9 +46,9 @@ static int dnd_exact_write(int fd, const void *buf, size_t count)
             return -1;
         } else {
             if (errno == EAGAIN || errno == EINTR) {
-                if (++retries > 1000)
+                if (++retries > 100)
                     return -1;
-                usleep(1000);
+                sched_yield();
                 continue;
             }
             return -1;
@@ -148,6 +148,23 @@ int dnd_register_drop_target(vanilla_window_t *win, dnd_drop_fn fn, void *userda
     return 0;
 }
 
+int dnd_unregister_drop_target(vanilla_window_t *win)
+{
+    if (!win)
+        return -EINVAL;
+
+    for (int i = 0; i < g_drop_target_count; i++) {
+        if (g_drop_targets[i].window_id == win->window_id) {
+            for (int j = i; j < g_drop_target_count - 1; j++) {
+                g_drop_targets[j] = g_drop_targets[j + 1];
+            }
+            g_drop_target_count--;
+            return 0;
+        }
+    }
+    return -ENOENT;
+}
+
 int dnd_handle_event(vanilla_window_t *win, const vanilla_event_t *ev)
 {
     if (!win || !ev)
@@ -165,6 +182,10 @@ int dnd_handle_event(vanilla_window_t *win, const vanilla_event_t *ev)
 
     if (ev->type == VANILLA_EVENT_DND_ENTER) {
         dnd_set_accept(win, 1);
+        return 1;
+    }
+
+    if (ev->type == VANILLA_EVENT_DND_LEAVE) {
         return 1;
     }
 

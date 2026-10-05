@@ -22,7 +22,8 @@
 #include "../include/protocol.h"
 #include "../include/surface.h"
 
-#define DND_THRESHOLD_PX  8
+#define DND_THRESHOLD_PX    8
+#define DND_DROP_TIMEOUT_MS 1000
 
 typedef enum {
     DND_IDLE      = 0,
@@ -39,6 +40,7 @@ typedef struct {
     int32_t     cur_x, cur_y;        /* current pointer position */
     uint32_t    over_window_id;       /* window under cursor, or 0 */
     int         over_window_accepted; /* 1 if MSG_DND_ACCEPT received */
+    int64_t     drop_timestamp_ms;    /* timestamp when entered DND_DROPPING */
 
     /* Offered data: for Phase 3, a single NUL-terminated file path */
     char        offer_path[256];
@@ -60,6 +62,7 @@ int         dnd_handle_key_escape(vanilla_server_t *srv);
 int         dnd_handle_offer(vanilla_server_t *srv, uint32_t window_id, const vanilla_msg_dnd_offer_t *offer);
 int         dnd_handle_accept(vanilla_server_t *srv, uint32_t window_id, const vanilla_msg_dnd_accept_t *accept);
 void        dnd_render_ghost(vanilla_server_t *srv, const vanilla_rect_t *dirty);
+void        dnd_check_timeout(vanilla_server_t *srv);
 void        dnd_cancel(vanilla_server_t *srv);
 void        dnd_window_destroyed(vanilla_server_t *srv, uint32_t window_id);
 int         dnd_run_selftests(void);

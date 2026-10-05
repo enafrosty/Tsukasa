@@ -672,6 +672,7 @@ void compositor_render_frame(struct vanilla_server *srv)
         return;
 
     compositor_animate_windows(srv);
+    dnd_check_timeout(srv);
 
     printf("[vanilla] compositor: render\n");
 

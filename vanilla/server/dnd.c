@@ -1,5 +1,5 @@
 /*
- * Project Tsukasa — Display Server Drag and Drop Implementation
+ * Project Tsukasa - Display Server Drag and Drop Implementation
  *
  * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
@@ -22,8 +22,18 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/time.h>
 
 static dnd_session_t g_dnd;
+
+static int64_t dnd_get_time_ms(void)
+{
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) == 0) {
+        return (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
+    }
+    return 0;
+}
 
 static int dnd_write_exact(int fd, const void *buf, size_t count)
 {
@@ -39,9 +49,9 @@ static int dnd_write_exact(int fd, const void *buf, size_t count)
             return -1;
         } else {
             if (errno == EAGAIN || errno == EINTR) {
-                if (++retries > 1000)
+                if (++retries > 100)
                     return -1;
-                usleep(1000);
+                sched_yield();
                 continue;
             }
             return -1;
@@ -58,13 +68,10 @@ static void dnd_generate_default_ghost(uint32_t *out_ghost)
         }
     }
 
-    /* Draw a 24x28 document icon with folded top-right corner */
     for (int y = 2; y < 30; y++) {
         for (int x = 4; x < 28; x++) {
-            /* Folded corner check */
-            if (x >= 20 && y <= (x - 20 + 2)) {
+            if (x >= 20 && y <= (x - 20 + 2))
                 continue;
-            }
 
             int is_border = (x == 4 || x == 27 || y == 2 || y == 29 ||
                              (x >= 20 && y == (x - 20 + 2)));
@@ -72,12 +79,10 @@ static void dnd_generate_default_ghost(uint32_t *out_ghost)
             if (is_border) {
                 out_ghost[y * 32 + x] = 0xFF2A75D3;
             } else {
-                /* Inner text lines */
-                if ((y == 10 || y == 14 || y == 18 || y == 22) && x >= 8 && x <= 23) {
+                if ((y == 10 || y == 14 || y == 18 || y == 22) && x >= 8 && x <= 23)
                     out_ghost[y * 32 + x] = 0xFF6C757D;
-                } else {
+                else
                     out_ghost[y * 32 + x] = 0xD8F8FAFC;
-                }
             }
         }
     }
@@ -89,8 +94,10 @@ static int dnd_send_enter(vanilla_server_t *srv, uint32_t target_window_id,
     if (!srv || target_window_id == 0)
         return -1;
     vanilla_server_window_t *w = vanilla_server_find_window(srv, target_window_id);
-    if (!w || w->client_fd < 0)
+    if (!w)
         return -1;
+    if (w->client_fd < 0)
+        return 0;
 
     vanilla_msg_hdr_t hdr;
     vanilla_msg_dnd_enter_t enter;
@@ -119,8 +126,10 @@ static int dnd_send_leave(vanilla_server_t *srv, uint32_t target_window_id)
     if (!srv || target_window_id == 0)
         return -1;
     vanilla_server_window_t *w = vanilla_server_find_window(srv, target_window_id);
-    if (!w || w->client_fd < 0)
+    if (!w)
         return -1;
+    if (w->client_fd < 0)
+        return 0;
 
     vanilla_msg_hdr_t hdr;
     vanilla_msg_dnd_leave_t leave;
@@ -146,8 +155,10 @@ static int dnd_send_drop(vanilla_server_t *srv, uint32_t target_window_id,
     if (!srv || target_window_id == 0)
         return -1;
     vanilla_server_window_t *w = vanilla_server_find_window(srv, target_window_id);
-    if (!w || w->client_fd < 0)
+    if (!w)
         return -1;
+    if (w->client_fd < 0)
+        return 0;
 
     vanilla_msg_hdr_t hdr;
     vanilla_msg_dnd_drop_t drop;
@@ -182,8 +193,10 @@ static int dnd_send_cancel(vanilla_server_t *srv, uint32_t source_window_id)
     if (!srv || source_window_id == 0)
         return -1;
     vanilla_server_window_t *w = vanilla_server_find_window(srv, source_window_id);
-    if (!w || w->client_fd < 0)
+    if (!w)
         return -1;
+    if (w->client_fd < 0)
+        return 0;
 
     vanilla_msg_hdr_t hdr;
     vanilla_msg_dnd_cancel_t cancel;
@@ -261,15 +274,24 @@ void dnd_handle_mouse_button(vanilla_server_t *srv, uint32_t window_id,
             g_dnd.source_window_id = 0;
         } else if (g_dnd.state == DND_ACTIVE) {
             if (g_dnd.over_window_id != 0 && g_dnd.over_window_accepted) {
-                g_dnd.state = DND_DROPPING;
                 vanilla_server_window_t *w = vanilla_server_find_window(srv, g_dnd.over_window_id);
                 int32_t lx = w ? (x - w->x) : 0;
                 int32_t ly = w ? (y - w->y) : 0;
-                dnd_send_drop(srv, g_dnd.over_window_id, lx, ly,
-                              g_dnd.offer_mime, g_dnd.offer_path,
-                              (uint32_t)strlen(g_dnd.offer_path));
-                dnd_dirty_ghost(srv, x, y);
-                cursor_set_active(CURSOR_ARROW);
+                if (dnd_send_drop(srv, g_dnd.over_window_id, lx, ly,
+                                  g_dnd.offer_mime, g_dnd.offer_path,
+                                  (uint32_t)strlen(g_dnd.offer_path)) == 0) {
+                    g_dnd.state = DND_DROPPING;
+                    g_dnd.drop_timestamp_ms = dnd_get_time_ms();
+                    dnd_dirty_ghost(srv, x, y);
+                    cursor_set_active(CURSOR_ARROW);
+                } else {
+                    if (g_dnd.source_window_id != 0)
+                        dnd_send_cancel(srv, g_dnd.source_window_id);
+                    dnd_dirty_ghost(srv, x, y);
+                    cursor_set_active(CURSOR_ARROW);
+                    memset(&g_dnd, 0, sizeof(g_dnd));
+                    g_dnd.state = DND_IDLE;
+                }
             } else {
                 if (g_dnd.over_window_id != 0)
                     dnd_send_leave(srv, g_dnd.over_window_id);
@@ -294,14 +316,8 @@ void dnd_handle_mouse_move(vanilla_server_t *srv, int32_t x, int32_t y)
     g_dnd.cur_x = x;
     g_dnd.cur_y = y;
 
-    if (g_dnd.state == DND_PENDING) {
-        int32_t dx = x - g_dnd.start_x;
-        int32_t dy = y - g_dnd.start_y;
-        if (dx * dx + dy * dy >= DND_THRESHOLD_PX * DND_THRESHOLD_PX) {
-            /* Ready for offer from client */
-        }
+    if (g_dnd.state == DND_PENDING)
         return;
-    }
 
     if (g_dnd.state == DND_ACTIVE) {
         vanilla_rect_t prev_r, new_r;
@@ -312,7 +328,9 @@ void dnd_handle_mouse_move(vanilla_server_t *srv, int32_t x, int32_t y)
 
         vanilla_server_window_t *under = wm_window_at(srv, x, y);
         if (under && under->window_id != g_dnd.source_window_id &&
-            !(under->flags & WINDOW_FLAG_POPUP)) {
+            !(under->flags & WINDOW_FLAG_POPUP) &&
+            x >= under->x && x < under->x + (int32_t)under->width &&
+            y >= under->y && y < under->y + (int32_t)under->height) {
             if (under->window_id != g_dnd.over_window_id) {
                 if (g_dnd.over_window_id != 0)
                     dnd_send_leave(srv, g_dnd.over_window_id);
@@ -357,6 +375,12 @@ int dnd_handle_offer(vanilla_server_t *srv, uint32_t window_id,
     if (!srv || !offer)
         return -1;
 
+    if (g_dnd.state != DND_PENDING && g_dnd.state != DND_ACTIVE)
+        return -1;
+
+    if (g_dnd.source_window_id != 0 && window_id != 0 && window_id != g_dnd.source_window_id)
+        return -1;
+
     g_dnd.source_window_id = window_id ? window_id : g_dnd.source_window_id;
     snprintf(g_dnd.offer_mime, sizeof(g_dnd.offer_mime), "%s", offer->mime);
     snprintf(g_dnd.offer_path, sizeof(g_dnd.offer_path), "%s", offer->data);
@@ -369,6 +393,7 @@ int dnd_handle_offer(vanilla_server_t *srv, uint32_t window_id,
 
     g_dnd.state = DND_ACTIVE;
     dnd_dirty_ghost(srv, srv->cursor_x, srv->cursor_y);
+    dnd_handle_mouse_move(srv, srv->cursor_x, srv->cursor_y);
     return 0;
 }
 
@@ -391,18 +416,20 @@ int dnd_handle_accept(vanilla_server_t *srv, uint32_t window_id,
             compositor_add_damage(&srv->compositor, &cbox);
         }
     } else if (g_dnd.state == DND_DROPPING) {
-        if (accept->accepted) {
-            dnd_dirty_ghost(srv, srv->cursor_x, srv->cursor_y);
-            cursor_set_active(CURSOR_ARROW);
-            memset(&g_dnd, 0, sizeof(g_dnd));
-            g_dnd.state = DND_IDLE;
-        } else {
-            if (g_dnd.source_window_id != 0)
-                dnd_send_cancel(srv, g_dnd.source_window_id);
-            dnd_dirty_ghost(srv, srv->cursor_x, srv->cursor_y);
-            cursor_set_active(CURSOR_ARROW);
-            memset(&g_dnd, 0, sizeof(g_dnd));
-            g_dnd.state = DND_IDLE;
+        if (window_id == g_dnd.over_window_id) {
+            if (accept->accepted) {
+                dnd_dirty_ghost(srv, srv->cursor_x, srv->cursor_y);
+                cursor_set_active(CURSOR_ARROW);
+                memset(&g_dnd, 0, sizeof(g_dnd));
+                g_dnd.state = DND_IDLE;
+            } else {
+                if (g_dnd.source_window_id != 0)
+                    dnd_send_cancel(srv, g_dnd.source_window_id);
+                dnd_dirty_ghost(srv, srv->cursor_x, srv->cursor_y);
+                cursor_set_active(CURSOR_ARROW);
+                memset(&g_dnd, 0, sizeof(g_dnd));
+                g_dnd.state = DND_IDLE;
+            }
         }
     }
 
@@ -424,6 +451,22 @@ void dnd_render_ghost(vanilla_server_t *srv, const vanilla_rect_t *dirty)
                           vis.x, vis.y,
                           g_dnd.ghost, 32,
                           sx, sy, vis.w, vis.h, 200);
+    }
+}
+
+void dnd_check_timeout(vanilla_server_t *srv)
+{
+    if (!srv || g_dnd.state != DND_DROPPING)
+        return;
+
+    int64_t now_ms = dnd_get_time_ms();
+    if (now_ms - g_dnd.drop_timestamp_ms > DND_DROP_TIMEOUT_MS) {
+        if (g_dnd.source_window_id != 0)
+            dnd_send_cancel(srv, g_dnd.source_window_id);
+        dnd_dirty_ghost(srv, srv->cursor_x, srv->cursor_y);
+        cursor_set_active(CURSOR_ARROW);
+        memset(&g_dnd, 0, sizeof(g_dnd));
+        g_dnd.state = DND_IDLE;
     }
 }
 
@@ -452,13 +495,21 @@ void dnd_window_destroyed(vanilla_server_t *srv, uint32_t window_id)
     if (window_id == g_dnd.source_window_id) {
         dnd_cancel(srv);
     } else if (window_id == g_dnd.over_window_id) {
-        g_dnd.over_window_id = 0;
-        g_dnd.over_window_accepted = 0;
-        cursor_set_active(CURSOR_ARROW);
+        if (g_dnd.state == DND_DROPPING) {
+            if (g_dnd.source_window_id != 0)
+                dnd_send_cancel(srv, g_dnd.source_window_id);
+            dnd_dirty_ghost(srv, srv->cursor_x, srv->cursor_y);
+            cursor_set_active(CURSOR_ARROW);
+            memset(&g_dnd, 0, sizeof(g_dnd));
+            g_dnd.state = DND_IDLE;
+        } else {
+            g_dnd.over_window_id = 0;
+            g_dnd.over_window_accepted = 0;
+            cursor_set_active(CURSOR_ARROW);
+        }
     }
 }
 
-/* Selftest covering state transitions without live socket IO */
 int dnd_run_selftests(void)
 {
     dnd_init();
@@ -470,7 +521,28 @@ int dnd_run_selftests(void)
     srv.cursor_x = 100;
     srv.cursor_y = 100;
 
-    /* 1. Mouse down inside window -> PENDING */
+    /* Setup mock windows: Window 10 (source) and Window 20 (target) */
+    srv.windows[0].in_use = 1;
+    srv.windows[0].is_mapped = 1;
+    srv.windows[0].window_id = 10;
+    srv.windows[0].client_fd = -1;
+    srv.windows[0].flags = WINDOW_FLAG_BORDERLESS;
+    srv.windows[0].x = 50;
+    srv.windows[0].y = 50;
+    srv.windows[0].width = 200;
+    srv.windows[0].height = 200;
+
+    srv.windows[1].in_use = 1;
+    srv.windows[1].is_mapped = 1;
+    srv.windows[1].window_id = 20;
+    srv.windows[1].client_fd = -1;
+    srv.windows[1].flags = WINDOW_FLAG_BORDERLESS;
+    srv.windows[1].x = 300;
+    srv.windows[1].y = 50;
+    srv.windows[1].width = 200;
+    srv.windows[1].height = 200;
+
+    /* 1. Mouse down inside window 10 -> PENDING */
     dnd_handle_mouse_button(&srv, 10, 1, 100, 100);
     if (dnd_get_state() != DND_PENDING)
         return -2;
@@ -485,10 +557,7 @@ int dnd_run_selftests(void)
     if (dnd_get_state() != DND_IDLE)
         return -4;
 
-    /* 4. Mouse down + move beyond threshold + offer -> ACTIVE */
-    dnd_handle_mouse_button(&srv, 10, 1, 100, 100);
-    dnd_handle_mouse_move(&srv, 120, 120);
-
+    /* 4. Mouse down + offer validation when idle or wrong window */
     vanilla_msg_dnd_offer_t offer;
     memset(&offer, 0, sizeof(offer));
     snprintf(offer.mime, sizeof(offer.mime), "%s", "text/uri-list");
@@ -496,39 +565,109 @@ int dnd_run_selftests(void)
     offer.data_len = (uint32_t)strlen(offer.data);
     offer.has_ghost = 0;
 
-    dnd_handle_offer(&srv, 10, &offer);
-    if (dnd_get_state() != DND_ACTIVE)
+    /* Rejected when IDLE */
+    if (dnd_handle_offer(&srv, 10, &offer) == 0)
         return -5;
-    if (!dnd_is_active())
+
+    /* Mouse down on 10 -> PENDING */
+    dnd_handle_mouse_button(&srv, 10, 1, 100, 100);
+    dnd_handle_mouse_move(&srv, 120, 120);
+
+    /* Rejected from non-source window (99 != 10) */
+    if (dnd_handle_offer(&srv, 99, &offer) == 0)
         return -6;
+
+    /* Accepted from source window 10 -> ACTIVE */
+    if (dnd_handle_offer(&srv, 10, &offer) != 0)
+        return -7;
+    if (dnd_get_state() != DND_ACTIVE || !dnd_is_active())
+        return -8;
 
     /* 5. Escape while ACTIVE -> clean cancellation to IDLE */
     if (!dnd_handle_key_escape(&srv))
-        return -7;
+        return -9;
     if (dnd_get_state() != DND_IDLE)
-        return -8;
+        return -10;
 
-    /* 6. Offer + accept + drop flow */
+    /* 6. Hit test window 20: move cursor to (350, 100) inside Window 20 */
     dnd_handle_mouse_button(&srv, 10, 1, 100, 100);
+    dnd_handle_mouse_move(&srv, 120, 120);
     dnd_handle_offer(&srv, 10, &offer);
-    g_dnd.over_window_id = 20;
 
+    srv.cursor_x = 350;
+    srv.cursor_y = 100;
+    dnd_handle_mouse_move(&srv, 350, 100);
+    if (g_dnd.over_window_id != 20)
+        return -11;
+
+    /* 7. Accept notification from window 20 */
     vanilla_msg_dnd_accept_t acc;
     acc.accepted = 1;
     dnd_handle_accept(&srv, 20, &acc);
     if (!g_dnd.over_window_accepted)
-        return -9;
+        return -12;
 
-    /* Mouse release -> DROPPING */
-    dnd_handle_mouse_button(&srv, 0, 0, 120, 120);
+    /* 8. Mouse release -> DROPPING */
+    dnd_handle_mouse_button(&srv, 0, 0, 350, 100);
     if (dnd_get_state() != DND_DROPPING)
-        return -10;
+        return -13;
 
-    /* Target sends drop acceptance ack -> IDLE */
+    /* 9. Target window 20 destroyed while in DROPPING -> clean recovery to IDLE */
+    dnd_window_destroyed(&srv, 20);
+    if (dnd_get_state() != DND_IDLE)
+        return -14;
+
+    /* 10. Drop rejection flow: drag again, drop, target sends reject */
+    dnd_handle_mouse_button(&srv, 10, 1, 100, 100);
+    dnd_handle_offer(&srv, 10, &offer);
+    dnd_handle_mouse_move(&srv, 350, 100);
+    dnd_handle_accept(&srv, 20, &acc);
+    dnd_handle_mouse_button(&srv, 0, 0, 350, 100);
+    if (dnd_get_state() != DND_DROPPING)
+        return -15;
+
+    acc.accepted = 0;
     dnd_handle_accept(&srv, 20, &acc);
     if (dnd_get_state() != DND_IDLE)
-        return -11;
+        return -16;
 
-    printf("[vanilla] drag and drop state machine self-tests passed (6/6)\n");
+    /* 11. Drop acceptance flow: drag again, drop, target sends accept */
+    dnd_handle_mouse_button(&srv, 10, 1, 100, 100);
+    dnd_handle_offer(&srv, 10, &offer);
+    dnd_handle_mouse_move(&srv, 350, 100);
+    acc.accepted = 1;
+    dnd_handle_accept(&srv, 20, &acc);
+    dnd_handle_mouse_button(&srv, 0, 0, 350, 100);
+    if (dnd_get_state() != DND_DROPPING)
+        return -17;
+
+    dnd_handle_accept(&srv, 20, &acc);
+    if (dnd_get_state() != DND_IDLE)
+        return -18;
+
+    /* 12. Drop timeout flow: drag, drop, simulate timeout expiry */
+    dnd_handle_mouse_button(&srv, 10, 1, 100, 100);
+    dnd_handle_offer(&srv, 10, &offer);
+    dnd_handle_mouse_move(&srv, 350, 100);
+    dnd_handle_accept(&srv, 20, &acc);
+    dnd_handle_mouse_button(&srv, 0, 0, 350, 100);
+    if (dnd_get_state() != DND_DROPPING)
+        return -19;
+
+    g_dnd.drop_timestamp_ms = dnd_get_time_ms() - 2000;
+    dnd_check_timeout(&srv);
+    if (dnd_get_state() != DND_IDLE)
+        return -20;
+
+    /* 13. Source window destroyed while ACTIVE -> clean cancel to IDLE */
+    dnd_handle_mouse_button(&srv, 10, 1, 100, 100);
+    dnd_handle_offer(&srv, 10, &offer);
+    if (dnd_get_state() != DND_ACTIVE)
+        return -21;
+    dnd_window_destroyed(&srv, 10);
+    if (dnd_get_state() != DND_IDLE)
+        return -22;
+
+    printf("[vanilla] drag and drop state machine self-tests passed (13/13)\n");
     return 0;
 }

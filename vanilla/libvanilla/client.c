@@ -706,6 +706,7 @@ void vanilla_destroy_window(vanilla_window_t *win)
         curr = &(*curr)->next;
     }
 
+    dnd_unregister_drop_target(win);
     free(win);
 }
 

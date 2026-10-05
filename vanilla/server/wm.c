@@ -549,7 +549,10 @@ int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
     wm_run_input_selftests();
     wm_run_animation_selftests();
     wm_run_context_menu_selftests();
-    dnd_run_selftests();
+    int dnd_rc = dnd_run_selftests();
+    if (dnd_rc != 0) {
+        printf("[vanilla] dnd selftests FAILED: %d\n", dnd_rc);
+    }
 
     return 0;
 }
@@ -3125,6 +3128,7 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
     }
 
     wm_context_menu_check_timers(srv);
+    dnd_check_timeout(srv);
 
     int64_t now_ms = get_time_ms();
     for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
@@ -3601,7 +3605,9 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
         if (srv->cursor_x != old_x || srv->cursor_y != old_y) {
             dnd_handle_mouse_move(srv, srv->cursor_x, srv->cursor_y);
 
-            if ((srv->mouse_buttons & 1) && srv->focused_window_id != 0) {
+            if ((srv->mouse_buttons & 1) && srv->focused_window_id != 0 &&
+                !srv->is_dragging && !srv->is_resizing && !srv->drag_threshold_pending &&
+                !dnd_is_active()) {
                 vanilla_server_window_t *fw = vanilla_server_find_window(srv, srv->focused_window_id);
                 if (fw) {
                     int lx = srv->cursor_x - fw->x;

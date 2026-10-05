@@ -56,6 +56,11 @@ typedef void (*dnd_drop_fn)(const char *mime, const char *data,
 int dnd_register_drop_target(vanilla_window_t *win, dnd_drop_fn fn, void *userdata);
 
 /*
+ * Unregister a drop target previously registered on win.
+ */
+int dnd_unregister_drop_target(vanilla_window_t *win);
+
+/*
  * Helper to dispatch drop target callback if registered on win.
  */
 int dnd_handle_event(vanilla_window_t *win, const vanilla_event_t *ev);
