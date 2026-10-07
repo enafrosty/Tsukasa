@@ -168,6 +168,9 @@ void vanilla_menu_builder_free(vanilla_menu_builder_t *b);
 /* Clipboard service */
 #include "../libvanilla/clipboard.h"
 
+/* Notification service */
+#include "../libvanilla/notify.h"
+
 /* Drag and drop subsystem */
 #include "../libvanilla/dnd.h"
 

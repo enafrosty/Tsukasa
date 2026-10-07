@@ -47,6 +47,7 @@ LIBVANILLA_OBJS = libvanilla/client.o \
                   libvanilla/service.o \
                   libvanilla/clipboard.o \
                   libvanilla/dnd.o \
+                  libvanilla/notify.o \
                   server/theme.o \
                   input/keymap.o
 
@@ -125,6 +126,7 @@ LIBVANILLALAYOUT_A = $(LIB_DIR)/libvanillalayout.a
 SERVER_BIN         = $(BIN_DIR)/vanilla_srv.elf
 REGISTRYD_BIN      = $(BIN_DIR)/registryd.elf
 CLIPBOARDD_BIN     = $(BIN_DIR)/clipboardd.elf
+NOTIFYD_BIN        = $(BIN_DIR)/notifyd.elf
 TEST_IPC_BIN       = $(BIN_DIR)/test_ipc.elf
 TEST_COMP_BIN      = $(BIN_DIR)/test_compositor.elf
 TEST_TYPO_BIN      = $(BIN_DIR)/test_typography.elf
@@ -142,7 +144,7 @@ SHELL_BIN       = $(BIN_DIR)/shell.elf
 APP_TARGETS     = $(TERMINAL_BIN) $(NOTEPAD_BIN) $(CALC_BIN) $(FILEMGR_BIN) $(SETTINGS_BIN) $(TASKMGR_BIN) $(SHELL_BIN)
 SUPERVISOR_BIN  = supervisor/SUPERVSD.ELF
 
-ALL_TARGETS     = $(LIBVANILLA_A) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(SERVER_BIN) $(REGISTRYD_BIN) $(CLIPBOARDD_BIN) $(TEST_IPC_BIN) $(TEST_COMP_BIN) $(TEST_TYPO_BIN) $(TEST_SHELL_BIN) $(TEST_LAYOUT_BIN) $(APP_TARGETS) $(SUPERVISOR_BIN)
+ALL_TARGETS     = $(LIBVANILLA_A) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(SERVER_BIN) $(REGISTRYD_BIN) $(CLIPBOARDD_BIN) $(NOTIFYD_BIN) $(TEST_IPC_BIN) $(TEST_COMP_BIN) $(TEST_TYPO_BIN) $(TEST_SHELL_BIN) $(TEST_LAYOUT_BIN) $(APP_TARGETS) $(SUPERVISOR_BIN)
 
 PYTHON ?= python3
 
@@ -183,6 +185,10 @@ $(REGISTRYD_BIN): $(CRT0) services/registryd.o $(LIBVANILLA_A) $(LIBC_A)
 $(CLIPBOARDD_BIN): $(CRT0) services/clipboardd.o $(LIBVANILLA_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) services/clipboardd.o $(LIBVANILLA_A) $(LIBC_A)
+
+$(NOTIFYD_BIN): $(CRT0) services/notifyd.o $(APP_COMMON_OBJ) $(LIBVANILLA_A) $(LIBC_A)
+	@mkdir -p $(BIN_DIR)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) services/notifyd.o $(APP_COMMON_OBJ) $(LIBVANILLA_A) $(LIBC_A)
 
 $(TEST_IPC_BIN): $(CRT0) $(TEST_IPC_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
@@ -226,6 +232,14 @@ ifeq ($(OS),Windows_NT)
 	gcc -O2 -Iinclude -Iservices -Ilibvanilla -I../scripts/test -DVANILLA_HOST -DVCLIP_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lws2_32 -lpthread
 else
 	gcc -O2 -Iinclude -Iservices -Ilibvanilla -I../scripts/test -DVANILLA_HOST -DVCLIP_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lpthread
+endif
+
+build/test_notify: tests/test_notify.c libvanilla/notify.c libvanilla/service.c services/notifyd.c apps/app_common.c server/theme.c
+	@mkdir -p build
+ifeq ($(OS),Windows_NT)
+	gcc -O2 -Ihost_emulator/sys_compat -Iinclude -Iinput -Iservices -Ilibvanilla -Iapps -I../scripts/test -DVANILLA_HOST -DVNOTIF_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lws2_32 -lpthread
+else
+	gcc -O2 -Ihost_emulator/sys_compat -Iinclude -Iinput -Iservices -Ilibvanilla -Iapps -I../scripts/test -DVANILLA_HOST -DVNOTIF_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lpthread
 endif
 
 $(TERMINAL_BIN): $(CRT0) apps/terminal.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
@@ -277,6 +291,7 @@ check: all
 	@echo "     - bin/vanilla_srv.elf"
 	@echo "     - bin/registryd.elf"
 	@echo "     - bin/clipboardd.elf"
+	@echo "     - bin/notifyd.elf"
 	@echo "     - bin/test_ipc.elf"
 	@echo "     - bin/test_compositor.elf"
 	@echo "     - bin/test_typography.elf"
