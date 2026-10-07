@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <sys/wait.h>
 
 #define TERM_WIDTH   640
 #define TERM_HEIGHT  400
@@ -315,6 +316,16 @@ int main(int argc, char **argv)
             }
         }
 
+        /* Check if shell subprocess exited */
+        if (state.shell_pid > 0) {
+            int status = 0;
+            pid_t wp = waitpid(state.shell_pid, &status, WNOHANG);
+            if (wp > 0) {
+                state.shell_pid = -1;
+                notify_send("Terminal", "Shell exited", "info", 5000, NULL, 0);
+            }
+        }
+
         /* Read output from shell */
         ssize_t n = read(state.out_pipe[0], read_buf, sizeof(read_buf));
         if (n > 0) {
@@ -331,6 +342,11 @@ int main(int argc, char **argv)
                 }
                 term_put_char(&state, c);
             }
+        } else if (n == 0 && state.shell_pid > 0) {
+            int status = 0;
+            waitpid(state.shell_pid, &status, WNOHANG);
+            state.shell_pid = -1;
+            notify_send("Terminal", "Shell exited", "info", 5000, NULL, 0);
         }
 
         if (state.dirty) {

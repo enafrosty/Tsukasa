@@ -153,4 +153,7 @@ void vanilla_menu_builder_free(vanilla_menu_builder_t *b);
 /* Clipboard service */
 #include "../libvanilla/clipboard.h"
 
+/* Notification service */
+#include "../libvanilla/notify.h"
+
 #endif /* _VANILLA_H */
