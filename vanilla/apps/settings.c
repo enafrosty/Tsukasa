@@ -89,8 +89,9 @@ int main(int argc, char **argv)
 
     vanilla_client_t *client = vanilla_connect(NULL);
     if (!client) return 1;
-    vanilla_window_t *win = vanilla_create_window(client, "Settings", 180, 110, SETTINGS_WIDTH, SETTINGS_HEIGHT, WINDOW_FLAG_NONE);
+    vanilla_window_t *win = vanilla_create_window(client, "Settings", 180, 110, SETTINGS_WIDTH, SETTINGS_HEIGHT, WINDOW_FLAG_RESIZABLE);
     if (!win) { vanilla_disconnect(client); return 1; }
+    vanilla_set_size_hints(client, win->window_id, 240, 180, 0, 0, 0, 0);
     vanilla_map_window(win);
 
     static uint8_t ui_arena[128 * 1024];
@@ -102,6 +103,8 @@ int main(int argc, char **argv)
     uint32_t fg = g_theme ? g_theme->fg_primary : 0xFFECEFF4u;
 
     st.root = ui_box(ctx, VDIR_COLUMN);
+    st.root->layout_elem->w_mode = VSIZE_GROW;
+    st.root->layout_elem->h_mode = VSIZE_GROW;
     st.root->layout_elem->bg_color = bg;
 
     static const char *tabs[] = { "System Info", "Appearance" };
@@ -109,6 +112,8 @@ int main(int argc, char **argv)
     ui_widget_add_child(st.root, tbar);
 
     ui_widget_t *content = ui_box(ctx, VDIR_COLUMN);
+    content->layout_elem->w_mode = VSIZE_GROW;
+    content->layout_elem->h_mode = VSIZE_GROW;
     content->layout_elem->pad_left = content->layout_elem->pad_right = content->layout_elem->pad_top = content->layout_elem->pad_bottom = 16;
     content->layout_elem->gap = 12;
     ui_widget_add_child(st.root, content);
@@ -134,6 +139,10 @@ int main(int argc, char **argv)
         vanilla_event_t ev;
         while (vanilla_poll_event(client, &ev) > 0) {
             if (ev.type == VANILLA_EVENT_CLOSE_REQ) { running = 0; break; }
+            if (ev.type == VANILLA_EVENT_CONFIGURE) {
+                vanilla_ack_configure(client, win->window_id, ev.configure.serial);
+                ui_widget_invalidate(st.root);
+            }
             if (ev.type == VANILLA_EVENT_INPUT)
                 ui_handle_event(ctx, st.root, &ev.input);
         }

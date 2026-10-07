@@ -15,10 +15,13 @@
  */
 
 #include "app_common.h"
+#include "../include/ui.h"
+#include "../include/ui_widgets.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include <time.h>
 
 #ifndef SIGKILL
@@ -28,10 +31,10 @@
 #define SIGTERM 15
 #endif
 
-#define TM_WIDTH        520
-#define TM_HEIGHT       380
-#define TM_HEADER_H     76
-#define TM_ROW_H        22
+#define TM_DEFAULT_W    540
+#define TM_DEFAULT_H    400
+#define TM_HEADER_H     78
+#define TM_ROW_H        24
 #define MAX_TASKS       64
 
 typedef struct {
@@ -43,12 +46,25 @@ typedef struct {
 
 typedef struct {
     task_entry_t tasks[MAX_TASKS];
+    char         item_labels[MAX_TASKS][96];
+    const char  *item_ptrs[MAX_TASKS];
     int          task_count;
     int          selected_idx;
     unsigned long mem_used_mb;
     unsigned long mem_total_mb;
     int          mem_pct;
     int          dirty;
+
+    char         mem_str[80];
+    char         count_str[64];
+
+    ui_ctx_t    *ui_ctx;
+    ui_widget_t *root;
+    ui_widget_t *mem_label;
+    ui_widget_t *count_label;
+    ui_widget_t *list_widget;
+    ui_widget_t *mem_bar_box;
+    ui_widget_t *cpu_bar_box;
 } taskmgr_state_t;
 
 static unsigned long tm_read_key_val(const char *filename, const char *key)
@@ -126,8 +142,13 @@ static void tm_refresh(taskmgr_state_t *st)
             memcpy(t->name, n_start, n_len);
             t->name[n_len] = '\0';
 
-            if (t->pid > 0)
+            if (t->pid > 0) {
+                snprintf(st->item_labels[st->task_count], sizeof(st->item_labels[0]),
+                         "%-6d %-6d %-12s %-24s",
+                         t->pid, t->ppid, t->state, t->name);
+                st->item_ptrs[st->task_count] = st->item_labels[st->task_count];
                 st->task_count++;
+            }
         }
         fclose(fp);
     }
@@ -135,77 +156,60 @@ static void tm_refresh(taskmgr_state_t *st)
     if (st->selected_idx >= st->task_count)
         st->selected_idx = st->task_count > 0 ? st->task_count - 1 : 0;
 
+    snprintf(st->mem_str, sizeof(st->mem_str),
+             "Physical Memory: %lu MB / %lu MB (%d%%)",
+             st->mem_used_mb, st->mem_total_mb, st->mem_pct);
+    if (st->mem_label) {
+        st->mem_label->label.text = st->mem_str;
+        ui_widget_invalidate(st->mem_label);
+    }
+
+    snprintf(st->count_str, sizeof(st->count_str),
+             "Total Processes: %d", st->task_count);
+    if (st->count_label) {
+        st->count_label->label.text = st->count_str;
+        ui_widget_invalidate(st->count_label);
+    }
+
+    if (st->list_widget) {
+        st->list_widget->list.items = st->item_ptrs;
+        st->list_widget->list.count = st->task_count;
+        st->list_widget->list.selected = st->selected_idx;
+        ui_widget_invalidate(st->list_widget);
+    }
+
     st->dirty = 1;
 }
 
-static void tm_render(vanilla_surface_t *surf, taskmgr_state_t *st)
+static void on_btn_refresh(ui_widget_t *w, const ui_event_t *ev, void *ud)
 {
-    app_fill_rect(surf, 0, 0, TM_WIDTH, TM_HEIGHT, g_theme->bg_base);
+    (void)w;
+    if (ev->type != UI_EVENT_CLICK) return;
+    taskmgr_state_t *st = (taskmgr_state_t *)ud;
+    tm_refresh(st);
+}
 
-    /* Telemetry Header */
-    app_fill_rect(surf, 0, 0, TM_WIDTH, TM_HEADER_H, g_theme->bg_elevated);
-    app_fill_rect(surf, 0, TM_HEADER_H - 1, TM_WIDTH, 1, g_theme->border);
-
-    char mem_str[64];
-    snprintf(mem_str, sizeof(mem_str), "Physical Memory: %lu MB / %lu MB (%d%%)",
-             st->mem_used_mb, st->mem_total_mb, st->mem_pct);
-    app_draw_text(surf, 16, 12, mem_str, g_theme->fg_primary);
-    app_draw_progress_bar(surf, 16, 28, TM_WIDTH - 32, 12, st->mem_pct, g_theme->accent, g_theme->bg_elevated);
-
-    app_draw_text(surf, 16, 48, "CPU Utilization: 18% (Estimated)", g_theme->fg_primary);
-    app_draw_progress_bar(surf, 16, 62, TM_WIDTH - 32, 8, 18, g_theme->success, g_theme->bg_elevated);
-
-    /* Process Table Header */
-    int tbl_y = TM_HEADER_H;
-    app_fill_rect(surf, 0, tbl_y, TM_WIDTH, 24, g_theme->bg_elevated);
-    app_fill_rect(surf, 0, tbl_y + 23, TM_WIDTH, 1, g_theme->border);
-
-    app_draw_text(surf, 16, tbl_y + 8, "PID", g_theme->fg_muted);
-    app_draw_text(surf, 80, tbl_y + 8, "PPID", g_theme->fg_muted);
-    app_draw_text(surf, 150, tbl_y + 8, "STATE", g_theme->fg_muted);
-    app_draw_text(surf, 260, tbl_y + 8, "PROCESS NAME", g_theme->fg_muted);
-
-    /* Process Table Rows */
-    int content_y = tbl_y + 24;
-    int visible_rows = (TM_HEIGHT - content_y - 36) / TM_ROW_H;
-
-    for (int i = 0; i < visible_rows && i < st->task_count; i++) {
-        task_entry_t *t = &st->tasks[i];
-        int ry = content_y + i * TM_ROW_H;
-
-        if (i == st->selected_idx) {
-            app_fill_rect(surf, 0, ry, TM_WIDTH, TM_ROW_H, g_theme->selection);
-        } else if (i % 2 == 1) {
-            app_fill_rect(surf, 0, ry, TM_WIDTH, TM_ROW_H, g_theme->bg_base);
+static void on_btn_kill(ui_widget_t *w, const ui_event_t *ev, void *ud)
+{
+    (void)w;
+    if (ev->type != UI_EVENT_CLICK) return;
+    taskmgr_state_t *st = (taskmgr_state_t *)ud;
+    if (st->selected_idx >= 0 && st->selected_idx < st->task_count) {
+        int pid = st->tasks[st->selected_idx].pid;
+        if (pid > 1) {
+            kill(pid, SIGTERM);
+            tm_refresh(st);
         }
-
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%d", t->pid);
-        app_draw_text(surf, 16, ry + 6, buf, g_theme->fg_primary);
-
-        snprintf(buf, sizeof(buf), "%d", t->ppid);
-        app_draw_text(surf, 80, ry + 6, buf, g_theme->fg_dim);
-
-        app_draw_text(surf, 150, ry + 6, t->state, g_theme->accent);
-        app_draw_text(surf, 260, ry + 6, t->name, g_theme->fg_primary);
-
-        app_fill_rect(surf, 0, ry + TM_ROW_H - 1, TM_WIDTH, 1, g_theme->border);
     }
+}
 
-    /* Bottom Action Bar */
-    int bot_y = TM_HEIGHT - 36;
-    app_fill_rect(surf, 0, bot_y, TM_WIDTH, 36, g_theme->bg_elevated);
-    app_fill_rect(surf, 0, bot_y, TM_WIDTH, 1, g_theme->border);
-
-    app_draw_button(surf, TM_WIDTH - 110, bot_y + 6, 96, 24, "End Task", 0);
-    app_draw_button(surf, TM_WIDTH - 216, bot_y + 6, 96, 24, "Refresh", 0);
-
-    if (st->task_count > 0 && st->selected_idx < st->task_count) {
-        char sel_info[64];
-        snprintf(sel_info, sizeof(sel_info), "Selected: PID %d (%s)",
-                 st->tasks[st->selected_idx].pid,
-                 st->tasks[st->selected_idx].name);
-        app_draw_text(surf, 16, bot_y + 14, sel_info, g_theme->fg_muted);
+static void on_task_selected(ui_widget_t *w, const ui_event_t *ev, void *ud)
+{
+    (void)w;
+    taskmgr_state_t *st = (taskmgr_state_t *)ud;
+    if (ev->type == UI_EVENT_VALUE_CHANGED) {
+        st->selected_idx = ev->toggle.state;
+        st->dirty = 1;
     }
 }
 
@@ -216,7 +220,6 @@ int main(int argc, char **argv)
 
     taskmgr_state_t state;
     memset(&state, 0, sizeof(state));
-    tm_refresh(&state);
 
     const char *sock_path = VANILLA_SOCKET_PATH;
     vanilla_client_t *client = NULL;
@@ -232,8 +235,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    vanilla_window_t *win = vanilla_create_window(client, "Task Manager", 150, 100,
-                                                  TM_WIDTH, TM_HEIGHT,
+    vanilla_window_t *win = vanilla_create_window(client, "Task Manager", 160, 100,
+                                                  TM_DEFAULT_W, TM_DEFAULT_H,
                                                   WINDOW_FLAG_RESIZABLE);
     if (!win) {
         vanilla_disconnect(client);
@@ -243,77 +246,217 @@ int main(int argc, char **argv)
     vanilla_set_size_hints(client, win->window_id, 160, 120, 0, 0, 0, 0);
     vanilla_map_window(win);
 
+    static uint8_t ui_arena[128 * 1024];
+    state.ui_ctx = ui_ctx_init(ui_arena, sizeof(ui_arena), NULL);
+    if (!state.ui_ctx) {
+        vanilla_destroy_window(win);
+        vanilla_disconnect(client);
+        return 1;
+    }
+
+    uint32_t bg = g_theme ? g_theme->bg_base : 0xFF2E3440u;
+    uint32_t elev = g_theme ? g_theme->bg_elevated : 0xFF3B4252u;
+    uint32_t bdr = g_theme ? g_theme->border : 0xFF4C566Au;
+    uint32_t fg_primary = g_theme ? g_theme->fg_primary : 0xFFECEFF4u;
+    uint32_t fg_muted = g_theme ? g_theme->fg_muted : 0xFFD8DEE9u;
+    uint32_t fg_dim = g_theme ? g_theme->fg_dim : 0xFF4C566Au;
+
+    state.root = ui_box(state.ui_ctx, VDIR_COLUMN);
+    state.root->layout_elem->w_mode = VSIZE_GROW;
+    state.root->layout_elem->h_mode = VSIZE_GROW;
+    state.root->layout_elem->bg_color = bg;
+
+    /* Telemetry Header */
+    ui_widget_t *header = ui_box(state.ui_ctx, VDIR_COLUMN);
+    header->layout_elem->w_mode = VSIZE_GROW;
+    header->layout_elem->h_mode = VSIZE_FIXED;
+    header->layout_elem->h_px = TM_HEADER_H;
+    header->layout_elem->pad_left = header->layout_elem->pad_right = 16;
+    header->layout_elem->pad_top = header->layout_elem->pad_bottom = 10;
+    header->layout_elem->gap = 6;
+    header->layout_elem->bg_color = elev;
+    header->layout_elem->border_color = bdr;
+    header->layout_elem->border_width = 1;
+    ui_widget_add_child(state.root, header);
+
+    strcpy(state.mem_str, "Physical Memory: Calculating...");
+    state.mem_label = ui_label(state.ui_ctx, state.mem_str, fg_primary);
+    ui_widget_add_child(header, state.mem_label);
+
+    state.mem_bar_box = ui_box(state.ui_ctx, VDIR_ROW);
+    state.mem_bar_box->layout_elem->w_mode = VSIZE_GROW;
+    state.mem_bar_box->layout_elem->h_mode = VSIZE_FIXED;
+    state.mem_bar_box->layout_elem->h_px = 10;
+    state.mem_bar_box->layout_elem->bg_color = bg;
+    state.mem_bar_box->layout_elem->border_color = bdr;
+    state.mem_bar_box->layout_elem->border_width = 1;
+    ui_widget_add_child(header, state.mem_bar_box);
+
+    ui_widget_t *cpu_lbl = ui_label(state.ui_ctx, "CPU Utilization: 18% (Estimated)", fg_primary);
+    ui_widget_add_child(header, cpu_lbl);
+
+    state.cpu_bar_box = ui_box(state.ui_ctx, VDIR_ROW);
+    state.cpu_bar_box->layout_elem->w_mode = VSIZE_GROW;
+    state.cpu_bar_box->layout_elem->h_mode = VSIZE_FIXED;
+    state.cpu_bar_box->layout_elem->h_px = 8;
+    state.cpu_bar_box->layout_elem->bg_color = bg;
+    state.cpu_bar_box->layout_elem->border_color = bdr;
+    state.cpu_bar_box->layout_elem->border_width = 1;
+    ui_widget_add_child(header, state.cpu_bar_box);
+
+    /* Process Table Header */
+    ui_widget_t *tbl_hdr = ui_box(state.ui_ctx, VDIR_ROW);
+    tbl_hdr->layout_elem->w_mode = VSIZE_GROW;
+    tbl_hdr->layout_elem->h_mode = VSIZE_FIXED;
+    tbl_hdr->layout_elem->h_px = 24;
+    tbl_hdr->layout_elem->pad_left = 12;
+    tbl_hdr->layout_elem->align_items = VALIGN_CENTER;
+    tbl_hdr->layout_elem->bg_color = elev;
+    tbl_hdr->layout_elem->border_color = bdr;
+    tbl_hdr->layout_elem->border_width = 1;
+    ui_widget_add_child(state.root, tbl_hdr);
+
+    ui_widget_t *col_lbl = ui_label(state.ui_ctx, "PID    PPID   STATE        PROCESS NAME", fg_dim);
+    ui_widget_add_child(tbl_hdr, col_lbl);
+
+    /* Process List View */
+    state.list_widget = ui_list(state.ui_ctx, state.item_ptrs, state.task_count,
+                                on_task_selected, &state);
+    state.list_widget->layout_elem->w_mode = VSIZE_GROW;
+    state.list_widget->layout_elem->h_mode = VSIZE_GROW;
+    ui_widget_add_child(state.root, state.list_widget);
+
+    /* Bottom Action Bar */
+    ui_widget_t *action_bar = ui_box(state.ui_ctx, VDIR_ROW);
+    action_bar->layout_elem->w_mode = VSIZE_GROW;
+    action_bar->layout_elem->h_mode = VSIZE_FIXED;
+    action_bar->layout_elem->h_px = 36;
+    action_bar->layout_elem->pad_left = action_bar->layout_elem->pad_right = 12;
+    action_bar->layout_elem->gap = 8;
+    action_bar->layout_elem->align_items = VALIGN_CENTER;
+    action_bar->layout_elem->bg_color = elev;
+    action_bar->layout_elem->border_color = bdr;
+    action_bar->layout_elem->border_width = 1;
+    ui_widget_add_child(state.root, action_bar);
+
+    strcpy(state.count_str, "Total Processes: 0");
+    state.count_label = ui_label(state.ui_ctx, state.count_str, fg_muted);
+    ui_widget_add_child(action_bar, state.count_label);
+
+    ui_widget_t *spacer = ui_box(state.ui_ctx, VDIR_ROW);
+    spacer->layout_elem->w_mode = VSIZE_GROW;
+    ui_widget_add_child(action_bar, spacer);
+
+    ui_widget_t *btn_ref = ui_button(state.ui_ctx, "Refresh", on_btn_refresh, &state);
+    ui_widget_add_child(action_bar, btn_ref);
+
+    ui_widget_t *btn_end = ui_button(state.ui_ctx, "End Task", on_btn_kill, &state);
+    ui_widget_add_child(action_bar, btn_end);
+
+    tm_refresh(&state);
+
     int running = 1;
     int tick = 0;
-
     while (running) {
         vanilla_event_t ev;
         while (vanilla_poll_event(client, &ev) > 0) {
             if (ev.type == VANILLA_EVENT_CLOSE_REQ) {
                 running = 0;
                 break;
+            } else if (ev.type == VANILLA_EVENT_CONFIGURE) {
+                vanilla_ack_configure(client, win->window_id, ev.configure.serial);
+                ui_widget_invalidate(state.root);
+                state.dirty = 1;
             } else if (ev.type == VANILLA_EVENT_INPUT) {
                 struct input_event *iev = &ev.input;
-                if (iev->type == EV_KEY && iev->value == 1) {
-                    if (iev->code == BTN_LEFT) {
-                        int cx = (int)iev->pad1;
-                        int cy = (int)iev->pad2;
-                        int bot_y = TM_HEIGHT - 36;
-                        int content_y = TM_HEADER_H + 24;
+                ui_handle_event(state.ui_ctx, state.root, iev);
 
-                        if (cy >= bot_y) {
-                            if (cx >= TM_WIDTH - 110 && cx < TM_WIDTH - 14 &&
-                                cy >= bot_y + 6 && cy < bot_y + 30) {
-                                if (state.task_count > 0 && state.selected_idx < state.task_count) {
-                                    kill(state.tasks[state.selected_idx].pid, SIGTERM);
-                                    tm_refresh(&state);
-                                }
-                            } else if (cx >= TM_WIDTH - 216 && cx < TM_WIDTH - 120 &&
-                                       cy >= bot_y + 6 && cy < bot_y + 30) {
-                                tm_refresh(&state);
-                            }
-                        } else if (cy >= content_y && cy < bot_y) {
-                            int row = (cy - content_y) / TM_ROW_H;
-                            if (row >= 0 && row < state.task_count) {
-                                state.selected_idx = row;
-                                state.dirty = 1;
-                            }
-                        }
-                    } else if (iev->code == KEY_UP) {
+                if (iev->type == EV_KEY && iev->value == 1) {
+                    if (iev->code == KEY_UP) {
                         if (state.selected_idx > 0) {
                             state.selected_idx--;
+                            state.list_widget->list.selected = state.selected_idx;
+                            int row_y = state.selected_idx * TM_ROW_H;
+                            if (row_y < state.list_widget->list.scroll_top)
+                                state.list_widget->list.scroll_top = row_y;
+                            ui_widget_invalidate(state.list_widget);
                             state.dirty = 1;
                         }
                     } else if (iev->code == KEY_DOWN) {
                         if (state.selected_idx < state.task_count - 1) {
                             state.selected_idx++;
+                            state.list_widget->list.selected = state.selected_idx;
+                            int row_y = state.selected_idx * TM_ROW_H;
+                            int lh = state.list_widget->layout_elem ? state.list_widget->layout_elem->computed_h : 200;
+                            if (row_y + TM_ROW_H > state.list_widget->list.scroll_top + lh)
+                                state.list_widget->list.scroll_top = row_y + TM_ROW_H - lh;
+                            ui_widget_invalidate(state.list_widget);
                             state.dirty = 1;
                         }
-                    } else if (iev->code == KEY_DELETE || iev->code == KEY_K) {
-                        /* Kill selected task */
-                        if (state.task_count > 0 && state.selected_idx < state.task_count) {
-                            kill(state.tasks[state.selected_idx].pid, SIGTERM);
-                            tm_refresh(&state);
-                        }
-                    } else if (iev->code == KEY_R) {
+                    } else if (iev->code == KEY_F5) {
                         tm_refresh(&state);
+                    } else if (iev->code == KEY_DELETE) {
+                        if (state.selected_idx >= 0 && state.selected_idx < state.task_count) {
+                            int pid = state.tasks[state.selected_idx].pid;
+                            if (pid > 1) {
+                                kill(pid, SIGTERM);
+                                tm_refresh(&state);
+                            }
+                        }
                     }
                 }
             }
         }
 
-        /* Periodic telemetry update every ~1.5 seconds */
+        /* Periodic refresh every ~2 seconds (120 frames at 60fps) */
         tick++;
-        if (tick % 90 == 0) {
+        if (tick % 120 == 0) {
             tm_refresh(&state);
         }
 
-        if (state.dirty) {
-            tm_render(&win->surface, &state);
-            vanilla_present(win, NULL);
-            state.dirty = 0;
+        ui_render(state.ui_ctx, state.root, &win->surface, NULL);
+
+        /* Render dynamic progress bars inside header boxes */
+        if (state.mem_bar_box && state.mem_bar_box->layout_elem) {
+            int mx = state.mem_bar_box->layout_elem->computed_x + 1;
+            int my = state.mem_bar_box->layout_elem->computed_y + 1;
+            int mw = state.mem_bar_box->layout_elem->computed_w - 2;
+            int mh = state.mem_bar_box->layout_elem->computed_h - 2;
+            int fill_w = (mw * state.mem_pct) / 100;
+            if (fill_w > 0 && mh > 0)
+                app_fill_rect(&win->surface, mx, my, fill_w, mh,
+                              g_theme ? g_theme->accent : 0xFF88C0D0u);
         }
 
+        if (state.cpu_bar_box && state.cpu_bar_box->layout_elem) {
+            int cx = state.cpu_bar_box->layout_elem->computed_x + 1;
+            int cy = state.cpu_bar_box->layout_elem->computed_y + 1;
+            int cw = state.cpu_bar_box->layout_elem->computed_w - 2;
+            int ch = state.cpu_bar_box->layout_elem->computed_h - 2;
+            int fill_w = (cw * 18) / 100;
+            if (fill_w > 0 && ch > 0)
+                app_fill_rect(&win->surface, cx, cy, fill_w, ch,
+                              g_theme ? g_theme->success : 0xFFA3BE8Cu);
+        }
+
+        /* Scrollbar for process list */
+        if (state.list_widget && state.list_widget->layout_elem) {
+            int lx = state.list_widget->layout_elem->computed_x;
+            int ly = state.list_widget->layout_elem->computed_y;
+            int lw = state.list_widget->layout_elem->computed_w;
+            int lh = state.list_widget->layout_elem->computed_h;
+            int total_h = state.task_count * TM_ROW_H;
+            if (total_h > lh && lh > 20) {
+                int thumb_h = (lh * lh) / total_h;
+                if (thumb_h < 14) thumb_h = 14;
+                int max_scroll = total_h - lh;
+                int thumb_y = ly + (state.list_widget->list.scroll_top * (lh - thumb_h)) / (max_scroll > 0 ? max_scroll : 1);
+                app_fill_rect(&win->surface, lx + lw - 5, thumb_y, 4, thumb_h,
+                              g_theme ? g_theme->accent : 0xFF88C0D0u);
+            }
+        }
+
+        vanilla_present(win, NULL);
         usleep(16000);
     }
 
