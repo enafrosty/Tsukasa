@@ -344,12 +344,14 @@ static void restack_toasts(vanilla_client_t *client, int screen_w)
                                               toast_x, next_y,
                                               TOAST_WIDTH, n->height,
                                               WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_TRANSPARENT);
-            if (n->window) {
-                n->window_id = n->window->window_id;
-                render_toast(n);
-                vanilla_map_window(n->window);
-                vanilla_present(n->window, NULL);
+            if (!n->window) {
+                notif_dismiss(n, 0);
+                continue;
             }
+            n->window_id = n->window->window_id;
+            render_toast(n);
+            vanilla_map_window(n->window);
+            vanilla_present(n->window, NULL);
         }
 
         next_y += n->height + TOAST_SPACING;
@@ -444,9 +446,18 @@ static void notif_handle_request(int cfd, vanilla_client_t *client, int screen_w
             g_next_notif_id = 1;
         n->seq = g_seq_counter++;
 
+        send_req.title[sizeof(send_req.title) - 1] = '\0';
+        send_req.body[sizeof(send_req.body) - 1] = '\0';
+        send_req.icon_name[sizeof(send_req.icon_name) - 1] = '\0';
+        for (int a = 0; a < VNOTIF_ACTION_MAX; a++)
+            send_req.actions[a].label[sizeof(send_req.actions[a].label) - 1] = '\0';
+
         strncpy(n->title, send_req.title, sizeof(n->title) - 1);
+        n->title[sizeof(n->title) - 1] = '\0';
         strncpy(n->body, send_req.body, sizeof(n->body) - 1);
+        n->body[sizeof(n->body) - 1] = '\0';
         strncpy(n->icon_name, send_req.icon_name, sizeof(n->icon_name) - 1);
+        n->icon_name[sizeof(n->icon_name) - 1] = '\0';
         n->timeout_ms = send_req.timeout_ms;
         n->action_count = send_req.action_count;
         if (n->action_count > 0) {
@@ -457,6 +468,8 @@ static void notif_handle_request(int cfd, vanilla_client_t *client, int screen_w
         }
 
         n->height = (n->action_count > 0) ? (TOAST_BASE_HEIGHT + TOAST_ACTION_HEIGHT) : TOAST_BASE_HEIGHT;
+
+        restack_toasts(client, screen_w);
 
         vnotif_resp_t resp;
         memset(&resp, 0, sizeof(resp));
@@ -469,7 +482,6 @@ static void notif_handle_request(int cfd, vanilla_client_t *client, int screen_w
             close_socket(cfd);
         }
 
-        restack_toasts(client, screen_w);
         return;
     }
 
@@ -621,9 +633,11 @@ int notifyd_run(const char *sock_path, volatile int *stop_flag)
         if (client) {
             vanilla_event_t ev;
             while (vanilla_poll_event(client, &ev) > 0) {
-                if (ev.type == VANILLA_EVENT_INPUT) {
+                if (ev.type == VANILLA_EVENT_INPUT ||
+                    ev.type == VANILLA_EVENT_DOUBLE_CLICK ||
+                    ev.type == VANILLA_EVENT_TRIPLE_CLICK) {
                     struct input_event *iev = &ev.input;
-                    if (iev->type == EV_KEY && iev->code == BTN_LEFT && iev->value == 1) {
+                    if (iev->type == EV_KEY && iev->code == BTN_LEFT && iev->value >= 1) {
                         int lx = (int)iev->pad1;
                         int ly = (int)iev->pad2;
 
@@ -735,6 +749,15 @@ int notifyd_test_trigger_action(uint32_t notif_id, uint32_t action_id)
         }
     }
     return -ENOENT;
+}
+
+uint32_t notifyd_test_get_window_id(uint32_t notif_id)
+{
+    for (int i = 0; i < NOTIF_MAX_ACTIVE; i++) {
+        if (g_notifs[i].active && g_notifs[i].notif_id == notif_id)
+            return g_notifs[i].window_id;
+    }
+    return 0;
 }
 #endif
 

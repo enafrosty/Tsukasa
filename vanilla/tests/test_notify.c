@@ -43,20 +43,84 @@
 
 #define TEST_VNOTIF_SOCK "/tmp/vnotif_test.sock"
 
-/* Headless Vanilla display server stubs for host test */
-vanilla_client_t *vanilla_connect(const char *path) { (void)path; return NULL; }
+/* Mock Vanilla display server with event queue for interactive testing */
+struct vanilla_client {
+    int dummy;
+};
+static vanilla_client_t g_mock_client_inst;
+static uint32_t g_next_win_id = 100;
+
+#define MOCK_EV_QUEUE_CAP 16
+static vanilla_event_t g_mock_ev_queue[MOCK_EV_QUEUE_CAP];
+static int g_mock_ev_head = 0;
+static int g_mock_ev_tail = 0;
+static pthread_mutex_t g_mock_ev_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void mock_push_event(const vanilla_event_t *ev)
+{
+    pthread_mutex_lock(&g_mock_ev_lock);
+    int next = (g_mock_ev_tail + 1) % MOCK_EV_QUEUE_CAP;
+    if (next != g_mock_ev_head) {
+        g_mock_ev_queue[g_mock_ev_tail] = *ev;
+        g_mock_ev_tail = next;
+    }
+    pthread_mutex_unlock(&g_mock_ev_lock);
+}
+
+vanilla_client_t *vanilla_connect(const char *path)
+{
+    (void)path;
+    return &g_mock_client_inst;
+}
+
 void vanilla_disconnect(vanilla_client_t *client) { (void)client; }
+
 vanilla_window_t *vanilla_create_window(vanilla_client_t *c, const char *t, int x, int y, int w, int h, uint32_t f)
 {
-    (void)c; (void)t; (void)x; (void)y; (void)w; (void)h; (void)f;
-    return NULL;
+    (void)t;
+    vanilla_window_t *win = (vanilla_window_t *)calloc(1, sizeof(vanilla_window_t));
+    if (!win) return NULL;
+    win->client = c;
+    win->window_id = g_next_win_id++;
+    win->x = x;
+    win->y = y;
+    win->width = (uint32_t)w;
+    win->height = (uint32_t)h;
+    win->flags = f;
+    win->surface.width = (uint32_t)w;
+    win->surface.height = (uint32_t)h;
+    win->surface.pitch = (uint32_t)w;
+    win->surface.size = (size_t)w * (size_t)h * 4;
+    win->surface.pixels = (uint32_t *)calloc(1, win->surface.size);
+    return win;
 }
-void vanilla_destroy_window(vanilla_window_t *w) { (void)w; }
+
+void vanilla_destroy_window(vanilla_window_t *w)
+{
+    if (w) {
+        if (w->surface.pixels) free(w->surface.pixels);
+        free(w);
+    }
+}
+
 int vanilla_map_window(vanilla_window_t *w) { (void)w; return 0; }
 int vanilla_unmap_window(vanilla_window_t *w) { (void)w; return 0; }
-int vanilla_move_window(vanilla_window_t *w, int32_t x, int32_t y) { (void)w; (void)x; (void)y; return 0; }
+int vanilla_move_window(vanilla_window_t *w, int32_t x, int32_t y) { if (w) { w->x = x; w->y = y; } return 0; }
 void vanilla_present(vanilla_window_t *w, const vanilla_rect_t *d) { (void)w; (void)d; }
-int vanilla_poll_event(vanilla_client_t *c, vanilla_event_t *ev) { (void)c; (void)ev; return 0; }
+
+int vanilla_poll_event(vanilla_client_t *c, vanilla_event_t *ev)
+{
+    (void)c;
+    int have = 0;
+    pthread_mutex_lock(&g_mock_ev_lock);
+    if (g_mock_ev_head != g_mock_ev_tail) {
+        *ev = g_mock_ev_queue[g_mock_ev_head];
+        g_mock_ev_head = (g_mock_ev_head + 1) % MOCK_EV_QUEUE_CAP;
+        have = 1;
+    }
+    pthread_mutex_unlock(&g_mock_ev_lock);
+    return have;
+}
 
 typedef struct {
     const char *sock_path;
@@ -110,18 +174,16 @@ int main(void)
 {
     printf("=== Running Notification Daemon Tests ===\n");
     int passed = 0;
-    int total = 12;
+    int total = 16;
 
 #if defined(_WIN32)
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     _putenv("VNOTIF_SOCKET_PATH=" TEST_VNOTIF_SOCK);
     _putenv("VNOTIF_NO_REGISTER=1");
-    _putenv("VNOTIF_HEADLESS=1");
 #else
     setenv("VNOTIF_SOCKET_PATH", TEST_VNOTIF_SOCK, 1);
     setenv("VNOTIF_NO_REGISTER", "1", 1);
-    setenv("VNOTIF_HEADLESS", "1", 1);
 #endif
 
     unlink_file(TEST_VNOTIF_SOCK);
@@ -398,6 +460,163 @@ int main(void)
             passed++;
         } else {
             TSK_TEST_FAIL("vnotif", "wire_invalid_opcode", "expected EINVAL");
+        }
+    }
+
+    /* Test 13: Mouse click on close button dismisses toast and sends dismiss event */
+    {
+        vnotif_action_t a[1];
+        memset(a, 0, sizeof(a));
+        strncpy(a[0].label, "CloseMe", sizeof(a[0].label) - 1);
+        a[0].action_id = 11;
+
+        int32_t id = notify_send("ClickClose", "Close test", "info", 0, a, 1);
+        if (id > 0) {
+            uint32_t wid = notifyd_test_get_window_id((uint32_t)id);
+            if (wid > 0) {
+                vanilla_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = VANILLA_EVENT_INPUT;
+                ev.window_id = wid;
+                ev.input.type = EV_KEY;
+                ev.input.code = BTN_LEFT;
+                ev.input.value = 1;
+                ev.input.pad1 = TOAST_WIDTH - 15; /* Close button X */
+                ev.input.pad2 = 12;               /* Close button Y */
+                mock_push_event(&ev);
+
+                uint32_t chosen = 999;
+                int rc = notify_wait_action((uint32_t)id, &chosen);
+                if (rc == 0 && chosen == 0) {
+                    TSK_TEST_PASS("vnotif", "mouse_click_close_button");
+                    passed++;
+                } else {
+                    TSK_TEST_FAIL("vnotif", "mouse_click_close_button", "expected action_id 0 on close");
+                }
+            } else {
+                TSK_TEST_FAIL("vnotif", "mouse_click_close_button", "window id not found");
+            }
+        } else {
+            TSK_TEST_FAIL("vnotif", "mouse_click_close_button", "notify_send failed");
+        }
+    }
+
+    /* Test 14: Mouse double-click on close button dismisses toast */
+    {
+        vnotif_action_t a[1];
+        memset(a, 0, sizeof(a));
+        strncpy(a[0].label, "DblClose", sizeof(a[0].label) - 1);
+        a[0].action_id = 22;
+
+        int32_t id = notify_send("DblClickClose", "Double click test", "info", 0, a, 1);
+        if (id > 0) {
+            uint32_t wid = notifyd_test_get_window_id((uint32_t)id);
+            if (wid > 0) {
+                vanilla_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = VANILLA_EVENT_DOUBLE_CLICK;
+                ev.window_id = wid;
+                ev.input.type = EV_KEY;
+                ev.input.code = BTN_LEFT;
+                ev.input.value = 2; /* double click value */
+                ev.input.pad1 = TOAST_WIDTH - 15;
+                ev.input.pad2 = 12;
+                mock_push_event(&ev);
+
+                uint32_t chosen = 999;
+                int rc = notify_wait_action((uint32_t)id, &chosen);
+                if (rc == 0 && chosen == 0) {
+                    TSK_TEST_PASS("vnotif", "mouse_double_click_close_button");
+                    passed++;
+                } else {
+                    TSK_TEST_FAIL("vnotif", "mouse_double_click_close_button", "expected action_id 0 on double click close");
+                }
+            } else {
+                TSK_TEST_FAIL("vnotif", "mouse_double_click_close_button", "window id not found");
+            }
+        } else {
+            TSK_TEST_FAIL("vnotif", "mouse_double_click_close_button", "notify_send failed");
+        }
+    }
+
+    /* Test 15: Mouse click on action button delivers selected action */
+    {
+        vnotif_action_t a[2];
+        memset(a, 0, sizeof(a));
+        strncpy(a[0].label, "Option A", sizeof(a[0].label) - 1);
+        a[0].action_id = 101;
+        strncpy(a[1].label, "Option B", sizeof(a[1].label) - 1);
+        a[1].action_id = 202;
+
+        int32_t id = notify_send("Choice", "Select option", "warning", 0, a, 2);
+        if (id > 0) {
+            uint32_t wid = notifyd_test_get_window_id((uint32_t)id);
+            if (wid > 0) {
+                /* Click Option B (second button): x approx 200, y approx 80 */
+                vanilla_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = VANILLA_EVENT_INPUT;
+                ev.window_id = wid;
+                ev.input.type = EV_KEY;
+                ev.input.code = BTN_LEFT;
+                ev.input.value = 1;
+                ev.input.pad1 = 200;
+                ev.input.pad2 = 80;
+                mock_push_event(&ev);
+
+                uint32_t chosen = 0;
+                int rc = notify_wait_action((uint32_t)id, &chosen);
+                if (rc == 0 && chosen == 202) {
+                    TSK_TEST_PASS("vnotif", "mouse_click_action_buttons");
+                    passed++;
+                } else {
+                    TSK_TEST_FAIL("vnotif", "mouse_click_action_buttons", "action 202 not delivered");
+                }
+            } else {
+                TSK_TEST_FAIL("vnotif", "mouse_click_action_buttons", "window id not found");
+            }
+        } else {
+            TSK_TEST_FAIL("vnotif", "mouse_click_action_buttons", "notify_send failed");
+        }
+    }
+
+    /* Test 16: Spurious mouse click outside buttons does not dismiss toast */
+    {
+        vnotif_action_t a[1];
+        memset(a, 0, sizeof(a));
+        strncpy(a[0].label, "Stay", sizeof(a[0].label) - 1);
+        a[0].action_id = 303;
+
+        int32_t id = notify_send("Spurious", "Do not dismiss", "info", 0, a, 1);
+        if (id > 0) {
+            uint32_t wid = notifyd_test_get_window_id((uint32_t)id);
+            if (wid > 0) {
+                vanilla_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = VANILLA_EVENT_INPUT;
+                ev.window_id = wid;
+                ev.input.type = EV_KEY;
+                ev.input.code = BTN_LEFT;
+                ev.input.value = 1;
+                ev.input.pad1 = 100; /* Click on toast body text */
+                ev.input.pad2 = 30;
+                mock_push_event(&ev);
+
+                sleep_ms(50);
+                int act = 0, vis = 0;
+                notifyd_test_get_counts(&act, &vis);
+                if (act >= 1 && notifyd_test_get_window_id((uint32_t)id) == wid) {
+                    TSK_TEST_PASS("vnotif", "mouse_click_spurious_ignored");
+                    passed++;
+                } else {
+                    TSK_TEST_FAIL("vnotif", "mouse_click_spurious_ignored", "toast dismissed unexpectedly");
+                }
+                notify_close((uint32_t)id);
+            } else {
+                TSK_TEST_FAIL("vnotif", "mouse_click_spurious_ignored", "window id not found");
+            }
+        } else {
+            TSK_TEST_FAIL("vnotif", "mouse_click_spurious_ignored", "notify_send failed");
         }
     }
 

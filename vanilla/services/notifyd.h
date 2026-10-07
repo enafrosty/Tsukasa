@@ -96,6 +96,7 @@ int notifyd_run(const char *sock_path, volatile int *stop_flag);
 #ifdef VNOTIF_TEST_NO_MAIN
 int notifyd_test_get_counts(int *out_active, int *out_visible);
 int notifyd_test_trigger_action(uint32_t notif_id, uint32_t action_id);
+uint32_t notifyd_test_get_window_id(uint32_t notif_id);
 #endif
 
 #endif /* _VANILLA_SERVICES_NOTIFYD_H */

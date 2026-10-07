@@ -32,7 +32,7 @@ CFLAGS = -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
 
 OBJS = client.o surface.o service.o clipboard.o notify.o
 
-all: notify.o
+all: $(OBJS)
 
 notify.o: notify.c notify.h ../services/notifyd.h
 	$(CC) $(CFLAGS) -c -o $@ $<
