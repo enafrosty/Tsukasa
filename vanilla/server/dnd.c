@@ -1,5 +1,5 @@
 /*
- * Project Tsukasa - Display Server Drag and Drop Implementation
+ * Project Tsukasa — Display Server Drag and Drop Implementation
  *
  * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
@@ -366,6 +366,11 @@ int dnd_handle_key_escape(vanilla_server_t *srv)
         g_dnd.state = DND_IDLE;
         return 1;
     }
+    if (g_dnd.state == DND_PENDING) {
+        memset(&g_dnd, 0, sizeof(g_dnd));
+        g_dnd.state = DND_IDLE;
+        return 1;
+    }
     return 0;
 }
 
@@ -375,11 +380,17 @@ int dnd_handle_offer(vanilla_server_t *srv, uint32_t window_id,
     if (!srv || !offer)
         return -1;
 
-    if (g_dnd.state != DND_PENDING && g_dnd.state != DND_ACTIVE)
+    if (g_dnd.state != DND_PENDING && g_dnd.state != DND_ACTIVE) {
+        if (window_id != 0)
+            dnd_send_cancel(srv, window_id);
         return -1;
+    }
 
-    if (g_dnd.source_window_id != 0 && window_id != 0 && window_id != g_dnd.source_window_id)
+    if (g_dnd.source_window_id != 0 && window_id != 0 && window_id != g_dnd.source_window_id) {
+        if (window_id != 0)
+            dnd_send_cancel(srv, window_id);
         return -1;
+    }
 
     g_dnd.source_window_id = window_id ? window_id : g_dnd.source_window_id;
     snprintf(g_dnd.offer_mime, sizeof(g_dnd.offer_mime), "%s", offer->mime);
@@ -668,6 +679,15 @@ int dnd_run_selftests(void)
     if (dnd_get_state() != DND_IDLE)
         return -22;
 
-    printf("[vanilla] drag and drop state machine self-tests passed (13/13)\n");
+    /* 14. Escape while in PENDING state -> returns to IDLE */
+    dnd_handle_mouse_button(&srv, 10, 1, 100, 100);
+    if (dnd_get_state() != DND_PENDING)
+        return -23;
+    if (!dnd_handle_key_escape(&srv))
+        return -24;
+    if (dnd_get_state() != DND_IDLE)
+        return -25;
+
+    printf("[vanilla] drag and drop state machine self-tests passed (14/14)\n");
     return 0;
 }

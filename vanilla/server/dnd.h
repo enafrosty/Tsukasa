@@ -42,7 +42,7 @@ typedef struct {
     int         over_window_accepted; /* 1 if MSG_DND_ACCEPT received */
     int64_t     drop_timestamp_ms;    /* timestamp when entered DND_DROPPING */
 
-    /* Offered data: for Phase 3, a single NUL-terminated file path */
+    /* Offered data: inline NUL-terminated file path */
     char        offer_path[256];
     char        offer_mime[64];       /* e.g. "text/uri-list" */
 

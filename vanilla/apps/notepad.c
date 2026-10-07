@@ -20,6 +20,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
 
 #define NOTE_WIDTH      560
 #define NOTE_HEIGHT     380
@@ -240,7 +241,15 @@ int main(int argc, char **argv)
     }
     note_init(state, argc >= 2 ? argv[1] : NULL);
 
-    vanilla_client_t *client = vanilla_connect(NULL);
+    const char *sock_path = VANILLA_SOCKET_PATH;
+    vanilla_client_t *client = NULL;
+    for (int retry = 0; retry < 50; retry++) {
+        client = vanilla_connect(sock_path);
+        if (client)
+            break;
+        struct timespec ts = { 0, 10000000 }; /* 10ms */
+        nanosleep(&ts, NULL);
+    }
     if (!client) {
         fprintf(stderr, "notepad: failed to connect to display server\n");
         free(state);

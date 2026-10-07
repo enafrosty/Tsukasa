@@ -32,7 +32,7 @@ typedef struct vanilla_event vanilla_event_t;
 /*
  * Called by a drag source after button-press-and-move crosses the threshold.
  * mime: MIME type of the offered data (e.g. "text/uri-list").
- * data: inline data (NUL-terminated file path for Phase 3).
+ * data: inline data (NUL-terminated file path).
  * ghost: optional 32x32 ARGB bitmap for the drag icon; may be NULL.
  * Returns 0 on success, negative errno on failure.
  */
@@ -49,7 +49,7 @@ int dnd_set_accept(vanilla_window_t *win, int accepted);
 /*
  * Toolkit helper: register a drop target callback for a widget.
  * The callback receives (mime, data, data_len) when a drop occurs.
- * This is the P1-5 toolkit integration point.
+ * Toolkit integration point for widgets.
  */
 typedef void (*dnd_drop_fn)(const char *mime, const char *data,
                             size_t data_len, void *userdata);
