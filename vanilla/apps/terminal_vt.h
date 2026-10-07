@@ -36,6 +36,7 @@ typedef enum {
     VT_NORMAL = 0,
     VT_ESC_START,
     VT_CSI_PARAMS,
+    VT_OSC,
 } vt_state_t;
 
 typedef struct terminal_state_t {

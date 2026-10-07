@@ -407,7 +407,7 @@ int main(int argc, char **argv)
                             }
                         }
                     }
-                } else if (iev->type == EV_REL) {
+                } else if (iev->type == EV_REL || iev->type == EV_ABS) {
                     if (state.drag_candidate) {
                         int cx = (int)iev->pad1;
                         int cy = (int)iev->pad2;

@@ -213,10 +213,31 @@ static void apply_sgr_code(terminal_state_t *st, int code)
         st->cur_bold = 0;
     } else if (code == 1) {
         st->cur_bold = 1;
+        for (int i = 0; i < 8; i++) {
+            if (st->cur_fg == ansi_colours[i]) {
+                st->cur_fg = ansi_colours[8 + i];
+                break;
+            }
+        }
+    } else if (code == 2) {
+        st->cur_fg = ansi_colours[8];
+    } else if (code == 7) {
+        uint32_t tmp = st->cur_fg;
+        st->cur_fg = (st->cur_bg != 0) ? st->cur_bg : COLOR_DEFAULT_FG;
+        st->cur_bg = (tmp != 0) ? tmp : 0xFF2E3440u;
     } else if (code == 22) {
         st->cur_bold = 0;
+        for (int i = 0; i < 8; i++) {
+            if (st->cur_fg == ansi_colours[8 + i]) {
+                st->cur_fg = ansi_colours[i];
+                break;
+            }
+        }
+    } else if (code == 27) {
+        /* Reverse off */
     } else if (code >= 30 && code <= 37) {
-        st->cur_fg = ansi_colours[code - 30];
+        int idx = code - 30;
+        st->cur_fg = ansi_colours[st->cur_bold ? (8 + idx) : idx];
     } else if (code == 39) {
         st->cur_fg = COLOR_DEFAULT_FG;
     } else if (code >= 40 && code <= 47) {
@@ -352,6 +373,11 @@ static void dispatch_csi(terminal_state_t *st, char cmd)
                     st->bg_colors[r][c] = st->cur_bg;
                 }
             }
+        } else if (mode == 3) {
+            /* Erase scrollback */
+            st->scrollback_count = 0;
+            st->scrollback_head = 0;
+            st->scroll_offset = 0;
         }
         break;
     }
@@ -402,6 +428,13 @@ static void dispatch_csi(terminal_state_t *st, char cmd)
     case 'l': {
         if (st->vt_private && st->vt_param_count >= 1 && st->vt_params[0] == 25)
             st->cursor_visible = 0;
+        break;
+    }
+    case 'c': { /* DA: Primary Device Attributes query */
+        if (st->in_pipe[1] > 0) {
+            const char *da = "\033[?1;2c";
+            write(st->in_pipe[1], da, strlen(da));
+        }
         break;
     }
     default:
@@ -492,6 +525,8 @@ void vt_process_byte(terminal_state_t *st, char c)
             st->vt_param_count = 0;
             st->vt_private = 0;
             memset(st->vt_params, 0, sizeof(st->vt_params));
+        } else if (c == ']') {
+            st->vt_state = VT_OSC;
         } else if (c == 'c') {
             /* Device attributes query or reset */
             st->vt_state = VT_NORMAL;
@@ -501,14 +536,28 @@ void vt_process_byte(terminal_state_t *st, char c)
             }
         } else if (c == 0x1B) {
             /* Remain in ESC_START */
+        } else if (c == 0x18 || c == 0x1A) {
+            st->vt_state = VT_NORMAL;
         } else {
             /* Unhandled 2-character escape sequence */
             st->vt_state = VT_NORMAL;
         }
         break;
 
+    case VT_OSC:
+        if (c == '\a' || c == 0x18 || c == 0x1A) {
+            st->vt_state = VT_NORMAL;
+        } else if (c == 0x1B) {
+            st->vt_state = VT_ESC_START;
+        }
+        break;
+
     case VT_CSI_PARAMS:
-        if (c == '?') {
+        if (c == 0x18 || c == 0x1A) {
+            st->vt_state = VT_NORMAL;
+        } else if (c == 0x1B) {
+            st->vt_state = VT_ESC_START;
+        } else if (c == '?') {
             st->vt_private = 1;
         } else if (c >= '0' && c <= '9') {
             if (st->vt_param_count == 0)
@@ -516,7 +565,11 @@ void vt_process_byte(terminal_state_t *st, char c)
             st->vt_params[st->vt_param_count - 1] =
                 st->vt_params[st->vt_param_count - 1] * 10 + (c - '0');
         } else if (c == ';') {
-            if (st->vt_param_count < TERM_MAX_PARAMS) {
+            if (st->vt_param_count == 0) {
+                st->vt_param_count = 2;
+                st->vt_params[0] = 0;
+                st->vt_params[1] = 0;
+            } else if (st->vt_param_count < TERM_MAX_PARAMS) {
                 st->vt_param_count++;
                 st->vt_params[st->vt_param_count - 1] = 0;
             }
@@ -524,8 +577,6 @@ void vt_process_byte(terminal_state_t *st, char c)
             /* Command byte */
             dispatch_csi(st, c);
             st->vt_state = VT_NORMAL;
-        } else if (c == 0x1B) {
-            st->vt_state = VT_ESC_START;
         }
         break;
     }

@@ -570,7 +570,34 @@ int main(int argc, char **argv)
                 struct input_event *iev = &ev.input;
                 ui_handle_event(state->ui_ctx, state->root, iev);
 
-                if (iev->type == EV_KEY) {
+                if (iev->type == EV_REL || iev->type == EV_ABS) {
+                    if (state->mouse_down && state->editor_box && state->editor_box->layout_elem) {
+                        int cx = (int)iev->pad1;
+                        int cy = (int)iev->pad2;
+                        int ed_y = state->editor_box->layout_elem->computed_y;
+                        int ed_h = state->editor_box->layout_elem->computed_h;
+                        if (cy >= ed_y && cy < ed_y + ed_h) {
+                            int clicked_line = state->scroll_line + (cy - ed_y) / LINE_HEIGHT;
+                            if (clicked_line < 0) clicked_line = 0;
+                            if (clicked_line >= state->num_lines) clicked_line = state->num_lines - 1;
+                            int col_px = cx - (GUTTER_WIDTH + 8);
+                            int clicked_col = (col_px + 4) / 8;
+                            if (clicked_col < 0) clicked_col = 0;
+                            int line_len = (int)strlen(state->lines[clicked_line]);
+                            if (clicked_col > line_len) clicked_col = line_len;
+
+                            if (!state->has_selection) {
+                                state->sel_anchor_line = state->cursor_line;
+                                state->sel_anchor_col = state->cursor_col;
+                                state->has_selection = 1;
+                            }
+                            state->cursor_line = clicked_line;
+                            state->cursor_col = clicked_col;
+                            state->dirty = 1;
+                            note_update_status(state);
+                        }
+                    }
+                } else if (iev->type == EV_KEY) {
                     if (iev->code == BTN_LEFT) {
                         if (iev->value == 1) {
                             int cx = (int)iev->pad1;

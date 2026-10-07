@@ -219,6 +219,93 @@ static void test_vt_resize(void)
     printf("[TEST] terminal_vt.resize PASS\n");
 }
 
+static void test_vt_omitted_params(void)
+{
+    terminal_state_t st;
+    vt_init(&st, 25, 80);
+
+    /* CUP with omitted row: \033[;5H -> row 1, col 5 (0-indexed: 0, 4) */
+    vt_process_bytes(&st, "\033[;5H", 5);
+    TEST_ASSERT(st.cursor_row == 0);
+    TEST_ASSERT(st.cursor_col == 4);
+
+    /* CUP with omitted col: \033[7;H -> row 7, col 1 (0-indexed: 6, 0) */
+    vt_process_bytes(&st, "\033[7;H", 5);
+    TEST_ASSERT(st.cursor_row == 6);
+    TEST_ASSERT(st.cursor_col == 0);
+
+    /* CUP with both omitted: \033[;H -> row 1, col 1 (0-indexed: 0, 0) */
+    vt_process_bytes(&st, "\033[;H", 4);
+    TEST_ASSERT(st.cursor_row == 0);
+    TEST_ASSERT(st.cursor_col == 0);
+
+    /* CUP with no params: \033[H -> row 1, col 1 (0-indexed: 0, 0) */
+    st.cursor_row = 10;
+    st.cursor_col = 15;
+    vt_process_bytes(&st, "\033[H", 3);
+    TEST_ASSERT(st.cursor_row == 0);
+    TEST_ASSERT(st.cursor_col == 0);
+
+    printf("[TEST] terminal_vt.omitted_params PASS\n");
+}
+
+static void test_vt_osc(void)
+{
+    terminal_state_t st;
+    vt_init(&st, 25, 80);
+
+    /* OSC sequence to set title, BEL terminated: should be swallowed */
+    const char *osc_bel = "\033]0;tsh prompt title\007OK";
+    vt_process_bytes(&st, osc_bel, strlen(osc_bel));
+    TEST_ASSERT(st.grid[0][0] == 'O');
+    TEST_ASSERT(st.grid[0][1] == 'K');
+    TEST_ASSERT(st.cursor_col == 2);
+
+    /* OSC sequence, ST (ESC \) terminated: should be swallowed */
+    const char *osc_st = "\r\n\033]2;window title\033\\DONE";
+    vt_process_bytes(&st, osc_st, strlen(osc_st));
+    TEST_ASSERT(st.grid[1][0] == 'D');
+    TEST_ASSERT(st.grid[1][1] == 'O');
+    TEST_ASSERT(st.grid[1][2] == 'N');
+    TEST_ASSERT(st.grid[1][3] == 'E');
+
+    printf("[TEST] terminal_vt.osc PASS\n");
+}
+
+static void test_vt_can_sub(void)
+{
+    terminal_state_t st;
+    vt_init(&st, 25, 80);
+
+    /* Partial escape aborted by CAN (0x18) */
+    const char *seq = "\033[12;\030ABC";
+    vt_process_bytes(&st, seq, strlen(seq));
+    TEST_ASSERT(st.vt_state == VT_NORMAL);
+    TEST_ASSERT(st.grid[0][0] == 'A');
+    TEST_ASSERT(st.grid[0][1] == 'B');
+    TEST_ASSERT(st.grid[0][2] == 'C');
+
+    printf("[TEST] terminal_vt.can_sub PASS\n");
+}
+
+static void test_vt_erase_scrollback(void)
+{
+    terminal_state_t st;
+    vt_init(&st, 25, 80);
+
+    for (int i = 0; i < 30; i++)
+        vt_process_bytes(&st, "Row\n", 4);
+
+    TEST_ASSERT(st.scrollback_count > 0);
+
+    /* ED 3: Erase scrollback */
+    vt_process_bytes(&st, "\033[3J", 4);
+    TEST_ASSERT(st.scrollback_count == 0);
+    TEST_ASSERT(st.scroll_offset == 0);
+
+    printf("[TEST] terminal_vt.erase_scrollback PASS\n");
+}
+
 int main(void)
 {
     printf("=== terminal_vt unit tests ===\n");
@@ -229,6 +316,10 @@ int main(void)
     test_vt_scrollback();
     test_vt_cursor_visibility();
     test_vt_resize();
-    printf("[TEST] terminal_vt DONE 7/7\n");
+    test_vt_omitted_params();
+    test_vt_osc();
+    test_vt_can_sub();
+    test_vt_erase_scrollback();
+    printf("[TEST] terminal_vt DONE 11/11\n");
     return 0;
 }
