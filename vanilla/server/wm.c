@@ -19,6 +19,7 @@
 #include "blitter.h"
 #include "font.h"
 #include "anim.h"
+#include "dnd.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -542,10 +543,16 @@ int vanilla_server_init(vanilla_server_t *srv, const char *socket_path)
     compositor_damage_all(&srv->compositor);
     compositor_render_frame(srv);
 
+    dnd_init();
+
     wm_run_resize_selftests();
     wm_run_input_selftests();
     wm_run_animation_selftests();
     wm_run_context_menu_selftests();
+    int dnd_rc = dnd_run_selftests();
+    if (dnd_rc != 0) {
+        printf("[vanilla] dnd selftests FAILED: %d\n", dnd_rc);
+    }
 
     return 0;
 }
@@ -625,6 +632,7 @@ void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_
     if (srv->drag_threshold_pending && srv->drag_threshold_window_id == w->window_id) {
         srv->drag_threshold_pending = 0;
     }
+    dnd_window_destroyed(srv, w->window_id);
     w->resize_has_target = 0;
     w->anim_state = ANIM_IDLE;
     w->anim_destroy_on_done = 0;
@@ -1311,7 +1319,7 @@ int wm_run_resize_selftests(void)
     }
 
     /* 2. Geometry calculation with basic directional dragging */
-    vanilla_server_t srv;
+    static vanilla_server_t srv;
     memset(&srv, 0, sizeof(srv));
     srv.resize_start_x = 100;
     srv.resize_start_y = 100;
@@ -1461,7 +1469,7 @@ static void wm_alttab_build_list(vanilla_server_t *srv);
 int wm_run_input_selftests(void)
 {
     /* 1. Modifier bitmask state machine */
-    vanilla_server_t srv;
+    static vanilla_server_t srv;
     memset(&srv, 0, sizeof(srv));
 
     update_mod_state(&srv, MOD_LSHIFT, 0, 1);
@@ -1804,7 +1812,7 @@ int wm_run_animation_selftests(void)
     }
 
     /* 2. compositor_start_anim parameter initialization and active animations flag */
-    vanilla_server_t srv;
+    static vanilla_server_t srv;
     memset(&srv, 0, sizeof(srv));
     srv.compositor.width = 1024;
     srv.compositor.height = 768;
@@ -1996,11 +2004,21 @@ int handle_msg_clipboard_offer(vanilla_server_t *srv, int client_idx, const vani
 
 int handle_msg_dnd_offer(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
 {
-    (void)srv;
     (void)client_idx;
-    (void)hdr;
-    (void)payload;
-    /* Stub for drag-and-drop protocol */
+    if (!srv || !hdr || !payload)
+        return -1;
+    const vanilla_msg_dnd_offer_t *offer = (const vanilla_msg_dnd_offer_t *)payload;
+    dnd_handle_offer(srv, hdr->window_id, offer);
+    return 0;
+}
+
+int handle_msg_dnd_accept(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    (void)client_idx;
+    if (!srv || !hdr || !payload)
+        return -1;
+    const vanilla_msg_dnd_accept_t *accept = (const vanilla_msg_dnd_accept_t *)payload;
+    dnd_handle_accept(srv, hdr->window_id, accept);
     return 0;
 }
 
@@ -2974,14 +2992,15 @@ int vanilla_server_send_dnd_drop(vanilla_server_t *srv, uint32_t target_window_i
 
     vanilla_msg_hdr_t hdr;
     vanilla_msg_dnd_drop_t drop;
+    memset(&hdr, 0, sizeof(hdr));
+    memset(&drop, 0, sizeof(drop));
     hdr.magic = VANILLA_IPC_MAGIC;
     hdr.msg_type = MSG_DND_DROP;
     hdr.payload_len = (uint16_t)sizeof(drop);
     hdr.window_id = target_window_id;
 
-    drop.target_window_id = target_window_id;
-    drop.x = x;
-    drop.y = y;
+    drop.local_x = x;
+    drop.local_y = y;
 
     if (exact_write(w->client_fd, &hdr, sizeof(hdr)) < 0 ||
         exact_write(w->client_fd, &drop, sizeof(drop)) < 0)
@@ -3111,6 +3130,7 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
     }
 
     wm_context_menu_check_timers(srv);
+    dnd_check_timeout(srv);
 
     int64_t now_ms = get_time_ms();
     for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
@@ -3585,6 +3605,22 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             srv->cursor_y = screen_h - 1;
 
         if (srv->cursor_x != old_x || srv->cursor_y != old_y) {
+            dnd_handle_mouse_move(srv, srv->cursor_x, srv->cursor_y);
+
+            if ((srv->mouse_buttons & 1) && srv->focused_window_id != 0 &&
+                !srv->is_dragging && !srv->is_resizing && !srv->drag_threshold_pending &&
+                !dnd_is_active()) {
+                vanilla_server_window_t *fw = vanilla_server_find_window(srv, srv->focused_window_id);
+                if (fw) {
+                    int lx = srv->cursor_x - fw->x;
+                    int ly = srv->cursor_y - fw->y;
+                    struct input_event client_ev = *ev;
+                    client_ev.pad1 = (uint16_t)(lx < 0 ? 0 : lx);
+                    client_ev.pad2 = (uint32_t)(ly < 0 ? 0 : ly);
+                    vanilla_server_send_input(srv, srv->focused_window_id, &client_ev);
+                }
+            }
+
             vanilla_rect_t old_box;
             cursor_get_rect(old_x, old_y, &old_box);
 
@@ -3626,6 +3662,8 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
 
             if (srv->context_menu_depth > 0) {
                 cursor_set_active(CURSOR_ARROW);
+            } else if (dnd_is_active()) {
+                /* Cursor managed by DnD subsystem */
             } else if (srv->is_resizing) {
                 cursor_set_active(resize_edge_to_cursor_shape((vanilla_resize_edge_t)srv->resize_edge));
             } else if (!srv->is_dragging) {
@@ -3911,6 +3949,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     /* Click within client surface area */
                     if (srv->cursor_x >= hit->x && srv->cursor_x < hit->x + (int32_t)hit->width &&
                         srv->cursor_y >= hit->y && srv->cursor_y < hit->y + (int32_t)hit->height) {
+                        dnd_handle_mouse_button(srv, hit->window_id, 1, srv->cursor_x, srv->cursor_y);
                         int lx = srv->cursor_x - hit->x;
                         int ly = srv->cursor_y - hit->y;
                         struct input_event client_ev = *ev;
@@ -3931,6 +3970,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 srv->mouse_buttons &= ~(1u << 0);
                 srv->drag_threshold_pending = 0;
                 srv->long_press_fired[0] = 0;
+                dnd_handle_mouse_button(srv, 0, 0, srv->cursor_x, srv->cursor_y);
 
                 if (srv->is_resizing) {
                     vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->resize_window_id);
@@ -4143,6 +4183,11 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 }
             }
             return 0;
+        }
+
+        if (ev->code == KEY_ESC && ev->value == 1) {
+            if (dnd_handle_key_escape(srv))
+                return 0;
         }
 
         /* Context menu keyboard navigation: Up, Down, Left, Right, Enter, Escape */

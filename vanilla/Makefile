@@ -46,6 +46,7 @@ LIBVANILLA_OBJS = libvanilla/client.o \
                   libvanilla/surface.o \
                   libvanilla/service.o \
                   libvanilla/clipboard.o \
+                  libvanilla/dnd.o \
                   libvanilla/notify.o \
                   server/theme.o \
                   input/keymap.o
@@ -72,7 +73,8 @@ SERVER_OBJS     = server/main.o \
                   server/default_font.o \
                   server/image.o \
                   server/theme.o \
-                  server/cursor.o
+                  server/cursor.o \
+                  server/dnd.o
 
 TEST_IPC_OBJS   = tests/test_ipc.o \
                   server/wm.o \
@@ -82,7 +84,8 @@ TEST_IPC_OBJS   = tests/test_ipc.o \
                   server/default_font.o \
                   server/image.o \
                   server/theme.o \
-                  server/cursor.o
+                  server/cursor.o \
+                  server/dnd.o
 
 TEST_COMP_OBJS  = tests/test_compositor.o \
                   server/wm.o \
@@ -92,7 +95,8 @@ TEST_COMP_OBJS  = tests/test_compositor.o \
                   server/default_font.o \
                   server/image.o \
                   server/theme.o \
-                  server/cursor.o
+                  server/cursor.o \
+                  server/dnd.o
 
 TEST_TYPO_OBJS  = tests/test_typography.o \
                   server/blitter.o \
@@ -109,6 +113,7 @@ TEST_SHELL_OBJS = tests/test_shell.o \
                   server/image.o \
                   server/theme.o \
                   server/cursor.o \
+                  server/dnd.o \
                   shell-client/shell_client.test.o \
                   apps/app_common.o
 

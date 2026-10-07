@@ -18,6 +18,7 @@
 #include "server.h"
 #include "blitter.h"
 #include "anim.h"
+#include "dnd.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -671,6 +672,7 @@ void compositor_render_frame(struct vanilla_server *srv)
         return;
 
     compositor_animate_windows(srv);
+    dnd_check_timeout(srv);
 
     printf("[vanilla] compositor: render\n");
 
@@ -980,6 +982,9 @@ void compositor_render_frame(struct vanilla_server *srv)
         /* 6.6 Render Server-Managed Popup Context Menus (if active) */
         if (srv->context_menu_depth > 0)
             compositor_paint_context_menus(srv, dirty);
+
+        /* 6.7 Render Drag and Drop Ghost Overlay (if active) */
+        dnd_render_ghost(srv, dirty);
 
         /* 7. Render Hardware Cursor Overlay */
         cursor_render(comp->backbuffer, comp->pitch_px, comp->width, comp->height,
