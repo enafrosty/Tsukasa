@@ -20,7 +20,7 @@
 int main(int argc, char **argv)
 {
     const char *sock_path = VANILLA_SOCKET_PATH;
-    vanilla_server_t srv;
+    static vanilla_server_t srv;
 
     if (argc > 1 && argv[1] && argv[1][0] != '\0')
         sock_path = argv[1];

@@ -1319,7 +1319,7 @@ int wm_run_resize_selftests(void)
     }
 
     /* 2. Geometry calculation with basic directional dragging */
-    vanilla_server_t srv;
+    static vanilla_server_t srv;
     memset(&srv, 0, sizeof(srv));
     srv.resize_start_x = 100;
     srv.resize_start_y = 100;
@@ -1469,7 +1469,7 @@ static void wm_alttab_build_list(vanilla_server_t *srv);
 int wm_run_input_selftests(void)
 {
     /* 1. Modifier bitmask state machine */
-    vanilla_server_t srv;
+    static vanilla_server_t srv;
     memset(&srv, 0, sizeof(srv));
 
     update_mod_state(&srv, MOD_LSHIFT, 0, 1);
@@ -1812,7 +1812,7 @@ int wm_run_animation_selftests(void)
     }
 
     /* 2. compositor_start_anim parameter initialization and active animations flag */
-    vanilla_server_t srv;
+    static vanilla_server_t srv;
     memset(&srv, 0, sizeof(srv));
     srv.compositor.width = 1024;
     srv.compositor.height = 768;
@@ -2008,7 +2008,8 @@ int handle_msg_dnd_offer(vanilla_server_t *srv, int client_idx, const vanilla_ms
     if (!srv || !hdr || !payload)
         return -1;
     const vanilla_msg_dnd_offer_t *offer = (const vanilla_msg_dnd_offer_t *)payload;
-    return dnd_handle_offer(srv, hdr->window_id, offer);
+    dnd_handle_offer(srv, hdr->window_id, offer);
+    return 0;
 }
 
 int handle_msg_dnd_accept(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
@@ -2017,7 +2018,8 @@ int handle_msg_dnd_accept(vanilla_server_t *srv, int client_idx, const vanilla_m
     if (!srv || !hdr || !payload)
         return -1;
     const vanilla_msg_dnd_accept_t *accept = (const vanilla_msg_dnd_accept_t *)payload;
-    return dnd_handle_accept(srv, hdr->window_id, accept);
+    dnd_handle_accept(srv, hdr->window_id, accept);
+    return 0;
 }
 
 static void menu_compute_size(vanilla_compositor_t *comp, vanilla_context_menu_t *m, const vanilla_context_menu_t *parent)

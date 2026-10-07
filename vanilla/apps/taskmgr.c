@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #ifndef SIGKILL
 #define SIGKILL 9
@@ -217,7 +218,15 @@ int main(int argc, char **argv)
     memset(&state, 0, sizeof(state));
     tm_refresh(&state);
 
-    vanilla_client_t *client = vanilla_connect(NULL);
+    const char *sock_path = VANILLA_SOCKET_PATH;
+    vanilla_client_t *client = NULL;
+    for (int retry = 0; retry < 50; retry++) {
+        client = vanilla_connect(sock_path);
+        if (client)
+            break;
+        struct timespec ts = { 0, 10000000 }; /* 10ms */
+        nanosleep(&ts, NULL);
+    }
     if (!client) {
         fprintf(stderr, "taskmgr: failed to connect to display server\n");
         return 1;

@@ -516,7 +516,7 @@ int dnd_run_selftests(void)
     if (dnd_get_state() != DND_IDLE)
         return -1;
 
-    vanilla_server_t srv;
+    static vanilla_server_t srv;
     memset(&srv, 0, sizeof(srv));
     srv.cursor_x = 100;
     srv.cursor_y = 100;

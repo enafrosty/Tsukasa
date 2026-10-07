@@ -54,8 +54,6 @@
 #define PROCESS_STACK_PAGES ((PROCESS_STACK_SIZE + PAGE_SIZE - 1) / PAGE_SIZE)
 #define PROCESS_CONTEXT_GPR_QWORDS 15u
 #define PROCESS_CONTEXT_TOTAL_QWORDS 21u
-#define PROCESS_CONTEXT_GUARD_QWORDS 16u
-#define PROCESS_CONTEXT_FRAME_QWORDS (PROCESS_CONTEXT_TOTAL_QWORDS + PROCESS_CONTEXT_GUARD_QWORDS)
 #define PROCESS_CONTEXT_TOP_BIAS 24u
 #define PROCESS_CONTEXT_IRET_INDEX 19u
 
@@ -421,9 +419,6 @@ static int setup_initial_context_locked(process_t *p)
     sp[18] = 0x202;
     sp[19] = (uint64_t)top;
     sp[20] = X64_GDT_KERNEL_DS;
-
-    for (uint32_t i = 0; i < PROCESS_CONTEXT_GUARD_QWORDS; i++)
-        sp[PROCESS_CONTEXT_TOTAL_QWORDS + i] = 0;
 
     p->kernel_rsp = (uint64_t)(uintptr_t)sp;
     p->main_thread.kernel_rsp = p->kernel_rsp;
