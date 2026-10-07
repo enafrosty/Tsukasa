@@ -42,6 +42,10 @@ typedef struct {
     int          selected_idx;
     int          scroll_offset;
     int          dirty;
+    int          drag_candidate;
+    int          drag_start_x;
+    int          drag_start_y;
+    int          drag_file_idx;
 } filemgr_state_t;
 
 static void fm_scan_dir(filemgr_state_t *st)
@@ -270,9 +274,11 @@ int main(int argc, char **argv)
                             int row = (cy - HEADER_HEIGHT) / ROW_HEIGHT;
                             int clicked_idx = state.scroll_offset + row;
                             if (clicked_idx >= 0 && clicked_idx < state.entry_count) {
-                                if (clicked_idx == state.selected_idx) {
-                                    fm_open_entry(&state, clicked_idx);
-                                } else {
+                                state.drag_candidate = 1;
+                                state.drag_start_x = cx;
+                                state.drag_start_y = cy;
+                                state.drag_file_idx = clicked_idx;
+                                if (clicked_idx != state.selected_idx) {
                                     state.selected_idx = clicked_idx;
                                     state.dirty = 1;
                                 }
@@ -301,6 +307,40 @@ int main(int argc, char **argv)
                             fm_scan_dir(&state);
                         }
                     }
+                } else if (iev->type == EV_KEY && iev->value == 0) {
+                    if (iev->code == BTN_LEFT) {
+                        state.drag_candidate = 0;
+                    }
+                } else if (iev->type == EV_REL) {
+                    if (state.drag_candidate) {
+                        int cx = (int)iev->pad1;
+                        int cy = (int)iev->pad2;
+                        int dx = cx - state.drag_start_x;
+                        int dy = cy - state.drag_start_y;
+                        if (dx * dx + dy * dy >= DND_THRESHOLD_PX * DND_THRESHOLD_PX) {
+                            if (state.drag_file_idx >= 0 && state.drag_file_idx < state.entry_count) {
+                                file_entry_t *e = &state.entries[state.drag_file_idx];
+                                char full[256];
+                                if (strcmp(state.cwd, "/") == 0)
+                                    snprintf(full, sizeof(full), "/%s", e->name);
+                                else
+                                    snprintf(full, sizeof(full), "%s/%s", state.cwd, e->name);
+
+                                char uri[280];
+                                snprintf(uri, sizeof(uri), "file://%s", full);
+                                dnd_start_drag(win, "text/uri-list", uri, strlen(uri), NULL);
+                                state.drag_candidate = 0;
+                            }
+                        }
+                    }
+                }
+            } else if (ev.type == VANILLA_EVENT_DOUBLE_CLICK) {
+                int cx = (int)ev.input.pad1;
+                int cy = (int)ev.input.pad2;
+                if (cx >= SIDEBAR_WIDTH && cy >= HEADER_HEIGHT) {
+                    int row = (cy - HEADER_HEIGHT) / ROW_HEIGHT;
+                    int clicked_idx = state.scroll_offset + row;
+                    fm_open_entry(&state, clicked_idx);
                 }
             }
         }

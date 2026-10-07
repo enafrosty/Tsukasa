@@ -20,6 +20,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
 
 #define NOTE_WIDTH      560
 #define NOTE_HEIGHT     380
@@ -240,7 +241,15 @@ int main(int argc, char **argv)
     }
     note_init(state, argc >= 2 ? argv[1] : NULL);
 
-    vanilla_client_t *client = vanilla_connect(NULL);
+    const char *sock_path = VANILLA_SOCKET_PATH;
+    vanilla_client_t *client = NULL;
+    for (int retry = 0; retry < 50; retry++) {
+        client = vanilla_connect(sock_path);
+        if (client)
+            break;
+        struct timespec ts = { 0, 10000000 }; /* 10ms */
+        nanosleep(&ts, NULL);
+    }
     if (!client) {
         fprintf(stderr, "notepad: failed to connect to display server\n");
         free(state);
@@ -269,6 +278,29 @@ int main(int argc, char **argv)
             if (ev.type == VANILLA_EVENT_CLOSE_REQ) {
                 running = 0;
                 break;
+            } else if (ev.type == VANILLA_EVENT_DND_ENTER) {
+                if (strcmp(ev.dnd_enter.mime, "text/uri-list") == 0) {
+                    dnd_set_accept(win, 1);
+                } else {
+                    dnd_set_accept(win, 0);
+                }
+            } else if (ev.type == VANILLA_EVENT_DND_DROP) {
+                if (strcmp(ev.dnd_drop.mime, "text/uri-list") != 0) {
+                    dnd_set_accept(win, 0);
+                    continue;
+                }
+                const char *path = ev.dnd_drop.data;
+                if (strncmp(path, "file://", 7) == 0) {
+                    path += 7;
+                }
+                note_init(state, path);
+                if (state->num_lines == 1 && state->lines[0][0] == '\0') {
+                    strncpy(state->lines[0], path, MAX_LINE_LEN - 1);
+                    state->lines[0][MAX_LINE_LEN - 1] = '\0';
+                }
+                snprintf(title, sizeof(title), "Notepad - %s", state->filename);
+                state->dirty = 1;
+                dnd_set_accept(win, 1);
             } else if (ev.type == VANILLA_EVENT_INPUT) {
                 struct input_event *iev = &ev.input;
                 if (iev->type == EV_KEY) {

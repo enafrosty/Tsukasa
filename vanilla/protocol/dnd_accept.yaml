@@ -1,0 +1,10 @@
+id: 29
+name: MSG_DND_ACCEPT
+direction: client_to_server
+version: 2
+v1_compat: false
+description: "Target window signals acceptance or rejection of drag."
+fields:
+  - name: accepted
+    type: uint32_t
+    description: "1 = accept, 0 = reject"

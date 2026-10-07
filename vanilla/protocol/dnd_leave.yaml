@@ -1,0 +1,10 @@
+id: 28
+name: MSG_DND_LEAVE
+direction: server_to_client
+version: 2
+v1_compat: false
+description: "Server notifies window that dragged item left its area."
+fields:
+  - name: reserved
+    type: uint32_t
+    description: "Reserved field"
