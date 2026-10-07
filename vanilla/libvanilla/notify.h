@@ -42,7 +42,7 @@ int32_t notify_send(const char *title, const char *body, const char *icon_name,
 int notify_close(uint32_t notif_id);
 
 /*
- * notify_wait_action: Block (busy-poll until P4-1) for an action event
+ * notify_wait_action: Block (busy-poll) for an action event
  *   on the given notification. Fills out_action_id with the selected action
  *   (0 = dismissed). Returns 0 on success, negative errno on failure.
  */
