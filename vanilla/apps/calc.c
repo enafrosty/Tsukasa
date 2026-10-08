@@ -104,8 +104,9 @@ int main(int argc, char **argv)
 
     vanilla_client_t *client = vanilla_connect(NULL);
     if (!client) return 1;
-    vanilla_window_t *win = vanilla_create_window(client, "Calculator", 120, 80, CALC_WIDTH, CALC_HEIGHT, WINDOW_FLAG_NONE);
+    vanilla_window_t *win = vanilla_create_window(client, "Calculator", 120, 80, CALC_WIDTH, CALC_HEIGHT, WINDOW_FLAG_RESIZABLE);
     if (!win) { vanilla_disconnect(client); return 1; }
+    vanilla_set_size_hints(client, win->window_id, 200, 260, 0, 0, 0, 0);
     vanilla_map_window(win);
 
     static uint8_t ui_arena[128 * 1024];
@@ -113,6 +114,8 @@ int main(int argc, char **argv)
     if (!ctx) { vanilla_destroy_window(win); vanilla_disconnect(client); return 1; }
 
     ui_widget_t *root = ui_box(ctx, VDIR_COLUMN);
+    root->layout_elem->w_mode = VSIZE_GROW;
+    root->layout_elem->h_mode = VSIZE_GROW;
     root->layout_elem->pad_left = root->layout_elem->pad_right = root->layout_elem->pad_top = root->layout_elem->pad_bottom = 16;
     root->layout_elem->gap = 8;
     root->layout_elem->bg_color = g_theme ? g_theme->bg_base : 0xFF2E3440u;
@@ -142,8 +145,8 @@ int main(int argc, char **argv)
 
     for (int r = 0; r < 5; r++) {
         ui_widget_t *row = ui_box(ctx, VDIR_ROW);
-        row->layout_elem->w_mode = VSIZE_GROW; row->layout_elem->h_mode = VSIZE_FIXED;
-        row->layout_elem->h_px = 44; row->layout_elem->gap = 8;
+        row->layout_elem->w_mode = VSIZE_GROW; row->layout_elem->h_mode = VSIZE_GROW;
+        row->layout_elem->gap = 8;
         for (int c = 0; c < 4; c++) {
             ui_widget_t *b = ui_button(ctx, labels[r][c], on_calc_button, &state);
             b->layout_elem->w_mode = b->layout_elem->h_mode = VSIZE_GROW;
@@ -157,6 +160,10 @@ int main(int argc, char **argv)
         vanilla_event_t ev;
         while (vanilla_poll_event(client, &ev) > 0) {
             if (ev.type == VANILLA_EVENT_CLOSE_REQ) { running = 0; break; }
+            if (ev.type == VANILLA_EVENT_CONFIGURE) {
+                vanilla_ack_configure(client, win->window_id, ev.configure.serial);
+                ui_widget_invalidate(root);
+            }
             if (ev.type == VANILLA_EVENT_INPUT) {
                 ui_handle_event(ctx, root, &ev.input);
                 if (ev.input.type == EV_KEY) {

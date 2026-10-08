@@ -15,6 +15,8 @@
  */
 
 #include "app_common.h"
+#include "terminal_vt.h"
+#include "../libvanilla/notify.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,141 +28,82 @@
 
 #define TERM_WIDTH   640
 #define TERM_HEIGHT  400
-#define TERM_ROWS    25
-#define TERM_COLS    80
-#define CELL_WIDTH   8
-#define CELL_HEIGHT  16
 
-#define COLOR_TERM_BG     (g_theme->bg_base)
-#define COLOR_TERM_FG     (g_theme->fg_primary)
-#define COLOR_TERM_CURSOR (g_theme->accent)
-
-typedef struct {
-    char     grid[TERM_ROWS][TERM_COLS];
-    uint32_t colors[TERM_ROWS][TERM_COLS];
-    int      cursor_row;
-    int      cursor_col;
-    int      in_pipe[2];
-    int      out_pipe[2];
-    int      shell_pid;
-    int      shift_down;
-    int      ctrl_down;
-    int      dirty;
-} terminal_state_t;
-
-static void term_copy_last_output(terminal_state_t *st)
-{
-    int target_row = -1;
-    if (st->cursor_row > 0) {
-        int last = TERM_COLS - 1;
-        while (last >= 0 && st->grid[st->cursor_row - 1][last] == ' ')
-            last--;
-        if (last >= 0)
-            target_row = st->cursor_row - 1;
-    }
-    if (target_row < 0) {
-        int last = TERM_COLS - 1;
-        while (last >= 0 && st->grid[st->cursor_row][last] == ' ')
-            last--;
-        if (last >= 0)
-            target_row = st->cursor_row;
-    }
-    if (target_row >= 0) {
-        int last = TERM_COLS - 1;
-        while (last >= 0 && st->grid[target_row][last] == ' ')
-            last--;
-        if (last >= 0) {
-            size_t len = (size_t)(last + 1);
-            char line_buf[TERM_COLS + 1];
-            memcpy(line_buf, st->grid[target_row], len);
-            line_buf[len] = '\0';
-            clipboard_set(line_buf, len);
-        }
-    }
-}
-
-static void term_scroll_up(terminal_state_t *st)
-{
-    for (int r = 0; r < TERM_ROWS - 1; r++) {
-        memcpy(st->grid[r], st->grid[r + 1], TERM_COLS);
-        memcpy(st->colors[r], st->colors[r + 1], TERM_COLS * sizeof(uint32_t));
-    }
-    memset(st->grid[TERM_ROWS - 1], ' ', TERM_COLS);
-    for (int c = 0; c < TERM_COLS; c++)
-        st->colors[TERM_ROWS - 1][c] = COLOR_TERM_FG;
-}
-
-static void term_put_char(terminal_state_t *st, char ch)
-{
-    if (ch == '\r') {
-        st->cursor_col = 0;
-        st->dirty = 1;
-        return;
-    }
-    if (ch == '\n') {
-        st->cursor_col = 0;
-        st->cursor_row++;
-        if (st->cursor_row >= TERM_ROWS) {
-            term_scroll_up(st);
-            st->cursor_row = TERM_ROWS - 1;
-        }
-        st->dirty = 1;
-        return;
-    }
-    if (ch == '\b') {
-        if (st->cursor_col > 0) {
-            st->cursor_col--;
-            st->grid[st->cursor_row][st->cursor_col] = ' ';
-            st->dirty = 1;
-        }
-        return;
-    }
-    if (ch == '\t') {
-        int next_tab = (st->cursor_col + 4) & ~3;
-        while (st->cursor_col < next_tab && st->cursor_col < TERM_COLS) {
-            st->grid[st->cursor_row][st->cursor_col] = ' ';
-            st->cursor_col++;
-        }
-        st->dirty = 1;
-        return;
-    }
-
-    if ((unsigned char)ch < 32)
-        return;
-
-    if (st->cursor_col >= TERM_COLS) {
-        st->cursor_col = 0;
-        st->cursor_row++;
-        if (st->cursor_row >= TERM_ROWS) {
-            term_scroll_up(st);
-            st->cursor_row = TERM_ROWS - 1;
-        }
-    }
-
-    st->grid[st->cursor_row][st->cursor_col] = ch;
-    st->colors[st->cursor_row][st->cursor_col] = COLOR_TERM_FG;
-    st->cursor_col++;
-    st->dirty = 1;
-}
+#define COLOR_TERM_BG     (g_theme ? g_theme->bg_base : 0xFF2E3440u)
+#define COLOR_TERM_FG     (g_theme ? g_theme->fg_primary : 0xFFD8DEE9u)
+#define COLOR_TERM_CURSOR (g_theme ? g_theme->accent : 0xFF88C0D0u)
 
 static void term_render(vanilla_surface_t *surf, terminal_state_t *st)
 {
-    app_fill_rect(surf, 0, 0, TERM_WIDTH, TERM_HEIGHT, COLOR_TERM_BG);
+    int32_t surf_w = (int32_t)surf->width;
+    int32_t surf_h = (int32_t)surf->height;
 
-    for (int r = 0; r < TERM_ROWS; r++) {
+    app_fill_rect(surf, 0, 0, surf_w, surf_h, COLOR_TERM_BG);
+
+    char empty_row[TERM_MAX_COLS];
+    memset(empty_row, ' ', sizeof(empty_row));
+
+    for (int r = 0; r < st->rows; r++) {
         int y = r * CELL_HEIGHT;
-        for (int c = 0; c < TERM_COLS; c++) {
-            char ch = st->grid[r][c];
+        if (y + CELL_HEIGHT > surf_h)
+            break;
+
+        const char *line_chars = NULL;
+        const uint32_t *line_fg = NULL;
+        const uint32_t *line_bg = NULL;
+
+        if (r - st->scroll_offset >= 0) {
+            int src_r = r - st->scroll_offset;
+            if (src_r < st->rows) {
+                line_chars = st->grid[src_r];
+                line_fg = st->colors[src_r];
+                line_bg = st->bg_colors[src_r];
+            }
+        } else {
+            int d = st->scroll_offset - r;
+            if (d <= st->scrollback_count) {
+                int idx = (st->scrollback_head - d + TERM_SCROLLBACK * 2) % TERM_SCROLLBACK;
+                line_chars = st->scrollback[idx];
+                line_fg = st->scrollback_fg[idx];
+                line_bg = st->scrollback_bg[idx];
+            }
+        }
+
+        if (!line_chars)
+            line_chars = empty_row;
+
+        for (int c = 0; c < st->cols; c++) {
+            int x = c * CELL_WIDTH;
+            if (x + CELL_WIDTH > surf_w)
+                break;
+
+            uint32_t bg = line_bg ? line_bg[c] : 0;
+            if (bg != 0 && bg != COLOR_TERM_BG)
+                app_fill_rect(surf, x, y, CELL_WIDTH, CELL_HEIGHT, bg);
+
+            char ch = line_chars[c];
             if (ch != ' ' && ch != '\0') {
-                app_draw_char(surf, c * CELL_WIDTH, y + 4, ch, st->colors[r][c]);
+                uint32_t fg = line_fg ? line_fg[c] : COLOR_TERM_FG;
+                app_draw_char(surf, x, y + 4, ch, fg);
             }
         }
     }
 
-    /* Draw cursor */
-    int cur_x = st->cursor_col * CELL_WIDTH;
-    int cur_y = st->cursor_row * CELL_HEIGHT;
-    app_fill_rect(surf, cur_x, cur_y + 13, CELL_WIDTH, 2, COLOR_TERM_CURSOR);
+    /* Draw cursor if live view and cursor visible */
+    if (st->cursor_visible && st->scroll_offset == 0) {
+        int cur_x = st->cursor_col * CELL_WIDTH;
+        int cur_y = st->cursor_row * CELL_HEIGHT;
+        if (cur_x + CELL_WIDTH <= surf_w && cur_y + CELL_HEIGHT <= surf_h)
+            app_fill_rect(surf, cur_x, cur_y + 13, CELL_WIDTH, 2, COLOR_TERM_CURSOR);
+    }
+
+    /* Scrollback indicator bar */
+    if (st->scroll_offset > 0 && st->scrollback_count > 0 && surf_h > 30) {
+        int bar_h = (surf_h * st->rows) / (st->scrollback_count + st->rows);
+        if (bar_h < 16) bar_h = 16;
+        int bar_y = ((surf_h - bar_h) * (st->scrollback_count - st->scroll_offset)) / st->scrollback_count;
+        app_fill_rect(surf, surf_w - 4, bar_y, 4, bar_h, COLOR_TERM_CURSOR);
+    }
 }
 
 int main(int argc, char **argv)
@@ -169,13 +112,7 @@ int main(int argc, char **argv)
     (void)argv;
 
     terminal_state_t state;
-    memset(&state, 0, sizeof(state));
-
-    for (int r = 0; r < TERM_ROWS; r++) {
-        memset(state.grid[r], ' ', TERM_COLS);
-        for (int c = 0; c < TERM_COLS; c++)
-            state.colors[r][c] = COLOR_TERM_FG;
-    }
+    vt_init(&state, TERM_DEFAULT_ROWS, TERM_DEFAULT_COLS);
 
     const char *sock_path = VANILLA_SOCKET_PATH;
     vanilla_client_t *client = NULL;
@@ -248,7 +185,7 @@ int main(int argc, char **argv)
     close(state.out_pipe[1]);
 
     state.dirty = 1;
-    char read_buf[256];
+    char read_buf[512];
     int running = 1;
 
     while (running) {
@@ -257,6 +194,11 @@ int main(int argc, char **argv)
             if (ev.type == VANILLA_EVENT_CLOSE_REQ) {
                 running = 0;
                 break;
+            } else if (ev.type == VANILLA_EVENT_CONFIGURE) {
+                int new_cols = (int)ev.configure.width / CELL_WIDTH;
+                int new_rows = (int)ev.configure.height / CELL_HEIGHT;
+                vt_resize(&state, new_rows, new_cols);
+                vanilla_ack_configure(client, win->window_id, ev.configure.serial);
             } else if (ev.type == VANILLA_EVENT_INPUT) {
                 struct input_event *iev = &ev.input;
                 if (iev->type == EV_KEY) {
@@ -267,9 +209,22 @@ int main(int argc, char **argv)
                     } else if (iev->value == 1) {
                         int is_ctrl = state.ctrl_down || ((ev.mod_state & MOD_CTRL) != 0);
                         int is_shift = state.shift_down || ((ev.mod_state & MOD_SHIFT) != 0);
+
+                        if (is_shift && iev->code == KEY_PAGEUP) {
+                            vt_scroll_history(&state, state.rows / 2);
+                            continue;
+                        } else if (is_shift && iev->code == KEY_PAGEDOWN) {
+                            vt_scroll_history(&state, -(state.rows / 2));
+                            continue;
+                        }
+
+                        /* Any typing snaps back to live prompt */
+                        if (state.scroll_offset > 0 && !is_ctrl)
+                            state.scroll_offset = 0;
+
                         if (is_ctrl) {
                             if (iev->code == KEY_C) {
-                                term_copy_last_output(&state);
+                                vt_copy_last_output(&state);
                                 if (!is_shift) {
                                     char c = 3;
                                     write(state.in_pipe[1], &c, 1);
@@ -309,6 +264,10 @@ int main(int argc, char **argv)
                                 write(state.in_pipe[1], "\033[C", 3);
                             } else if (iev->code == KEY_LEFT) {
                                 write(state.in_pipe[1], "\033[D", 3);
+                            } else if (iev->code == KEY_PAGEUP) {
+                                vt_scroll_history(&state, state.rows / 2);
+                            } else if (iev->code == KEY_PAGEDOWN) {
+                                vt_scroll_history(&state, -(state.rows / 2));
                             }
                         }
                     }
@@ -326,22 +285,10 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Read output from shell */
+        /* Read output from shell and interpret via VT state machine */
         ssize_t n = read(state.out_pipe[0], read_buf, sizeof(read_buf));
         if (n > 0) {
-            for (ssize_t i = 0; i < n; i++) {
-                char c = read_buf[i];
-                if (c == 0x1B) {
-                    /* Consume simple ANSI CSI sequence */
-                    if (i + 1 < n && read_buf[i + 1] == '[') {
-                        i += 2;
-                        while (i < n && read_buf[i] >= 0x20 && read_buf[i] <= 0x3F)
-                            i++;
-                        continue;
-                    }
-                }
-                term_put_char(&state, c);
-            }
+            vt_process_bytes(&state, read_buf, (size_t)n);
         } else if (n == 0 && state.shell_pid > 0) {
             int status = 0;
             waitpid(state.shell_pid, &status, WNOHANG);
@@ -355,7 +302,7 @@ int main(int argc, char **argv)
             state.dirty = 0;
         }
 
-        usleep(10000); /* 10ms frame pacing */
+        usleep(10000); /* 10ms pacing */
     }
 
     if (state.shell_pid > 0)

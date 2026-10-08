@@ -234,6 +234,10 @@ else
 	gcc -O2 -Iinclude -Iservices -Ilibvanilla -I../scripts/test -DVANILLA_HOST -DVCLIP_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lpthread
 endif
 
+build/test_terminal_vt: tests/test_terminal_vt.c apps/terminal_vt.c
+	@mkdir -p build
+	gcc -O2 -Iapps -DVANILLA_HOST -o $@ $^
+
 build/test_notify: tests/test_notify.c libvanilla/notify.c libvanilla/service.c services/notifyd.c apps/app_common.c server/theme.c
 	@mkdir -p build
 ifeq ($(OS),Windows_NT)
@@ -242,29 +246,29 @@ else
 	gcc -O2 -Ihost_emulator/sys_compat -Iinclude -Iinput -Iservices -Ilibvanilla -Iapps -I../scripts/test -DVANILLA_HOST -DVNOTIF_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lpthread
 endif
 
-$(TERMINAL_BIN): $(CRT0) apps/terminal.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(TERMINAL_BIN): $(CRT0) apps/terminal.o apps/terminal_vt.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/terminal.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/terminal.o apps/terminal_vt.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-$(NOTEPAD_BIN): $(CRT0) apps/notepad.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(NOTEPAD_BIN): $(CRT0) apps/notepad.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/notepad.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/notepad.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
 $(CALC_BIN): $(CRT0) apps/calc.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/calc.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-$(FILEMGR_BIN): $(CRT0) apps/filemgr.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(FILEMGR_BIN): $(CRT0) apps/filemgr.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/filemgr.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/filemgr.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
 $(SETTINGS_BIN): $(CRT0) apps/settings.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/settings.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-$(TASKMGR_BIN): $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(TASKMGR_BIN): $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
 $(SHELL_BIN): $(CRT0) shell-client/shell_client.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
