@@ -16,6 +16,7 @@
 
 #include "app_common.h"
 #include "terminal_vt.h"
+#include "../libvanilla/notify.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -280,6 +281,7 @@ int main(int argc, char **argv)
             pid_t wp = waitpid(state.shell_pid, &status, WNOHANG);
             if (wp > 0) {
                 state.shell_pid = -1;
+                notify_send("Terminal", "Shell exited", "info", 5000, NULL, 0);
             }
         }
 
@@ -291,6 +293,7 @@ int main(int argc, char **argv)
             int status = 0;
             waitpid(state.shell_pid, &status, WNOHANG);
             state.shell_pid = -1;
+            notify_send("Terminal", "Shell exited", "info", 5000, NULL, 0);
         }
 
         if (state.dirty) {
