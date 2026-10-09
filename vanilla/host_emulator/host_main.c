@@ -253,10 +253,17 @@ int main(int argc, char *argv[])
 
         if (srv.compositor.dirty_count > 0) {
             int dcount = srv.compositor.dirty_count;
-            vanilla_rect_t drects[MAX_DIRTY_RECTS];
+            vanilla_rect_t drects[MAX_DIRTY_RECTS + 1];
             memcpy(drects, srv.compositor.dirty_rects, dcount * sizeof(vanilla_rect_t));
 
             compositor_render_frame(&srv);
+            if (g_perf_overlay_enabled && dcount < (int)(sizeof(drects) / sizeof(drects[0]))) {
+                drects[dcount].x = THEME_PX(8);
+                drects[dcount].y = THEME_PX(8);
+                drects[dcount].w = THEME_PX(240);
+                drects[dcount].h = THEME_PX(48);
+                dcount++;
+            }
             sdl_backend_present(&backend, srv.compositor.backbuffer, drects, dcount);
         }
 

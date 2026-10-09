@@ -1,0 +1,10 @@
+id: 30
+name: MSG_DND_CANCEL
+direction: server_to_client
+version: 2
+v1_compat: false
+description: "Server notifies drag source that drag was cancelled."
+fields:
+  - name: reserved
+    type: uint32_t
+    description: "Reserved field"

@@ -58,6 +58,12 @@ typedef enum {
     MSG_INPUT_EVENT_V2       = 24,
     MSG_SHOW_CONTEXT_MENU    = 25,
     MSG_CONTEXT_MENU_RESULT  = 26,
+    MSG_DND_ENTER            = 27,
+    MSG_DND_LEAVE            = 28,
+    MSG_DND_ACCEPT           = 29,
+    MSG_DND_CANCEL           = 30,
+    MSG_DEBUG_QUERY          = 31,
+    MSG_DEBUG_QUERY_RESP     = 32,
 } vanilla_msg_type_t;
 
 /* MSG_HELLO payload (client to server, v1+) */
@@ -242,21 +248,26 @@ _Static_assert(sizeof(vanilla_msg_clipboard_request_t) == 40,
 
 /* MSG_DND_OFFER payload (client to server, v2+) */
 typedef struct {
-    uint32_t window_id;
-    uint32_t mime_count;
+    char     mime[64];
+    char     data[256];
+    uint32_t data_len;
+    uint32_t has_ghost;
+    uint8_t  ghost[4096];
 } __attribute__((packed)) vanilla_msg_dnd_offer_t;
 
-_Static_assert(sizeof(vanilla_msg_dnd_offer_t) == 8,
+_Static_assert(sizeof(vanilla_msg_dnd_offer_t) == 4424,
     "vanilla_msg_dnd_offer_t size mismatch; regenerate protocol");
 
 /* MSG_DND_DROP payload (server to client, v2+) */
 typedef struct {
-    uint32_t target_window_id;
-    int32_t  x;
-    int32_t  y;
+    int32_t  local_x;
+    int32_t  local_y;
+    char     mime[64];
+    char     data[256];
+    uint32_t data_len;
 } __attribute__((packed)) vanilla_msg_dnd_drop_t;
 
-_Static_assert(sizeof(vanilla_msg_dnd_drop_t) == 12,
+_Static_assert(sizeof(vanilla_msg_dnd_drop_t) == 332,
     "vanilla_msg_dnd_drop_t size mismatch; regenerate protocol");
 
 /* MSG_THEME_CHANGED payload (server to client, v2+) */
@@ -313,6 +324,56 @@ typedef struct {
 _Static_assert(sizeof(vanilla_msg_context_menu_result_t) == 12,
     "vanilla_msg_context_menu_result_t size mismatch; regenerate protocol");
 
+/* MSG_DND_ENTER payload (server to client, v2+) */
+typedef struct {
+    int32_t  local_x;
+    int32_t  local_y;
+    char     mime[64];
+} __attribute__((packed)) vanilla_msg_dnd_enter_t;
+
+_Static_assert(sizeof(vanilla_msg_dnd_enter_t) == 72,
+    "vanilla_msg_dnd_enter_t size mismatch; regenerate protocol");
+
+/* MSG_DND_LEAVE payload (server to client, v2+) */
+typedef struct {
+    uint32_t reserved;
+} __attribute__((packed)) vanilla_msg_dnd_leave_t;
+
+_Static_assert(sizeof(vanilla_msg_dnd_leave_t) == 4,
+    "vanilla_msg_dnd_leave_t size mismatch; regenerate protocol");
+
+/* MSG_DND_ACCEPT payload (client to server, v2+) */
+typedef struct {
+    uint32_t accepted;
+} __attribute__((packed)) vanilla_msg_dnd_accept_t;
+
+_Static_assert(sizeof(vanilla_msg_dnd_accept_t) == 4,
+    "vanilla_msg_dnd_accept_t size mismatch; regenerate protocol");
+
+/* MSG_DND_CANCEL payload (server to client, v2+) */
+typedef struct {
+    uint32_t reserved;
+} __attribute__((packed)) vanilla_msg_dnd_cancel_t;
+
+_Static_assert(sizeof(vanilla_msg_dnd_cancel_t) == 4,
+    "vanilla_msg_dnd_cancel_t size mismatch; regenerate protocol");
+
+/* MSG_DEBUG_QUERY payload (client to server, v2+) */
+typedef struct {
+    uint32_t query_type;
+} __attribute__((packed)) vanilla_msg_debug_query_t;
+
+_Static_assert(sizeof(vanilla_msg_debug_query_t) == 4,
+    "vanilla_msg_debug_query_t size mismatch; regenerate protocol");
+
+/* MSG_DEBUG_QUERY_RESP payload (server to client, v2+) */
+typedef struct {
+    uint32_t window_count;
+} __attribute__((packed)) vanilla_msg_debug_query_resp_t;
+
+_Static_assert(sizeof(vanilla_msg_debug_query_resp_t) == 4,
+    "vanilla_msg_debug_query_resp_t size mismatch; regenerate protocol");
+
 typedef struct vanilla_server vanilla_server_t;
 
 typedef int (*vanilla_dispatch_fn_t)(vanilla_server_t *srv, int client_idx,
@@ -339,6 +400,8 @@ int handle_msg_clipboard_offer(vanilla_server_t *srv, int client_idx, const vani
 int handle_msg_dnd_offer(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 int handle_msg_set_size_hints(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 int handle_msg_show_context_menu(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
+int handle_msg_dnd_accept(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
+int handle_msg_debug_query(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 
 #ifdef VANILLA_DISPATCH_TABLE_IMPL
 const vanilla_dispatch_entry_t g_vanilla_dispatch_table[] = {
@@ -355,6 +418,8 @@ const vanilla_dispatch_entry_t g_vanilla_dispatch_table[] = {
     { MSG_DND_OFFER, 2, sizeof(vanilla_msg_dnd_offer_t), handle_msg_dnd_offer },
     { MSG_SET_SIZE_HINTS, 2, sizeof(vanilla_msg_set_size_hints_t), handle_msg_set_size_hints },
     { MSG_SHOW_CONTEXT_MENU, 2, 0, handle_msg_show_context_menu },
+    { MSG_DND_ACCEPT, 2, sizeof(vanilla_msg_dnd_accept_t), handle_msg_dnd_accept },
+    { MSG_DEBUG_QUERY, 2, 0, handle_msg_debug_query },
 };
 const size_t g_vanilla_dispatch_table_len = sizeof(g_vanilla_dispatch_table) / sizeof(g_vanilla_dispatch_table[0]);
 #else

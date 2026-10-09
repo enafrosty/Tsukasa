@@ -51,9 +51,12 @@ typedef enum {
     VANILLA_EVENT_TRIPLE_CLICK = 8,
     VANILLA_EVENT_LONG_PRESS = 9,
     VANILLA_EVENT_CONTEXT_MENU_RESULT = 10,
+    VANILLA_EVENT_DND_ENTER = 11,
+    VANILLA_EVENT_DND_LEAVE = 12,
+    VANILLA_EVENT_DND_DROP = 13,
 } vanilla_event_type_t;
 
-typedef struct {
+typedef struct vanilla_event {
     vanilla_event_type_t type;
     uint32_t             window_id;
     uint16_t             mod_state;
@@ -81,6 +84,18 @@ typedef struct {
             uint32_t menu_id;
             uint32_t item_id;
         } context_menu_result;
+        struct {
+            int32_t  local_x;
+            int32_t  local_y;
+            char     mime[64];
+        } dnd_enter;
+        struct {
+            int32_t  local_x;
+            int32_t  local_y;
+            char     mime[64];
+            char     data[256];
+            uint32_t data_len;
+        } dnd_drop;
     };
 } vanilla_event_t;
 
@@ -152,5 +167,11 @@ void vanilla_menu_builder_free(vanilla_menu_builder_t *b);
 
 /* Clipboard service */
 #include "../libvanilla/clipboard.h"
+
+/* Notification service */
+#include "../libvanilla/notify.h"
+
+/* Drag and drop subsystem */
+#include "../libvanilla/dnd.h"
 
 #endif /* _VANILLA_H */

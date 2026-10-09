@@ -65,8 +65,12 @@ typedef struct {
 int sched_yield(void);
 #endif
 
+#ifndef VANILLA_MAX_CLIENTS
 #define VANILLA_MAX_CLIENTS 16
+#endif
+#ifndef VANILLA_MAX_WINDOWS
 #define VANILLA_MAX_WINDOWS 64
+#endif
 
 typedef enum {
     LAYER_BACKGROUND = 0,
@@ -184,11 +188,15 @@ typedef struct vanilla_server_window {
     int               anim_unmap_on_done;
     float             anim_current_scale;
     float             anim_current_alpha;
+
+    /* Debug & diagnostics */
+    uint32_t          presented_frames;
 } vanilla_server_window_t;
 
 typedef struct {
     int      in_use;
     int      fd;
+    pid_t    client_pid;
     uint32_t version;
     uint32_t negotiated_version;
 } vanilla_client_conn_t;
@@ -293,6 +301,8 @@ vanilla_resize_edge_t wm_hit_test_resize_edge(const vanilla_server_window_t *w, 
 int  wm_run_resize_selftests(void);
 int  wm_run_input_selftests(void);
 int  wm_run_animation_selftests(void);
+int  dnd_run_selftests(void);
+void dnd_check_timeout(vanilla_server_t *srv);
 
 void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_window_t *w);
 

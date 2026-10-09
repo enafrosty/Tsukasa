@@ -46,6 +46,8 @@ LIBVANILLA_OBJS = libvanilla/client.o \
                   libvanilla/surface.o \
                   libvanilla/service.o \
                   libvanilla/clipboard.o \
+                  libvanilla/dnd.o \
+                  libvanilla/notify.o \
                   libvanilla/icon.o \
                   icons/icon.o \
                   server/theme.o \
@@ -73,7 +75,8 @@ SERVER_OBJS     = server/main.o \
                   server/default_font.o \
                   server/image.o \
                   server/theme.o \
-                  server/cursor.o
+                  server/cursor.o \
+                  server/dnd.o
 
 TEST_IPC_OBJS   = tests/test_ipc.o \
                   server/wm.o \
@@ -83,7 +86,8 @@ TEST_IPC_OBJS   = tests/test_ipc.o \
                   server/default_font.o \
                   server/image.o \
                   server/theme.o \
-                  server/cursor.o
+                  server/cursor.o \
+                  server/dnd.o
 
 TEST_COMP_OBJS  = tests/test_compositor.o \
                   server/wm.o \
@@ -93,7 +97,8 @@ TEST_COMP_OBJS  = tests/test_compositor.o \
                   server/default_font.o \
                   server/image.o \
                   server/theme.o \
-                  server/cursor.o
+                  server/cursor.o \
+                  server/dnd.o
 
 TEST_TYPO_OBJS  = tests/test_typography.o \
                   server/blitter.o \
@@ -110,6 +115,7 @@ TEST_SHELL_OBJS = tests/test_shell.o \
                   server/image.o \
                   server/theme.o \
                   server/cursor.o \
+                  server/dnd.o \
                   shell-client/shell_client.test.o \
                   apps/app_common.o
 
@@ -122,6 +128,7 @@ LIBVANILLALAYOUT_A = $(LIB_DIR)/libvanillalayout.a
 SERVER_BIN         = $(BIN_DIR)/vanilla_srv.elf
 REGISTRYD_BIN      = $(BIN_DIR)/registryd.elf
 CLIPBOARDD_BIN     = $(BIN_DIR)/clipboardd.elf
+NOTIFYD_BIN        = $(BIN_DIR)/notifyd.elf
 TEST_IPC_BIN       = $(BIN_DIR)/test_ipc.elf
 TEST_COMP_BIN      = $(BIN_DIR)/test_compositor.elf
 TEST_TYPO_BIN      = $(BIN_DIR)/test_typography.elf
@@ -138,8 +145,9 @@ TASKMGR_BIN     = $(BIN_DIR)/taskmgr.elf
 SHELL_BIN       = $(BIN_DIR)/shell.elf
 APP_TARGETS     = $(TERMINAL_BIN) $(NOTEPAD_BIN) $(CALC_BIN) $(FILEMGR_BIN) $(SETTINGS_BIN) $(TASKMGR_BIN) $(SHELL_BIN)
 SUPERVISOR_BIN  = supervisor/SUPERVSD.ELF
+DEVTOOLS_BIN    = devtools/DEVTOOLS.ELF
 
-ALL_TARGETS     = $(LIBVANILLA_A) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(SERVER_BIN) $(REGISTRYD_BIN) $(CLIPBOARDD_BIN) $(TEST_IPC_BIN) $(TEST_COMP_BIN) $(TEST_TYPO_BIN) $(TEST_SHELL_BIN) $(TEST_LAYOUT_BIN) $(APP_TARGETS) $(SUPERVISOR_BIN)
+ALL_TARGETS     = $(LIBVANILLA_A) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(SERVER_BIN) $(REGISTRYD_BIN) $(CLIPBOARDD_BIN) $(NOTIFYD_BIN) $(TEST_IPC_BIN) $(TEST_COMP_BIN) $(TEST_TYPO_BIN) $(TEST_SHELL_BIN) $(TEST_LAYOUT_BIN) $(APP_TARGETS) $(SUPERVISOR_BIN) $(DEVTOOLS_BIN)
 
 PYTHON ?= python3
 
@@ -180,6 +188,10 @@ $(REGISTRYD_BIN): $(CRT0) services/registryd.o $(LIBVANILLA_A) $(LIBC_A)
 $(CLIPBOARDD_BIN): $(CRT0) services/clipboardd.o $(LIBVANILLA_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) services/clipboardd.o $(LIBVANILLA_A) $(LIBC_A)
+
+$(NOTIFYD_BIN): $(CRT0) services/notifyd.o $(APP_COMMON_OBJ) $(LIBVANILLA_A) $(LIBC_A)
+	@mkdir -p $(BIN_DIR)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) services/notifyd.o $(APP_COMMON_OBJ) $(LIBVANILLA_A) $(LIBC_A)
 
 $(TEST_IPC_BIN): $(CRT0) $(TEST_IPC_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
@@ -225,29 +237,41 @@ else
 	gcc -O2 -Iinclude -Iservices -Ilibvanilla -I../scripts/test -DVANILLA_HOST -DVCLIP_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lpthread
 endif
 
-$(TERMINAL_BIN): $(CRT0) apps/terminal.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
-	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/terminal.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+build/test_terminal_vt: tests/test_terminal_vt.c apps/terminal_vt.c
+	@mkdir -p build
+	gcc -O2 -Iapps -DVANILLA_HOST -o $@ $^
 
-$(NOTEPAD_BIN): $(CRT0) apps/notepad.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+build/test_notify: tests/test_notify.c libvanilla/notify.c libvanilla/service.c services/notifyd.c apps/app_common.c server/theme.c
+	@mkdir -p build
+ifeq ($(OS),Windows_NT)
+	gcc -O2 -Ihost_emulator/sys_compat -Iinclude -Iinput -Iservices -Ilibvanilla -Iapps -I../scripts/test -DVANILLA_HOST -DVNOTIF_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lws2_32 -lpthread
+else
+	gcc -O2 -Ihost_emulator/sys_compat -Iinclude -Iinput -Iservices -Ilibvanilla -Iapps -I../scripts/test -DVANILLA_HOST -DVNOTIF_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lpthread
+endif
+
+$(TERMINAL_BIN): $(CRT0) apps/terminal.o apps/terminal_vt.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/notepad.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/terminal.o apps/terminal_vt.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+
+$(NOTEPAD_BIN): $(CRT0) apps/notepad.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	@mkdir -p $(BIN_DIR)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/notepad.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
 $(CALC_BIN): $(CRT0) apps/calc.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/calc.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-$(FILEMGR_BIN): $(CRT0) apps/filemgr.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(FILEMGR_BIN): $(CRT0) apps/filemgr.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/filemgr.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/filemgr.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
 $(SETTINGS_BIN): $(CRT0) apps/settings.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/settings.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-$(TASKMGR_BIN): $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(TASKMGR_BIN): $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
 $(SHELL_BIN): $(CRT0) shell-client/shell_client.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
@@ -257,6 +281,11 @@ $(SUPERVISOR_BIN): supervisor/supervisor.c supervisor/supervisor.h supervisor/Ma
 	$(MAKE) -C supervisor all
 	@mkdir -p $(BIN_DIR)
 	cp $@ $(BIN_DIR)/supervsd.elf
+
+$(DEVTOOLS_BIN): $(LIBVANILLA_A) $(APP_COMMON_OBJ)
+	$(MAKE) -C devtools all
+	@mkdir -p $(BIN_DIR)
+	cp $@ $(BIN_DIR)/devtools.elf
 
 shell-client/shell_client.test.o: shell-client/shell_client.c
 	@mkdir -p $(dir $@)
@@ -274,6 +303,7 @@ check: all
 	@echo "     - bin/vanilla_srv.elf"
 	@echo "     - bin/registryd.elf"
 	@echo "     - bin/clipboardd.elf"
+	@echo "     - bin/notifyd.elf"
 	@echo "     - bin/test_ipc.elf"
 	@echo "     - bin/test_compositor.elf"
 	@echo "     - bin/test_typography.elf"
@@ -287,10 +317,12 @@ check: all
 	@echo "     - bin/taskmgr.elf"
 	@echo "     - bin/shell.elf"
 	@echo "     - supervisor/SUPERVSD.ELF"
+	@echo "     - devtools/DEVTOOLS.ELF"
 
 clean:
 	rm -rf libvanilla/*.o libvanilla-ui/*.o icons/*.o icons/*.host.o server/*.o services/*.o tests/*.o apps/*.o input/*.o layout/*.o shell-client/*.o $(BIN_DIR) $(LIB_DIR) host_emulator/*.host.o server/*.host.o libvanilla/*.host.o input/*.host.o host_emulator/bin build
 	$(MAKE) -C supervisor clean
+	$(MAKE) -C devtools clean
 
 host: gen-protocol
 	$(MAKE) -f host_emulator/Makefile.host all

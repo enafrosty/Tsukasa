@@ -539,6 +539,65 @@ vanilla_window_t *vanilla_create_window(vanilla_client_t *client, const char *ti
             ev.context_menu_result.menu_id = res.menu_id;
             ev.context_menu_result.item_id = res.item_id;
             event_queue_push(client, &ev);
+        } else if (ack_hdr.msg_type == MSG_DND_ENTER) {
+            vanilla_msg_dnd_enter_t enter;
+            if (exact_read(client->socket_fd, &enter, sizeof(enter)) < 0)
+                return NULL;
+            if (ack_hdr.payload_len > sizeof(enter)) {
+                uint8_t discard[128];
+                size_t rem = ack_hdr.payload_len - sizeof(enter);
+                while (rem > 0) {
+                    size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+                    if (exact_read(client->socket_fd, discard, chunk) < 0)
+                        return NULL;
+                    rem -= chunk;
+                }
+            }
+            vanilla_event_t ev;
+            ev.type = VANILLA_EVENT_DND_ENTER;
+            ev.window_id = ack_hdr.window_id;
+            ev.dnd_enter.local_x = enter.local_x;
+            ev.dnd_enter.local_y = enter.local_y;
+            memcpy(ev.dnd_enter.mime, enter.mime, sizeof(ev.dnd_enter.mime));
+            event_queue_push(client, &ev);
+        } else if (ack_hdr.msg_type == MSG_DND_LEAVE) {
+            if (ack_hdr.payload_len > 0) {
+                uint8_t discard[128];
+                size_t rem = ack_hdr.payload_len;
+                while (rem > 0) {
+                    size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+                    if (exact_read(client->socket_fd, discard, chunk) < 0)
+                        return NULL;
+                    rem -= chunk;
+                }
+            }
+            vanilla_event_t ev;
+            ev.type = VANILLA_EVENT_DND_LEAVE;
+            ev.window_id = ack_hdr.window_id;
+            event_queue_push(client, &ev);
+        } else if (ack_hdr.msg_type == MSG_DND_DROP) {
+            vanilla_msg_dnd_drop_t drop;
+            if (exact_read(client->socket_fd, &drop, sizeof(drop)) < 0)
+                return NULL;
+            if (ack_hdr.payload_len > sizeof(drop)) {
+                uint8_t discard[128];
+                size_t rem = ack_hdr.payload_len - sizeof(drop);
+                while (rem > 0) {
+                    size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+                    if (exact_read(client->socket_fd, discard, chunk) < 0)
+                        return NULL;
+                    rem -= chunk;
+                }
+            }
+            vanilla_event_t ev;
+            ev.type = VANILLA_EVENT_DND_DROP;
+            ev.window_id = ack_hdr.window_id;
+            ev.dnd_drop.local_x = drop.local_x;
+            ev.dnd_drop.local_y = drop.local_y;
+            memcpy(ev.dnd_drop.mime, drop.mime, sizeof(ev.dnd_drop.mime));
+            memcpy(ev.dnd_drop.data, drop.data, sizeof(ev.dnd_drop.data));
+            ev.dnd_drop.data_len = drop.data_len;
+            event_queue_push(client, &ev);
         } else {
             if (ack_hdr.payload_len > 0) {
                 uint8_t discard[128];
@@ -647,6 +706,7 @@ void vanilla_destroy_window(vanilla_window_t *win)
         curr = &(*curr)->next;
     }
 
+    dnd_unregister_drop_target(win);
     free(win);
 }
 
@@ -1027,6 +1087,68 @@ int vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev)
             out_ev->window_id = hdr.window_id ? hdr.window_id : res.window_id;
             out_ev->context_menu_result.menu_id = res.menu_id;
             out_ev->context_menu_result.item_id = res.item_id;
+            return 1;
+        }
+
+        if (hdr.msg_type == MSG_DND_ENTER) {
+            vanilla_msg_dnd_enter_t enter;
+            if (exact_read(client->socket_fd, &enter, sizeof(enter)) < 0)
+                return -1;
+            if (hdr.payload_len > sizeof(enter)) {
+                uint8_t discard[128];
+                size_t rem = hdr.payload_len - sizeof(enter);
+                while (rem > 0) {
+                    size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+                    if (exact_read(client->socket_fd, discard, chunk) < 0)
+                        return -1;
+                    rem -= chunk;
+                }
+            }
+            out_ev->type = VANILLA_EVENT_DND_ENTER;
+            out_ev->window_id = hdr.window_id;
+            out_ev->dnd_enter.local_x = enter.local_x;
+            out_ev->dnd_enter.local_y = enter.local_y;
+            memcpy(out_ev->dnd_enter.mime, enter.mime, sizeof(out_ev->dnd_enter.mime));
+            return 1;
+        }
+
+        if (hdr.msg_type == MSG_DND_LEAVE) {
+            if (hdr.payload_len > 0) {
+                uint8_t discard[128];
+                size_t rem = hdr.payload_len;
+                while (rem > 0) {
+                    size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+                    if (exact_read(client->socket_fd, discard, chunk) < 0)
+                        return -1;
+                    rem -= chunk;
+                }
+            }
+            out_ev->type = VANILLA_EVENT_DND_LEAVE;
+            out_ev->window_id = hdr.window_id;
+            return 1;
+        }
+
+        if (hdr.msg_type == MSG_DND_DROP) {
+            vanilla_msg_dnd_drop_t drop;
+            if (exact_read(client->socket_fd, &drop, sizeof(drop)) < 0)
+                return -1;
+            if (hdr.payload_len > sizeof(drop)) {
+                uint8_t discard[128];
+                size_t rem = hdr.payload_len - sizeof(drop);
+                while (rem > 0) {
+                    size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+                    if (exact_read(client->socket_fd, discard, chunk) < 0)
+                        return -1;
+                    rem -= chunk;
+                }
+            }
+            out_ev->type = VANILLA_EVENT_DND_DROP;
+            out_ev->window_id = hdr.window_id;
+            out_ev->dnd_drop.local_x = drop.local_x;
+            out_ev->dnd_drop.local_y = drop.local_y;
+            memcpy(out_ev->dnd_drop.mime, drop.mime, sizeof(out_ev->dnd_drop.mime));
+            memcpy(out_ev->dnd_drop.data, drop.data, sizeof(out_ev->dnd_drop.data));
+            out_ev->dnd_drop.data_len = drop.data_len;
             return 1;
         }
 

@@ -1,5 +1,5 @@
 #
-# Project Tsukasa — libvanilla Client Library Makefile
+# Project Tsukasa — Vanilla Developer Tools Makefile
 #
 # Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
 #
@@ -28,19 +28,32 @@ endif
 
 CFLAGS = -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
          -fno-pie -fstack-protector-strong -O2 \
-         -I../../tsukasa-libc/include -I../include -I../input -I. -DSTBI_NO_THREAD_LOCALS
+         -I../../tsukasa-libc/include -I../include -Ivendor/microui -I../apps
 
-OBJS = client.o surface.o service.o clipboard.o dnd.o notify.o icon.o
+LDFLAGS = -m elf_x86_64 -T ../../tsukasa-libc/tsukasa_app.ld -nostdlib
 
-all: $(OBJS)
+CRT0           = ../../tsukasa-libc/crt/crt0.o
+LIBC_A         = ../../tsukasa-libc/lib/libc.a
+LIBM_A         = ../../tsukasa-libc/lib/libm.a
+LIBVANILLA_A   = ../lib/libvanilla.a
+APP_COMMON_OBJ = ../apps/app_common.o
 
-notify.o: notify.c notify.h ../services/notifyd.h
+BIN = DEVTOOLS.ELF
+
+OBJS = inspector.o vendor/microui/microui.o
+
+all: $(BIN)
+
+$(BIN): $(CRT0) $(OBJS) $(APP_COMMON_OBJ) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) $(OBJS) $(APP_COMMON_OBJ) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+
+inspector.o: inspector.c inspector.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-%.o: %.c
+vendor/microui/microui.o: vendor/microui/microui.c vendor/microui/microui.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS)
+	rm -f $(OBJS) $(BIN)
 
 .PHONY: all clean

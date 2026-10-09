@@ -41,3 +41,25 @@ $CC -O2 -I"${REPO_ROOT}/vanilla/include" -I"${REPO_ROOT}/scripts/test" \
     -lm
 
 "${BUILD_DIR}/test_typography" 2>&1 | tee "$LOG"
+
+# 2. Vanilla developer tools and debug protocol tests
+$CC -O2 \
+    -I"${REPO_ROOT}/vanilla/host_emulator/sys_compat" \
+    -I"${REPO_ROOT}/vanilla/include" \
+    -I"${REPO_ROOT}/scripts/test" \
+    -I"${REPO_ROOT}/vanilla/server" \
+    -I"${REPO_ROOT}/vanilla/devtools/vendor/microui" \
+    -DVANILLA_HOST \
+    -o "${BUILD_DIR}/test_devtools" \
+    "${REPO_ROOT}/vanilla/tests/test_devtools.c" \
+    "${REPO_ROOT}/vanilla/server/blitter.c" \
+    "${REPO_ROOT}/vanilla/server/compositor.c" \
+    "${REPO_ROOT}/vanilla/server/font.c" \
+    "${REPO_ROOT}/vanilla/server/default_font.c" \
+    "${REPO_ROOT}/vanilla/server/image.c" \
+    "${REPO_ROOT}/vanilla/server/theme.c" \
+    "${REPO_ROOT}/vanilla/devtools/vendor/microui/microui.c" \
+    "${REPO_ROOT}/vanilla/host_emulator/host_compat.c" \
+    -lm
+
+"${BUILD_DIR}/test_devtools" 2>&1 | tee -a "$LOG"

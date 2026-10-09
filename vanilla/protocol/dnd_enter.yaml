@@ -1,0 +1,16 @@
+id: 27
+name: MSG_DND_ENTER
+direction: server_to_client
+version: 2
+v1_compat: false
+description: "Server notifies window that dragged item entered its area."
+fields:
+  - name: local_x
+    type: int32_t
+    description: "Pointer position X relative to target window"
+  - name: local_y
+    type: int32_t
+    description: "Pointer position Y relative to target window"
+  - name: mime
+    type: "char[64]"
+    description: "MIME type of offered data"
