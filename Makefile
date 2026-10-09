@@ -394,9 +394,9 @@ $(INITRD_IMG): $(INITRD_FILES)/hello.elf $(INITRD_FILES)/hello_sc.elf $(INITRD_F
 initrd: $(INITRD_IMG)
 
 check:
-	@scripts/test/run-host-tests.sh
-	@scripts/test/run-guest-tests.sh
-	@scripts/test/summarize.sh
+	@bash scripts/test/run-host-tests.sh
+	@bash scripts/test/run-guest-tests.sh
+	@bash scripts/test/summarize.sh
 
 $(LIMINE_DIR)/limine:
 	@if [ ! -d $(LIMINE_DIR) ]; then \
