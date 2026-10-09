@@ -53,8 +53,14 @@ typedef struct {
     float            snap_preview_alpha;
     uint64_t         snap_preview_start;
     uint32_t         snap_preview_dur;
+
+    /* Performance metrics */
+    uint32_t         last_frame_time_us;
+    uint32_t         last_dirty_count;
+    uint32_t         last_damage_area_px;
 } vanilla_compositor_t;
 
+extern int g_perf_overlay_enabled;
 
 struct vanilla_server;
 struct vanilla_server_window;
@@ -75,6 +81,10 @@ void compositor_frame_rendered(vanilla_compositor_t *comp);
 
 /* Frame rendering */
 void compositor_render_frame(struct vanilla_server *srv);
+void compositor_render_overlay(vanilla_compositor_t *comp,
+                               uint32_t frame_time_us,
+                               int dirty_count,
+                               int client_count);
 
 /* Animation API */
 void compositor_start_anim(struct vanilla_server_window *w,

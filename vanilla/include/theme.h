@@ -111,6 +111,9 @@ int  theme_load(const char *ini_path);
 /* Reload the active INI file in place (call after a SIGHUP or GUI action). */
 int  theme_reload(void);
 
+/* Set the active theme from an in-memory theme structure. */
+int  theme_set(const vanilla_theme_t *theme);
+
 /* Return a pointer to the compiled-in nord-dark defaults. */
 const vanilla_theme_t *theme_defaults_nord_dark(void);
 

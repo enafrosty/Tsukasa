@@ -342,3 +342,12 @@ int theme_reload(void)
 {
     return theme_load(s_last_path);
 }
+
+int theme_set(const vanilla_theme_t *theme)
+{
+    if (!theme)
+        return -1;
+    memcpy(&g_theme_mutable, theme, sizeof(vanilla_theme_t));
+    g_theme = &g_theme_mutable;
+    return 0;
+}

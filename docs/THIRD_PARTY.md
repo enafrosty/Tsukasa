@@ -12,6 +12,7 @@ record the new commit here in the same change.
 | Lua | lua.org | 5.4.7 | MIT | `tsukasa-ports/ports/lua/src/` |
 | TinyCC | github.com/TinyCC/tinycc | `0fb54300b56512754221d80adda85ddb9815bceb` (branch `mob`) | LGPL-2.1 | `tsukasa-ports/ports/tcc/src/tinycc/` |
 | Clay | github.com/nicbarker/clay | `b25a31c1a152915cd7dd6796e6592273e5a10aac` (v0.14) | Zlib | `vanilla/layout/clay.h` |
+| microui | github.com/rxi/microui | `897763f04497064d8520267c7e5bf0d4b14dbe1f` | MIT | `vanilla/devtools/vendor/microui/` |
 
 Notes: TinyCC's upstream `.github/` was removed when vendoring. Its own
 `.gitignore` is retained so its build output stays untracked.
@@ -21,6 +22,12 @@ Clay layout engine
   Upstream: https://github.com/nicbarker/clay
   Commit: b25a31c1a152915cd7dd6796e6592273e5a10aac
   Location: vanilla/layout/clay.h
+
+microui immediate-mode GUI library
+  License: MIT
+  Upstream: https://github.com/rxi/microui
+  Commit: 897763f04497064d8520267c7e5bf0d4b14dbe1f
+  Location: vanilla/devtools/vendor/microui/
 
 ## Process Lifecycle and Supervisor Architecture
 The Vanilla service supervisor (`vanilla/supervisor/`) manages services using the current `spawn_ex` process model. When copy-on-write `fork()` and `execve()` primitives land in the kernel along with `SIGCHLD` signal notifications, the supervisor will transition to standard fork/exec and replace liveness polling with a `SIGCHLD` signal handler and `waitpid()`.

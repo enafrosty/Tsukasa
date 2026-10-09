@@ -63,6 +63,14 @@
 #define VANILLA_MAX_WIDTH       4096
 #define VANILLA_MAX_HEIGHT      4096
 
+#ifndef VANILLA_MAX_WINDOWS
+#define VANILLA_MAX_WINDOWS     64
+#endif
+
+#ifndef VANILLA_MAX_CLIENTS
+#define VANILLA_MAX_CLIENTS     16
+#endif
+
 /* Window creation and configuration flags */
 #define WINDOW_FLAG_NONE        0x00000000u
 #define WINDOW_FLAG_BORDERLESS  (1u << 0)
@@ -96,5 +104,47 @@ typedef struct {
 
 _Static_assert(sizeof(vanilla_msg_window_configure_v2_t) == 24,
     "vanilla_msg_window_configure_v2_t size mismatch");
+
+#ifndef KEY_F12
+#define KEY_F12 88
+#endif
+
+/* Debug query types */
+#define DBGQ_WINDOWS       1
+#define DBGQ_COMPOSITOR    2
+#define DBGQ_THEME         3
+#define DBGQ_SET_THEME     4
+#define DBGQ_THEME_RELOAD  5
+
+/* Record returned for DBGQ_WINDOWS */
+typedef struct {
+    uint32_t window_id;
+    int32_t  pid;          /* process ID of the owning client (-1 if not tracked) */
+    char     title[VANILLA_TITLE_MAX];
+    int32_t  x, y;
+    uint32_t w, h;
+    int32_t  z_index;
+    uint8_t  layer;
+    uint8_t  is_mapped;
+    uint8_t  is_focused;
+    uint8_t  _pad;
+    int32_t  damage_x, damage_y, damage_w, damage_h;
+    uint32_t frame_count;   /* frames presented since last query */
+} __attribute__((packed)) vanilla_dbg_window_t;
+
+_Static_assert(sizeof(vanilla_dbg_window_t) == 116,
+    "vanilla_dbg_window_t size mismatch");
+
+/* Record returned for DBGQ_COMPOSITOR */
+typedef struct {
+    uint32_t frame_time_us;    /* microseconds for last composite pass */
+    uint32_t dirty_rect_count; /* dirty_rects[] entries in last pass */
+    uint32_t damage_area_px;   /* total pixels in dirty rects */
+    uint32_t client_count;
+    uint32_t window_count;
+} __attribute__((packed)) vanilla_dbg_compositor_t;
+
+_Static_assert(sizeof(vanilla_dbg_compositor_t) == 20,
+    "vanilla_dbg_compositor_t size mismatch");
 
 #endif /* _VANILLA_PROTOCOL_H */

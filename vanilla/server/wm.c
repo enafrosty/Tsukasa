@@ -608,6 +608,14 @@ int vanilla_server_accept(vanilla_server_t *srv)
     srv->clients[slot].in_use = 1;
     srv->clients[slot].fd = cfd;
     srv->clients[slot].version = 1;
+    srv->clients[slot].client_pid = -1;
+#if defined(SO_PEERCRED)
+    struct ucred cr;
+    socklen_t cr_len = sizeof(cr);
+    if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cr, &cr_len) == 0) {
+        srv->clients[slot].client_pid = (pid_t)cr.pid;
+    }
+#endif
     printf("[vanilla] Accepted client connection (slot=%d, fd=%d)\n", slot, cfd);
 
     return slot;
@@ -1105,6 +1113,8 @@ int handle_msg_present(vanilla_server_t *srv, int client_idx, const vanilla_msg_
     vanilla_server_window_t *w = vanilla_server_find_window(srv, hdr->window_id);
     if (!w || w->client_fd != cfd)
         return 0;
+
+    w->presented_frames++;
 
     if (is_v2) {
         w->present_serial = frame_serial;
@@ -2019,6 +2029,147 @@ int handle_msg_dnd_accept(vanilla_server_t *srv, int client_idx, const vanilla_m
         return -1;
     const vanilla_msg_dnd_accept_t *accept = (const vanilla_msg_dnd_accept_t *)payload;
     dnd_handle_accept(srv, hdr->window_id, accept);
+    return 0;
+}
+
+int handle_msg_debug_query(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    if (!srv || !hdr || !payload || client_idx < 0 || client_idx >= VANILLA_MAX_CLIENTS)
+        return -1;
+
+    if (hdr->payload_len < sizeof(vanilla_msg_debug_query_t))
+        return 0;
+
+    const vanilla_msg_debug_query_t *req = (const vanilla_msg_debug_query_t *)payload;
+    int cfd = srv->clients[client_idx].fd;
+    if (cfd < 0)
+        return -1;
+
+    vanilla_msg_hdr_t resp_hdr;
+    resp_hdr.magic = VANILLA_IPC_MAGIC;
+    resp_hdr.msg_type = MSG_DEBUG_QUERY_RESP;
+    resp_hdr.window_id = 0;
+
+    switch (req->query_type) {
+    case DBGQ_WINDOWS: {
+        vanilla_dbg_window_t win_records[VANILLA_MAX_WINDOWS];
+        uint32_t count = 0;
+
+        for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+            vanilla_server_window_t *w = &srv->windows[i];
+            if (!w->in_use)
+                continue;
+
+            vanilla_dbg_window_t *rec = &win_records[count++];
+            memset(rec, 0, sizeof(*rec));
+            rec->window_id = w->window_id;
+            rec->pid = -1;
+
+            vanilla_client_conn_t *c = find_client_by_fd(srv, w->client_fd);
+            if (c)
+                rec->pid = (int32_t)c->client_pid;
+
+            strncpy(rec->title, w->title, sizeof(rec->title) - 1);
+            rec->x = w->x;
+            rec->y = w->y;
+            rec->w = w->width;
+            rec->h = w->height;
+            rec->z_index = w->z_index;
+            rec->layer = (uint8_t)w->layer;
+            rec->is_mapped = (uint8_t)w->is_mapped;
+            rec->is_focused = (uint8_t)w->is_focused;
+            rec->damage_x = w->damage.x;
+            rec->damage_y = w->damage.y;
+            rec->damage_w = w->damage.w;
+            rec->damage_h = w->damage.h;
+            rec->frame_count = w->presented_frames;
+        }
+
+        vanilla_msg_debug_query_resp_t resp;
+        resp.window_count = count;
+        resp_hdr.payload_len = (uint16_t)(sizeof(resp) + count * sizeof(vanilla_dbg_window_t));
+
+        if (exact_write(cfd, &resp_hdr, sizeof(resp_hdr)) < 0 ||
+            exact_write(cfd, &resp, sizeof(resp)) < 0)
+            return -1;
+
+        if (count > 0 && exact_write(cfd, win_records, count * sizeof(vanilla_dbg_window_t)) < 0)
+            return -1;
+        break;
+    }
+    case DBGQ_COMPOSITOR: {
+        vanilla_dbg_compositor_t comp_stat;
+        memset(&comp_stat, 0, sizeof(comp_stat));
+        comp_stat.frame_time_us = srv->compositor.last_frame_time_us;
+        comp_stat.dirty_rect_count = (uint32_t)srv->compositor.last_dirty_count;
+        comp_stat.damage_area_px = srv->compositor.last_damage_area_px;
+
+        for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
+            if (srv->clients[i].in_use)
+                comp_stat.client_count++;
+        }
+        for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+            if (srv->windows[i].in_use)
+                comp_stat.window_count++;
+        }
+
+        vanilla_msg_debug_query_resp_t resp;
+        resp.window_count = 1;
+        resp_hdr.payload_len = (uint16_t)(sizeof(resp) + sizeof(comp_stat));
+
+        if (exact_write(cfd, &resp_hdr, sizeof(resp_hdr)) < 0 ||
+            exact_write(cfd, &resp, sizeof(resp)) < 0 ||
+            exact_write(cfd, &comp_stat, sizeof(comp_stat)) < 0)
+            return -1;
+        break;
+    }
+    case DBGQ_THEME: {
+        vanilla_msg_debug_query_resp_t resp;
+        resp.window_count = 1;
+        resp_hdr.payload_len = (uint16_t)(sizeof(resp) + sizeof(vanilla_theme_t));
+
+        if (exact_write(cfd, &resp_hdr, sizeof(resp_hdr)) < 0 ||
+            exact_write(cfd, &resp, sizeof(resp)) < 0 ||
+            exact_write(cfd, g_theme, sizeof(vanilla_theme_t)) < 0)
+            return -1;
+        break;
+    }
+    case DBGQ_SET_THEME: {
+        if (hdr->payload_len >= sizeof(vanilla_msg_debug_query_t) + sizeof(vanilla_theme_t)) {
+            const vanilla_theme_t *new_th = (const vanilla_theme_t *)(payload + sizeof(vanilla_msg_debug_query_t));
+            theme_set(new_th);
+            srv->compositor.bg_color = g_theme->bg_base;
+            compositor_damage_all(&srv->compositor);
+            vanilla_server_broadcast_theme_changed(srv);
+        }
+        vanilla_msg_debug_query_resp_t resp;
+        resp.window_count = 0;
+        resp_hdr.payload_len = (uint16_t)sizeof(resp);
+
+        if (exact_write(cfd, &resp_hdr, sizeof(resp_hdr)) < 0 ||
+            exact_write(cfd, &resp, sizeof(resp)) < 0)
+            return -1;
+        break;
+    }
+    case DBGQ_THEME_RELOAD: {
+        theme_reload();
+        srv->compositor.bg_color = g_theme->bg_base;
+        compositor_damage_all(&srv->compositor);
+        vanilla_server_broadcast_theme_changed(srv);
+
+        vanilla_msg_debug_query_resp_t resp;
+        resp.window_count = 0;
+        resp_hdr.payload_len = (uint16_t)sizeof(resp);
+
+        if (exact_write(cfd, &resp_hdr, sizeof(resp_hdr)) < 0 ||
+            exact_write(cfd, &resp, sizeof(resp)) < 0)
+            return -1;
+        break;
+    }
+    default:
+        break;
+    }
+
     return 0;
 }
 
@@ -4199,6 +4350,13 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                 wm_context_menu_handle_key(srv, ev->code, ev->value);
                 return 0;
             }
+        }
+
+        /* Hotkey: F12 toggles performance overlay HUD */
+        if (ev->code == KEY_F12 && ev->value == 1) {
+            g_perf_overlay_enabled = !g_perf_overlay_enabled;
+            compositor_damage_all(&srv->compositor);
+            return 0;
         }
 
         /* Hotkey: Alt+Space forwarded to shell client window to toggle Quick Launcher */
