@@ -46,6 +46,8 @@ LIBVANILLA_OBJS = libvanilla/client.o \
                   libvanilla/surface.o \
                   libvanilla/service.o \
                   libvanilla/clipboard.o \
+                  libvanilla/icon.o \
+                  icons/icon.o \
                   server/theme.o \
                   input/keymap.o
 
@@ -287,7 +289,7 @@ check: all
 	@echo "     - supervisor/SUPERVSD.ELF"
 
 clean:
-	rm -rf libvanilla/*.o libvanilla-ui/*.o server/*.o services/*.o tests/*.o apps/*.o input/*.o layout/*.o shell-client/*.o $(BIN_DIR) $(LIB_DIR) host_emulator/*.host.o server/*.host.o libvanilla/*.host.o input/*.host.o host_emulator/bin build
+	rm -rf libvanilla/*.o libvanilla-ui/*.o icons/*.o icons/*.host.o server/*.o services/*.o tests/*.o apps/*.o input/*.o layout/*.o shell-client/*.o $(BIN_DIR) $(LIB_DIR) host_emulator/*.host.o server/*.host.o libvanilla/*.host.o input/*.host.o host_emulator/bin build
 	$(MAKE) -C supervisor clean
 
 host: gen-protocol

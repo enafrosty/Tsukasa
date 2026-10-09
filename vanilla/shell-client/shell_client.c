@@ -17,6 +17,7 @@
 #include "shell_client.h"
 #include "../server/server.h"
 #include "../apps/app_common.h"
+#include "../libvanilla/icon.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,14 +29,15 @@ typedef struct {
     const char *title;
     const char *path;
     const char *badge;
+    icon_t     *icon;
 } start_menu_item_t;
 
-static const start_menu_item_t g_start_menu_items[START_MENU_NUM_ITEMS] = {
-    { "Terminal",     "/bin/terminal.elf", ">_" },
-    { "File Manager", "/bin/filemgr.elf",  "FM" },
-    { "Notepad",      "/bin/notepad.elf",  "NP" },
-    { "Calculator",   "/bin/calc.elf",     "+-" },
-    { "Task Manager", "/bin/taskmgr.elf",  "TM" },
+static start_menu_item_t g_start_menu_items[START_MENU_NUM_ITEMS] = {
+    { "Terminal",     "/bin/terminal.elf", ">_", NULL },
+    { "File Manager", "/bin/filemgr.elf",  "FM", NULL },
+    { "Notepad",      "/bin/notepad.elf",  "NP", NULL },
+    { "Calculator",   "/bin/calc.elf",     "+-", NULL },
+    { "Task Manager", "/bin/taskmgr.elf",  "TM", NULL },
 };
 
 static const vanilla_app_entry_t g_launcher_apps[] = {
@@ -50,6 +52,47 @@ static const vanilla_app_entry_t g_launcher_apps[] = {
     { "Network Info",    "Network status and sockets",   "/bin/net",          0 },
 };
 #define LAUNCHER_NUM_BUILTIN_APPS (int)(sizeof(g_launcher_apps) / sizeof(g_launcher_apps[0]))
+
+static icon_t *g_launcher_icons[LAUNCHER_NUM_BUILTIN_APPS];
+static int g_icons_loaded = 0;
+
+static void shell_load_icons(void)
+{
+    if (g_icons_loaded)
+        return;
+
+    for (int i = 0; i < START_MENU_NUM_ITEMS; i++) {
+        g_start_menu_items[i].icon = icon_load(g_start_menu_items[i].title);
+    }
+
+    for (int i = 0; i < LAUNCHER_NUM_BUILTIN_APPS; i++) {
+        g_launcher_icons[i] = icon_load(g_launcher_apps[i].name);
+    }
+
+    g_icons_loaded = 1;
+}
+
+static __attribute__((unused)) void shell_free_icons(void)
+{
+    if (!g_icons_loaded)
+        return;
+
+    for (int i = 0; i < START_MENU_NUM_ITEMS; i++) {
+        if (g_start_menu_items[i].icon) {
+            icon_free(g_start_menu_items[i].icon);
+            g_start_menu_items[i].icon = NULL;
+        }
+    }
+
+    for (int i = 0; i < LAUNCHER_NUM_BUILTIN_APPS; i++) {
+        if (g_launcher_icons[i]) {
+            icon_free(g_launcher_icons[i]);
+            g_launcher_icons[i] = NULL;
+        }
+    }
+
+    g_icons_loaded = 0;
+}
 
 static inline uint32_t shell_get_badge_color(int index)
 {
@@ -301,6 +344,8 @@ void shell_init(vanilla_shell_t *shell)
     if (!shell)
         return;
 
+    shell_load_icons();
+
     shell->start_menu_open = 0;
     shell->selected_idx = 0;
     shell->last_clock_sec = 0;
@@ -421,8 +466,13 @@ static void start_menu_render_client(shell_state_t *st)
         /* Item badge / icon */
         int32_t badge_x = THEME_PX(6) + THEME_PX(4);
         int32_t badge_y = item_y + THEME_PX(3);
-        app_fill_rect(surf, badge_x, badge_y, THEME_PX(18), THEME_PX(18), shell_get_badge_color(i));
-        app_draw_text(surf, badge_x + THEME_PX(2), badge_y + THEME_PX(4), item->badge, g_theme->fg_primary);
+        if (item->icon && icon_render_to_surface(item->icon, surf, badge_x, badge_y, THEME_PX(18)) == 0) {
+            /* Vector or bitmap icon rendered */
+        } else {
+            app_fill_rect(surf, badge_x, badge_y, THEME_PX(18), THEME_PX(18), shell_get_badge_color(i));
+            if (item->badge)
+                app_draw_text(surf, badge_x + THEME_PX(2), badge_y + THEME_PX(4), item->badge, g_theme->fg_primary);
+        }
 
         /* Item title */
         app_draw_text(surf, THEME_PX(6) + THEME_PX(28), item_y + THEME_PX(6), item->title, g_theme->fg_primary);
@@ -475,7 +525,12 @@ static void launcher_render_client(shell_state_t *st)
         /* Icon badge */
         int32_t ic_x = sb_x + THEME_PX(8);
         int32_t ic_y = iy + THEME_PX(8);
-        app_fill_rect(surf, ic_x, ic_y, THEME_PX(16), THEME_PX(16), launcher_get_icon_color(app_idx));
+        icon_t *app_icon = (app_idx >= 0 && app_idx < LAUNCHER_NUM_BUILTIN_APPS) ? g_launcher_icons[app_idx] : NULL;
+        if (app_icon && icon_render_to_surface(app_icon, surf, ic_x, ic_y, THEME_PX(16)) == 0) {
+            /* Vector or bitmap icon rendered */
+        } else {
+            app_fill_rect(surf, ic_x, ic_y, THEME_PX(16), THEME_PX(16), launcher_get_icon_color(app_idx));
+        }
 
         /* App name and description */
         app_draw_text(surf, sb_x + THEME_PX(32), iy + THEME_PX(9), app->name, g_theme->fg_primary);
@@ -916,6 +971,8 @@ int main(int argc, char **argv)
         vanilla_destroy_window(state.shell.start_menu_win);
     if (state.taskbar_win)
         vanilla_destroy_window(state.taskbar_win);
+
+    shell_free_icons();
 
     vanilla_disconnect(client);
     return 0;

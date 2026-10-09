@@ -37,7 +37,10 @@ CFLAGS      := -Wall -Wextra -O2 \
                -I$(VANILLA_DIR)/include \
                -I$(VANILLA_DIR)/server \
                -I$(VANILLA_DIR)/input \
-               -I$(EMU_DIR)
+               -I$(VANILLA_DIR)/icons \
+               -I$(VANILLA_DIR)/libvanilla \
+               -I$(EMU_DIR) \
+               -DSTBI_NO_THREAD_LOCALS
 
 HOST_SRCS   := $(EMU_DIR)/sdl_backend.c \
                $(EMU_DIR)/host_compat.c \
@@ -51,6 +54,8 @@ HOST_SRCS   := $(EMU_DIR)/sdl_backend.c \
                $(VANILLA_DIR)/server/theme.c \
                $(VANILLA_DIR)/server/cursor.c \
                $(VANILLA_DIR)/libvanilla/surface.c \
+               $(VANILLA_DIR)/libvanilla/icon.c \
+               $(VANILLA_DIR)/icons/icon.c \
                $(VANILLA_DIR)/input/keymap.c
 
 HOST_OBJS   := $(patsubst %.c,%.host.o,$(HOST_SRCS))
