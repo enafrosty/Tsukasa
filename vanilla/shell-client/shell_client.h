@@ -111,6 +111,7 @@ typedef struct {
 struct vanilla_server;
 
 void shell_init(vanilla_shell_t *shell);
+void shell_free_icons(void);
 void shell_update_clock(vanilla_shell_t *shell, struct vanilla_server *srv);
 void shell_spawn_app(const char *path);
 

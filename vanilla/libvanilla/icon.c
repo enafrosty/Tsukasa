@@ -46,10 +46,10 @@
 
 #include "../include/stb_image.h"
 
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#elif defined(__GNUC__)
-#pragma GCC diagnostic pop
+#if defined(STBI_NO_THREAD_LOCALS)
+void stbi_set_unpremultiply_on_load_thread(int flag) { (void)flag; }
+void stbi_convert_iphone_png_to_rgb_thread(int flag) { (void)flag; }
+void stbi_set_flip_vertically_on_load_thread(int flag) { (void)flag; }
 #endif
 
 typedef struct {
@@ -105,6 +105,11 @@ static inline void blend_pixel(uint32_t *dst, uint32_t src)
 
     uint32_t dp = *dst;
     uint32_t da = (dp >> 24) & 0xFF;
+    if (da == 0) {
+        *dst = src;
+        return;
+    }
+
     uint32_t inv = 255 - sa;
 
     uint32_t r = (((src >> 16) & 0xFF) * sa + ((dp >> 16) & 0xFF) * inv + 127) / 255;
@@ -129,7 +134,7 @@ static void *read_file_bytes(const char *path, size_t *out_sz)
     }
 
     long sz = ftell(fp);
-    if (sz <= 0 || fseek(fp, 0, SEEK_SET) != 0) {
+    if (sz <= 0 || sz > 16 * 1024 * 1024 || fseek(fp, 0, SEEK_SET) != 0) {
         fclose(fp);
         return NULL;
     }
@@ -247,7 +252,7 @@ icon_t *icon_load(const char *name)
             if (buf) {
                 if (sz >= sizeof(vico_hdr_t)) {
                     vico_hdr_t *hdr = (vico_hdr_t *)buf;
-                    if (hdr->magic == VICO_MAGIC) {
+                    if (hdr->magic == VICO_MAGIC && hdr->version == VICO_VERSION) {
                         icon_t *icon = (icon_t *)malloc(sizeof(icon_t));
                         if (!icon) {
                             free(buf);
@@ -326,7 +331,7 @@ icon_t *icon_load(const char *name)
 int icon_render(const icon_t *icon, int target_size,
                 uint32_t *out_pixels, int stride_px)
 {
-    if (!icon || target_size <= 0 || !out_pixels || stride_px <= 0)
+    if (!icon || target_size <= 0 || target_size > 512 || !out_pixels || stride_px < target_size)
         return -1;
 
     if (icon->source.is_bmp) {
@@ -363,7 +368,10 @@ int icon_render(const icon_t *icon, int target_size,
 int icon_render_to_surface(const icon_t *icon, vanilla_surface_t *surf,
                            int32_t x, int32_t y, int target_size)
 {
-    if (!icon || !surf || !surf->pixels || target_size <= 0)
+    if (!icon || !surf || !surf->pixels || target_size <= 0 || target_size > 512)
+        return -1;
+
+    if (surf->width == 0 || surf->height == 0 || surf->pitch < surf->width * sizeof(uint32_t))
         return -1;
 
     int32_t surf_w = (int32_t)surf->width;
@@ -429,3 +437,9 @@ void icon_free(icon_t *icon)
 
     free(icon);
 }
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif

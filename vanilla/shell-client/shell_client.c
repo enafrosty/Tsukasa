@@ -72,7 +72,7 @@ static void shell_load_icons(void)
     g_icons_loaded = 1;
 }
 
-static __attribute__((unused)) void shell_free_icons(void)
+void shell_free_icons(void)
 {
     if (!g_icons_loaded)
         return;

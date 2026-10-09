@@ -46,6 +46,11 @@ static inline void blend_pixel(uint32_t *dst, uint32_t src)
 
     uint32_t dp = *dst;
     uint32_t da = (dp >> 24) & 0xFF;
+    if (da == 0) {
+        *dst = src;
+        return;
+    }
+
     uint32_t inv = 255 - sa;
 
     uint32_t r = (((src >> 16) & 0xFF) * sa + ((dp >> 16) & 0xFF) * inv + 127) / 255;
@@ -238,6 +243,8 @@ static void rasterize_polygon_fill(const vico_path_context_t *ctx, int target_si
             int ix1 = (int)(x_nodes[i + 1] + 0.5f);
 
             if (ix0 < 0) ix0 = 0;
+            if (ix0 > target_size) ix0 = target_size;
+            if (ix1 < 0) ix1 = 0;
             if (ix1 > target_size) ix1 = target_size;
 
             for (int x = ix0; x < ix1; x++) {
@@ -252,10 +259,18 @@ static void rasterize_polygon_fill(const vico_path_context_t *ctx, int target_si
                     if (t < 0.0f) t = 0.0f;
                     else if (t > 1.0f) t = 1.0f;
 
-                    uint32_t a = (uint32_t)(c0_a + t * ((float)c1_a - (float)c0_a));
-                    uint32_t r = (uint32_t)(c0_r + t * ((float)c1_r - (float)c0_r));
-                    uint32_t g = (uint32_t)(c0_g + t * ((float)c1_g - (float)c0_g));
-                    uint32_t b = (uint32_t)(c0_b + t * ((float)c1_b - (float)c0_b));
+                    float fa = (float)c0_a + t * ((float)c1_a - (float)c0_a);
+                    float fr = (float)c0_r + t * ((float)c1_r - (float)c0_r);
+                    float fg = (float)c0_g + t * ((float)c1_g - (float)c0_g);
+                    float fb = (float)c0_b + t * ((float)c1_b - (float)c0_b);
+                    if (fa < 0.0f) fa = 0.0f; else if (fa > 255.0f) fa = 255.0f;
+                    if (fr < 0.0f) fr = 0.0f; else if (fr > 255.0f) fr = 255.0f;
+                    if (fg < 0.0f) fg = 0.0f; else if (fg > 255.0f) fg = 255.0f;
+                    if (fb < 0.0f) fb = 0.0f; else if (fb > 255.0f) fb = 255.0f;
+                    uint32_t a = (uint32_t)(fa + 0.5f);
+                    uint32_t r = (uint32_t)(fr + 0.5f);
+                    uint32_t g = (uint32_t)(fg + 0.5f);
+                    uint32_t b = (uint32_t)(fb + 0.5f);
                     color = (a << 24) | (r << 16) | (g << 8) | b;
                 }
                 blend_pixel(&row[x], color);
@@ -319,7 +334,8 @@ static void rasterize_polyline_stroke(const vico_path_context_t *ctx, int target
 int vico_rasterize(const uint8_t *data, size_t data_len, int target_size,
                    uint32_t *out_pixels, int stride_px)
 {
-    if (!data || data_len == 0 || target_size <= 0 || !out_pixels || stride_px <= 0)
+    if (!data || data_len == 0 || target_size <= 0 || target_size > 512 ||
+        !out_pixels || stride_px < target_size)
         return -1;
 
     size_t offset = 0;
@@ -328,6 +344,8 @@ int vico_rasterize(const uint8_t *data, size_t data_len, int target_size,
     if (data_len >= sizeof(vico_hdr_t)) {
         const vico_hdr_t *hdr = (const vico_hdr_t *)data;
         if (hdr->magic == VICO_MAGIC) {
+            if (hdr->version != VICO_VERSION)
+                return -1;
             offset = sizeof(vico_hdr_t);
         }
     }
@@ -380,6 +398,9 @@ int vico_rasterize(const uint8_t *data, size_t data_len, int target_size,
             float fcy = ((float)cy8 / 255.0f) * (float)target_size;
             float fex = ((float)ex8 / 255.0f) * (float)target_size;
             float fey = ((float)ey8 / 255.0f) * (float)target_size;
+
+            if (path.count == 0 && path.count < VICO_MAX_POINTS)
+                path.points[path.count++] = path.current;
 
             vico_point_t p0 = path.current;
             for (int s = 1; s <= 4; s++) {
