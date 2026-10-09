@@ -395,7 +395,11 @@ initrd: $(INITRD_IMG)
 
 check:
 	@bash scripts/test/run-host-tests.sh
-	@bash scripts/test/run-guest-tests.sh
+	@if command -v qemu-system-x86_64 >/dev/null 2>&1 && command -v qemu-img >/dev/null 2>&1; then \
+		bash scripts/test/run-guest-tests.sh; \
+	else \
+		echo "SKIP: qemu not installed; skipping guest tests"; \
+	fi
 	@bash scripts/test/summarize.sh
 
 $(LIMINE_DIR)/limine:
