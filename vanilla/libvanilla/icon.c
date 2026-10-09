@@ -59,6 +59,7 @@ typedef struct {
 
 static const app_alias_t g_app_aliases[] = {
     { "terminal",       "TERM" },
+    { "term",           "TERM" },
     { "file manager",   "FILEMGR" },
     { "filemgr",        "FILEMGR" },
     { "notepad",        "NOTEPAD" },
@@ -78,10 +79,14 @@ static const app_alias_t g_app_aliases[] = {
 };
 
 static const char *g_search_dirs[] = {
-    "/icons/",
+    "/fat12/",
+    "/bin/",
     "/fat12/ICONS/",
-    "icons/",
+    "/fat12/icons/",
+    "/icons/",
     "fat12/ICONS/",
+    "fat12/icons/",
+    "icons/",
     "vanilla/icons/builtin/",
     "icons/builtin/",
     "/assets/icons/",
@@ -187,6 +192,71 @@ static void to_upper_str(const char *src, char *dst, size_t max)
     dst[i] = '\0';
 }
 
+static icon_t *load_icon_vico_buf(void *buf, size_t sz, const char *base_name)
+{
+    if (sz >= sizeof(vico_hdr_t)) {
+        vico_hdr_t *hdr = (vico_hdr_t *)buf;
+        if (hdr->magic == VICO_MAGIC && hdr->version == VICO_VERSION) {
+            icon_t *icon = (icon_t *)malloc(sizeof(icon_t));
+            if (!icon)
+                return NULL;
+            memset(icon, 0, sizeof(*icon));
+            size_t nlen = strlen(base_name);
+            if (nlen >= sizeof(icon->name))
+                nlen = sizeof(icon->name) - 1;
+            memcpy(icon->name, base_name, nlen);
+            icon->name[nlen] = '\0';
+            icon->source.is_bmp = 0;
+            icon->source.vico.is_loaded = 1;
+            icon->source.vico.data = (uint8_t *)buf;
+            icon->source.vico.data_len = (uint32_t)sz;
+            return icon;
+        }
+    }
+    return NULL;
+}
+
+static icon_t *load_icon_bmp_buf(void *buf, size_t sz, const char *base_name)
+{
+    int w = 0, h = 0, ch = 0;
+    stbi_uc *raw = stbi_load_from_memory((const stbi_uc *)buf, (int)sz, &w, &h, &ch, 4);
+    if (raw && w > 0 && h > 0) {
+        size_t pixel_count = (size_t)w * (size_t)h;
+        uint32_t *pixels = (uint32_t *)malloc(pixel_count * sizeof(uint32_t));
+        if (!pixels) {
+            stbi_image_free(raw);
+            return NULL;
+        }
+
+        for (size_t i = 0; i < pixel_count; i++) {
+            uint32_t r = raw[i * 4 + 0];
+            uint32_t g = raw[i * 4 + 1];
+            uint32_t b = raw[i * 4 + 2];
+            uint32_t a = raw[i * 4 + 3];
+            pixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+        stbi_image_free(raw);
+
+        icon_t *icon = (icon_t *)malloc(sizeof(icon_t));
+        if (!icon) {
+            free(pixels);
+            return NULL;
+        }
+        memset(icon, 0, sizeof(*icon));
+        size_t nlen = strlen(base_name);
+        if (nlen >= sizeof(icon->name))
+            nlen = sizeof(icon->name) - 1;
+        memcpy(icon->name, base_name, nlen);
+        icon->name[nlen] = '\0';
+        icon->source.is_bmp = 1;
+        icon->source.bmp_w = w;
+        icon->source.bmp_h = h;
+        icon->source.pixels = pixels;
+        return icon;
+    }
+    return NULL;
+}
+
 icon_t *icon_load(const char *name)
 {
     if (!name || !name[0])
@@ -207,6 +277,22 @@ icon_t *icon_load(const char *name)
     char *dot = strrchr(base, '.');
     if (dot)
         *dot = '\0';
+
+    /* Check if name was a direct file path */
+    if (strchr(name, '/') || strchr(name, '\\') || strstr(name, ".vco") ||
+        strstr(name, ".VCO") || strstr(name, ".bmp") || strstr(name, ".BMP")) {
+        size_t dsz = 0;
+        void *dbuf = read_file_bytes(name, &dsz);
+        if (dbuf) {
+            icon_t *icon = load_icon_vico_buf(dbuf, dsz, base);
+            if (icon)
+                return icon;
+            icon = load_icon_bmp_buf(dbuf, dsz, base);
+            free(dbuf);
+            if (icon)
+                return icon;
+        }
+    }
 
     char lower[32];
     to_lower_str(base, lower, sizeof(lower));
@@ -250,23 +336,9 @@ icon_t *icon_load(const char *name)
             }
 
             if (buf) {
-                if (sz >= sizeof(vico_hdr_t)) {
-                    vico_hdr_t *hdr = (vico_hdr_t *)buf;
-                    if (hdr->magic == VICO_MAGIC && hdr->version == VICO_VERSION) {
-                        icon_t *icon = (icon_t *)malloc(sizeof(icon_t));
-                        if (!icon) {
-                            free(buf);
-                            return NULL;
-                        }
-                        memset(icon, 0, sizeof(*icon));
-                        snprintf(icon->name, sizeof(icon->name), "%s", base);
-                        icon->source.is_bmp = 0;
-                        icon->source.vico.is_loaded = 1;
-                        icon->source.vico.data = (uint8_t *)buf;
-                        icon->source.vico.data_len = (uint32_t)sz;
-                        return icon;
-                    }
-                }
+                icon_t *icon = load_icon_vico_buf(buf, sz, base);
+                if (icon)
+                    return icon;
                 free(buf);
             }
         }
@@ -287,40 +359,10 @@ icon_t *icon_load(const char *name)
             }
 
             if (buf) {
-                int w = 0, h = 0, ch = 0;
-                stbi_uc *raw = stbi_load_from_memory((const stbi_uc *)buf, (int)sz, &w, &h, &ch, 4);
+                icon_t *icon = load_icon_bmp_buf(buf, sz, base);
                 free(buf);
-
-                if (raw && w > 0 && h > 0) {
-                    size_t pixel_count = (size_t)w * (size_t)h;
-                    uint32_t *pixels = (uint32_t *)malloc(pixel_count * sizeof(uint32_t));
-                    if (!pixels) {
-                        stbi_image_free(raw);
-                        return NULL;
-                    }
-
-                    for (size_t i = 0; i < pixel_count; i++) {
-                        uint32_t r = raw[i * 4 + 0];
-                        uint32_t g = raw[i * 4 + 1];
-                        uint32_t b = raw[i * 4 + 2];
-                        uint32_t a = raw[i * 4 + 3];
-                        pixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
-                    }
-                    stbi_image_free(raw);
-
-                    icon_t *icon = (icon_t *)malloc(sizeof(icon_t));
-                    if (!icon) {
-                        free(pixels);
-                        return NULL;
-                    }
-                    memset(icon, 0, sizeof(*icon));
-                    snprintf(icon->name, sizeof(icon->name), "%s", base);
-                    icon->source.is_bmp = 1;
-                    icon->source.bmp_w = w;
-                    icon->source.bmp_h = h;
-                    icon->source.pixels = pixels;
+                if (icon)
                     return icon;
-                }
             }
         }
     }

@@ -67,6 +67,9 @@ static void rasterize_rect(int target_size, uint32_t *out_pixels, int stride_px,
                            uint8_t x8, uint8_t y8, uint8_t w8, uint8_t h8,
                            uint32_t color)
 {
+    if (w8 == 0 || h8 == 0)
+        return;
+
     float fx0 = ((float)x8 / 255.0f) * (float)target_size;
     float fy0 = ((float)y8 / 255.0f) * (float)target_size;
     float fx1 = ((float)(x8 + w8) / 255.0f) * (float)target_size;
@@ -99,6 +102,9 @@ static void rasterize_rrect(int target_size, uint32_t *out_pixels, int stride_px
                             uint8_t x8, uint8_t y8, uint8_t w8, uint8_t h8,
                             uint8_t corner8, uint32_t color)
 {
+    if (w8 == 0 || h8 == 0)
+        return;
+
     float fx0 = ((float)x8 / 255.0f) * (float)target_size;
     float fy0 = ((float)y8 / 255.0f) * (float)target_size;
     float fx1 = ((float)(x8 + w8) / 255.0f) * (float)target_size;
@@ -162,6 +168,9 @@ static void rasterize_rrect(int target_size, uint32_t *out_pixels, int stride_px
 static void rasterize_circle(int target_size, uint32_t *out_pixels, int stride_px,
                              uint8_t cx8, uint8_t cy8, uint8_t r8, uint32_t color)
 {
+    if (r8 == 0)
+        return;
+
     float fcx = ((float)cx8 / 255.0f) * (float)target_size;
     float fcy = ((float)cy8 / 255.0f) * (float)target_size;
     float fr = ((float)r8 / 255.0f) * (float)target_size;
@@ -283,7 +292,7 @@ static void rasterize_polyline_stroke(const vico_path_context_t *ctx, int target
                                       uint32_t *out_pixels, int stride_px,
                                       uint8_t width8, uint32_t color)
 {
-    if (ctx->count < 2)
+    if (width8 == 0 || ctx->count < 2)
         return;
 
     float sw = ((float)width8 / 255.0f) * (float)target_size;
@@ -340,10 +349,14 @@ int vico_rasterize(const uint8_t *data, size_t data_len, int target_size,
 
     size_t offset = 0;
 
-    /* Check optional VICO header */
-    if (data_len >= sizeof(vico_hdr_t)) {
-        const vico_hdr_t *hdr = (const vico_hdr_t *)data;
-        if (hdr->magic == VICO_MAGIC) {
+    /* Check optional VICO header with safe magic check */
+    if (data_len >= 4) {
+        uint32_t magic = (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+                         ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+        if (magic == VICO_MAGIC) {
+            if (data_len < sizeof(vico_hdr_t))
+                return -1;
+            const vico_hdr_t *hdr = (const vico_hdr_t *)data;
             if (hdr->version != VICO_VERSION)
                 return -1;
             offset = sizeof(vico_hdr_t);
