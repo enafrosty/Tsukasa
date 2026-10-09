@@ -61,6 +61,18 @@ static uint16_t sdl_scancode_to_evdev(SDL_Scancode sc)
     case SDL_SCANCODE_DOWN:         return KEY_DOWN;
     case SDL_SCANCODE_LEFT:         return KEY_LEFT;
     case SDL_SCANCODE_RIGHT:        return KEY_RIGHT;
+    case SDL_SCANCODE_F1:           return KEY_F1;
+    case SDL_SCANCODE_F2:           return KEY_F2;
+    case SDL_SCANCODE_F3:           return KEY_F3;
+    case SDL_SCANCODE_F4:           return KEY_F4;
+    case SDL_SCANCODE_F5:           return KEY_F5;
+    case SDL_SCANCODE_F6:           return KEY_F6;
+    case SDL_SCANCODE_F7:           return KEY_F7;
+    case SDL_SCANCODE_F8:           return KEY_F8;
+    case SDL_SCANCODE_F9:           return KEY_F9;
+    case SDL_SCANCODE_F10:          return KEY_F10;
+    case SDL_SCANCODE_F11:          return KEY_F11;
+    case SDL_SCANCODE_F12:          return KEY_F12;
     default:                        return 0;
     }
 }

@@ -71,6 +71,7 @@ static int exact_read_fd(int fd, void *buf, size_t count)
 {
     uint8_t *p = (uint8_t *)buf;
     size_t received = 0;
+    int retries = 0;
     while (received < count) {
         ssize_t ret = read(fd, p + received, count - received);
         if (ret > 0) {
@@ -79,6 +80,8 @@ static int exact_read_fd(int fd, void *buf, size_t count)
             return -1;
         } else {
             if (errno == EAGAIN || errno == EINTR) {
+                if (++retries > 1000)
+                    return -1;
                 usleep(1000);
                 continue;
             }
@@ -103,28 +106,65 @@ static mu_Rect intersect_rects(mu_Rect r1, mu_Rect r2)
 
 void mu_renderer_draw_rect(mu_Rect rect, mu_Color color)
 {
-    if (!g_render_surf) return;
+    if (!g_render_surf || color.a == 0)
+        return;
+
     mu_Rect clipped = intersect_rects(rect, g_clip_rect);
-    if (clipped.w <= 0 || clipped.h <= 0) return;
+    if (clipped.w <= 0 || clipped.h <= 0)
+        return;
 
     /* microui is RGBA; project Tsukasa blitter is ARGB */
     uint32_t argb = ((uint32_t)color.a << 24) |
                     ((uint32_t)color.r << 16) |
                     ((uint32_t)color.g << 8)  |
                     ((uint32_t)color.b);
-    app_fill_rect(g_render_surf, clipped.x, clipped.y, clipped.w, clipped.h, argb);
+
+    if (color.a == 255) {
+        app_fill_rect(g_render_surf, clipped.x, clipped.y, clipped.w, clipped.h, argb);
+        return;
+    }
+
+    /* Alpha blend into target surface */
+    uint32_t alpha = color.a;
+    uint32_t inv_a = 255 - alpha;
+    uint32_t r = color.r;
+    uint32_t g = color.g;
+    uint32_t b = color.b;
+    uint32_t pitch_px = g_render_surf->pitch / sizeof(uint32_t);
+
+    for (int cy = clipped.y; cy < clipped.y + clipped.h; cy++) {
+        uint32_t *row = g_render_surf->pixels + (size_t)cy * pitch_px;
+        for (int cx = clipped.x; cx < clipped.x + clipped.w; cx++) {
+            uint32_t dst = row[cx];
+            uint32_t dr = (dst >> 16) & 0xFF;
+            uint32_t dg = (dst >> 8)  & 0xFF;
+            uint32_t db = dst & 0xFF;
+            uint32_t out_r = (r * alpha + dr * inv_a) / 255;
+            uint32_t out_g = (g * alpha + dg * inv_a) / 255;
+            uint32_t out_b = (b * alpha + db * inv_a) / 255;
+            row[cx] = 0xFF000000u | (out_r << 16) | (out_g << 8) | out_b;
+        }
+    }
 }
 
 void mu_renderer_draw_text(const char *text, mu_Vec2 pos, mu_Color color)
 {
-    if (!g_render_surf || !text) return;
-    if (pos.y + 8 < g_clip_rect.y || pos.y > g_clip_rect.y + g_clip_rect.h) return;
+    if (!g_render_surf || !text)
+        return;
 
     uint32_t argb = ((uint32_t)color.a << 24) |
                     ((uint32_t)color.r << 16) |
                     ((uint32_t)color.g << 8)  |
                     ((uint32_t)color.b);
-    app_draw_text(g_render_surf, pos.x, pos.y, text, argb);
+
+    int cur_x = pos.x;
+    for (const char *p = text; *p; p++) {
+        if (cur_x + 8 >= g_clip_rect.x && cur_x < g_clip_rect.x + g_clip_rect.w &&
+            pos.y + 8 >= g_clip_rect.y && pos.y < g_clip_rect.y + g_clip_rect.h) {
+            app_draw_char(g_render_surf, cur_x, pos.y, *p, argb);
+        }
+        cur_x += 8;
+    }
 }
 
 void mu_renderer_draw_icon(int icon, mu_Rect rect, mu_Color color)
@@ -309,7 +349,8 @@ static void dbg_query_compositor(devtools_state_t *st)
         exact_read_fd(st->dbg_fd, &rpayload, sizeof(rpayload)) < 0)
         return;
 
-    exact_read_fd(st->dbg_fd, &st->comp_stats, sizeof(st->comp_stats));
+    if (exact_read_fd(st->dbg_fd, &st->comp_stats, sizeof(st->comp_stats)) < 0)
+        return;
 }
 
 static void dbg_query_theme(devtools_state_t *st)
@@ -367,8 +408,9 @@ static void dbg_set_theme(devtools_state_t *st, const vanilla_theme_t *th)
 
     vanilla_msg_hdr_t rhdr;
     vanilla_msg_debug_query_resp_t rpayload;
-    exact_read_fd(st->dbg_fd, &rhdr, sizeof(rhdr));
-    exact_read_fd(st->dbg_fd, &rpayload, sizeof(rpayload));
+    if (exact_read_fd(st->dbg_fd, &rhdr, sizeof(rhdr)) < 0 ||
+        exact_read_fd(st->dbg_fd, &rpayload, sizeof(rpayload)) < 0)
+        return;
 }
 
 static void dbg_revert_theme(devtools_state_t *st)
@@ -390,8 +432,9 @@ static void dbg_revert_theme(devtools_state_t *st)
 
     vanilla_msg_hdr_t rhdr;
     vanilla_msg_debug_query_resp_t rpayload;
-    exact_read_fd(st->dbg_fd, &rhdr, sizeof(rhdr));
-    exact_read_fd(st->dbg_fd, &rpayload, sizeof(rpayload));
+    if (exact_read_fd(st->dbg_fd, &rhdr, sizeof(rhdr)) < 0 ||
+        exact_read_fd(st->dbg_fd, &rpayload, sizeof(rpayload)) < 0)
+        return;
 
     dbg_query_theme(st);
 }
@@ -417,7 +460,7 @@ static void render_inspector_panel(devtools_state_t *st)
              st->window_count);
     mu_label(ctx, text);
 
-    int col_widths[] = { 45, 45, 170, 150, 45, 45, 45, 45, -1 };
+    int col_widths[] = { 50, 45, 175, 145, 45, 45, 45, 45 };
     mu_layout_row(ctx, 8, col_widths, 20);
     mu_label(ctx, "ID");
     mu_label(ctx, "PID");
@@ -433,6 +476,9 @@ static void render_inspector_panel(devtools_state_t *st)
         mu_label(ctx, "No windows connected.");
         return;
     }
+
+    mu_layout_row(ctx, 1, (int[]){ -1 }, -1);
+    mu_begin_panel(ctx, "inspector_table_panel");
 
     for (uint32_t i = 0; i < st->window_count; i++) {
         const devtools_win_entry_t *w = &st->windows[i];
@@ -463,6 +509,8 @@ static void render_inspector_panel(devtools_state_t *st)
         snprintf(fps_str, sizeof(fps_str), "%u", w->fps);
         mu_label(ctx, fps_str);
     }
+
+    mu_end_panel(ctx);
 }
 
 static void render_perf_panel(devtools_state_t *st)
@@ -515,63 +563,112 @@ static void render_theme_panel(devtools_state_t *st)
     mu_Context *ctx = &st->mu_ctx;
     vanilla_theme_t *t = &st->active_theme;
 
-    mu_layout_row(ctx, 1, (int[]){ -1 }, 24);
+    mu_layout_row(ctx, 1, (int[]){ -1 }, 22);
     mu_label(ctx, "Live Theme Editor - Modify Design Tokens in Memory");
 
+    if (st->status_msg[0]) {
+        mu_layout_row(ctx, 1, (int[]){ -1 }, 20);
+        mu_label(ctx, st->status_msg);
+    }
+
+    mu_layout_row(ctx, 3, (int[]){ 140, 140, 140 }, 28);
+    if (mu_button(ctx, "Apply Theme")) {
+        dbg_set_theme(st, &st->active_theme);
+        snprintf(st->status_msg, sizeof(st->status_msg), "Theme applied live.");
+    }
+    if (mu_button(ctx, "Save Theme")) {
+        dbg_set_theme(st, &st->active_theme);
+        st->theme_saved = 1;
+        snprintf(st->status_msg, sizeof(st->status_msg), "Theme saved for session.");
+    }
+    if (mu_button(ctx, "Revert Theme")) {
+        dbg_revert_theme(st);
+        st->theme_saved = 0;
+        snprintf(st->status_msg, sizeof(st->status_msg), "Theme reverted to boot defaults.");
+    }
+
     theme_token_entry_t tokens[] = {
-        { "bg_base",          &t->bg_base },
-        { "bg_elevated",      &t->bg_elevated },
-        { "bg_overlay",       &t->bg_overlay },
-        { "fg_primary",       &t->fg_primary },
-        { "fg_muted",         &t->fg_muted },
-        { "fg_dim",           &t->fg_dim },
-        { "border",           &t->border },
-        { "border_focus",     &t->border_focus },
-        { "accent",           &t->accent },
-        { "accent_hover",     &t->accent_hover },
-        { "accent_pressed",   &t->accent_pressed },
-        { "selection",        &t->selection },
-        { "success",          &t->success },
-        { "warning",          &t->warning },
-        { "danger",           &t->danger },
-        { "titlebar_active",  &t->titlebar_active },
-        { "titlebar_inactive",&t->titlebar_inactive },
-        { "titlebar_text_active", &t->titlebar_text_active },
-        { "taskbar_bg",       &t->taskbar_bg },
-        { "taskbar_item_active", &t->taskbar_item_active },
+        { "bg_base",               &t->bg_base },
+        { "bg_elevated",           &t->bg_elevated },
+        { "bg_overlay",            &t->bg_overlay },
+        { "fg_primary",            &t->fg_primary },
+        { "fg_muted",              &t->fg_muted },
+        { "fg_dim",                &t->fg_dim },
+        { "border",                &t->border },
+        { "border_focus",          &t->border_focus },
+        { "accent",                &t->accent },
+        { "accent_hover",          &t->accent_hover },
+        { "accent_pressed",        &t->accent_pressed },
+        { "selection",             &t->selection },
+        { "success",               &t->success },
+        { "warning",               &t->warning },
+        { "danger",                &t->danger },
+        { "titlebar_active",       &t->titlebar_active },
+        { "titlebar_inactive",     &t->titlebar_inactive },
+        { "titlebar_text_active",  &t->titlebar_text_active },
+        { "titlebar_text_inactive",&t->titlebar_text_inactive },
+        { "titlebar_btn_bg",       &t->titlebar_btn_bg },
+        { "titlebar_btn_bg_hover", &t->titlebar_btn_bg_hover },
+        { "titlebar_btn_icon",     &t->titlebar_btn_icon },
+        { "taskbar_bg",            &t->taskbar_bg },
+        { "taskbar_item_active",   &t->taskbar_item_active },
+        { "taskbar_item_open",     &t->taskbar_item_open },
+        { "taskbar_text",          &t->taskbar_text },
     };
     size_t num_tokens = sizeof(tokens) / sizeof(tokens[0]);
 
-    for (size_t i = 0; i < num_tokens; i++) {
-        uint32_t color = *tokens[i].ptr;
-        mu_Real r = (color >> 16) & 0xFF;
-        mu_Real g = (color >> 8)  & 0xFF;
-        mu_Real b = color & 0xFF;
+    mu_layout_row(ctx, 1, (int[]){ -1 }, -1);
+    mu_begin_panel(ctx, "theme_tokens_panel");
 
-        mu_layout_row(ctx, 5, (int[]){ 150, 40, 80, 80, 80 }, 22);
+    int changed = 0;
+    for (size_t i = 0; i < num_tokens; i++) {
+        uint32_t orig_color = *tokens[i].ptr;
+        uint32_t a = (orig_color >> 24) & 0xFF;
+        mu_Real r = (orig_color >> 16) & 0xFF;
+        mu_Real g = (orig_color >> 8)  & 0xFF;
+        mu_Real b = orig_color & 0xFF;
+
+        mu_layout_row(ctx, 5, (int[]){ 160, 36, 85, 85, 85 }, 22);
         mu_label(ctx, tokens[i].name);
 
         mu_Rect swatch = mu_layout_next(ctx);
         mu_draw_rect(ctx, swatch, mu_color((int)r, (int)g, (int)b, 255));
 
         mu_push_id(ctx, tokens[i].name, strlen(tokens[i].name));
-        mu_slider(ctx, &r, 0, 255);
-        mu_slider(ctx, &g, 0, 255);
-        mu_slider(ctx, &b, 0, 255);
+
+        mu_push_id(ctx, "r", 1);
+        if (mu_slider(ctx, &r, 0, 255) & MU_RES_CHANGE)
+            changed = 1;
         mu_pop_id(ctx);
 
-        *tokens[i].ptr = (0xFFu << 24) |
-                         (((uint32_t)r & 0xFF) << 16) |
-                         (((uint32_t)g & 0xFF) << 8) |
-                         ((uint32_t)b & 0xFF);
+        mu_push_id(ctx, "g", 1);
+        if (mu_slider(ctx, &g, 0, 255) & MU_RES_CHANGE)
+            changed = 1;
+        mu_pop_id(ctx);
+
+        mu_push_id(ctx, "b", 1);
+        if (mu_slider(ctx, &b, 0, 255) & MU_RES_CHANGE)
+            changed = 1;
+        mu_pop_id(ctx);
+
+        mu_pop_id(ctx);
+
+        uint32_t new_color = ((uint32_t)a << 24) |
+                             (((uint32_t)r & 0xFF) << 16) |
+                             (((uint32_t)g & 0xFF) << 8) |
+                             ((uint32_t)b & 0xFF);
+        if (new_color != orig_color) {
+            *tokens[i].ptr = new_color;
+            changed = 1;
+        }
     }
 
-    mu_layout_row(ctx, 2, (int[]){ 140, 140 }, 30);
-    if (mu_button(ctx, "Apply Theme")) {
+    mu_end_panel(ctx);
+
+    if (changed) {
         dbg_set_theme(st, &st->active_theme);
-    }
-    if (mu_button(ctx, "Revert Theme")) {
-        dbg_revert_theme(st);
+        st->theme_saved = 0;
+        snprintf(st->status_msg, sizeof(st->status_msg), "Theme modified (live preview, unsaved)");
     }
 }
 
@@ -732,6 +829,10 @@ int main(int argc, char **argv)
 
         vanilla_present(st.win, NULL);
         usleep(16000);
+    }
+
+    if (st.theme_loaded && !st.theme_saved) {
+        dbg_revert_theme(&st);
     }
 
     if (st.dbg_fd >= 0)

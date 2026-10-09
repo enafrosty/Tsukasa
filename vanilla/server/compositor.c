@@ -755,6 +755,10 @@ void compositor_render_frame(struct vanilla_server *srv)
     printf("[vanilla] compositor: render\n");
 
     vanilla_compositor_t *comp = &srv->compositor;
+    if (g_perf_overlay_enabled) {
+        vanilla_rect_t hud_dmg = { THEME_PX(8), THEME_PX(8), THEME_PX(240), THEME_PX(48) };
+        compositor_add_damage(comp, &hud_dmg);
+    }
     compositor_merge_damage(comp);
 
     int initial_dirty_count = comp->dirty_count;
@@ -1096,9 +1100,6 @@ void compositor_render_frame(struct vanilla_server *srv)
                 client_count++;
         }
         compositor_render_overlay(comp, frame_time_us, initial_dirty_count, client_count);
-
-        vanilla_rect_t hud_dmg = { THEME_PX(8), THEME_PX(8), THEME_PX(240), THEME_PX(48) };
-        compositor_add_damage(comp, &hud_dmg);
     }
 
     vanilla_server_release_buffers(srv);

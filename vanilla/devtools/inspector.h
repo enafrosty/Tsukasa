@@ -71,6 +71,8 @@ typedef struct {
     vanilla_theme_t         active_theme;
     vanilla_theme_t         original_theme;
     int                     theme_loaded;
+    int                     theme_saved;
+    char                    status_msg[64];
 } devtools_state_t;
 
 /* Renderer callbacks for microui */
