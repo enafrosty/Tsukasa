@@ -43,6 +43,15 @@ BIN = ../bin/shell.elf
 
 OBJS = shell_client.o dock.o statusbar.o
 
+$(CRT0) $(LIBC_A) $(LIBM_A):
+	$(MAKE) -C ../../tsukasa-libc all
+
+$(LIBVANILLA_A):
+	$(MAKE) -C .. $(LIBVANILLA_A)
+
+$(APP_COMMON):
+	$(MAKE) -C .. $(APP_COMMON)
+
 all: $(BIN)
 
 $(BIN): $(CRT0) $(OBJS) $(APP_COMMON) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
