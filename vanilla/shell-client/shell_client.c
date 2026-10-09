@@ -15,6 +15,8 @@
  */
 
 #include "shell_client.h"
+#include "statusbar.h"
+#include "dock.h"
 #include "../server/server.h"
 #include "../apps/app_common.h"
 #include "../libvanilla/icon.h"
@@ -22,8 +24,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <time.h>
+
+#ifndef SHELL_SEPARATE_UNITS
+#include "statusbar.c"
+#include "dock.c"
+#endif
 
 typedef struct {
     const char *title;
@@ -363,14 +371,14 @@ void shell_update_clock(vanilla_shell_t *shell, struct vanilla_server *srv)
 
     time_t now = time(NULL);
     if (now != shell->last_clock_sec && now > 0) {
-        struct tm tm;
+        struct tm tm_val;
 #if defined(_WIN32)
-        gmtime_s(&tm, &now);
+        gmtime_s(&tm_val, &now);
 #else
-        gmtime_r(&now, &tm);
+        gmtime_r(&now, &tm_val);
 #endif
         char buf[16];
-        snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
+        snprintf(buf, sizeof(buf), "%02d:%02d", tm_val.tm_hour, tm_val.tm_min);
 
         if (strncmp(buf, shell->clock_str, sizeof(buf)) != 0) {
             strncpy(shell->clock_str, buf, sizeof(shell->clock_str) - 1);
@@ -379,7 +387,6 @@ void shell_update_clock(vanilla_shell_t *shell, struct vanilla_server *srv)
         shell->last_clock_sec = now;
     }
 }
-
 
 static void __attribute__((unused)) shell_render_taskbar(shell_state_t *st)
 {
@@ -635,6 +642,39 @@ static void shell_toggle_start_menu(shell_state_t *st)
     }
 }
 
+static int shell_move_resize_window(vanilla_window_t *win, int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (!win || !win->client)
+        return -1;
+
+    vanilla_msg_hdr_t hdr;
+    vanilla_msg_move_resize_t req;
+
+    hdr.magic = VANILLA_IPC_MAGIC;
+    hdr.msg_type = MSG_MOVE_RESIZE;
+    hdr.payload_len = (uint16_t)sizeof(req);
+    hdr.window_id = win->window_id;
+
+    req.x = x;
+    req.y = y;
+    req.width = w;
+    req.height = h;
+
+    int sfd = vanilla_client_get_fd(win->client);
+    if (sfd < 0)
+        return -1;
+
+    if (write(sfd, &hdr, sizeof(hdr)) < 0 ||
+        write(sfd, &req, sizeof(req)) < 0)
+        return -1;
+
+    win->x = x;
+    win->y = y;
+    win->width = w;
+    win->height = h;
+    return 0;
+}
+
 void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
 {
     if (!st || !ev)
@@ -643,10 +683,17 @@ void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
     st->mod_state = ev->mod_state;
 
     if (ev->type == VANILLA_EVENT_CLOSE_REQ) {
-        if (st->taskbar_win && ev->window_id == st->taskbar_win->window_id) {
+        if ((st->statusbar_win && ev->window_id == st->statusbar_win->window_id) ||
+            (st->dock_win && ev->window_id == st->dock_win->window_id)) {
+            st->running = 0;
+        } else if (st->taskbar_win && ev->window_id == st->taskbar_win->window_id) {
             st->running = 0;
         } else if (st->launcher.win && ev->window_id == st->launcher.win->window_id) {
             shell_close_launcher(st);
+        } else if (st->statusbar.menu_win && ev->window_id == st->statusbar.menu_win->window_id) {
+            statusbar_close_menu(&st->statusbar);
+        } else if (st->dock.menu_win && ev->window_id == st->dock.menu_win->window_id) {
+            dock_close_menu(&st->dock);
         } else if (st->shell.start_menu_win && ev->window_id == st->shell.start_menu_win->window_id) {
             shell_close_start_menu(st);
         }
@@ -654,6 +701,27 @@ void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
     }
 
     if (ev->type == VANILLA_EVENT_CONFIGURE) {
+        if (st->statusbar_win && ev->window_id == st->statusbar_win->window_id) {
+            if (ev->configure.width > 0 && ev->configure.height > 0) {
+                if ((int32_t)ev->configure.width != st->screen_w) {
+                    st->screen_w = (int32_t)ev->configure.width;
+                    st->statusbar.dirty = 1;
+                    dock_recompute_geometry(&st->dock, st->screen_w, st->screen_h);
+                    if (st->dock_win) {
+                        shell_move_resize_window(st->dock_win, st->dock.x, st->dock.y,
+                                                 st->dock.width, st->dock.height);
+                        st->dock.dirty = 1;
+                    }
+                }
+            }
+            return;
+        }
+
+        if (st->dock_win && ev->window_id == st->dock_win->window_id) {
+            st->dock.dirty = 1;
+            return;
+        }
+
         if (st->taskbar_win && ev->window_id == st->taskbar_win->window_id) {
             if (ev->configure.width > 0 && ev->configure.height > 0) {
                 if ((int32_t)ev->configure.width != st->screen_w) {
@@ -661,8 +729,13 @@ void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
                     st->taskbar_dirty = 1;
                 }
             }
-        } else if ((!st->launcher.win || ev->window_id != st->launcher.win->window_id) &&
-                   (!st->shell.start_menu_win || ev->window_id != st->shell.start_menu_win->window_id)) {
+            return;
+        }
+
+        if ((!st->launcher.win || ev->window_id != st->launcher.win->window_id) &&
+            (!st->statusbar.menu_win || ev->window_id != st->statusbar.menu_win->window_id) &&
+            (!st->dock.menu_win || ev->window_id != st->dock.menu_win->window_id) &&
+            (!st->shell.start_menu_win || ev->window_id != st->shell.start_menu_win->window_id)) {
             if (ev->configure.width == 0 || ev->configure.height == 0) {
                 /* Window unmapped or destroyed */
                 for (int i = 0; i < st->win_list.count; i++) {
@@ -695,31 +768,56 @@ void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
                 }
                 st->taskbar_dirty = 1;
             }
+
+            int old_dock_w = st->dock.width;
+            dock_sync_windows(&st->dock, &st->win_list, st->screen_w, st->screen_h);
+            if (st->dock_win && st->dock.width != old_dock_w) {
+                shell_move_resize_window(st->dock_win, st->dock.x, st->dock.y,
+                                         st->dock.width, st->dock.height);
+            }
         }
         return;
     }
 
     if (ev->type == VANILLA_EVENT_FOCUS) {
+        const char *focused_title = NULL;
         for (int i = 0; i < st->win_list.count; i++) {
             if (st->win_list.windows[i].window_id == ev->window_id) {
                 st->win_list.windows[i].is_focused = ev->focus.focused;
-                if (ev->focus.focused)
+                if (ev->focus.focused) {
                     st->win_list.windows[i].is_mapped = 1;
+                    st->win_list.windows[i].is_minimized = 0;
+                    focused_title = st->win_list.windows[i].title;
+                }
             } else if (ev->focus.focused) {
                 st->win_list.windows[i].is_focused = 0;
             }
         }
         st->taskbar_dirty = 1;
 
+        if (ev->focus.focused && focused_title) {
+            statusbar_set_active_title(&st->statusbar, focused_title);
+        }
+
+        dock_sync_windows(&st->dock, &st->win_list, st->screen_w, st->screen_h);
+
         /* Dismiss popups when focus changes */
         if (ev->focus.focused) {
             if (st->launcher.visible && st->launcher.win && ev->window_id != st->launcher.win->window_id)
                 shell_close_launcher(st);
+            if (st->statusbar.menu_open && st->statusbar.menu_win && ev->window_id != st->statusbar.menu_win->window_id)
+                statusbar_close_menu(&st->statusbar);
+            if (st->dock.menu_open && st->dock.menu_win && ev->window_id != st->dock.menu_win->window_id)
+                dock_close_menu(&st->dock);
             if (st->shell.start_menu_open && st->shell.start_menu_win && ev->window_id != st->shell.start_menu_win->window_id)
                 shell_close_start_menu(st);
         } else {
             if (st->launcher.visible && st->launcher.win && ev->window_id == st->launcher.win->window_id)
                 shell_close_launcher(st);
+            if (st->statusbar.menu_open && st->statusbar.menu_win && ev->window_id == st->statusbar.menu_win->window_id)
+                statusbar_close_menu(&st->statusbar);
+            if (st->dock.menu_open && st->dock.menu_win && ev->window_id == st->dock.menu_win->window_id)
+                dock_close_menu(&st->dock);
             if (st->shell.start_menu_open && st->shell.start_menu_win && ev->window_id == st->shell.start_menu_win->window_id)
                 shell_close_start_menu(st);
         }
@@ -735,14 +833,62 @@ void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
             return;
         }
 
-        /* Super / Windows key Start Menu toggle */
+        /* Super / Windows key Start / System Menu toggle */
         if (iev->type == EV_KEY && (iev->code == KEY_LEFTMETA || iev->code == KEY_RIGHTMETA) && iev->value == 1) {
-            shell_toggle_start_menu(st);
+            if (st->statusbar.win)
+                statusbar_toggle_menu(&st->statusbar, st);
+            else
+                shell_toggle_start_menu(st);
             return;
         }
 
-        /* Taskbar window events */
-        if (st->taskbar_win && ev->window_id == st->taskbar_win->window_id) {
+        /* Top status bar events */
+        if (st->statusbar.win && ev->window_id == st->statusbar.win->window_id) {
+            if (iev->type == EV_KEY && iev->code == BTN_LEFT && iev->value == 1) {
+                int32_t cx = (int32_t)iev->pad1;
+                int32_t cy = (int32_t)iev->pad2;
+                statusbar_handle_mouse_click(&st->statusbar, cx, cy, st);
+            }
+            return;
+        }
+
+        /* Status bar System Menu events */
+        if (st->statusbar.menu_win && ev->window_id == st->statusbar.menu_win->window_id) {
+            if (iev->type == EV_KEY && iev->code == BTN_LEFT && iev->value == 1) {
+                int32_t cx = (int32_t)iev->pad1;
+                int32_t cy = (int32_t)iev->pad2;
+                statusbar_handle_menu_click(&st->statusbar, cx, cy, st);
+            } else if (iev->type == EV_KEY && iev->value == 1 && iev->code == KEY_ESC) {
+                statusbar_close_menu(&st->statusbar);
+            }
+            return;
+        }
+
+        /* Floating Aurora Dock events */
+        if (st->dock.win && ev->window_id == st->dock.win->window_id) {
+            if (iev->type == EV_KEY && (iev->code == BTN_LEFT || iev->code == BTN_RIGHT) && iev->value == 1) {
+                int32_t cx = (int32_t)iev->pad1;
+                int32_t cy = (int32_t)iev->pad2;
+                dock_handle_mouse_click(&st->dock, cx, cy, iev->code, st);
+            }
+            return;
+        }
+
+        /* Dock context menu events */
+        if (st->dock.menu_win && ev->window_id == st->dock.menu_win->window_id) {
+            if (iev->type == EV_KEY && iev->code == BTN_LEFT && iev->value == 1) {
+                int32_t cx = (int32_t)iev->pad1;
+                int32_t cy = (int32_t)iev->pad2;
+                dock_handle_menu_click(&st->dock, cx, cy, st);
+            } else if (iev->type == EV_KEY && iev->value == 1 && iev->code == KEY_ESC) {
+                dock_close_menu(&st->dock);
+            }
+            return;
+        }
+
+        /* Taskbar window events (preserved for test runner) */
+        if (st->taskbar_win && ev->window_id == st->taskbar_win->window_id &&
+            (!st->statusbar.win || ev->window_id != st->statusbar.win->window_id)) {
             if (iev->type == EV_KEY && iev->code == BTN_LEFT && iev->value == 1) {
                 int32_t cx = (int32_t)iev->pad1;
                 int32_t cy = (int32_t)iev->pad2;
@@ -893,7 +1039,7 @@ int main(int argc, char **argv)
     (void)argc;
     (void)argv;
 
-    printf("[shell] Desktop shell client started\n");
+    printf("[shell] Desktop modern shell client started\n");
 
     const char *sock_path = VANILLA_SOCKET_PATH;
     vanilla_client_t *client = NULL;
@@ -917,23 +1063,48 @@ int main(int argc, char **argv)
     state.screen_w = 1024;
     state.screen_h = 768;
     state.running = 1;
-    state.taskbar_dirty = 1;
 
     shell_init(&state.shell);
     launcher_init(&state.launcher);
+    statusbar_init(&state.statusbar);
+    dock_init(&state.dock);
 
-    state.taskbar_win = vanilla_create_window(client, "Taskbar", 0, state.screen_h - TASKBAR_HEIGHT,
-                                              state.screen_w, TASKBAR_HEIGHT,
-                                              WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_TRANSPARENT);
-    if (!state.taskbar_win) {
-        printf("[shell] Fatal: Failed to create taskbar window\n");
+    /* 1. Top status bar window: (0, 0, screen_w, 28) */
+    state.statusbar_win = vanilla_create_window(client, "Statusbar", 0, 0,
+                                               state.screen_w, STATUSBAR_HEIGHT,
+                                               WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_TRANSPARENT);
+    if (!state.statusbar_win) {
+        printf("[shell] Fatal: Failed to create status bar window\n");
         vanilla_disconnect(client);
         return 1;
     }
+    state.statusbar.win = state.statusbar_win;
 
-    vanilla_map_window(state.taskbar_win);
-    shell_render_taskbar(&state);
-    vanilla_present(state.taskbar_win, NULL);
+    /* 2. Floating dock window: centered horizontally, floating 12px above bottom edge */
+    dock_recompute_geometry(&state.dock, state.screen_w, state.screen_h);
+    state.dock_win = vanilla_create_window(client, "Dock", state.dock.x, state.dock.y,
+                                          state.dock.width, state.dock.height,
+                                          WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_TRANSPARENT);
+    if (!state.dock_win) {
+        printf("[shell] Fatal: Failed to create dock window\n");
+        vanilla_destroy_window(state.statusbar_win);
+        vanilla_disconnect(client);
+        return 1;
+    }
+    state.dock.win = state.dock_win;
+
+    /* Backward compatibility alias pointer */
+    state.taskbar_win = state.statusbar_win;
+
+    vanilla_map_window(state.statusbar_win);
+    statusbar_render(&state.statusbar, state.screen_w);
+    vanilla_present(state.statusbar_win, NULL);
+    state.statusbar.dirty = 0;
+
+    vanilla_map_window(state.dock_win);
+    dock_render(&state.dock);
+    vanilla_present(state.dock_win, NULL);
+    state.dock.dirty = 0;
 
     while (state.running) {
         vanilla_event_t ev;
@@ -941,18 +1112,38 @@ int main(int argc, char **argv)
             shell_handle_event(&state, &ev);
         }
 
+        /* Throttled system telemetry (strictly once per second) */
+        statusbar_update_telemetry(&state.statusbar);
         shell_update_clock(&state.shell, NULL);
 
-        if (state.taskbar_dirty && state.taskbar_win) {
-            shell_render_taskbar(&state);
-            vanilla_present(state.taskbar_win, NULL);
-            state.taskbar_dirty = 0;
+        if (state.statusbar.dirty && state.statusbar_win) {
+            statusbar_render(&state.statusbar, state.screen_w);
+            vanilla_present(state.statusbar_win, NULL);
+            state.statusbar.dirty = 0;
+        }
+
+        if (state.dock.dirty && state.dock_win) {
+            dock_render(&state.dock);
+            vanilla_present(state.dock_win, NULL);
+            state.dock.dirty = 0;
         }
 
         if (state.launcher.visible && state.launcher.dirty && state.launcher.win) {
             launcher_render_client(&state);
             vanilla_present(state.launcher.win, NULL);
             state.launcher.dirty = 0;
+        }
+
+        if (state.statusbar.menu_open && state.statusbar.dirty && state.statusbar.menu_win) {
+            statusbar_render_menu(&state.statusbar);
+            vanilla_present(state.statusbar.menu_win, NULL);
+            state.statusbar.dirty = 0;
+        }
+
+        if (state.dock.menu_open && state.dock.dirty && state.dock.menu_win) {
+            dock_render_menu(&state.dock);
+            vanilla_present(state.dock.menu_win, NULL);
+            state.dock.dirty = 0;
         }
 
         if (state.shell.start_menu_open && state.shell.start_menu_dirty && state.shell.start_menu_win) {
@@ -965,13 +1156,20 @@ int main(int argc, char **argv)
         nanosleep(&ts, NULL);
     }
 
+    if (state.dock.menu_win)
+        vanilla_destroy_window(state.dock.menu_win);
+    if (state.statusbar.menu_win)
+        vanilla_destroy_window(state.statusbar.menu_win);
     if (state.launcher.win)
         vanilla_destroy_window(state.launcher.win);
     if (state.shell.start_menu_win)
         vanilla_destroy_window(state.shell.start_menu_win);
-    if (state.taskbar_win)
-        vanilla_destroy_window(state.taskbar_win);
+    if (state.dock_win)
+        vanilla_destroy_window(state.dock_win);
+    if (state.statusbar_win)
+        vanilla_destroy_window(state.statusbar_win);
 
+    dock_free_icons(&state.dock);
     shell_free_icons();
 
     vanilla_disconnect(client);

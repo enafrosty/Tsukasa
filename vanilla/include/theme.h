@@ -102,6 +102,18 @@ extern const vanilla_theme_t *g_theme;
 #define THEME_PX(n)  ((int32_t)((float)(n) * g_theme->scale_factor))
 #define THEME_F(f)   ((f) * g_theme->scale_factor)
 
+/* Modern shell design tokens */
+#define STATUSBAR_HEIGHT_PX          28
+#define DOCK_HEIGHT_PX               52
+#define DOCK_RADIUS_PX               16
+#define THEME_COLOR_STATUSBAR_BG     0xD02E3440u
+#define THEME_COLOR_STATUSBAR_BORDER 0x2088C0D0u
+#define THEME_COLOR_DOCK_BG          0xCC232831u
+#define THEME_COLOR_DOCK_BORDER      0x4088C0D0u
+#define THEME_COLOR_DOCK_PILL        0x3088C0D0u
+#define THEME_COLOR_FROST_CYAN       0xFF88C0D0u
+#define THEME_COLOR_SLATE            0xFF4C566Au
+
 /*
  * Load theme from an INI file. Returns 0 on success, -1 on parse error.
  * Falls back to the compiled-in nord-dark defaults on any failure.

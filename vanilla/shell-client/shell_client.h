@@ -24,6 +24,8 @@
 #include "../include/theme.h"
 #include "../include/vanilla.h"
 #include "../input/keymap.h"
+#include "statusbar.h"
+#include "dock.h"
 
 #define TASKBAR_HEIGHT       THEME_PX(36)
 #define TASKBAR_START_X      THEME_PX(4)
@@ -95,11 +97,15 @@ typedef struct vanilla_shell {
     int              start_menu_dirty;
 } vanilla_shell_t;
 
-typedef struct {
+typedef struct shell_state {
     vanilla_client_t    *client;
     vanilla_window_t    *taskbar_win;
+    vanilla_window_t    *statusbar_win;
+    vanilla_window_t    *dock_win;
     int32_t              screen_w;
     int32_t              screen_h;
+    statusbar_state_t    statusbar;
+    dock_state_t         dock;
     vanilla_shell_t      shell;
     vanilla_launcher_t   launcher;
     shell_window_list_t  win_list;

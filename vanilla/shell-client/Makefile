@@ -41,16 +41,24 @@ APP_COMMON   = ../apps/app_common.o
 
 BIN = ../bin/shell.elf
 
+OBJS = shell_client.o dock.o statusbar.o
+
 all: $(BIN)
 
-$(BIN): $(CRT0) shell_client.o $(APP_COMMON) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(BIN): $(CRT0) $(OBJS) $(APP_COMMON) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p ../bin
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) shell_client.o $(APP_COMMON) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) $(OBJS) $(APP_COMMON) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-shell_client.o: shell_client.c shell_client.h
+dock.o: dock.c dock.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+statusbar.o: statusbar.c statusbar.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+shell_client.o: shell_client.c shell_client.h dock.h statusbar.h
+	$(CC) $(CFLAGS) -DSHELL_SEPARATE_UNITS -c -o $@ $<
+
 clean:
-	rm -f shell_client.o $(BIN)
+	rm -f $(OBJS) $(BIN)
 
 .PHONY: all clean
