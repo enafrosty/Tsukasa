@@ -54,6 +54,7 @@
 typedef struct {
     uint32_t window_id;
     char     title[VANILLA_TITLE_MAX];
+    char     exec_name[32];
     int      is_mapped;
     int      is_focused;
     int      is_minimized;
@@ -125,6 +126,8 @@ void launcher_init(vanilla_launcher_t *launcher);
 int  launcher_fuzzy_match(const char *pattern, const char *target);
 void launcher_update_matches(vanilla_launcher_t *launcher);
 int  launcher_handle_key_state(vanilla_launcher_t *launcher, uint16_t code, int pressed, uint16_t mod_state);
+void shell_close_launcher(shell_state_t *st);
+void shell_close_start_menu(shell_state_t *st);
 void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev);
 
 #endif /* _VANILLA_SHELL_CLIENT_H */

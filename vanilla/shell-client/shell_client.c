@@ -27,6 +27,8 @@
 #include <strings.h>
 #include <unistd.h>
 #include <time.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 
 #ifndef SHELL_SEPARATE_UNITS
 #include "statusbar.c"
@@ -135,8 +137,61 @@ static inline char to_lower(char c)
     return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
 }
 
+typedef struct {
+    char   app_name[32];
+    char   exec_name[32];
+    pid_t  pid;
+    time_t spawn_time;
+} shell_pending_spawn_t;
+
+static shell_pending_spawn_t g_pending_spawn;
+
+static void shell_record_pending_spawn(const char *path)
+{
+    memset(&g_pending_spawn, 0, sizeof(g_pending_spawn));
+    if (!path || !path[0])
+        return;
+
+    const char *leaf = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\')
+            leaf = p + 1;
+    }
+    strncpy(g_pending_spawn.exec_name, leaf, sizeof(g_pending_spawn.exec_name) - 1);
+
+    if (strcasestr(leaf, "terminal") || strcasestr(leaf, "term"))
+        strncpy(g_pending_spawn.app_name, "Terminal", sizeof(g_pending_spawn.app_name) - 1);
+    else if (strcasestr(leaf, "filemgr") || strcasestr(leaf, "file"))
+        strncpy(g_pending_spawn.app_name, "File Manager", sizeof(g_pending_spawn.app_name) - 1);
+    else if (strcasestr(leaf, "notepad"))
+        strncpy(g_pending_spawn.app_name, "Notepad", sizeof(g_pending_spawn.app_name) - 1);
+    else if (strcasestr(leaf, "calc"))
+        strncpy(g_pending_spawn.app_name, "Calculator", sizeof(g_pending_spawn.app_name) - 1);
+    else if (strcasestr(leaf, "settings"))
+        strncpy(g_pending_spawn.app_name, "Settings", sizeof(g_pending_spawn.app_name) - 1);
+    else if (strcasestr(leaf, "taskmgr"))
+        strncpy(g_pending_spawn.app_name, "Task Manager", sizeof(g_pending_spawn.app_name) - 1);
+    else if (strcasestr(leaf, "sysfetch"))
+        strncpy(g_pending_spawn.app_name, "System Fetch", sizeof(g_pending_spawn.app_name) - 1);
+    else if (strcasestr(leaf, "ps"))
+        strncpy(g_pending_spawn.app_name, "Process Viewer", sizeof(g_pending_spawn.app_name) - 1);
+    else if (strcasestr(leaf, "net"))
+        strncpy(g_pending_spawn.app_name, "Network Info", sizeof(g_pending_spawn.app_name) - 1);
+    else {
+        strncpy(g_pending_spawn.app_name, leaf, sizeof(g_pending_spawn.app_name) - 1);
+        char *dot = strrchr(g_pending_spawn.app_name, '.');
+        if (dot)
+            *dot = '\0';
+        if (g_pending_spawn.app_name[0] >= 'a' && g_pending_spawn.app_name[0] <= 'z')
+            g_pending_spawn.app_name[0] = (char)(g_pending_spawn.app_name[0] - 32);
+    }
+    g_pending_spawn.spawn_time = time(NULL);
+}
+
 void shell_spawn_app(const char *path)
 {
+    shell_record_pending_spawn(path);
+
     char current_path[256];
     strncpy(current_path, path, sizeof(current_path) - 1);
     current_path[sizeof(current_path) - 1] = '\0';
@@ -170,7 +225,8 @@ void shell_spawn_app(const char *path)
             pid = spawn(fat_upath, fuargv, NULL);
         }
     }
-    (void)pid;
+    if (pid > 0)
+        g_pending_spawn.pid = pid;
 }
 
 static void launcher_exec_selected(vanilla_launcher_t *launcher)
@@ -545,7 +601,7 @@ static void launcher_render_client(shell_state_t *st)
     }
 }
 
-static void shell_close_launcher(shell_state_t *st)
+void shell_close_launcher(shell_state_t *st)
 {
     st->launcher.visible = 0;
     if (st->launcher.win) {
@@ -553,7 +609,7 @@ static void shell_close_launcher(shell_state_t *st)
     }
 }
 
-static void shell_close_start_menu(shell_state_t *st)
+void shell_close_start_menu(shell_state_t *st)
 {
     st->shell.start_menu_open = 0;
     if (st->shell.start_menu_win) {
@@ -642,38 +698,7 @@ static void shell_toggle_start_menu(shell_state_t *st)
     }
 }
 
-static int shell_move_resize_window(vanilla_window_t *win, int32_t x, int32_t y, int32_t w, int32_t h)
-{
-    if (!win || !win->client)
-        return -1;
 
-    vanilla_msg_hdr_t hdr;
-    vanilla_msg_move_resize_t req;
-
-    hdr.magic = VANILLA_IPC_MAGIC;
-    hdr.msg_type = MSG_MOVE_RESIZE;
-    hdr.payload_len = (uint16_t)sizeof(req);
-    hdr.window_id = win->window_id;
-
-    req.x = x;
-    req.y = y;
-    req.width = w;
-    req.height = h;
-
-    int sfd = vanilla_client_get_fd(win->client);
-    if (sfd < 0)
-        return -1;
-
-    if (write(sfd, &hdr, sizeof(hdr)) < 0 ||
-        write(sfd, &req, sizeof(req)) < 0)
-        return -1;
-
-    win->x = x;
-    win->y = y;
-    win->width = w;
-    win->height = h;
-    return 0;
-}
 
 void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
 {
@@ -706,11 +731,23 @@ void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
                 if ((int32_t)ev->configure.width != st->screen_w) {
                     st->screen_w = (int32_t)ev->configure.width;
                     st->statusbar.dirty = 1;
+                    int old_w = st->dock.width;
                     dock_recompute_geometry(&st->dock, st->screen_w, st->screen_h);
                     if (st->dock_win) {
-                        shell_move_resize_window(st->dock_win, st->dock.x, st->dock.y,
-                                                 st->dock.width, st->dock.height);
-                        st->dock.dirty = 1;
+                        if (st->dock.width != old_w) {
+                            vanilla_destroy_window(st->dock_win);
+                            st->dock_win = vanilla_create_window(st->client, "Dock", st->dock.x, st->dock.y,
+                                                                 st->dock.width, st->dock.height,
+                                                                 WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_TRANSPARENT);
+                            if (st->dock_win) {
+                                st->dock.win = st->dock_win;
+                                vanilla_map_window(st->dock_win);
+                                st->dock.dirty = 1;
+                            }
+                        } else {
+                            vanilla_move_window(st->dock_win, st->dock.x, st->dock.y);
+                            st->dock.dirty = 1;
+                        }
                     }
                 }
             }
@@ -764,16 +801,84 @@ void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
                     we->is_focused = 0;
                     we->is_minimized = 0;
                     we->flags = ev->configure.flags;
-                    snprintf(we->title, sizeof(we->title), "App");
+
+                    char app_title[VANILLA_TITLE_MAX] = "App";
+                    char exec_name[32] = "";
+
+                    time_t now = time(NULL);
+                    if (g_pending_spawn.app_name[0] && (now - g_pending_spawn.spawn_time) < 10) {
+                        strncpy(app_title, g_pending_spawn.app_name, sizeof(app_title) - 1);
+                        strncpy(exec_name, g_pending_spawn.exec_name, sizeof(exec_name) - 1);
+                        memset(&g_pending_spawn, 0, sizeof(g_pending_spawn));
+                    } else {
+                        FILE *fp = fopen("/proc/processes", "r");
+                        if (fp) {
+                            char line[256];
+                            int is_header = 1;
+                            while (fgets(line, sizeof(line), fp)) {
+                                if (is_header) {
+                                    is_header = 0;
+                                    continue;
+                                }
+                                char *p = line;
+                                while (*p == ' ') p++;
+                                int pid = (int)strtol(p, &p, 10);
+                                while (*p == ' ') p++;
+                                strtol(p, &p, 10);
+                                while (*p == ' ') p++;
+                                while (*p && *p != ' ' && *p != '\n') p++;
+                                while (*p == ' ') p++;
+                                char *n_start = p;
+                                while (*p && *p != ' ' && *p != '\n') p++;
+                                size_t n_len = (size_t)(p - n_start);
+                                if (n_len > 0 && pid > 0) {
+                                    char pname[32];
+                                    if (n_len >= sizeof(pname)) n_len = sizeof(pname) - 1;
+                                    memcpy(pname, n_start, n_len);
+                                    pname[n_len] = '\0';
+
+                                    for (int pi = 0; pi < DOCK_PINNED_COUNT; pi++) {
+                                        if (st->dock.items[pi].window_id == 0 &&
+                                            (strcasestr(pname, st->dock.items[pi].name) ||
+                                             strcasestr(st->dock.items[pi].name, pname))) {
+                                            strncpy(app_title, st->dock.items[pi].name, sizeof(app_title) - 1);
+                                            strncpy(exec_name, pname, sizeof(exec_name) - 1);
+                                            break;
+                                        }
+                                    }
+                                    if (exec_name[0])
+                                        break;
+                                }
+                            }
+                            fclose(fp);
+                        }
+                    }
+
+                    strncpy(we->title, app_title, sizeof(we->title) - 1);
+                    we->title[sizeof(we->title) - 1] = '\0';
+                    strncpy(we->exec_name, exec_name, sizeof(we->exec_name) - 1);
+                    we->exec_name[sizeof(we->exec_name) - 1] = '\0';
                 }
                 st->taskbar_dirty = 1;
             }
 
             int old_dock_w = st->dock.width;
+            int old_dock_x = st->dock.x;
             dock_sync_windows(&st->dock, &st->win_list, st->screen_w, st->screen_h);
-            if (st->dock_win && st->dock.width != old_dock_w) {
-                shell_move_resize_window(st->dock_win, st->dock.x, st->dock.y,
-                                         st->dock.width, st->dock.height);
+            if (st->dock_win) {
+                if (st->dock.width != old_dock_w) {
+                    vanilla_destroy_window(st->dock_win);
+                    st->dock_win = vanilla_create_window(st->client, "Dock", st->dock.x, st->dock.y,
+                                                         st->dock.width, st->dock.height,
+                                                         WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_TRANSPARENT);
+                    if (st->dock_win) {
+                        st->dock.win = st->dock_win;
+                        vanilla_map_window(st->dock_win);
+                        st->dock.dirty = 1;
+                    }
+                } else if (st->dock.x != old_dock_x) {
+                    vanilla_move_window(st->dock_win, st->dock.x, st->dock.y);
+                }
             }
         }
         return;
@@ -1063,6 +1168,22 @@ int main(int argc, char **argv)
     state.screen_w = 1024;
     state.screen_h = 768;
     state.running = 1;
+
+#if !defined(_WIN32)
+    int fb_fd = open("/dev/fb0", O_RDONLY);
+    if (fb_fd >= 0) {
+        struct fb_var_screeninfo_query {
+            uint32_t xres, yres, xres_virtual, yres_virtual;
+            uint32_t xoffset, yoffset;
+            uint32_t bits_per_pixel;
+        } vinfo;
+        if (ioctl(fb_fd, 0x4600, &vinfo) == 0 && vinfo.xres > 0 && vinfo.yres > 0) {
+            state.screen_w = (int32_t)vinfo.xres;
+            state.screen_h = (int32_t)vinfo.yres;
+        }
+        close(fb_fd);
+    }
+#endif
 
     shell_init(&state.shell);
     launcher_init(&state.launcher);

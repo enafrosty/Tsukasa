@@ -338,5 +338,10 @@ int statusbar_handle_mouse_click(statusbar_state_t *sb, int32_t cx, int32_t cy, 
         return 1;
     }
 
+    if (sb->menu_open) {
+        statusbar_close_menu(sb);
+        return 1;
+    }
+
     return 0;
 }

@@ -291,17 +291,28 @@ void dock_render(dock_state_t *dock)
     }
 }
 
-static int match_app_name(const char *win_title, const char *app_name)
+static int match_app_name(const char *win_title, const char *exec_name, const char *app_name)
 {
-    if (!win_title || !app_name)
+    if (!app_name)
         return 0;
 
-    size_t alen = strlen(app_name);
-    if (strncasecmp(win_title, app_name, alen) == 0)
-        return 1;
+    if (win_title && win_title[0]) {
+        size_t alen = strlen(app_name);
+        if (strncasecmp(win_title, app_name, alen) == 0)
+            return 1;
 
-    if (strcasestr(win_title, app_name) != NULL)
-        return 1;
+        if (strcasestr(win_title, app_name) != NULL)
+            return 1;
+    }
+
+    if (exec_name && exec_name[0]) {
+        size_t alen = strlen(app_name);
+        if (strncasecmp(exec_name, app_name, alen) == 0)
+            return 1;
+
+        if (strcasestr(exec_name, app_name) != NULL)
+            return 1;
+    }
 
     return 0;
 }
@@ -323,7 +334,8 @@ void dock_sync_windows(dock_state_t *dock, const void *win_list_ptr, int32_t scr
             if (!we->window_id || (we->flags & WINDOW_FLAG_BORDERLESS))
                 continue;
 
-            if (match_app_name(we->title, pinned->name) || (pinned->window_id != 0 && pinned->window_id == we->window_id)) {
+            if (match_app_name(we->title, we->exec_name, pinned->name) ||
+                (pinned->window_id != 0 && pinned->window_id == we->window_id)) {
                 pinned->window_id = we->window_id;
                 pinned->is_mapped = we->is_mapped;
                 pinned->is_focused = we->is_focused;
@@ -408,11 +420,14 @@ void dock_sync_windows(dock_state_t *dock, const void *win_list_ptr, int32_t scr
             memset(dyn, 0, sizeof(*dyn));
             dyn->type = DOCK_ITEM_RUNNING;
             strncpy(dyn->name, we->title, sizeof(dyn->name) - 1);
+            strncpy(dyn->exec_path, we->exec_name, sizeof(dyn->exec_path) - 1);
             dyn->window_id = we->window_id;
             dyn->is_mapped = we->is_mapped;
             dyn->is_focused = we->is_focused;
             dyn->is_minimized = we->is_minimized;
             dyn->icon = icon_load(we->title);
+            if (!dyn->icon && we->exec_name[0])
+                dyn->icon = icon_load(we->exec_name);
         }
     }
 
@@ -442,6 +457,13 @@ int dock_handle_mouse_click(dock_state_t *dock, int32_t cx, int32_t cy, int btn,
     dock_item_t *item = &dock->items[clicked_idx];
 
     if (btn == BTN_LEFT) {
+        if (st->statusbar.menu_open)
+            statusbar_close_menu(&st->statusbar);
+        if (st->launcher.visible)
+            shell_close_launcher(st);
+        if (dock->menu_open)
+            dock_close_menu(dock);
+
         if (item->type == DOCK_ITEM_PINNED && item->window_id == 0) {
             /* Unlaunched pinned item: spawn application */
             shell_spawn_app(item->exec_path);
@@ -482,10 +504,29 @@ int dock_handle_mouse_click(dock_state_t *dock, int32_t cx, int32_t cy, int btn,
                 item->is_focused = 0;
                 item->is_minimized = 1;
             }
+
+            /* Synchronize state with master window list */
+            for (int w = 0; w < st->win_list.count; w++) {
+                if (st->win_list.windows[w].window_id == item->window_id) {
+                    st->win_list.windows[w].is_mapped = item->is_mapped;
+                    st->win_list.windows[w].is_focused = item->is_focused;
+                    st->win_list.windows[w].is_minimized = item->is_minimized;
+                } else if (item->is_focused) {
+                    st->win_list.windows[w].is_focused = 0;
+                }
+            }
+            if (item->is_focused) {
+                statusbar_set_active_title(&st->statusbar, item->name);
+            }
+
             dock->dirty = 1;
             return 1;
         }
     } else if (btn == BTN_RIGHT) {
+        if (st->statusbar.menu_open)
+            statusbar_close_menu(&st->statusbar);
+        if (st->launcher.visible)
+            shell_close_launcher(st);
         dock_open_menu(dock, clicked_idx, st);
         return 1;
     }
@@ -568,7 +609,18 @@ int dock_handle_menu_click(dock_state_t *dock, int32_t cx, int32_t cy, shell_sta
 
     int item_idx = dock->menu_item_idx;
     dock_item_t *item = &dock->items[item_idx];
-    int action_idx = (cy - THEME_PX(4)) / DOCK_MENU_ITEM_H;
+
+    int rel_y = cy - THEME_PX(4);
+    if (rel_y < 0) {
+        dock_close_menu(dock);
+        return 0;
+    }
+
+    int action_idx = rel_y / DOCK_MENU_ITEM_H;
+    if (action_idx < 0 || action_idx >= 3) {
+        dock_close_menu(dock);
+        return 0;
+    }
 
     if (action_idx == 0) {
         /* New Window */
@@ -591,6 +643,17 @@ int dock_handle_menu_click(dock_state_t *dock, int32_t cx, int32_t cy, shell_sta
             }
             item->is_mapped = 1;
             item->is_focused = 1;
+            item->is_minimized = 0;
+            for (int w = 0; w < st->win_list.count; w++) {
+                if (st->win_list.windows[w].window_id == item->window_id) {
+                    st->win_list.windows[w].is_mapped = 1;
+                    st->win_list.windows[w].is_focused = 1;
+                    st->win_list.windows[w].is_minimized = 0;
+                } else {
+                    st->win_list.windows[w].is_focused = 0;
+                }
+            }
+            statusbar_set_active_title(&st->statusbar, item->name);
         }
     } else if (action_idx == 2) {
         /* Close */
