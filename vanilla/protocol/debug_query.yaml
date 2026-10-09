@@ -1,0 +1,11 @@
+id: 31
+name: MSG_DEBUG_QUERY
+direction: client_to_server
+version: 2
+v1_compat: false
+variable_payload: true
+description: "Client requests debug state (windows, compositor, theme) or mutates theme."
+fields:
+  - name: query_type
+    type: uint32_t
+    description: "Debug query type: DBGQ_WINDOWS=1, DBGQ_COMPOSITOR=2, DBGQ_THEME=3, DBGQ_SET_THEME=4, DBGQ_THEME_RELOAD=5"

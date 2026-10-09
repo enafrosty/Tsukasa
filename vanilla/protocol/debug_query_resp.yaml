@@ -1,0 +1,11 @@
+id: 32
+name: MSG_DEBUG_QUERY_RESP
+direction: server_to_client
+version: 2
+v1_compat: false
+variable_payload: true
+description: "Server responds to debug query with window table, compositor metrics, or theme."
+fields:
+  - name: window_count
+    type: uint32_t
+    description: "Window count or query status"

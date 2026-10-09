@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 
 #ifndef FBIOPUT_VSCREENINFO
 #define FBIOPUT_VSCREENINFO 0x4601
@@ -72,6 +73,81 @@ __attribute__((weak)) uint32_t pit_frequency(void)
     return 100;
 }
 #endif
+
+int g_perf_overlay_enabled = 0;
+
+static uint64_t get_time_us_mono(void)
+{
+#if defined(_WIN32)
+    static LARGE_INTEGER freq;
+    static int freq_init = 0;
+    if (!freq_init) {
+        QueryPerformanceFrequency(&freq);
+        freq_init = 1;
+    }
+    LARGE_INTEGER counter;
+    if (QueryPerformanceCounter(&counter) && freq.QuadPart > 0) {
+        return (uint64_t)((counter.QuadPart * 1000000ULL) / freq.QuadPart);
+    }
+    return (uint64_t)GetTickCount64() * 1000ULL;
+#elif defined(VANILLA_HOST) || (defined(__STDC_HOSTED__) && __STDC_HOSTED__ == 1)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000L);
+    }
+    return 0;
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000L);
+    }
+    return pit_ticks() * 1000ULL;
+#endif
+}
+
+void compositor_render_overlay(vanilla_compositor_t *comp,
+                               uint32_t frame_time_us,
+                               int dirty_count,
+                               int client_count)
+{
+    if (!comp || !comp->backbuffer)
+        return;
+
+    int32_t hud_w = THEME_PX(240);
+    int32_t hud_h = THEME_PX(48);
+    int32_t hud_x = THEME_PX(8);
+    int32_t hud_y = THEME_PX(8);
+
+    vanilla_rect_t hud_rect = { hud_x, hud_y, hud_w, hud_h };
+    vanilla_rect_t clip_full = { 0, 0, (int32_t)comp->width, (int32_t)comp->height };
+
+    blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
+                             hud_x, hud_y, hud_w, hud_h,
+                             THEME_PX(6), 0xFF1C2030u, BLT_CORNER_ALL, &clip_full);
+
+    if (comp->font.info) {
+        char line1[64];
+        char line2[64];
+        float ms = (float)frame_time_us / 1000.0f;
+        snprintf(line1, sizeof(line1), "Frame: %.2f ms (%u us) | Dirty: %d", ms, frame_time_us, dirty_count);
+        snprintf(line2, sizeof(line2), "Clients: %d | Damage: %u px", client_count, comp->last_damage_area_px);
+
+        font_draw_text(comp->backbuffer, comp->pitch_px, &clip_full, &comp->font,
+                       line1, hud_x + THEME_PX(8), hud_y + THEME_PX(6),
+                       THEME_F(11.0f), 0xFF88C0D0u);
+        font_draw_text(comp->backbuffer, comp->pitch_px, &clip_full, &comp->font,
+                       line2, hud_x + THEME_PX(8), hud_y + THEME_PX(24),
+                       THEME_F(11.0f), 0xFFECEFF4u);
+    }
+
+    if (comp->fb_mem && !comp->is_offscreen) {
+        blt_copy_subrect((uint32_t *)comp->fb_mem, comp->pitch_px,
+                         hud_rect.x, hud_rect.y,
+                         comp->backbuffer, comp->pitch_px,
+                         hud_rect.x, hud_rect.y,
+                         hud_rect.w, hud_rect.h);
+    }
+}
 
 int compositor_frame_due(vanilla_compositor_t *comp)
 {
@@ -671,6 +747,8 @@ void compositor_render_frame(struct vanilla_server *srv)
     if (!srv || srv->compositor.dirty_count <= 0)
         return;
 
+    uint64_t t_start_us = get_time_us_mono();
+
     compositor_animate_windows(srv);
     dnd_check_timeout(srv);
 
@@ -678,6 +756,12 @@ void compositor_render_frame(struct vanilla_server *srv)
 
     vanilla_compositor_t *comp = &srv->compositor;
     compositor_merge_damage(comp);
+
+    int initial_dirty_count = comp->dirty_count;
+    uint32_t damage_area_px = 0;
+    for (int d = 0; d < comp->dirty_count; d++) {
+        damage_area_px += (uint32_t)(comp->dirty_rects[d].w * comp->dirty_rects[d].h);
+    }
 
     vanilla_server_window_t *sorted[VANILLA_MAX_WINDOWS];
     int win_count = 0;
@@ -998,6 +1082,23 @@ void compositor_render_frame(struct vanilla_server *srv)
                              dirty->x, dirty->y,
                              dirty->w, dirty->h);
         }
+    }
+
+    uint32_t frame_time_us = (uint32_t)(get_time_us_mono() - t_start_us);
+    comp->last_frame_time_us = frame_time_us;
+    comp->last_dirty_count = initial_dirty_count;
+    comp->last_damage_area_px = damage_area_px;
+
+    if (g_perf_overlay_enabled) {
+        int client_count = 0;
+        for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
+            if (srv->clients[i].in_use)
+                client_count++;
+        }
+        compositor_render_overlay(comp, frame_time_us, initial_dirty_count, client_count);
+
+        vanilla_rect_t hud_dmg = { THEME_PX(8), THEME_PX(8), THEME_PX(240), THEME_PX(48) };
+        compositor_add_damage(comp, &hud_dmg);
     }
 
     vanilla_server_release_buffers(srv);

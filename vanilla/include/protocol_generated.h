@@ -62,6 +62,8 @@ typedef enum {
     MSG_DND_LEAVE            = 28,
     MSG_DND_ACCEPT           = 29,
     MSG_DND_CANCEL           = 30,
+    MSG_DEBUG_QUERY          = 31,
+    MSG_DEBUG_QUERY_RESP     = 32,
 } vanilla_msg_type_t;
 
 /* MSG_HELLO payload (client to server, v1+) */
@@ -356,6 +358,22 @@ typedef struct {
 _Static_assert(sizeof(vanilla_msg_dnd_cancel_t) == 4,
     "vanilla_msg_dnd_cancel_t size mismatch; regenerate protocol");
 
+/* MSG_DEBUG_QUERY payload (client to server, v2+) */
+typedef struct {
+    uint32_t query_type;
+} __attribute__((packed)) vanilla_msg_debug_query_t;
+
+_Static_assert(sizeof(vanilla_msg_debug_query_t) == 4,
+    "vanilla_msg_debug_query_t size mismatch; regenerate protocol");
+
+/* MSG_DEBUG_QUERY_RESP payload (server to client, v2+) */
+typedef struct {
+    uint32_t window_count;
+} __attribute__((packed)) vanilla_msg_debug_query_resp_t;
+
+_Static_assert(sizeof(vanilla_msg_debug_query_resp_t) == 4,
+    "vanilla_msg_debug_query_resp_t size mismatch; regenerate protocol");
+
 typedef struct vanilla_server vanilla_server_t;
 
 typedef int (*vanilla_dispatch_fn_t)(vanilla_server_t *srv, int client_idx,
@@ -383,6 +401,7 @@ int handle_msg_dnd_offer(vanilla_server_t *srv, int client_idx, const vanilla_ms
 int handle_msg_set_size_hints(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 int handle_msg_show_context_menu(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 int handle_msg_dnd_accept(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
+int handle_msg_debug_query(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload);
 
 #ifdef VANILLA_DISPATCH_TABLE_IMPL
 const vanilla_dispatch_entry_t g_vanilla_dispatch_table[] = {
@@ -400,6 +419,7 @@ const vanilla_dispatch_entry_t g_vanilla_dispatch_table[] = {
     { MSG_SET_SIZE_HINTS, 2, sizeof(vanilla_msg_set_size_hints_t), handle_msg_set_size_hints },
     { MSG_SHOW_CONTEXT_MENU, 2, 0, handle_msg_show_context_menu },
     { MSG_DND_ACCEPT, 2, sizeof(vanilla_msg_dnd_accept_t), handle_msg_dnd_accept },
+    { MSG_DEBUG_QUERY, 2, 0, handle_msg_debug_query },
 };
 const size_t g_vanilla_dispatch_table_len = sizeof(g_vanilla_dispatch_table) / sizeof(g_vanilla_dispatch_table[0]);
 #else
