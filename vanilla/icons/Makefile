@@ -1,5 +1,5 @@
 #
-# Project Tsukasa — libvanilla Client Library Makefile
+# Project Tsukasa — Vanilla Vector Icon Subsystem Makefile
 #
 # Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
 #
@@ -28,19 +28,14 @@ endif
 
 CFLAGS = -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
          -fno-pie -fstack-protector-strong -O2 \
-         -I../../tsukasa-libc/include -I../include -I../input -I. -DSTBI_NO_THREAD_LOCALS
+         -I../../tsukasa-libc/include -I../include -I.
 
-OBJS = client.o surface.o service.o clipboard.o dnd.o notify.o icon.o
+OBJS = icon.o
 
 all: $(OBJS)
-
-notify.o: notify.c notify.h ../services/notifyd.h
-	$(CC) $(CFLAGS) -c -o $@ $<
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
 	rm -f $(OBJS)
-
-.PHONY: all clean
