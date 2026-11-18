@@ -32,9 +32,11 @@
 
 #define DOCK_PINNED_COUNT 6
 
-#define DOCK_MENU_WIDTH  140
-#define DOCK_MENU_HEIGHT 86
-#define DOCK_MENU_ITEM_H 26
+#define DOCK_MENU_WIDTH  THEME_PX(152)
+#define DOCK_MENU_ITEM_H THEME_PX(26)
+#define DOCK_MENU_SEP_H  THEME_PX(7)
+#define DOCK_MENU_PAD_Y  THEME_PX(6)
+#define DOCK_MENU_HEIGHT (DOCK_MENU_PAD_Y * 2 + 3 * DOCK_MENU_ITEM_H + DOCK_MENU_SEP_H)
 
 typedef enum {
     DOCK_ITEM_PINNED = 0,
@@ -71,6 +73,7 @@ typedef struct {
     int               menu_open;
     int               menu_item_idx;
     vanilla_window_t *menu_win;
+    int               menu_dirty;
 } dock_state_t;
 
 struct shell_state;

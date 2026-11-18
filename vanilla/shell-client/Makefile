@@ -38,10 +38,13 @@ LIBM_A = ../../tsukasa-libc/lib/libm.a
 
 LIBVANILLA_A = ../lib/libvanilla.a
 APP_COMMON   = ../apps/app_common.o
+FONT_OBJS    = ../server/font.o ../server/default_font.o
 
 BIN = ../bin/shell.elf
 
 OBJS = shell_client.o dock.o statusbar.o
+
+all: $(BIN)
 
 $(CRT0) $(LIBC_A) $(LIBM_A):
 	$(MAKE) -C ../../tsukasa-libc all
@@ -52,11 +55,12 @@ $(LIBVANILLA_A):
 $(APP_COMMON):
 	$(MAKE) -C .. $(APP_COMMON)
 
-all: $(BIN)
+$(FONT_OBJS):
+	$(MAKE) -C .. server/font.o server/default_font.o
 
-$(BIN): $(CRT0) $(OBJS) $(APP_COMMON) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(BIN): $(CRT0) $(OBJS) $(APP_COMMON) $(FONT_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p ../bin
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) $(OBJS) $(APP_COMMON) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) $(OBJS) $(APP_COMMON) $(FONT_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
 dock.o: dock.c dock.h
 	$(CC) $(CFLAGS) -c -o $@ $<

@@ -36,7 +36,7 @@ int main(int argc, char **argv)
 
     printf("[vanilla] Listening for client connections.\n");
     while (srv.running)
-        vanilla_server_poll(&srv, 50);
+        vanilla_server_poll(&srv, -1);
 
     printf("[vanilla] Shutting down display server...\n");
     vanilla_server_close(&srv);

@@ -138,6 +138,7 @@ int  vanilla_set_size_hints(vanilla_client_t *client, uint32_t window_id,
                             uint32_t asp_n, uint32_t asp_d);
 
 /* Event processing */
+int  vanilla_client_pending(const vanilla_client_t *client);
 int  vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev);
 int  vanilla_wait_event(vanilla_client_t *client, vanilla_event_t *out_ev);
 
