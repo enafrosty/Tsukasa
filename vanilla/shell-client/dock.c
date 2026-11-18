@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <math.h>
 
 static const struct {
     const char *name;
@@ -39,27 +40,29 @@ static const struct {
 
 static inline void dock_blend_pixel(uint32_t *dst, uint32_t src)
 {
-    uint32_t sa = (src >> 24) & 0xFF;
-    if (sa == 0)
-        return;
+    *dst = shell_blend_argb(*dst, src);
+}
 
-    if (sa == 255) {
-        *dst = src;
-        return;
+static inline float dock_clampf(float v, float lo, float hi)
+{
+    if (v < lo)
+        return lo;
+    if (v > hi)
+        return hi;
+    return v;
+}
+
+static inline float dock_rounded_box_sd(float px, float py, float w, float h, float r)
+{
+    float half_w = w * 0.5f;
+    float half_h = h * 0.5f;
+    float qx = fabsf(px - half_w) - (half_w - r);
+    float qy = fabsf(py - half_h) - (half_h - r);
+    if (qx > 0.0f && qy > 0.0f) {
+        return sqrtf(qx * qx + qy * qy) - r;
     }
-
-    uint32_t dp = *dst;
-    uint32_t da = (dp >> 24) & 0xFF;
-    uint32_t inv = 255 - sa;
-
-    uint32_t r = (((src >> 16) & 0xFF) * sa + ((dp >> 16) & 0xFF) * inv + 127) / 255;
-    uint32_t g = (((src >> 8) & 0xFF) * sa + ((dp >> 8) & 0xFF) * inv + 127) / 255;
-    uint32_t b = ((src & 0xFF) * sa + (dp & 0xFF) * inv + 127) / 255;
-    uint32_t a = sa + (da * inv + 127) / 255;
-    if (a > 255)
-        a = 255;
-
-    *dst = (a << 24) | (r << 16) | (g << 8) | b;
+    float d = qx > qy ? qx : qy;
+    return d - r;
 }
 
 static void dock_fill_rounded_rect(vanilla_surface_t *surf, int32_t rx, int32_t ry,
@@ -72,43 +75,46 @@ static void dock_fill_rounded_rect(vanilla_surface_t *surf, int32_t rx, int32_t 
     int32_t surf_h = (int32_t)surf->height;
     uint32_t pitch_px = surf->pitch / sizeof(uint32_t);
 
-    if (radius * 2 > rw) radius = rw / 2;
-    if (radius * 2 > rh) radius = rh / 2;
-    if (radius < 1) radius = 1;
-    int32_t r_sq = radius * radius;
+    if (radius * 2 > rw)
+        radius = rw / 2;
+    if (radius * 2 > rh)
+        radius = rh / 2;
+    if (radius <= 0) {
+        app_fill_rect(surf, rx, ry, rw, rh, color);
+        return;
+    }
 
-    for (int32_t cy = 0; cy < rh; cy++) {
-        int32_t py = ry + cy;
-        if (py < 0 || py >= surf_h)
-            continue;
+    int32_t x0 = rx < 0 ? 0 : rx;
+    int32_t y0 = ry < 0 ? 0 : ry;
+    int32_t x1 = (rx + rw) > surf_w ? surf_w : (rx + rw);
+    int32_t y1 = (ry + rh) > surf_h ? surf_h : (ry + rh);
+    if (x0 >= x1 || y0 >= y1)
+        return;
 
+    uint32_t sa = (color >> 24) & 0xFFu;
+    uint32_t rgb = color & 0x00FFFFFFu;
+    if (sa == 0)
+        return;
+
+    float r = (float)radius;
+    float fw = (float)rw;
+    float fh = (float)rh;
+
+    for (int32_t py = y0; py < y1; py++) {
         uint32_t *row = surf->pixels + (size_t)py * pitch_px;
-        for (int32_t cx = 0; cx < rw; cx++) {
-            int32_t px = rx + cx;
-            if (px < 0 || px >= surf_w)
+        float fy = (float)(py - ry) + 0.5f;
+        for (int32_t px = x0; px < x1; px++) {
+            float fx = (float)(px - rx) + 0.5f;
+            float sd = dock_rounded_box_sd(fx, fy, fw, fh, r);
+            float cov = dock_clampf(0.5f - sd, 0.0f, 1.0f);
+            if (cov <= 0.0f)
                 continue;
-
-            int is_inside = 1;
-            if (cx < radius && cy < radius) {
-                int32_t dx = radius - 1 - cx;
-                int32_t dy = radius - 1 - cy;
-                if (dx * dx + dy * dy > r_sq) is_inside = 0;
-            } else if (cx >= rw - radius && cy < radius) {
-                int32_t dx = cx - (rw - radius);
-                int32_t dy = radius - 1 - cy;
-                if (dx * dx + dy * dy > r_sq) is_inside = 0;
-            } else if (cx < radius && cy >= rh - radius) {
-                int32_t dx = radius - 1 - cx;
-                int32_t dy = cy - (rh - radius);
-                if (dx * dx + dy * dy > r_sq) is_inside = 0;
-            } else if (cx >= rw - radius && cy >= rh - radius) {
-                int32_t dx = cx - (rw - radius);
-                int32_t dy = cy - (rh - radius);
-                if (dx * dx + dy * dy > r_sq) is_inside = 0;
-            }
-
-            if (is_inside) {
+            if (cov >= 0.999f) {
                 dock_blend_pixel(&row[px], color);
+            } else {
+                uint32_t eff_a = (uint32_t)((float)sa * cov + 0.5f);
+                if (eff_a > 0)
+                    dock_blend_pixel(&row[px], (eff_a << 24) | rgb);
             }
         }
     }
@@ -162,19 +168,24 @@ void dock_recompute_geometry(dock_state_t *dock, int32_t screen_w, int32_t scree
     if (!dock)
         return;
 
+    int32_t item_sz = THEME_PX(DOCK_ITEM_SIZE);
+    int32_t item_gap = THEME_PX(DOCK_ITEM_GAP);
+    int32_t pad_x = THEME_PX(DOCK_PAD_X);
+    int32_t pad_y = THEME_PX(DOCK_PAD_Y);
+
     int32_t content_w = 0;
     for (int i = 0; i < dock->item_count; i++) {
-        dock->items[i].x_offset = DOCK_PAD_X + content_w;
+        dock->items[i].x_offset = pad_x + content_w;
         if (dock->items[i].type == DOCK_ITEM_SEPARATOR)
-            content_w += THEME_PX(6) + DOCK_ITEM_GAP;
+            content_w += THEME_PX(6) + item_gap;
         else
-            content_w += THEME_PX(DOCK_ITEM_SIZE) + THEME_PX(DOCK_ITEM_GAP);
+            content_w += item_sz + item_gap;
     }
     if (dock->item_count > 0)
-        content_w -= THEME_PX(DOCK_ITEM_GAP);
+        content_w -= item_gap;
 
-    dock->width = content_w + (DOCK_PAD_X * 2);
-    dock->height = THEME_PX(DOCK_ITEM_SIZE) + (DOCK_PAD_Y * 2);
+    dock->width = content_w + (pad_x * 2);
+    dock->height = item_sz + (pad_y * 2);
     dock->x = (screen_w - dock->width) / 2;
     dock->y = screen_h - dock->height - THEME_PX(12);
 }
@@ -198,94 +209,112 @@ void dock_render(dock_state_t *dock)
         memset(row, 0, (size_t)w * sizeof(uint32_t));
     }
 
-    /* Render frosted glass capsule with 16px corner radius */
-    int32_t radius = DOCK_RADIUS_PX;
+    /* Render frosted glass capsule with smooth AA DOCK_RADIUS_PX corner radius */
+    int32_t radius = THEME_PX(DOCK_RADIUS_PX);
     if (radius * 2 > h) radius = h / 2;
     if (radius * 2 > w) radius = w / 2;
-    int32_t r_sq = radius * radius;
-    int32_t r_inner_sq = (radius - 1) * (radius - 1);
+    if (radius < 1) radius = 1;
+
+    float r = (float)radius;
+    float fw = (float)w;
+    float fh = (float)h;
+    uint32_t bg = THEME_COLOR_DOCK_BG;
+    uint32_t bd = THEME_COLOR_DOCK_BORDER;
+    uint32_t bg_a = (bg >> 24) & 0xFFu;
+    uint32_t bg_rgb = bg & 0x00FFFFFFu;
+    uint32_t bd_a = (bd >> 24) & 0xFFu;
+    uint32_t bd_rgb = bd & 0x00FFFFFFu;
 
     for (int32_t y = 0; y < h; y++) {
         uint32_t *row = surf->pixels + (size_t)y * pitch_px;
+        float fy = (float)y + 0.5f;
         for (int32_t x = 0; x < w; x++) {
-            int is_border = 0;
-            int is_inside = 1;
+            float fx = (float)x + 0.5f;
+            float sd = dock_rounded_box_sd(fx, fy, fw, fh, r);
+            float outer_cov = dock_clampf(0.5f - sd, 0.0f, 1.0f);
+            if (outer_cov <= 0.0f)
+                continue;
 
-            if (x < radius && y < radius) {
-                int32_t dx = radius - 1 - x;
-                int32_t dy = radius - 1 - y;
-                int32_t d2 = dx * dx + dy * dy;
-                if (d2 > r_sq) is_inside = 0;
-                else if (d2 >= r_inner_sq) is_border = 1;
-            } else if (x >= w - radius && y < radius) {
-                int32_t dx = x - (w - radius);
-                int32_t dy = radius - 1 - y;
-                int32_t d2 = dx * dx + dy * dy;
-                if (d2 > r_sq) is_inside = 0;
-                else if (d2 >= r_inner_sq) is_border = 1;
-            } else if (x < radius && y >= h - radius) {
-                int32_t dx = radius - 1 - x;
-                int32_t dy = y - (h - radius);
-                int32_t d2 = dx * dx + dy * dy;
-                if (d2 > r_sq) is_inside = 0;
-                else if (d2 >= r_inner_sq) is_border = 1;
-            } else if (x >= w - radius && y >= h - radius) {
-                int32_t dx = x - (w - radius);
-                int32_t dy = y - (h - radius);
-                int32_t d2 = dx * dx + dy * dy;
-                if (d2 > r_sq) is_inside = 0;
-                else if (d2 >= r_inner_sq) is_border = 1;
-            } else {
-                if (x == 0 || x == w - 1 || y == 0 || y == h - 1)
-                    is_border = 1;
+            float inner_cov = dock_clampf(-0.5f - sd, 0.0f, 1.0f);
+            float border_cov = outer_cov - inner_cov;
+
+            if (outer_cov >= 0.999f && border_cov <= 0.001f) {
+                row[x] = bg;
+                continue;
             }
 
-            if (is_inside) {
-                row[x] = is_border ? THEME_COLOR_DOCK_BORDER : THEME_COLOR_DOCK_BG;
+            uint32_t fill_a = (uint32_t)((float)bg_a * outer_cov + 0.5f);
+            uint32_t px_col = (fill_a << 24) | bg_rgb;
+            if (border_cov > 0.001f) {
+                uint32_t rim_a = (uint32_t)((float)bd_a * border_cov + 0.5f);
+                if (rim_a > 0)
+                    px_col = shell_blend_argb(px_col, (rim_a << 24) | bd_rgb);
             }
+            row[x] = px_col;
         }
     }
+
+    int32_t item_sz = THEME_PX(DOCK_ITEM_SIZE);
+    int32_t pad_y = THEME_PX(DOCK_PAD_Y);
+    int32_t pill_r = THEME_PX(DOCK_RADIUS_PX);
+    uint32_t hover_pill_color = (THEME_COLOR_FROST_CYAN & 0x00FFFFFFu) | 0x1E000000u;
 
     /* Render dock items */
     for (int i = 0; i < dock->item_count; i++) {
         dock_item_t *item = &dock->items[i];
 
         if (item->type == DOCK_ITEM_SEPARATOR) {
-            app_fill_rect(surf, item->x_offset + 3, DOCK_PAD_Y + 4, 1, DOCK_ITEM_SIZE - 8, THEME_COLOR_DOCK_BORDER);
+            app_fill_rect(surf, item->x_offset + THEME_PX(3), pad_y + THEME_PX(4),
+                          1, item_sz - THEME_PX(8), THEME_COLOR_DOCK_BORDER);
             continue;
         }
 
-        /* Focus highlight pill behind active window icon */
+        /* Hover and focus highlight pills behind icon */
+        if (i == dock->hovered_idx && !item->is_focused) {
+            dock_fill_rounded_rect(surf, item->x_offset - THEME_PX(2), pad_y - THEME_PX(2),
+                                   item_sz + THEME_PX(4), item_sz + THEME_PX(4),
+                                   pill_r, hover_pill_color);
+        }
         if (item->is_focused) {
-            dock_fill_rounded_rect(surf, item->x_offset - 2, DOCK_PAD_Y - 2,
-                                   DOCK_ITEM_SIZE + 4, DOCK_ITEM_SIZE + 4, 8, THEME_COLOR_DOCK_PILL);
+            dock_fill_rounded_rect(surf, item->x_offset - THEME_PX(2), pad_y - THEME_PX(2),
+                                   item_sz + THEME_PX(4), item_sz + THEME_PX(4),
+                                   pill_r, THEME_COLOR_DOCK_PILL);
         }
 
         /* Vector or fallback icon render */
         int rendered = 0;
         if (item->icon) {
-            if (icon_render_to_surface(item->icon, surf, item->x_offset, DOCK_PAD_Y, DOCK_ITEM_SIZE) == 0)
+            if (icon_render_to_surface(item->icon, surf, item->x_offset, pad_y, item_sz) == 0)
                 rendered = 1;
         }
 
         if (!rendered) {
             /* Fallback badge for unpinned dynamic apps or missing icons */
-            uint32_t bg = item->is_focused ? g_theme->accent : g_theme->bg_elevated;
-            dock_fill_rounded_rect(surf, item->x_offset, DOCK_PAD_Y, DOCK_ITEM_SIZE, DOCK_ITEM_SIZE, 8, bg);
+            uint32_t fallback_bg = item->is_focused ? g_theme->accent : g_theme->bg_elevated;
+            dock_fill_rounded_rect(surf, item->x_offset, pad_y, item_sz, item_sz, pill_r, fallback_bg);
             char badge[3];
             badge[0] = item->name[0] ? item->name[0] : 'A';
             badge[1] = item->name[1] ? item->name[1] : 'P';
             badge[2] = '\0';
-            app_draw_text(surf, item->x_offset + 10, DOCK_PAD_Y + 14, badge, g_theme->fg_primary);
+            int32_t bw = 0;
+            int32_t bh = 0;
+            float bsz = THEME_F(13.0f);
+            app_measure_text_ex(badge, bsz, APP_FONT_BOLD, &bw, &bh);
+            app_draw_text_ex(surf, item->x_offset + (item_sz - bw) / 2,
+                             pad_y + (item_sz - bh) / 2,
+                             badge, bsz, APP_FONT_BOLD, g_theme->fg_primary);
         }
 
-        /* Running state indicator dot centered 3px below the icon */
+        /* Active/running AA indicator pill centered below the icon */
         if (item->is_mapped || item->window_id != 0) {
             uint32_t dot_color = item->is_minimized ? THEME_COLOR_SLATE : THEME_COLOR_FROST_CYAN;
-            int32_t dot_x = item->x_offset + (DOCK_ITEM_SIZE / 2) - 2;
-            int32_t dot_y = DOCK_PAD_Y + DOCK_ITEM_SIZE + 3;
-            if (dot_y + 4 <= h) {
-                app_fill_rect(surf, dot_x, dot_y, 4, 4, dot_color);
+            int32_t dot_w = item->is_focused ? THEME_PX(12) : THEME_PX(5);
+            int32_t dot_h = THEME_PX(4);
+            int32_t dot_r = dot_h / 2;
+            int32_t dot_x = item->x_offset + (item_sz - dot_w) / 2;
+            int32_t dot_y = pad_y + item_sz + THEME_PX(2);
+            if (dot_y + dot_h <= h) {
+                dock_fill_rounded_rect(surf, dot_x, dot_y, dot_w, dot_h, dot_r, dot_color);
             }
         }
     }
@@ -298,19 +327,19 @@ static int match_app_name(const char *win_title, const char *exec_name, const ch
 
     if (win_title && win_title[0]) {
         size_t alen = strlen(app_name);
-        if (strncasecmp(win_title, app_name, alen) == 0)
+        if (shell_strncasecmp(win_title, app_name, alen) == 0)
             return 1;
 
-        if (strcasestr(win_title, app_name) != NULL)
+        if (shell_strcasestr(win_title, app_name) != NULL)
             return 1;
     }
 
     if (exec_name && exec_name[0]) {
         size_t alen = strlen(app_name);
-        if (strncasecmp(exec_name, app_name, alen) == 0)
+        if (shell_strncasecmp(exec_name, app_name, alen) == 0)
             return 1;
 
-        if (strcasestr(exec_name, app_name) != NULL)
+        if (shell_strcasestr(exec_name, app_name) != NULL)
             return 1;
     }
 
@@ -441,11 +470,12 @@ int dock_handle_mouse_click(dock_state_t *dock, int32_t cx, int32_t cy, int btn,
     if (!dock || !st)
         return 0;
 
+    int32_t item_sz = THEME_PX(DOCK_ITEM_SIZE);
     int clicked_idx = -1;
     for (int i = 0; i < dock->item_count; i++) {
         if (dock->items[i].type == DOCK_ITEM_SEPARATOR)
             continue;
-        if (cx >= dock->items[i].x_offset && cx < dock->items[i].x_offset + DOCK_ITEM_SIZE) {
+        if (cx >= dock->items[i].x_offset && cx < dock->items[i].x_offset + item_sz) {
             clicked_idx = i;
             break;
         }
@@ -534,6 +564,14 @@ int dock_handle_mouse_click(dock_state_t *dock, int32_t cx, int32_t cy, int btn,
     return 0;
 }
 
+static int32_t dock_menu_item_y(int idx)
+{
+    int32_t y = DOCK_MENU_PAD_Y + idx * DOCK_MENU_ITEM_H;
+    if (idx >= 2)
+        y += DOCK_MENU_SEP_H;
+    return y;
+}
+
 void dock_open_menu(dock_state_t *dock, int item_idx, shell_state_t *st)
 {
     if (!dock || !st || !st->client || item_idx < 0 || item_idx >= dock->item_count)
@@ -543,11 +581,14 @@ void dock_open_menu(dock_state_t *dock, int item_idx, shell_state_t *st)
     dock->menu_item_idx = item_idx;
 
     int32_t mx = dock->x + dock->items[item_idx].x_offset;
-    if (mx + DOCK_MENU_WIDTH > st->screen_w)
-        mx = st->screen_w - DOCK_MENU_WIDTH - 8;
-    int32_t my = dock->y - DOCK_MENU_HEIGHT - 6;
-    if (my < 32)
-        my = 32;
+    if (mx < THEME_PX(8))
+        mx = THEME_PX(8);
+    if (mx + DOCK_MENU_WIDTH > st->screen_w - THEME_PX(8))
+        mx = st->screen_w - DOCK_MENU_WIDTH - THEME_PX(8);
+    int32_t my = dock->y - DOCK_MENU_HEIGHT - THEME_PX(6);
+    int32_t min_top = STATUSBAR_HEIGHT + THEME_PX(4);
+    if (my < min_top)
+        my = min_top;
 
     if (!dock->menu_win) {
         dock->menu_win = vanilla_create_window(st->client, "Dock Menu", mx, my,
@@ -562,6 +603,9 @@ void dock_open_menu(dock_state_t *dock, int item_idx, shell_state_t *st)
         vanilla_map_window(dock->menu_win);
         dock_render_menu(dock);
         vanilla_present(dock->menu_win, NULL);
+        dock->menu_dirty = 0;
+    } else {
+        dock->menu_dirty = 1;
     }
 }
 
@@ -572,6 +616,7 @@ void dock_close_menu(dock_state_t *dock)
 
     dock->menu_open = 0;
     dock->menu_item_idx = -1;
+    dock->menu_dirty = 0;
     if (dock->menu_win) {
         vanilla_unmap_window(dock->menu_win);
     }
@@ -587,17 +632,37 @@ void dock_render_menu(dock_state_t *dock)
     int32_t w = (int32_t)surf->width;
     int32_t h = (int32_t)surf->height;
 
-    app_fill_rect(surf, 0, 0, w, h, g_theme->bg_base);
+    /* Sharp 0px menu panel surface contrast (MENU_RADIUS_PX == 0) */
+    app_fill_rect(surf, 0, 0, w, h, shell_menu_bg());
     int32_t bw = g_theme->border_width > 0 ? g_theme->border_width : 1;
-    app_fill_rect(surf, 0, 0, w, bw, g_theme->border);
-    app_fill_rect(surf, w - bw, 0, bw, h, g_theme->border);
-    app_fill_rect(surf, 0, 0, bw, h, g_theme->border);
-    app_fill_rect(surf, 0, h - bw, w, bw, g_theme->border);
+    uint32_t bcol = shell_menu_border();
+    app_fill_rect(surf, 0, 0, w, bw, bcol);
+    app_fill_rect(surf, w - bw, 0, bw, h, bcol);
+    app_fill_rect(surf, 0, 0, bw, h, bcol);
+    app_fill_rect(surf, 0, h - bw, w, bw, bcol);
+
+    dock_item_t *item = (dock->menu_item_idx >= 0 && dock->menu_item_idx < dock->item_count)
+                        ? &dock->items[dock->menu_item_idx] : NULL;
 
     const char *actions[3] = { "New Window", "Maximize", "Close" };
+    float font_sz = THEME_F(12.0f);
+    int32_t pad_x = THEME_PX(12);
+    vanilla_rect_t clip = { pad_x, 0, w - pad_x * 2, h };
+
     for (int i = 0; i < 3; i++) {
-        int32_t iy = THEME_PX(4) + i * DOCK_MENU_ITEM_H;
-        app_draw_text(surf, THEME_PX(12), iy + THEME_PX(6), actions[i], g_theme->fg_primary);
+        if (i == 2) {
+            int32_t div_y = DOCK_MENU_PAD_Y + 2 * DOCK_MENU_ITEM_H + (DOCK_MENU_SEP_H / 2);
+            app_fill_rect(surf, THEME_PX(8), div_y, w - THEME_PX(16), 1, shell_menu_divider());
+        }
+
+        int32_t iy = dock_menu_item_y(i);
+        int32_t th = 0;
+        app_measure_text_ex(actions[i], font_sz, APP_FONT_MEDIUM, NULL, &th);
+        int32_t ty = iy + (DOCK_MENU_ITEM_H - th) / 2;
+        uint32_t fg = g_theme->fg_primary;
+        if (i >= 1 && (!item || item->window_id == 0))
+            fg = g_theme->fg_dim;
+        app_draw_text_clipped(surf, &clip, pad_x, ty, actions[i], font_sz, APP_FONT_MEDIUM, fg);
     }
 }
 
@@ -610,13 +675,14 @@ int dock_handle_menu_click(dock_state_t *dock, int32_t cx, int32_t cy, shell_sta
     int item_idx = dock->menu_item_idx;
     dock_item_t *item = &dock->items[item_idx];
 
-    int rel_y = cy - THEME_PX(4);
-    if (rel_y < 0) {
-        dock_close_menu(dock);
-        return 0;
+    int action_idx = -1;
+    for (int i = 0; i < 3; i++) {
+        int32_t iy = dock_menu_item_y(i);
+        if (cy >= iy && cy < iy + DOCK_MENU_ITEM_H) {
+            action_idx = i;
+            break;
+        }
     }
-
-    int action_idx = rel_y / DOCK_MENU_ITEM_H;
     if (action_idx < 0 || action_idx >= 3) {
         dock_close_menu(dock);
         return 0;

@@ -3371,6 +3371,121 @@ int vanilla_server_dispatch_client(vanilla_server_t *srv, int client_idx)
     return 0;
 }
 
+static void wm_clamp_min_timeout(int *cur_timeout, int candidate_ms)
+{
+    if (!cur_timeout || candidate_ms < 0)
+        return;
+    if (*cur_timeout < 0 || candidate_ms < *cur_timeout)
+        *cur_timeout = candidate_ms;
+}
+
+static int wm_ticks_to_ms_ceil(uint64_t ticks, uint32_t freq)
+{
+    if (ticks == 0)
+        return 0;
+    if (freq == 0)
+        freq = 1000;
+    uint64_t ms = (ticks * 1000ULL + (uint64_t)freq - 1ULL) / (uint64_t)freq;
+    if (ms == 0)
+        ms = 1;
+    if (ms > 60000ULL)
+        ms = 60000ULL;
+    return (int)ms;
+}
+
+static int wm_compute_poll_timeout(vanilla_server_t *srv, int idle_timeout_ms,
+                                   int64_t now_ms, uint64_t now_ticks)
+{
+    int eff = idle_timeout_ms;
+    uint32_t freq = pit_frequency();
+    if (freq == 0)
+        freq = 1000;
+
+    int frame_ms = (int)(1000 / COMPOSITOR_TARGET_FPS);
+    if (frame_ms < 1)
+        frame_ms = 1;
+
+    if (srv->compositor.dirty_count > 0 || compositor_has_active_animations(srv)) {
+        if (srv->compositor.dirty_count > 0 && compositor_frame_due(&srv->compositor)) {
+            wm_clamp_min_timeout(&eff, 0);
+        } else if (srv->compositor.last_frame_ticks == 0 ||
+                   now_ticks < srv->compositor.last_frame_ticks) {
+            wm_clamp_min_timeout(&eff, 0);
+        } else {
+            uint64_t elapsed = now_ticks - srv->compositor.last_frame_ticks;
+            if (elapsed >= srv->compositor.frame_target_ticks) {
+                wm_clamp_min_timeout(&eff, srv->compositor.dirty_count > 0 ? 0 : frame_ms);
+            } else {
+                uint64_t rem_ticks = srv->compositor.frame_target_ticks - elapsed;
+                int rem_ms = wm_ticks_to_ms_ceil(rem_ticks, freq);
+                if (rem_ms > frame_ms)
+                    rem_ms = frame_ms;
+                wm_clamp_min_timeout(&eff, rem_ms);
+            }
+        }
+    }
+
+    if (srv->context_menu_depth > 0) {
+        const vanilla_context_menu_t *m = &srv->context_menu_stack[srv->context_menu_depth - 1];
+        if (m->active && m->hover_item_idx >= 0 && m->hover_timer_start > 0) {
+            uint64_t timeout_ticks = ((uint64_t)freq * 300ULL) / 1000ULL;
+            if (timeout_ticks == 0)
+                timeout_ticks = 1;
+            uint64_t elapsed = (now_ticks >= m->hover_timer_start) ? (now_ticks - m->hover_timer_start) : 0;
+            if (elapsed >= timeout_ticks) {
+                wm_clamp_min_timeout(&eff, 0);
+            } else {
+                int rem_ms = wm_ticks_to_ms_ceil(timeout_ticks - elapsed, freq);
+                if (rem_ms > 300)
+                    rem_ms = 300;
+                wm_clamp_min_timeout(&eff, rem_ms);
+            }
+        }
+    }
+
+    if (dnd_get_state() == DND_DROPPING)
+        wm_clamp_min_timeout(&eff, 100);
+
+    for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+        const vanilla_server_window_t *w = &srv->windows[i];
+        if (w->in_use && w->configure_pending) {
+            int64_t elapsed = now_ms - (int64_t)w->configure_timestamp_ms;
+            if (elapsed > 500) {
+                wm_clamp_min_timeout(&eff, 0);
+            } else {
+                int rem_ms = (int)(501 - elapsed);
+                if (rem_ms < 1)
+                    rem_ms = 1;
+                wm_clamp_min_timeout(&eff, rem_ms);
+            }
+        }
+    }
+
+    uint64_t long_press_ticks = (uint64_t)freq / 2ULL;
+    if (long_press_ticks == 0)
+        long_press_ticks = 1;
+    for (int b = 0; b < 3; b++) {
+        if (((srv->mouse_buttons >> b) & 1u) && !srv->long_press_fired[b]) {
+            int dx = srv->cursor_x - srv->btn_down_x[b];
+            int dy = srv->cursor_y - srv->btn_down_y[b];
+            int chebyshev = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
+            if (chebyshev <= 4) {
+                uint64_t held = (now_ticks >= srv->btn_down_ticks[b]) ? (now_ticks - srv->btn_down_ticks[b]) : 0;
+                if (held >= long_press_ticks) {
+                    wm_clamp_min_timeout(&eff, 0);
+                } else {
+                    int rem_ms = wm_ticks_to_ms_ceil(long_press_ticks - held, freq);
+                    if (rem_ms > 500)
+                        rem_ms = 500;
+                    wm_clamp_min_timeout(&eff, rem_ms);
+                }
+            }
+        }
+    }
+
+    return eff;
+}
+
 int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
 {
     struct pollfd fds[2 + VANILLA_MAX_CLIENTS];
@@ -3454,6 +3569,9 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
         }
     }
 
+    if (srv->compositor.dirty_count == 0 && compositor_has_active_animations(srv))
+        compositor_animate_windows(srv);
+
     fds[0].fd = srv->listen_fd;
     fds[0].events = POLLIN;
     fds[0].revents = 0;
@@ -3477,13 +3595,15 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
         }
     }
 
-    (void)timeout_ms;
-    int frame_ms = (int)(1000 / COMPOSITOR_TARGET_FPS);
-    ret = poll(fds, (nfds_t)nfds, frame_ms);
+    int eff_timeout = wm_compute_poll_timeout(srv, timeout_ms, now_ms, now_ticks);
+    ret = poll(fds, (nfds_t)nfds, eff_timeout);
 
     wm_context_menu_check_timers(srv);
+    dnd_check_timeout(srv);
 
     if (ret <= 0) {
+        if (srv->compositor.dirty_count == 0 && compositor_has_active_animations(srv))
+            compositor_animate_windows(srv);
         if (srv->compositor.dirty_count > 0) {
             if (compositor_frame_due(&srv->compositor)) {
                 vanilla_server_send_frame_begin(srv);
@@ -3515,6 +3635,10 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
     }
 
     wm_context_menu_check_timers(srv);
+    dnd_check_timeout(srv);
+
+    if (srv->compositor.dirty_count == 0 && compositor_has_active_animations(srv))
+        compositor_animate_windows(srv);
 
     if (srv->compositor.dirty_count > 0) {
         if (compositor_frame_due(&srv->compositor)) {

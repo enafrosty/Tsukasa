@@ -211,6 +211,13 @@ int vanilla_client_get_fd(const vanilla_client_t *client)
     return client ? client->socket_fd : -1;
 }
 
+int vanilla_client_pending(const vanilla_client_t *client)
+{
+    if (!client)
+        return 0;
+    return (int)client->event_count;
+}
+
 int vanilla_ack_configure(vanilla_client_t *client, uint32_t window_id, uint32_t serial)
 {
     if (!client || client->socket_fd < 0)
@@ -854,6 +861,9 @@ int vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev)
             return 1;
         }
 
+        if (client->socket_fd < 0)
+            return -1;
+
         pfd.fd = client->socket_fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
@@ -862,8 +872,11 @@ int vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev)
         if (ret <= 0)
             return ret;
 
-        if (!(pfd.revents & POLLIN))
+        if (!(pfd.revents & POLLIN)) {
+            if (pfd.revents & (POLLERR | POLLHUP))
+                return -1;
             return 0;
+        }
 
         if (exact_read(client->socket_fd, &hdr, sizeof(hdr)) < 0)
             return -1;
@@ -1173,19 +1186,29 @@ int vanilla_wait_event(vanilla_client_t *client, vanilla_event_t *out_ev)
     if (!client || !out_ev)
         return -1;
 
-    ret = vanilla_poll_event(client, out_ev);
-    if (ret != 0)
-        return ret;
+    for (;;) {
+        ret = vanilla_poll_event(client, out_ev);
+        if (ret != 0)
+            return ret;
 
-    pfd.fd = client->socket_fd;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
+        if (client->socket_fd < 0)
+            return -1;
 
-    ret = poll(&pfd, 1, -1);
-    if (ret <= 0)
-        return -1;
+        pfd.fd = client->socket_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
 
-    return vanilla_poll_event(client, out_ev);
+        ret = poll(&pfd, 1, -1);
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (ret == 0)
+            continue;
+        if (!(pfd.revents & POLLIN) && (pfd.revents & (POLLERR | POLLHUP)))
+            return -1;
+    }
 }
 
 int vanilla_show_submenu(vanilla_client_t *client, vanilla_window_t *win,

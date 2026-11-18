@@ -342,13 +342,96 @@ static void test_shell_click_and_window_toggle(void)
     printf("       Passed.\n");
 }
 
+static void test_modern_shell_chrome_and_poll(void)
+{
+    printf("[TEST] Modern shell chrome, AA corners, and client pending API...\n");
+
+    theme_set(theme_defaults_nord_dark());
+
+    ASSERT(vanilla_client_pending(NULL) == 0, "vanilla_client_pending(NULL) returns 0");
+    ASSERT(shell_strcasestr("File Manager", "mana") != NULL, "shell_strcasestr matches substring");
+    ASSERT(shell_strcasestr("Calculator", "xyz") == NULL, "shell_strcasestr rejects non-match");
+    ASSERT(shell_strncasecmp("Terminal", "term", 4) == 0, "shell_strncasecmp prefix match");
+    ASSERT(STATUSBAR_HEIGHT == STATUSBAR_HEIGHT_PX, "statusbar height matches design token");
+    ASSERT(MENU_RADIUS_PX == 0, "menu radius token is sharp 0px");
+
+    /* Statusbar + System Menu render */
+    statusbar_state_t sb;
+    statusbar_init(&sb);
+    vanilla_window_t sb_win;
+    memset(&sb_win, 0, sizeof(sb_win));
+    sb_win.surface.width = 640;
+    sb_win.surface.height = (uint32_t)STATUSBAR_HEIGHT;
+    sb_win.surface.pitch = sb_win.surface.width * sizeof(uint32_t);
+    sb_win.surface.pixels = calloc((size_t)sb_win.surface.width * sb_win.surface.height, sizeof(uint32_t));
+    ASSERT(sb_win.surface.pixels != NULL, "allocated statusbar test surface");
+    sb.win = &sb_win;
+
+    statusbar_render(&sb, 640);
+    ASSERT((sb_win.surface.pixels[sb_win.surface.width / 2] >> 24) > 0, "statusbar interior pixel rendered");
+
+    vanilla_window_t sb_menu_win;
+    memset(&sb_menu_win, 0, sizeof(sb_menu_win));
+    sb_menu_win.surface.width = (uint32_t)SYSTEM_MENU_WIDTH;
+    sb_menu_win.surface.height = (uint32_t)SYSTEM_MENU_HEIGHT;
+    sb_menu_win.surface.pitch = sb_menu_win.surface.width * sizeof(uint32_t);
+    sb_menu_win.surface.pixels = calloc((size_t)SYSTEM_MENU_WIDTH * SYSTEM_MENU_HEIGHT, sizeof(uint32_t));
+    ASSERT(sb_menu_win.surface.pixels != NULL, "allocated statusbar menu surface");
+    sb.menu_win = &sb_menu_win;
+    sb.menu_open = 1;
+    statusbar_render_menu(&sb);
+    ASSERT(sb_menu_win.surface.pixels[0] == shell_menu_border(), "system menu corner is crisp 0px border");
+
+    /* Floating dock AA capsule + menu render */
+    dock_state_t dock;
+    dock_init(&dock);
+    dock_recompute_geometry(&dock, 1024, 768);
+    ASSERT(dock.height == DOCK_HEIGHT_PX, "dock height matches DOCK_HEIGHT_PX (52px)");
+
+    vanilla_window_t dock_win;
+    memset(&dock_win, 0, sizeof(dock_win));
+    dock_win.surface.width = (uint32_t)dock.width;
+    dock_win.surface.height = (uint32_t)dock.height;
+    dock_win.surface.pitch = dock_win.surface.width * sizeof(uint32_t);
+    dock_win.surface.pixels = calloc((size_t)dock.width * dock.height, sizeof(uint32_t));
+    ASSERT(dock_win.surface.pixels != NULL, "allocated dock test surface");
+    dock.win = &dock_win;
+    dock_render(&dock);
+
+    ASSERT(dock_win.surface.pixels[0] == 0x00000000u, "dock corner pixel is transparent");
+    size_t mid_idx = ((size_t)dock.height / 2) * dock.width + (size_t)(dock.width / 2);
+    ASSERT((dock_win.surface.pixels[mid_idx] >> 24) > 0, "dock interior capsule pixel is visible");
+
+    vanilla_window_t dock_menu_win;
+    memset(&dock_menu_win, 0, sizeof(dock_menu_win));
+    dock_menu_win.surface.width = (uint32_t)DOCK_MENU_WIDTH;
+    dock_menu_win.surface.height = (uint32_t)DOCK_MENU_HEIGHT;
+    dock_menu_win.surface.pitch = dock_menu_win.surface.width * sizeof(uint32_t);
+    dock_menu_win.surface.pixels = calloc((size_t)DOCK_MENU_WIDTH * DOCK_MENU_HEIGHT, sizeof(uint32_t));
+    ASSERT(dock_menu_win.surface.pixels != NULL, "allocated dock menu surface");
+    dock.menu_win = &dock_menu_win;
+    dock.menu_open = 1;
+    dock.menu_item_idx = 0;
+    dock_render_menu(&dock);
+    ASSERT(dock_menu_win.surface.pixels[0] == shell_menu_border(), "dock menu corner is sharp 0px border");
+
+    free(dock_menu_win.surface.pixels);
+    free(dock_win.surface.pixels);
+    free(sb_menu_win.surface.pixels);
+    free(sb_win.surface.pixels);
+    statusbar_free_icons(&sb);
+    dock_free_icons(&dock);
+
+    printf("       Passed.\n");
+}
+
 int main(void)
 {
     printf("============================================================\n");
     printf("  Project Tsukasa - Desktop Shell & Launcher Unit Tests\n");
     printf("============================================================\n");
     int passed = 0;
-    int total = 6;
+    int total = 7;
 
     g_shell_case = "layout_clock";
     test_shell_layout_and_clock();
@@ -378,6 +461,11 @@ int main(void)
     g_shell_case = "click_toggle";
     test_shell_click_and_window_toggle();
     TSK_TEST_PASS("shell", "click_toggle");
+    passed++;
+
+    g_shell_case = "modern_chrome";
+    test_modern_shell_chrome_and_poll();
+    TSK_TEST_PASS("shell", "modern_chrome");
     passed++;
 
     TSK_TEST_DONE("shell", passed, total);
