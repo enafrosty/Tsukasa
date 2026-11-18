@@ -111,7 +111,7 @@ void app_draw_char_scale(vanilla_surface_t *surf, int32_t x, int32_t y, char c, 
     if (!font)
         return;
 
-    float size_px = 11.0f * (float)scale;
+    float size_px = 13.5f * (float)scale;
     const vanilla_glyph_t *g = font_get_glyph(font, (uint32_t)uc, size_px);
     if (!g)
         return;

@@ -576,7 +576,7 @@ int main(int argc, char **argv)
     if (!client)
         return 1;
 
-    vanilla_window_t *win = vanilla_create_window(client, "Calculator", 120, 80,
+    vanilla_window_t *win = vanilla_create_window(client, "Calculator", 860, 110,
                                                   CALC_WIDTH, CALC_HEIGHT,
                                                   WINDOW_FLAG_RESIZABLE);
     if (!win) {

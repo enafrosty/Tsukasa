@@ -134,6 +134,10 @@ const vanilla_glyph_t *font_get_glyph(vanilla_font_t *font, uint32_t codepoint, 
     int advance = 0, lsb = 0;
     stbtt_GetCodepointHMetrics(info, (int)codepoint, &advance, &lsb);
 
+    int32_t xadv = (int32_t)(advance * scale + 0.5f);
+    if (advance > 0 && xadv <= 0)
+        return NULL;
+
     int width = 0, height = 0, xoff = 0, yoff = 0;
     uint8_t *bmp = stbtt_GetCodepointBitmap(info, 0.0f, scale, (int)codepoint,
                                             &width, &height, &xoff, &yoff);
@@ -162,7 +166,7 @@ const vanilla_glyph_t *font_get_glyph(vanilla_font_t *font, uint32_t codepoint, 
     font->glyph_cache[slot].height = height;
     font->glyph_cache[slot].xoff = xoff;
     font->glyph_cache[slot].yoff = yoff;
-    font->glyph_cache[slot].xadvance = (int32_t)(advance * scale + 0.5f);
+    font->glyph_cache[slot].xadvance = xadv;
     font->glyph_cache[slot].last_used_tick = ++font->current_tick;
 
     return &font->glyph_cache[slot];

@@ -27,8 +27,8 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#define FM_DEFAULT_W    640
-#define FM_DEFAULT_H    440
+#define FM_DEFAULT_W    590
+#define FM_DEFAULT_H    332
 #define FM_TOOLBAR_H    34
 #define FM_PATHBAR_H    34
 #define FM_STATUS_H     24
@@ -1079,7 +1079,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    vanilla_window_t *win = vanilla_create_window(client, "File Manager", 140, 90,
+    vanilla_window_t *win = vanilla_create_window(client, "File Manager", 36, 390,
                                                   FM_DEFAULT_W, FM_DEFAULT_H,
                                                   WINDOW_FLAG_RESIZABLE);
     if (!win) {

@@ -337,36 +337,41 @@ static void aa_draw_chrome_button(vanilla_compositor_t *comp,
     }
 }
 
-static int generate_nordic_wallpaper(vanilla_image_t *img)
+static int generate_nordic_wallpaper(vanilla_image_t *img, int32_t target_w, int32_t target_h)
 {
     if (!img)
         return -1;
 
-    const int32_t w = 320;
-    const int32_t h = 240;
+    int32_t w = target_w > 0 ? target_w : 640;
+    int32_t h = target_h > 0 ? target_h : 400;
+    if (w > 1280) w = 1280;
+    if (h > 800) h = 800;
+
     uint32_t *pixels = (uint32_t *)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
     if (!pixels)
         return -1;
 
     for (int32_t y = 0; y < h; y++) {
-        float v = (float)y / (float)(h - 1);
+        float v = (h > 1) ? ((float)y / (float)(h - 1)) : 0.0f;
+        uint32_t sky = (v < 0.55f)
+                       ? aa_lerp_argb(0xFF121620u, 0xFF1E2430u, v / 0.55f)
+                       : aa_lerp_argb(0xFF1E2430u, 0xFF2A3242u, (v - 0.55f) / 0.45f);
         for (int32_t x = 0; x < w; x++) {
-            float u = (float)x / (float)(w - 1);
+            float u = (w > 1) ? ((float)x / (float)(w - 1)) : 0.0f;
 
-            float diag = aa_clampf(0.65f * v + 0.35f * u, 0.0f, 1.0f);
-            uint32_t base = aa_lerp_argb(0xFF1A1F2Bu, 0xFF2E3440u, diag);
+            float ax = (u - 0.62f) * 1.5f;
+            float ay = (v - 0.30f) * 2.4f;
+            float glow = 1.0f / (1.0f + (ax * ax + ay * ay) * 3.0f);
+            uint32_t col = aa_lerp_argb(sky, 0xFF569AAEu, glow * 0.42f);
 
-            float ax = (u - 0.62f) * 1.6f;
-            float ay = (v - 0.34f) * 2.2f;
-            float r2 = ax * ax + ay * ay;
-            float glow = 1.0f / (1.0f + r2 * 2.8f);
-            uint32_t col = aa_lerp_argb(base, 0xFF4C6A88u, glow * 0.42f);
+            float bx = (u - 0.28f) * 1.8f;
+            float by = (v - 0.44f) * 2.6f;
+            float glow2 = 1.0f / (1.0f + (bx * bx + by * by) * 3.2f);
+            col = aa_lerp_argb(col, 0xFF447E88u, glow2 * 0.30f);
 
-            float bx = (u - 0.25f) * 1.9f;
-            float by = (v - 0.72f) * 2.4f;
-            float r2b = bx * bx + by * by;
-            float glow2 = 1.0f / (1.0f + r2b * 3.2f);
-            col = aa_lerp_argb(col, 0xFF3B536Eu, glow2 * 0.28f);
+            float ridge_y = 0.78f + 0.04f * (u - 0.5f) * (u - 0.5f);
+            if (v >= ridge_y)
+                col = aa_lerp_argb(col, 0xFF171B26u, aa_clampf((v - ridge_y) * 24.0f, 0.0f, 1.0f));
 
             pixels[(size_t)y * (size_t)w + (size_t)x] = col;
         }
@@ -390,6 +395,14 @@ int compositor_load_default_wallpaper(vanilla_compositor_t *comp)
     }
 
     static const char *const wallpaper_paths[] = {
+        "/fat12/WALLPAP.PNG",
+        "/fat12/wallpap.png",
+        "/WALLPAP.PNG",
+        "/assets/wallpaper.png",
+        "assets/wallpaper.png",
+        "vanilla/assets/wallpaper.png",
+        "../assets/wallpaper.png",
+        "../../assets/wallpaper.png",
         "/fat12/WALLPAP.BMP",
         "/fat12/wallpap.bmp",
         "/WALLPAP.BMP",
@@ -409,7 +422,7 @@ int compositor_load_default_wallpaper(vanilla_compositor_t *comp)
         }
     }
 
-    if (generate_nordic_wallpaper(&comp->wallpaper) == 0) {
+    if (generate_nordic_wallpaper(&comp->wallpaper, (int32_t)comp->width, (int32_t)comp->height) == 0) {
         comp->has_wallpaper = 1;
         compositor_damage_all(comp);
         return 0;
@@ -1203,8 +1216,9 @@ void compositor_render_frame(struct vanilla_server *srv)
 
                     vanilla_rect_t vis_client;
                     if (vanilla_rect_intersect(&client_rect, dirty, &vis_client)) {
-                        /* Fill client background for areas where surface is smaller than window container */
-                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_client, g_theme->bg_base);
+                        /* Fill client background for opaque surfaces or undersized buffers */
+                        if (!(win->flags & WINDOW_FLAG_TRANSPARENT))
+                            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_client, g_theme->bg_base);
 
                         /* Intersect visible client rectangle with actual allocated surface bounds */
                         int32_t surf_w = (int32_t)win->surface.width;

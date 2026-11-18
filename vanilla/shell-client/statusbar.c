@@ -426,7 +426,7 @@ void statusbar_open_menu(statusbar_state_t *sb, shell_state_t *st)
         return;
 
     sb->menu_open = 1;
-    sb->menu_selected_idx = 0;
+    sb->menu_selected_idx = -1;
 
     if (!sb->menu_win) {
         int32_t sm_x = THEME_PX(6);

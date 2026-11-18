@@ -31,6 +31,8 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 #ifndef TEST_SHELL_RUNNER
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/poll.h>
 #endif
 
@@ -69,6 +71,186 @@ static const vanilla_app_entry_t g_launcher_apps[] = {
 
 static icon_t *g_launcher_icons[LAUNCHER_NUM_BUILTIN_APPS];
 static int g_icons_loaded = 0;
+
+#ifndef TEST_SHELL_RUNNER
+static int shell_dbg_io_exact(int fd, void *buf, size_t count, int is_write)
+{
+    uint8_t *p = (uint8_t *)buf;
+    size_t done = 0;
+    int retries = 0;
+
+    while (done < count) {
+        ssize_t n = is_write ? write(fd, p + done, count - done)
+                             : read(fd, p + done, count - done);
+        if (n > 0) {
+            done += (size_t)n;
+        } else if (n == 0) {
+            return -1;
+        } else if (errno == EAGAIN || errno == EINTR) {
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = is_write ? POLLOUT : POLLIN;
+            pfd.revents = 0;
+            if (++retries > 20 || poll(&pfd, 1, 50) <= 0)
+                return -1;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int shell_dbg_discard_exact(int fd, size_t count)
+{
+    uint8_t buf[128];
+    while (count > 0) {
+        size_t chunk = count < sizeof(buf) ? count : sizeof(buf);
+        if (shell_dbg_io_exact(fd, buf, chunk, 0) < 0)
+            return -1;
+        count -= chunk;
+    }
+    return 0;
+}
+
+static int shell_query_window_title(uint32_t win_id, char *out_title, size_t out_cap)
+{
+    if (!out_title || out_cap == 0 || win_id == 0)
+        return -1;
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, VANILLA_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    vanilla_msg_hdr_t hdr;
+    vanilla_msg_hello_t hello;
+    memset(&hdr, 0, sizeof(hdr));
+    memset(&hello, 0, sizeof(hello));
+    hdr.magic = VANILLA_IPC_MAGIC;
+    hdr.msg_type = MSG_HELLO;
+    hdr.payload_len = (uint16_t)sizeof(hello);
+    hello.client_version = VANILLA_IPC_VERSION;
+    strncpy(hello.client_name, "shell-title", sizeof(hello.client_name) - 1);
+
+    if (shell_dbg_io_exact(fd, &hdr, sizeof(hdr), 1) < 0 ||
+        shell_dbg_io_exact(fd, &hello, sizeof(hello), 1) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    vanilla_msg_hdr_t ack_hdr;
+    vanilla_msg_hello_ack_t ack_body;
+    int hello_skipped = 0;
+    for (;;) {
+        if (shell_dbg_io_exact(fd, &ack_hdr, sizeof(ack_hdr), 0) < 0 ||
+            ack_hdr.magic != VANILLA_IPC_MAGIC) {
+            close(fd);
+            return -1;
+        }
+        if (ack_hdr.msg_type == MSG_HELLO_ACK)
+            break;
+        if (ack_hdr.payload_len > 0 && shell_dbg_discard_exact(fd, ack_hdr.payload_len) < 0) {
+            close(fd);
+            return -1;
+        }
+        if (++hello_skipped > 64) {
+            close(fd);
+            return -1;
+        }
+    }
+    if (ack_hdr.payload_len < sizeof(ack_body) ||
+        shell_dbg_io_exact(fd, &ack_body, sizeof(ack_body), 0) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (ack_hdr.payload_len > sizeof(ack_body) &&
+        shell_dbg_discard_exact(fd, ack_hdr.payload_len - sizeof(ack_body)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    vanilla_msg_debug_query_t qpayload;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = VANILLA_IPC_MAGIC;
+    hdr.msg_type = MSG_DEBUG_QUERY;
+    hdr.payload_len = (uint16_t)sizeof(qpayload);
+    qpayload.query_type = DBGQ_WINDOWS;
+
+    if (shell_dbg_io_exact(fd, &hdr, sizeof(hdr), 1) < 0 ||
+        shell_dbg_io_exact(fd, &qpayload, sizeof(qpayload), 1) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    int skipped = 0;
+    for (;;) {
+        vanilla_msg_hdr_t rhdr;
+        if (shell_dbg_io_exact(fd, &rhdr, sizeof(rhdr), 0) < 0 ||
+            rhdr.magic != VANILLA_IPC_MAGIC) {
+            close(fd);
+            return -1;
+        }
+        if (rhdr.msg_type != MSG_DEBUG_QUERY_RESP) {
+            if (rhdr.payload_len > 0 && shell_dbg_discard_exact(fd, rhdr.payload_len) < 0) {
+                close(fd);
+                return -1;
+            }
+            if (++skipped > 64) {
+                close(fd);
+                return -1;
+            }
+            continue;
+        }
+
+        vanilla_msg_debug_query_resp_t rpayload;
+        if (rhdr.payload_len < sizeof(rpayload) ||
+            shell_dbg_io_exact(fd, &rpayload, sizeof(rpayload), 0) < 0) {
+            close(fd);
+            return -1;
+        }
+
+        size_t rem = rhdr.payload_len - sizeof(rpayload);
+        int found = -1;
+        for (uint32_t i = 0; i < rpayload.window_count && rem >= sizeof(vanilla_dbg_window_t); i++) {
+            vanilla_dbg_window_t rec;
+            if (shell_dbg_io_exact(fd, &rec, sizeof(rec), 0) < 0) {
+                close(fd);
+                return -1;
+            }
+            rem -= sizeof(rec);
+            if (found != 0 && rec.window_id == win_id && rec.title[0] != '\0') {
+                size_t len = strlen(rec.title);
+                if (len >= out_cap)
+                    len = out_cap - 1;
+                memcpy(out_title, rec.title, len);
+                out_title[len] = '\0';
+                found = 0;
+            }
+        }
+        if (rem > 0)
+            (void)shell_dbg_discard_exact(fd, rem);
+        close(fd);
+        return found;
+    }
+}
+#else
+static int shell_query_window_title(uint32_t win_id, char *out_title, size_t out_cap)
+{
+    (void)win_id;
+    (void)out_title;
+    (void)out_cap;
+    return -1;
+}
+#endif
 
 static void shell_load_icons(void)
 {
@@ -900,11 +1082,26 @@ void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
             } else if (!(ev->configure.flags & WINDOW_FLAG_BORDERLESS)) {
                 /* Normal top-level window */
                 int found = 0;
+                int existing_idx = -1;
                 for (int i = 0; i < st->win_list.count; i++) {
                     if (st->win_list.windows[i].window_id == ev->window_id) {
                         st->win_list.windows[i].flags = ev->configure.flags;
                         found = 1;
+                        existing_idx = i;
                         break;
+                    }
+                }
+                if (found && existing_idx >= 0) {
+                    shell_window_entry_t *we = &st->win_list.windows[existing_idx];
+                    if (we->title[0] == '\0' || strcmp(we->title, "App") == 0) {
+                        char queried[VANILLA_TITLE_MAX] = "";
+                        if (shell_query_window_title(ev->window_id, queried, sizeof(queried)) == 0 &&
+                            queried[0] != '\0') {
+                            strncpy(we->title, queried, sizeof(we->title) - 1);
+                            we->title[sizeof(we->title) - 1] = '\0';
+                            if (we->is_focused)
+                                statusbar_set_active_title(&st->statusbar, we->title);
+                        }
                     }
                 }
                 if (!found && st->win_list.count < SHELL_MAX_WINDOWS) {
@@ -917,54 +1114,14 @@ void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
 
                     char app_title[VANILLA_TITLE_MAX] = "App";
                     char exec_name[32] = "";
+                    int have_title = (shell_query_window_title(ev->window_id, app_title, sizeof(app_title)) == 0 &&
+                                      app_title[0] != '\0');
 
                     time_t now = time(NULL);
-                    if (g_pending_spawn.app_name[0] && (now - g_pending_spawn.spawn_time) < 10) {
+                    if (!have_title && g_pending_spawn.app_name[0] && (now - g_pending_spawn.spawn_time) < 10) {
                         strncpy(app_title, g_pending_spawn.app_name, sizeof(app_title) - 1);
                         strncpy(exec_name, g_pending_spawn.exec_name, sizeof(exec_name) - 1);
                         memset(&g_pending_spawn, 0, sizeof(g_pending_spawn));
-                    } else {
-                        FILE *fp = fopen("/proc/processes", "r");
-                        if (fp) {
-                            char line[256];
-                            int is_header = 1;
-                            while (fgets(line, sizeof(line), fp)) {
-                                if (is_header) {
-                                    is_header = 0;
-                                    continue;
-                                }
-                                char *p = line;
-                                while (*p == ' ') p++;
-                                int pid = (int)strtol(p, &p, 10);
-                                while (*p == ' ') p++;
-                                strtol(p, &p, 10);
-                                while (*p == ' ') p++;
-                                while (*p && *p != ' ' && *p != '\n') p++;
-                                while (*p == ' ') p++;
-                                char *n_start = p;
-                                while (*p && *p != ' ' && *p != '\n') p++;
-                                size_t n_len = (size_t)(p - n_start);
-                                if (n_len > 0 && pid > 0) {
-                                    char pname[32];
-                                    if (n_len >= sizeof(pname)) n_len = sizeof(pname) - 1;
-                                    memcpy(pname, n_start, n_len);
-                                    pname[n_len] = '\0';
-
-                                    for (int pi = 0; pi < DOCK_PINNED_COUNT; pi++) {
-                                        if (st->dock.items[pi].window_id == 0 &&
-                                            (shell_strcasestr(pname, st->dock.items[pi].name) ||
-                                             shell_strcasestr(st->dock.items[pi].name, pname))) {
-                                            strncpy(app_title, st->dock.items[pi].name, sizeof(app_title) - 1);
-                                            strncpy(exec_name, pname, sizeof(exec_name) - 1);
-                                            break;
-                                        }
-                                    }
-                                    if (exec_name[0])
-                                        break;
-                                }
-                            }
-                            fclose(fp);
-                        }
                     }
 
                     strncpy(we->title, app_title, sizeof(we->title) - 1);
@@ -1005,6 +1162,16 @@ void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
                 if (ev->focus.focused) {
                     st->win_list.windows[i].is_mapped = 1;
                     st->win_list.windows[i].is_minimized = 0;
+                    if (st->win_list.windows[i].title[0] == '\0' ||
+                        strcmp(st->win_list.windows[i].title, "App") == 0) {
+                        char queried[VANILLA_TITLE_MAX] = "";
+                        if (shell_query_window_title(ev->window_id, queried, sizeof(queried)) == 0 &&
+                            queried[0] != '\0') {
+                            strncpy(st->win_list.windows[i].title, queried,
+                                    sizeof(st->win_list.windows[i].title) - 1);
+                            st->win_list.windows[i].title[sizeof(st->win_list.windows[i].title) - 1] = '\0';
+                        }
+                    }
                     focused_title = st->win_list.windows[i].title;
                 }
             } else if (ev->focus.focused) {
