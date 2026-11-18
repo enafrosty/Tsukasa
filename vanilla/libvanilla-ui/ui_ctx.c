@@ -141,7 +141,8 @@ ui_widget_t *ui_alloc_widget(ui_ctx_t *ctx, ui_widget_type_t type)
             w->layout_elem->type = VELEM_TEXT;
             w->layout_elem->w_mode = VSIZE_FIT;
             w->layout_elem->h_mode = VSIZE_FIT;
-            w->layout_elem->font_size = 8.0f;
+            w->layout_elem->font_size = 0.0f;
+            w->layout_elem->font_weight = APP_FONT_REGULAR;
         }
         break;
 
@@ -149,6 +150,7 @@ ui_widget_t *ui_alloc_widget(ui_ctx_t *ctx, ui_widget_type_t type)
         w->focusable = 1;
         w->text_field.sel_start = -1;
         w->text_field.sel_end = -1;
+        w->text_field.sel_anchor = -1;
         if (w->layout_elem) {
             w->layout_elem->type = VELEM_BOX;
             w->layout_elem->w_mode = VSIZE_GROW;
@@ -198,6 +200,7 @@ ui_widget_t *ui_alloc_widget(ui_ctx_t *ctx, ui_widget_type_t type)
 
     case UI_WIDGET_LIST:
         w->focusable = 1;
+        w->list.hovered = -1;
         if (w->layout_elem) {
             w->layout_elem->type = VELEM_BOX;
             w->layout_elem->w_mode = VSIZE_GROW;
@@ -212,22 +215,27 @@ ui_widget_t *ui_alloc_widget(ui_ctx_t *ctx, ui_widget_type_t type)
             w->layout_elem->type = VELEM_BOX;
             w->layout_elem->w_mode = VSIZE_GROW;
             w->layout_elem->h_mode = VSIZE_GROW;
+            w->layout_elem->direction = VDIR_COLUMN;
+            w->layout_elem->align_items = VALIGN_START;
             w->layout_elem->clip_children = 1;
         }
         break;
 
     case UI_WIDGET_MENU:
         w->focusable = 1;
+        w->menu.selected = -1;
+        w->menu.hovered = -1;
         if (w->layout_elem) {
             w->layout_elem->type = VELEM_BOX;
             w->layout_elem->w_mode = VSIZE_FIT;
             w->layout_elem->h_mode = VSIZE_FIT;
-            w->layout_elem->corner_radius = 4;
+            w->layout_elem->corner_radius = 0;
         }
         break;
 
     case UI_WIDGET_TAB_BAR:
         w->focusable = 1;
+        w->tab_bar.hovered_tab = -1;
         if (w->layout_elem) {
             w->layout_elem->type = VELEM_BOX;
             w->layout_elem->w_mode = VSIZE_GROW;
@@ -254,7 +262,114 @@ ui_widget_t *ui_alloc_widget(ui_ctx_t *ctx, ui_widget_type_t type)
             w->layout_elem->h_mode = VSIZE_FIT;
         }
         break;
+
+    case UI_WIDGET_PROGRESS_BAR:
+        w->focusable = 0;
+        w->progress_bar.max_val = 100.0f;
+        w->progress_bar.show_label = 1;
+        if (w->layout_elem) {
+            w->layout_elem->type = VELEM_BOX;
+            w->layout_elem->w_mode = VSIZE_GROW;
+            w->layout_elem->h_mode = VSIZE_FIXED;
+            w->layout_elem->h_px = 18;
+            w->layout_elem->corner_radius = 4;
+        }
+        break;
     }
 
     return w;
+}
+
+void ui_ctx_set_clipboard_ops(ui_ctx_t *ctx,
+                              ui_clipboard_set_fn_t set_fn,
+                              ui_clipboard_get_fn_t get_fn)
+{
+    if (!ctx)
+        return;
+    ctx->clipboard_set_fn = set_fn;
+    ctx->clipboard_get_fn = get_fn;
+}
+
+void ui_ctx_show_popup(ui_ctx_t *ctx, ui_widget_t *menu, int32_t x, int32_t y)
+{
+    if (!ctx || !menu)
+        return;
+
+    if (ctx->active_popup && ctx->active_popup != menu)
+        ctx->active_popup->hidden = 1;
+
+    if (menu->type == UI_WIDGET_MENU) {
+        menu->menu.floating = 1;
+        menu->menu.float_x = x;
+        menu->menu.float_y = y;
+        menu->menu.hovered = -1;
+        menu->menu.selected = -1;
+    }
+    menu->hidden = 0;
+    ctx->active_popup = menu;
+    ctx->overlay_dirty = 1;
+    ui_widget_invalidate(menu);
+}
+
+void ui_ctx_hide_popup(ui_ctx_t *ctx)
+{
+    if (!ctx || !ctx->active_popup)
+        return;
+
+    ctx->active_popup->hidden = 1;
+    if (ctx->active_popup->type == UI_WIDGET_MENU)
+        ctx->active_popup->menu.hovered = -1;
+    ctx->active_popup = NULL;
+    ctx->overlay_dirty = 1;
+}
+
+ui_widget_t *ui_ctx_get_popup(ui_ctx_t *ctx)
+{
+    return ctx ? ctx->active_popup : NULL;
+}
+
+void ui_ctx_show_modal(ui_ctx_t *ctx, ui_widget_t *modal)
+{
+    if (!ctx || !modal)
+        return;
+
+    if (ctx->active_popup)
+        ui_ctx_hide_popup(ctx);
+
+    if (ctx->active_modal && ctx->active_modal != modal)
+        ctx->active_modal->hidden = 1;
+
+    modal->hidden = 0;
+    if (modal->type == UI_WIDGET_MODAL_DIALOG) {
+        modal->modal.result = UI_DIALOG_RES_NONE;
+        modal->modal.pressed_btn = 0;
+        modal->modal.hovered_btn = 0;
+    }
+    ctx->active_modal = modal;
+    ctx->overlay_dirty = 1;
+    ui_widget_invalidate(modal);
+
+    if (modal->type == UI_WIDGET_MODAL_DIALOG && modal->modal.input_field)
+        ui_widget_set_focus(ctx, modal->modal.input_field);
+}
+
+void ui_ctx_hide_modal(ui_ctx_t *ctx)
+{
+    if (!ctx || !ctx->active_modal)
+        return;
+
+    ui_widget_t *m = ctx->active_modal;
+    if (m->type == UI_WIDGET_MODAL_DIALOG &&
+        m->modal.input_field &&
+        ctx->focused_widget == m->modal.input_field) {
+        ui_widget_set_focus(ctx, NULL);
+    }
+    m->hidden = 1;
+    ctx->active_modal = NULL;
+    ctx->overlay_dirty = 1;
+}
+
+ui_widget_t *ui_ctx_get_modal(ui_ctx_t *ctx)
+{
+    return ctx ? ctx->active_modal : NULL;
 }

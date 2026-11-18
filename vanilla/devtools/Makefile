@@ -37,6 +37,7 @@ LIBC_A         = ../../tsukasa-libc/lib/libc.a
 LIBM_A         = ../../tsukasa-libc/lib/libm.a
 LIBVANILLA_A   = ../lib/libvanilla.a
 APP_COMMON_OBJ = ../apps/app_common.o
+FONT_OBJS      = ../server/font.o ../server/default_font.o
 
 BIN = DEVTOOLS.ELF
 
@@ -44,8 +45,8 @@ OBJS = inspector.o vendor/microui/microui.o
 
 all: $(BIN)
 
-$(BIN): $(CRT0) $(OBJS) $(APP_COMMON_OBJ) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) $(OBJS) $(APP_COMMON_OBJ) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(BIN): $(CRT0) $(OBJS) $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) $(OBJS) $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
 inspector.o: inspector.c inspector.h
 	$(CC) $(CFLAGS) -c -o $@ $<

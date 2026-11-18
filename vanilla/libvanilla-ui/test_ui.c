@@ -324,7 +324,7 @@ static int test_ui_text_field(void)
     TEST_ASSERT(strlen(tf->text_field.buf) == 255, "256th char rejected, buffer stayed at 255");
     TEST_ASSERT(tf->text_field.buf[255] == '\0', "buffer null terminator intact");
 
-    /* Mouse click cursor positioning */
+    /* Mouse click cursor positioning using real TrueType glyph advances */
     tf->text_field.buf[0] = 'A';
     tf->text_field.buf[1] = 'B';
     tf->text_field.buf[2] = 'C';
@@ -334,9 +334,24 @@ static int test_ui_text_field(void)
     tf->layout_elem->computed_w = 200;
     tf->layout_elem->computed_h = 28;
     tf->text_field.scroll_x = 0;
-    /* Click near character 2 (inner_x = 56, char 2 is around 56 + 16 = 72) */
-    ui_text_field_handle_click(tf, 73, 55, 0);
+    int32_t ab_w = 0;
+    app_measure_text_n("ABC", 2, app_default_font_size(), APP_FONT_REGULAR, &ab_w, NULL);
+    ui_text_field_handle_click(tf, 56 + ab_w + 1, 55, 0);
     TEST_ASSERT(tf->text_field.cursor_pos == 2, "click placed cursor at index 2");
+
+    /* Proportional TrueType glyphs: "iiii" is narrower than "MMMM" */
+    int32_t narrow_w = 0, wide_w = 0;
+    app_measure_text("iiii", &narrow_w, NULL);
+    app_measure_text("MMMM", &wide_w, NULL);
+    TEST_ASSERT(wide_w > narrow_w, "TrueType M is wider than i");
+
+    strcpy(tf->text_field.buf, "MMMM");
+    ui_text_field_handle_click(tf, 56 + narrow_w, 55, 0);
+    int32_t pos_wide = tf->text_field.cursor_pos;
+    strcpy(tf->text_field.buf, "iiii");
+    ui_text_field_handle_click(tf, 56 + narrow_w, 55, 0);
+    int32_t pos_narrow = tf->text_field.cursor_pos;
+    TEST_ASSERT(pos_narrow > pos_wide, "same click X lands deeper in narrow string");
 
     PASS("text_field");
     return 0;
@@ -482,12 +497,425 @@ static int test_ui_widgets_and_render(void)
     return 0;
 }
 
+static uint32_t s_ext_pixels[640 * 480];
+static uint8_t  s_layout_arena[64 * 1024];
+
+static char s_mock_clip[256];
+static int  s_mock_clip_len = 0;
+
+static int mock_clip_set(const char *text, size_t len)
+{
+    if (!text)
+        return -1;
+    if (len >= sizeof(s_mock_clip))
+        len = sizeof(s_mock_clip) - 1;
+    memcpy(s_mock_clip, text, len);
+    s_mock_clip[len] = '\0';
+    s_mock_clip_len = (int)len;
+    return 0;
+}
+
+static int mock_clip_get(char *out, size_t max_len)
+{
+    if (!out || max_len == 0)
+        return 0;
+    size_t n = (size_t)s_mock_clip_len;
+    if (n >= max_len)
+        n = max_len - 1;
+    if (n > 0)
+        memcpy(out, s_mock_clip, n);
+    out[n] = '\0';
+    return (int)n;
+}
+
+static int test_ui_scroll_and_list(void)
+{
+    vanilla_layout_t *lctx = vlayout_init(s_layout_arena, sizeof(s_layout_arena));
+    TEST_ASSERT(lctx != NULL, "vlayout_init failed");
+    ui_ctx_t *ctx = ui_ctx_init(s_arena, sizeof(s_arena), lctx);
+    TEST_ASSERT(ctx != NULL, "ui_ctx_init failed");
+
+    ui_widget_t *root = ui_box(ctx, VDIR_COLUMN);
+    ui_widget_t *scv = ui_scroll_view(ctx);
+    scv->layout_elem->h_mode = VSIZE_FIXED;
+    scv->layout_elem->h_px = 100;
+    ui_widget_add_child(root, scv);
+
+    ui_widget_t *b1 = ui_button(ctx, "First", NULL, NULL);
+    b1->layout_elem->h_mode = VSIZE_FIXED;
+    b1->layout_elem->h_px = 120;
+    ui_widget_t *b2 = ui_button(ctx, "Second", NULL, NULL);
+    b2->layout_elem->h_mode = VSIZE_FIXED;
+    b2->layout_elem->h_px = 120;
+    ui_widget_add_child(scv, b1);
+    ui_widget_add_child(scv, b2);
+
+    ui_widget_t *lst = ui_list(ctx, NULL, 0, NULL, NULL);
+    const char *long_items[20] = {
+        "Row 00", "Row 01", "Row 02", "Row 03", "Row 04",
+        "Row 05", "Row 06", "Row 07", "Row 08", "Row 09",
+        "Row 10", "Row 11", "Row 12", "Row 13", "Row 14",
+        "Row 15", "Row 16", "Row 17", "Row 18", "Row 19"
+    };
+    ui_list_set_items(lst, long_items, 20);
+    lst->layout_elem->h_mode = VSIZE_FIXED;
+    lst->layout_elem->h_px = 100;
+    ui_widget_add_child(root, lst);
+
+    vanilla_surface_t surf;
+    memset(&surf, 0, sizeof(surf));
+    surf.width = 400;
+    surf.height = 300;
+    surf.pitch = 400 * sizeof(uint32_t);
+    surf.pixels = s_ext_pixels;
+
+    ui_render(ctx, root, &surf, NULL);
+    int32_t b1_y0 = b1->layout_elem->computed_y;
+    int32_t b2_y0 = b2->layout_elem->computed_y;
+    TEST_ASSERT(b2_y0 > b1_y0, "second child positioned below first");
+    TEST_ASSERT(ui_scroll_view_effective_content_h(scv) >= 240, "scroll_view content height computed");
+
+    /* Wheel scroll down inside scroll_view */
+    struct input_event iev;
+    memset(&iev, 0, sizeof(iev));
+    iev.type = EV_REL;
+    iev.code = REL_WHEEL;
+    iev.pad1 = (uint16_t)(scv->layout_elem->computed_x + 20);
+    iev.pad2 = (uint32_t)(scv->layout_elem->computed_y + 20);
+    iev.value = -2;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(scv->scroll_view.scroll_y > 0, "wheel down increased scroll_y");
+
+    int32_t scrolled_y = scv->scroll_view.scroll_y;
+    ui_render(ctx, root, &surf, NULL);
+    TEST_ASSERT(b1->layout_elem->computed_y == b1_y0 - scrolled_y,
+                "scroll_view translated child computed_y");
+
+    /* Clipped second child outside viewport must not hit when offscreen, scroll to reveal it */
+    ui_scroll_view_scroll_to(scv, 140);
+    ui_render(ctx, root, &surf, NULL);
+    TEST_ASSERT(scv->scroll_view.scroll_y == 140, "scroll_to clamped within range");
+    ui_widget_t *hit = ui_hit_test(root,
+                                   scv->layout_elem->computed_x + 20,
+                                   scv->layout_elem->computed_y + 50);
+    TEST_ASSERT(hit == b2, "scrolled child b2 now hittable inside viewport");
+
+    /* Scrollbar press/drag on scroll_view scrollbar edge */
+    int32_t sb_x = scv->layout_elem->computed_x + scv->layout_elem->computed_w - 4;
+    int32_t sb_top = scv->layout_elem->computed_y + 5;
+    iev.type = EV_KEY;
+    iev.code = BTN_LEFT;
+    iev.pad1 = (uint16_t)sb_x;
+    iev.pad2 = (uint32_t)sb_top;
+    iev.value = 1;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(scv->scroll_view.scroll_y < 140, "track click above thumb scrolled up");
+    iev.value = 0;
+    ui_handle_event(ctx, root, &iev);
+
+    /* List keyboard navigation & scroll-to-selection */
+    ui_widget_set_focus(ctx, lst);
+    iev.type = EV_KEY;
+    iev.code = KEY_END;
+    iev.value = 1;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(lst->list.selected == 19, "KEY_END selected last item");
+    TEST_ASSERT(lst->list.scroll_top > 0, "list auto-scrolled to bottom selection");
+
+    iev.code = KEY_HOME;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(lst->list.selected == 0, "KEY_HOME selected first item");
+    TEST_ASSERT(lst->list.scroll_top == 0, "list auto-scrolled back to top");
+
+    PASS("scroll_and_list");
+    return 0;
+}
+
+static int test_ui_menus_and_sharp_corners(void)
+{
+    vanilla_layout_t *lctx = vlayout_init(s_layout_arena, sizeof(s_layout_arena));
+    TEST_ASSERT(lctx != NULL, "vlayout_init failed");
+    ui_ctx_t *ctx = ui_ctx_init(s_arena, sizeof(s_arena), lctx);
+    TEST_ASSERT(ctx != NULL, "ui_ctx_init failed");
+
+    ui_widget_t *root = ui_box(ctx, VDIR_COLUMN);
+    const char *bar_labels[] = { "File", "Edit", "Help" };
+    ui_widget_t *bar = ui_menubar(ctx, bar_labels, 3, on_test_menu, NULL);
+    ui_widget_add_child(root, bar);
+
+    const ui_menu_item_t mitems[] = {
+        { "New",      "Ctrl+N", 0,                     1 },
+        { NULL,       NULL,     UI_MENU_ITEM_SEPARATOR, 0 },
+        { "Save",     "Ctrl+S", UI_MENU_ITEM_CHECKED,  2 },
+        { "Disabled", NULL,     UI_MENU_ITEM_DISABLED, 3 },
+    };
+    s_menu_val = -1;
+    ui_widget_t *pop = ui_menu_ex(ctx, mitems, 4, on_test_menu, NULL);
+    TEST_ASSERT(pop->layout_elem->corner_radius == 0, "menu corner_radius is 0px sharp");
+    TEST_ASSERT(bar->layout_elem->corner_radius == 0, "menubar corner_radius is 0px sharp");
+
+    vanilla_surface_t surf;
+    memset(&surf, 0, sizeof(surf));
+    surf.width = 480;
+    surf.height = 320;
+    surf.pitch = 480 * sizeof(uint32_t);
+    surf.pixels = s_ext_pixels;
+
+    int32_t fx = ui_menubar_item_x(bar, 0);
+    ui_ctx_show_popup(ctx, pop, fx, 28);
+    ui_render(ctx, root, &surf, NULL);
+    TEST_ASSERT(ui_ctx_get_popup(ctx) == pop, "popup active after show");
+
+    /* Verify menu emit_draw uses zero rounded_rects (sharp 0px corners) */
+    vanilla_draw_cmd_t cmd_buf[128];
+    vanilla_draw_cmd_array_t cmds = { cmd_buf, 0, 128 };
+    ui_widget_emit_draw(pop, &cmds);
+    int rounded_count = 0;
+    for (int32_t i = 0; i < cmds.count; i++) {
+        if (cmd_buf[i].type == VCMD_ROUNDED_RECT)
+            rounded_count++;
+    }
+    TEST_ASSERT(rounded_count == 0, "menu draw emits 0 rounded_rects (sharp 0px corners)");
+
+    /* Clicking separator and disabled item must not trigger selection */
+    int32_t sep_y = 0, sep_h = 0;
+    ui_menu_row_rect(pop, 1, &sep_y, &sep_h);
+    struct input_event iev;
+    memset(&iev, 0, sizeof(iev));
+    iev.type = EV_KEY;
+    iev.code = BTN_LEFT;
+    iev.pad1 = (uint16_t)(pop->layout_elem->computed_x + 12);
+    iev.pad2 = (uint32_t)(sep_y + sep_h / 2);
+    iev.value = 1;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(s_menu_val == -1, "separator click ignored");
+    TEST_ASSERT(ui_ctx_get_popup(ctx) == pop, "popup stays open on separator click");
+
+    int32_t dis_y = 0, dis_h = 0;
+    ui_menu_row_rect(pop, 3, &dis_y, &dis_h);
+    iev.pad2 = (uint32_t)(dis_y + dis_h / 2);
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(s_menu_val == -1, "disabled menu item click ignored");
+
+    /* Clicking enabled Save row fires callback and closes popup */
+    int32_t sav_y = 0, sav_h = 0;
+    ui_menu_row_rect(pop, 2, &sav_y, &sav_h);
+    iev.pad2 = (uint32_t)(sav_y + sav_h / 2);
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(s_menu_val == 2, "Save menu item selected");
+    TEST_ASSERT(ui_ctx_get_popup(ctx) == NULL, "popup auto-hidden after item click");
+
+    PASS("menus_and_sharp_corners");
+    return 0;
+}
+
+static ui_dialog_result_t s_last_dlg_res = UI_DIALOG_RES_NONE;
+static void on_test_dialog(ui_widget_t *w, const ui_event_t *ev, void *ud)
+{
+    (void)ud;
+    if (w && w->type == UI_WIDGET_MODAL_DIALOG && ev->type == UI_EVENT_CLICK) {
+        s_modal_clicked++;
+        s_last_dlg_res = w->modal.result;
+    }
+}
+
+static int test_ui_modals_and_progress(void)
+{
+    vanilla_layout_t *lctx = vlayout_init(s_layout_arena, sizeof(s_layout_arena));
+    TEST_ASSERT(lctx != NULL, "vlayout_init failed");
+    ui_ctx_t *ctx = ui_ctx_init(s_arena, sizeof(s_arena), lctx);
+    TEST_ASSERT(ctx != NULL, "ui_ctx_init failed");
+
+    ui_widget_t *root = ui_box(ctx, VDIR_COLUMN);
+    s_btn_clicked = 0;
+    ui_widget_t *bg_btn = ui_button(ctx, "Behind", on_test_btn_click, NULL);
+    ui_widget_add_child(root, bg_btn);
+
+    ui_widget_t *pb = ui_progress_bar_create(ctx, 42.0f);
+    TEST_ASSERT(strcmp(pb->progress_bar.label_buf, "42%") == 0, "progress bar initial 42%");
+    ui_progress_bar_set(pb, 75.6f);
+    TEST_ASSERT(strcmp(pb->progress_bar.label_buf, "76%") == 0, "progress bar updated to 76%");
+    ui_progress_bar_set(pb, 150.0f);
+    TEST_ASSERT(pb->progress_bar.value == 100.0f, "progress bar clamped at 100");
+    ui_widget_add_child(root, pb);
+
+    vanilla_surface_t surf;
+    memset(&surf, 0, sizeof(surf));
+    surf.width = 480;
+    surf.height = 360;
+    surf.pitch = 480 * sizeof(uint32_t);
+    surf.pixels = s_ext_pixels;
+
+    /* Confirm modal overlay: blocks background clicks, Cancel sets RES_CANCEL */
+    ui_widget_t *cfm = ui_dialog_confirm(ctx, "Delete?", "Confirm action",
+                                         "Delete", "Cancel", on_test_dialog, NULL);
+    ui_ctx_show_modal(ctx, cfm);
+    ui_render(ctx, root, &surf, NULL);
+    TEST_ASSERT(ui_ctx_get_modal(ctx) == cfm, "confirm modal shown");
+
+    struct input_event iev;
+    memset(&iev, 0, sizeof(iev));
+    iev.type = EV_KEY;
+    iev.code = BTN_LEFT;
+    iev.pad1 = (uint16_t)(bg_btn->layout_elem->computed_x + 10);
+    iev.pad2 = (uint32_t)(bg_btn->layout_elem->computed_y + 10);
+    iev.value = 1;
+    ui_handle_event(ctx, root, &iev);
+    iev.value = 0;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(s_btn_clicked == 0, "modal blocks background button click");
+
+    int32_t cx = 0, cy = 0, cw = 0, ch = 0;
+    ui_modal_compute_layout(cfm, &cx, &cy, &cw, &ch);
+    s_modal_clicked = 0;
+    s_last_dlg_res = UI_DIALOG_RES_NONE;
+    iev.pad1 = (uint16_t)(cx + cw - 186 + 20);
+    iev.pad2 = (uint32_t)(cy + ch - 40 + 12);
+    iev.value = 1;
+    ui_handle_event(ctx, root, &iev);
+    iev.value = 0;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(s_modal_clicked == 1, "Cancel click invoked dialog callback");
+    TEST_ASSERT(s_last_dlg_res == UI_DIALOG_RES_CANCEL, "Cancel click returned UI_DIALOG_RES_CANCEL");
+    TEST_ASSERT(ui_ctx_get_modal(ctx) == NULL, "modal hidden after Cancel");
+
+    /* Prompt modal: accepts text input and Enter submits OK */
+    ui_widget_t *prm = ui_dialog_prompt(ctx, "Rename", "Enter new name",
+                                        "doc", "Save", "Cancel", on_test_dialog, NULL);
+    ui_ctx_show_modal(ctx, prm);
+    ui_render(ctx, root, &surf, NULL);
+    TEST_ASSERT(ui_get_focused(ctx) == prm->modal.input_field,
+                "prompt modal auto-focused input field");
+
+    memset(&iev, 0, sizeof(iev));
+    iev.type = EV_KEY;
+    iev.code = KEY_2;
+    iev.value = 1;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(strcmp(ui_dialog_get_input(prm), "doc2") == 0, "prompt text appended");
+
+    s_modal_clicked = 0;
+    s_last_dlg_res = UI_DIALOG_RES_NONE;
+    iev.code = KEY_ENTER;
+    iev.value = 1;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(s_modal_clicked == 1, "Enter confirmed prompt modal");
+    TEST_ASSERT(s_last_dlg_res == UI_DIALOG_RES_OK, "Enter yielded UI_DIALOG_RES_OK");
+    TEST_ASSERT(strcmp(ui_dialog_get_input(prm), "doc2") == 0, "prompt text retained after OK");
+    TEST_ASSERT(ui_ctx_get_modal(ctx) == NULL, "prompt modal hidden after Enter");
+
+    PASS("modals_and_progress");
+    return 0;
+}
+
+static int test_ui_multiline_text_area(void)
+{
+    vanilla_layout_t *lctx = vlayout_init(s_layout_arena, sizeof(s_layout_arena));
+    TEST_ASSERT(lctx != NULL, "vlayout_init failed");
+    ui_ctx_t *ctx = ui_ctx_init(s_arena, sizeof(s_arena), lctx);
+    TEST_ASSERT(ctx != NULL, "ui_ctx_init failed");
+    ui_ctx_set_clipboard_ops(ctx, mock_clip_set, mock_clip_get);
+
+    ui_widget_t *root = ui_box(ctx, VDIR_COLUMN);
+    ui_widget_t *ta = ui_text_area(ctx, "alpha\nbeta\ngamma", 1, NULL, NULL);
+    ui_widget_t *next_btn = ui_button(ctx, "Next", NULL, NULL);
+    ui_widget_add_child(root, ta);
+    ui_widget_add_child(root, next_btn);
+
+    TEST_ASSERT(ui_text_field_get_line_count(ta) == 3, "multiline count is 3");
+    int32_t ln = 0, col = 0;
+    ui_text_field_get_cursor_lc(ta, &ln, &col);
+    TEST_ASSERT(ln == 1 && col == 1, "initial cursor at line 1 col 1");
+
+    ui_widget_set_focus(ctx, ta);
+    struct input_event iev;
+    memset(&iev, 0, sizeof(iev));
+    iev.type = EV_KEY;
+    iev.value = 1;
+
+    /* Move down to line 2, end of line, press Enter, insert Tab (4 spaces) */
+    iev.code = KEY_DOWN;
+    ui_handle_event(ctx, root, &iev);
+    ui_text_field_get_cursor_lc(ta, &ln, &col);
+    TEST_ASSERT(ln == 2, "KEY_DOWN moved to line 2");
+
+    iev.code = KEY_END;
+    ui_handle_event(ctx, root, &iev);
+    iev.code = KEY_ENTER;
+    ui_handle_event(ctx, root, &iev);
+    iev.code = KEY_TAB;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(ui_get_focused(ctx) == ta, "Tab inside multiline text_area did not blur focus");
+    TEST_ASSERT(ui_text_field_get_line_count(ta) == 4, "Enter added a line");
+    TEST_ASSERT(strcmp(ui_text_field_get_text(ta), "alpha\nbeta\n    \ngamma") == 0,
+                "Enter + Tab inserted newline and 4 spaces");
+
+    /* Clipboard Ctrl+A / Ctrl+C / Ctrl+End / Ctrl+V */
+    ctx->ctrl_down = 1;
+    iev.code = KEY_A;
+    ui_handle_event(ctx, root, &iev);
+    iev.code = KEY_C;
+    ui_handle_event(ctx, root, &iev);
+    ctx->ctrl_down = 0;
+    TEST_ASSERT(strcmp(s_mock_clip, "alpha\nbeta\n    \ngamma") == 0,
+                "Ctrl+C copied multiline text");
+
+    ui_text_field_set_text(ta, "head:");
+    ctx->ctrl_down = 1;
+    iev.code = KEY_END;
+    ui_handle_event(ctx, root, &iev);
+    iev.code = KEY_V;
+    ui_handle_event(ctx, root, &iev);
+    ctx->ctrl_down = 0;
+    TEST_ASSERT(strncmp(ui_text_field_get_text(ta), "head:alpha", 10) == 0,
+                "Ctrl+V pasted clipboard content");
+
+    /* Render 30-line text area inside fixed box and verify wheel scrolling */
+    ta->layout_elem->h_mode = VSIZE_FIXED;
+    ta->layout_elem->h_px = 100;
+    ui_text_field_set_text(ta,
+                           "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10\n"
+                           "L11\nL12\nL13\nL14\nL15\nL16\nL17\nL18\nL19\nL20");
+    vanilla_surface_t surf;
+    memset(&surf, 0, sizeof(surf));
+    surf.width = 480;
+    surf.height = 240;
+    surf.pitch = 480 * sizeof(uint32_t);
+    surf.pixels = s_ext_pixels;
+    ui_render(ctx, root, &surf, NULL);
+
+    iev.type = EV_REL;
+    iev.code = REL_WHEEL;
+    iev.pad1 = (uint16_t)(ta->layout_elem->computed_x + 50);
+    iev.pad2 = (uint32_t)(ta->layout_elem->computed_y + 40);
+    iev.value = -2;
+    ui_handle_event(ctx, root, &iev);
+    TEST_ASSERT(ta->text_field.scroll_y > 0, "wheel scrolled multiline text_area");
+
+    /* Shift+Tab leaves multiline editor */
+    iev.type = EV_KEY;
+    iev.code = KEY_TAB;
+    iev.value = 1;
+    ctx->shift_down = 1;
+    ui_handle_event(ctx, root, &iev);
+    ctx->shift_down = 0;
+    TEST_ASSERT(ui_get_focused(ctx) != ta, "Shift+Tab moved focus out of multiline text_area");
+
+    ui_text_field_free(ta);
+    PASS("multiline_text_area");
+    return 0;
+}
+
 int main(void)
 {
     printf("=== libvanilla-ui unit tests ===\n");
     if (test_ui_tree_and_focus() != 0) return 1;
     if (test_ui_text_field() != 0) return 1;
     if (test_ui_widgets_and_render() != 0) return 1;
-    printf("[TEST] ui DONE 3/3\n");
+    if (test_ui_scroll_and_list() != 0) return 1;
+    if (test_ui_menus_and_sharp_corners() != 0) return 1;
+    if (test_ui_modals_and_progress() != 0) return 1;
+    if (test_ui_multiline_text_area() != 0) return 1;
+    printf("[TEST] ui DONE 7/7\n");
     return 0;
 }

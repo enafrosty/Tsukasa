@@ -15,6 +15,7 @@
  */
 
 #include "../include/layout.h"
+#include "../apps/app_common.h"
 #include <string.h>
 
 struct vanilla_layout_t {
@@ -99,6 +100,12 @@ vanilla_elem_t *vlayout_spacer(vanilla_layout_t *ctx)
 
 vanilla_elem_t *vlayout_text(vanilla_layout_t *ctx, const char *text, uint32_t color, float font_size)
 {
+    return vlayout_text_ex(ctx, text, color, font_size, APP_FONT_REGULAR);
+}
+
+vanilla_elem_t *vlayout_text_ex(vanilla_layout_t *ctx, const char *text, uint32_t color,
+                                float font_size, int32_t font_weight)
+{
     vanilla_elem_t *elem = vlayout_alloc_elem(ctx);
     if (!elem)
         return NULL;
@@ -109,6 +116,7 @@ vanilla_elem_t *vlayout_text(vanilla_layout_t *ctx, const char *text, uint32_t c
     elem->text = text;
     elem->text_color = color;
     elem->font_size = font_size;
+    elem->font_weight = font_weight;
     return elem;
 }
 
@@ -152,42 +160,19 @@ static void vlayout_measure(vanilla_elem_t *elem)
         vlayout_measure(child);
 
     switch (elem->type) {
-    case VELEM_TEXT: {
-        int scale = (int32_t)elem->font_size / 8;
-        if (scale < 1)
-            scale = 1;
-        int char_w = 8 * scale;
-        int line_h = 8 * scale;
-        int max_len = 0;
-        int cur_len = 0;
-        int lines = 0;
-
+    case VELEM_TEXT:
         if (elem->text && elem->text[0] != '\0') {
-            lines = 1;
-            const char *p = elem->text;
-            while (*p) {
-                if (*p == '\r') {
-                    p++;
-                    continue;
-                }
-                if (*p == '\n') {
-                    lines++;
-                    if (cur_len > max_len)
-                        max_len = cur_len;
-                    cur_len = 0;
-                } else {
-                    cur_len++;
-                }
-                p++;
-            }
-            if (cur_len > max_len)
-                max_len = cur_len;
+            float fsize = (elem->font_size > 0.0f) ? elem->font_size : app_default_font_size();
+            int32_t tw = 0;
+            int32_t th = 0;
+            app_measure_text_ex(elem->text, fsize, (app_font_weight_t)elem->font_weight, &tw, &th);
+            elem->computed_w = tw;
+            elem->computed_h = th;
+        } else {
+            elem->computed_w = 0;
+            elem->computed_h = 0;
         }
-
-        elem->computed_w = max_len * char_w;
-        elem->computed_h = lines * line_h + (lines > 1 ? (lines - 1) * 2 : 0);
         break;
-    }
 
     case VELEM_IMAGE:
         if (elem->image_src_rect.w > 0 && elem->image_src_rect.h > 0) {
@@ -544,8 +529,9 @@ static void vlayout_emit_elem(vanilla_elem_t *elem, vanilla_draw_cmd_array_t *ou
                 cmd.bounds.h = elem->computed_h;
                 cmd.text.text = elem->text;
                 cmd.text.color = elem->text_color;
-                cmd.text.font_size = elem->font_size;
+                cmd.text.font_size = (elem->font_size > 0.0f) ? elem->font_size : app_default_font_size();
                 cmd.text.font_id = 0;
+                cmd.text.font_weight = elem->font_weight;
                 out->cmds[out->count++] = cmd;
             }
         }

@@ -80,6 +80,7 @@ struct vanilla_elem_t {
     const char         *text;
     uint32_t            text_color;
     float               font_size;
+    int32_t             font_weight; /* 0 = regular, 1 = medium, 2 = bold */
 
     /* Content (for VELEM_IMAGE) */
     vanilla_surface_t  *image_src;
@@ -121,6 +122,8 @@ void vlayout_emit(vanilla_layout_t *ctx, vanilla_elem_t *root,
 vanilla_elem_t *vlayout_box(vanilla_layout_t *ctx);
 vanilla_elem_t *vlayout_spacer(vanilla_layout_t *ctx);
 vanilla_elem_t *vlayout_text(vanilla_layout_t *ctx, const char *text, uint32_t color, float font_size);
+vanilla_elem_t *vlayout_text_ex(vanilla_layout_t *ctx, const char *text, uint32_t color,
+                                float font_size, int32_t font_weight);
 vanilla_elem_t *vlayout_image(vanilla_layout_t *ctx, vanilla_surface_t *src, vanilla_draw_rect_t src_rect);
 void vlayout_add_child(vanilla_elem_t *parent, vanilla_elem_t *child);
 
