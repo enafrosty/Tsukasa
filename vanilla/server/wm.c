@@ -408,6 +408,97 @@ void wm_invalidate_window(vanilla_server_t *srv, const vanilla_server_window_t *
     compositor_add_damage(&srv->compositor, &dirty);
 }
 
+static int wm_get_chrome_btn_rect(vanilla_server_t *srv,
+                                  uint32_t win_id,
+                                  vanilla_chrome_btn_kind_t kind,
+                                  vanilla_rect_t *out_rect)
+{
+    if (!srv || win_id == 0 || kind == CHROME_BTN_NONE || !out_rect)
+        return 0;
+
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, win_id);
+    if (!w || !w->in_use || !w->is_mapped || (w->flags & WINDOW_FLAG_BORDERLESS))
+        return 0;
+
+    vanilla_rect_t frame;
+    wm_get_frame_rect(w, &frame);
+    chrome_btn_rects_t btns = chrome_metrics(&frame);
+
+    if (kind == CHROME_BTN_CLOSE) {
+        *out_rect = btns.close_btn;
+        return 1;
+    }
+    if (kind == CHROME_BTN_MAX) {
+        *out_rect = btns.max_btn;
+        return 1;
+    }
+    if (kind == CHROME_BTN_MIN) {
+        *out_rect = btns.min_btn;
+        return 1;
+    }
+    return 0;
+}
+
+static void wm_hit_test_chrome_btn(vanilla_server_t *srv,
+                                   int32_t px,
+                                   int32_t py,
+                                   uint32_t *out_win_id,
+                                   vanilla_chrome_btn_kind_t *out_kind)
+{
+    *out_win_id = 0;
+    *out_kind = CHROME_BTN_NONE;
+
+    if (!srv || srv->context_menu_depth > 0 || srv->alttab_visible ||
+        srv->is_dragging || srv->is_resizing) {
+        return;
+    }
+
+    vanilla_server_window_t *hit = wm_window_at(srv, px, py);
+    if (!hit || !hit->in_use || !hit->is_mapped || (hit->flags & WINDOW_FLAG_BORDERLESS))
+        return;
+
+    vanilla_rect_t frame;
+    wm_get_frame_rect(hit, &frame);
+    if (py >= frame.y + g_theme->titlebar_height + g_theme->border_width)
+        return;
+
+    chrome_btn_rects_t btns = chrome_metrics(&frame);
+    if (vanilla_rect_contains(&btns.close_btn, px, py)) {
+        *out_win_id = hit->window_id;
+        *out_kind = CHROME_BTN_CLOSE;
+    } else if (vanilla_rect_contains(&btns.max_btn, px, py)) {
+        *out_win_id = hit->window_id;
+        *out_kind = CHROME_BTN_MAX;
+    } else if (vanilla_rect_contains(&btns.min_btn, px, py)) {
+        *out_win_id = hit->window_id;
+        *out_kind = CHROME_BTN_MIN;
+    }
+}
+
+void wm_update_hover(vanilla_server_t *srv)
+{
+    if (!srv)
+        return;
+
+    uint32_t new_win_id = 0;
+    vanilla_chrome_btn_kind_t new_kind = CHROME_BTN_NONE;
+    wm_hit_test_chrome_btn(srv, srv->cursor_x, srv->cursor_y, &new_win_id, &new_kind);
+
+    if (new_win_id == srv->hovered_btn_win_id && new_kind == srv->hovered_btn_kind)
+        return;
+
+    vanilla_rect_t old_rect;
+    if (wm_get_chrome_btn_rect(srv, srv->hovered_btn_win_id, srv->hovered_btn_kind, &old_rect))
+        compositor_invalidate_rect(&srv->compositor, &old_rect);
+
+    vanilla_rect_t new_rect;
+    if (wm_get_chrome_btn_rect(srv, new_win_id, new_kind, &new_rect))
+        compositor_invalidate_rect(&srv->compositor, &new_rect);
+
+    srv->hovered_btn_win_id = new_win_id;
+    srv->hovered_btn_kind = new_kind;
+}
+
 void wm_raise_window(vanilla_server_t *srv, uint32_t window_id)
 {
     if (!srv || window_id == 0)
@@ -428,6 +519,7 @@ void wm_raise_window(vanilla_server_t *srv, uint32_t window_id)
     target->z_index = max_z + 1;
 
     wm_invalidate_window(srv, target);
+    wm_update_hover(srv);
 }
 
 void wm_lower_window(vanilla_server_t *srv, uint32_t window_id)
@@ -449,6 +541,7 @@ void wm_lower_window(vanilla_server_t *srv, uint32_t window_id)
 
     target->z_index = min_z - 1;
     wm_invalidate_window(srv, target);
+    wm_update_hover(srv);
 }
 
 static void update_mod_state(vanilla_server_t *srv, uint16_t bit, int toggle, int value)
@@ -640,6 +733,10 @@ void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_
     if (srv->drag_threshold_pending && srv->drag_threshold_window_id == w->window_id) {
         srv->drag_threshold_pending = 0;
     }
+    if (srv->hovered_btn_win_id == w->window_id) {
+        srv->hovered_btn_win_id = 0;
+        srv->hovered_btn_kind = CHROME_BTN_NONE;
+    }
     dnd_window_destroyed(srv, w->window_id);
     w->resize_has_target = 0;
     w->anim_state = ANIM_IDLE;
@@ -672,6 +769,7 @@ void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_
     wm_invalidate_window(srv, w);
     surface_destroy(&w->surface);
     w->in_use = 0;
+    wm_update_hover(srv);
 }
 
 void vanilla_server_remove_client(vanilla_server_t *srv, int client_idx)
@@ -974,6 +1072,10 @@ int handle_msg_destroy_window(vanilla_server_t *srv, int client_idx, const vanil
         if (srv->drag_threshold_pending && srv->drag_threshold_window_id == w->window_id) {
             srv->drag_threshold_pending = 0;
         }
+        if (srv->hovered_btn_win_id == w->window_id) {
+            srv->hovered_btn_win_id = 0;
+            srv->hovered_btn_kind = CHROME_BTN_NONE;
+        }
         w->resize_has_target = 0;
 
         if (g_theme->reduce_motion != 0 || !w->is_mapped) {
@@ -1035,6 +1137,10 @@ int handle_msg_unmap_window(vanilla_server_t *srv, int client_idx, const vanilla
         if (srv->drag_threshold_pending && srv->drag_threshold_window_id == w->window_id) {
             srv->drag_threshold_pending = 0;
         }
+        if (srv->hovered_btn_win_id == w->window_id) {
+            srv->hovered_btn_win_id = 0;
+            srv->hovered_btn_kind = CHROME_BTN_NONE;
+        }
         w->resize_has_target = 0;
         w->anim_state = ANIM_IDLE;
         w->anim_destroy_on_done = 0;
@@ -1048,6 +1154,7 @@ int handle_msg_unmap_window(vanilla_server_t *srv, int client_idx, const vanilla
         if (srv->focused_window_id == w->window_id)
             srv->focused_window_id = 0;
         wm_send_configure(srv, w);
+        wm_update_hover(srv);
     }
     return 0;
 }
@@ -2412,6 +2519,7 @@ void wm_context_menu_close_stack(vanilla_server_t *srv, uint32_t result_item_id)
 
     srv->context_menu_depth = 0;
     srv->context_menu_pool_count = 0;
+    wm_update_hover(srv);
 }
 
 int handle_msg_show_context_menu(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
@@ -2582,6 +2690,7 @@ int wm_context_menu_open_desktop(vanilla_server_t *srv, int32_t x, int32_t y)
     srv->context_menu_pool_count = 1;
 
     wm_context_menu_damage(srv, m);
+    wm_update_hover(srv);
     return 0;
 }
 
@@ -2630,6 +2739,7 @@ int wm_context_menu_open_taskbar(vanilla_server_t *srv, int32_t x, int32_t y, ui
     srv->context_menu_pool_count = 1;
 
     wm_context_menu_damage(srv, m);
+    wm_update_hover(srv);
     return 0;
 }
 
@@ -3537,6 +3647,7 @@ int vanilla_server_focus_window(vanilla_server_t *srv, uint32_t window_id)
         srv->focused_window_id = 0;
     }
 
+    wm_update_hover(srv);
     return 0;
 }
 
@@ -3670,6 +3781,8 @@ void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
         wm_send_configure(srv, w);
         wm_invalidate_window(srv, w);
     }
+
+    wm_update_hover(srv);
 }
 
 void wm_unsnap_window(vanilla_server_t *srv, uint32_t window_id)
@@ -3840,6 +3953,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             if (srv->context_menu_depth > 0) {
                 wm_context_menu_handle_motion(srv, srv->cursor_x, srv->cursor_y);
             }
+            wm_update_hover(srv);
 
             if (srv->is_dragging) {
                 vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->drag_window_id);
@@ -4047,12 +4161,17 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
 
                         /* Minimize button [_] */
                         if (vanilla_rect_contains(&btns.min_btn, srv->cursor_x, srv->cursor_y)) {
+                            if (srv->hovered_btn_win_id == hit->window_id) {
+                                srv->hovered_btn_win_id = 0;
+                                srv->hovered_btn_kind = CHROME_BTN_NONE;
+                            }
                             if (g_theme->reduce_motion != 0) {
                                 hit->is_mapped = 0;
                                 hit->is_focused = 0;
                                 if (srv->focused_window_id == hit->window_id)
                                     srv->focused_window_id = 0;
                                 wm_invalidate_window(srv, hit);
+                                wm_update_hover(srv);
                             } else {
                                 vanilla_rect_t fr;
                                 wm_get_frame_rect(hit, &fr);
@@ -4182,6 +4301,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     vanilla_rect_t cur_box;
                     cursor_get_rect(srv->cursor_x, srv->cursor_y, &cur_box);
                     compositor_add_damage(&srv->compositor, &cur_box);
+                    wm_update_hover(srv);
                     return 0;
                 }
 
@@ -4211,6 +4331,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     vanilla_rect_t cur_box;
                     cursor_get_rect(srv->cursor_x, srv->cursor_y, &cur_box);
                     compositor_add_damage(&srv->compositor, &cur_box);
+                    wm_update_hover(srv);
                     return 0;
                 }
 

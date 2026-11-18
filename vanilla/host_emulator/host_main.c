@@ -199,6 +199,8 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    compositor_load_default_wallpaper(&srv.compositor);
+
     srv.cursor_x = SCREEN_WIDTH / 2;
     srv.cursor_y = SCREEN_HEIGHT / 2;
     srv.running = 1;
@@ -235,7 +237,13 @@ int main(int argc, char *argv[])
 
     /* Main prototyping event and frame loop */
     while (backend.running && srv.running) {
+        int32_t prev_cx = srv.cursor_x;
+        int32_t prev_cy = srv.cursor_y;
+        uint32_t prev_btns = srv.mouse_buttons;
+
         sdl_backend_poll_events(&backend, &srv);
+        if (srv.cursor_x != prev_cx || srv.cursor_y != prev_cy || srv.mouse_buttons != prev_btns)
+            wm_update_hover(&srv);
 
         /* Adapt mock surfaces if window dimensions changed (e.g. snapped or maximized) */
         for (int i = 0; i < 2; i++) {

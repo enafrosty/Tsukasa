@@ -68,10 +68,12 @@ struct vanilla_server_window;
 /* Compositor lifecycle */
 int  compositor_init(vanilla_compositor_t *comp, const char *fb_dev);
 int  compositor_init_offscreen(vanilla_compositor_t *comp, uint32_t width, uint32_t height);
+int  compositor_load_default_wallpaper(vanilla_compositor_t *comp);
 void compositor_destroy(vanilla_compositor_t *comp);
 
 /* Damage management */
 void compositor_add_damage(vanilla_compositor_t *comp, const vanilla_rect_t *rect);
+void compositor_invalidate_rect(vanilla_compositor_t *comp, const vanilla_rect_t *rect);
 void compositor_merge_damage(vanilla_compositor_t *comp);
 void compositor_damage_all(vanilla_compositor_t *comp);
 

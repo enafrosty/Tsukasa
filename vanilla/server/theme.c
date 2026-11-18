@@ -48,6 +48,9 @@ static vanilla_theme_t g_theme_mutable = {
     .taskbar_item_active = 0xFF88C0D0u,
     .taskbar_item_open = 0xFF4C566Au,
     .taskbar_text = 0xFFECEFF4u,
+    .menu_bg = 0xFF434C5Eu,
+    .menu_border = 0xFF5E6A80u,
+    .menu_divider = 0xFF4C566Au,
     .titlebar_height = 24,
     .border_width = 1,
     .btn_size = 12,
@@ -55,6 +58,7 @@ static vanilla_theme_t g_theme_mutable = {
     .radius_sm = 4,
     .radius_md = 8,
     .radius_lg = 12,
+    .radius_menu = 0,
     .shadow_radius = 16,
     .shadow_alpha = 140,
     .space_1 = 4,
@@ -106,6 +110,9 @@ static void theme_apply_defaults(vanilla_theme_t *t)
     t->taskbar_item_active = 0xFF88C0D0u;
     t->taskbar_item_open = 0xFF4C566Au;
     t->taskbar_text = 0xFFECEFF4u;
+    t->menu_bg = 0xFF434C5Eu;
+    t->menu_border = 0xFF5E6A80u;
+    t->menu_divider = 0xFF4C566Au;
 
     t->titlebar_height = 24;
     t->border_width = 1;
@@ -114,6 +121,7 @@ static void theme_apply_defaults(vanilla_theme_t *t)
     t->radius_sm = 4;
     t->radius_md = 8;
     t->radius_lg = 12;
+    t->radius_menu = 0;
     t->shadow_radius = 16;
     t->shadow_alpha = 140;
     t->space_1 = 4;
@@ -201,7 +209,12 @@ static void split_kv(char *line, char **out_key, char **out_val)
     *out_val = trim_whitespace(eq + 1);
 }
 
-static void theme_apply_kv(vanilla_theme_t *t, const char *section, const char *key, const char *val)
+#define THEME_SEEN_MENU_BG      (1u << 0)
+#define THEME_SEEN_MENU_BORDER  (1u << 1)
+#define THEME_SEEN_MENU_DIVIDER (1u << 2)
+
+static void theme_apply_kv(vanilla_theme_t *t, const char *section, const char *key,
+                           const char *val, uint32_t *seen_mask)
 {
     if (!t || !section || !key || !val || !*key || !*val)
         return;
@@ -235,6 +248,16 @@ static void theme_apply_kv(vanilla_theme_t *t, const char *section, const char *
         else if (strcmp(key, "taskbar_item_active") == 0) t->taskbar_item_active = col;
         else if (strcmp(key, "taskbar_item_open") == 0) t->taskbar_item_open = col;
         else if (strcmp(key, "taskbar_text") == 0) t->taskbar_text = col;
+        else if (strcmp(key, "menu_bg") == 0) {
+            t->menu_bg = col;
+            if (seen_mask) *seen_mask |= THEME_SEEN_MENU_BG;
+        } else if (strcmp(key, "menu_border") == 0) {
+            t->menu_border = col;
+            if (seen_mask) *seen_mask |= THEME_SEEN_MENU_BORDER;
+        } else if (strcmp(key, "menu_divider") == 0) {
+            t->menu_divider = col;
+            if (seen_mask) *seen_mask |= THEME_SEEN_MENU_DIVIDER;
+        }
     } else if (strcmp(section, "metrics") == 0) {
         if (strcmp(key, "titlebar_height") == 0) t->titlebar_height = (int32_t)strtol(val, NULL, 0);
         else if (strcmp(key, "border_width") == 0) t->border_width = (int32_t)strtol(val, NULL, 0);
@@ -243,6 +266,7 @@ static void theme_apply_kv(vanilla_theme_t *t, const char *section, const char *
         else if (strcmp(key, "radius_sm") == 0) t->radius_sm = (int32_t)strtol(val, NULL, 0);
         else if (strcmp(key, "radius_md") == 0) t->radius_md = (int32_t)strtol(val, NULL, 0);
         else if (strcmp(key, "radius_lg") == 0) t->radius_lg = (int32_t)strtol(val, NULL, 0);
+        else if (strcmp(key, "radius_menu") == 0) t->radius_menu = (int32_t)strtol(val, NULL, 0);
         else if (strcmp(key, "shadow_radius") == 0) t->shadow_radius = (int32_t)strtol(val, NULL, 0);
         else if (strcmp(key, "shadow_alpha") == 0) t->shadow_alpha = (uint8_t)strtoul(val, NULL, 0);
         else if (strcmp(key, "space_1") == 0) t->space_1 = (int32_t)strtol(val, NULL, 0);
@@ -303,6 +327,7 @@ int theme_load(const char *ini_path)
 
     char line[256];
     char current_section[64] = "";
+    uint32_t seen_mask = 0;
 
     while (fgets(line, sizeof(line), f)) {
         strip_comments(line);
@@ -323,11 +348,26 @@ int theme_load(const char *ini_path)
             char *val = NULL;
             split_kv(trimmed, &key, &val);
             if (key && val)
-                theme_apply_kv(&g_theme_mutable, current_section, key, val);
+                theme_apply_kv(&g_theme_mutable, current_section, key, val, &seen_mask);
         }
     }
 
     fclose(f);
+
+    if (!(seen_mask & THEME_SEEN_MENU_BG)) {
+        if (g_theme_mutable.bg_base == 0xFF2E3440u && g_theme_mutable.bg_elevated == 0xFF3B4252u)
+            g_theme_mutable.menu_bg = 0xFF434C5Eu;
+        else
+            g_theme_mutable.menu_bg = g_theme_mutable.bg_elevated;
+    }
+    if (!(seen_mask & THEME_SEEN_MENU_BORDER)) {
+        if (g_theme_mutable.bg_base == 0xFF2E3440u && g_theme_mutable.border == 0xFF4C566Au)
+            g_theme_mutable.menu_border = 0xFF5E6A80u;
+        else
+            g_theme_mutable.menu_border = g_theme_mutable.border;
+    }
+    if (!(seen_mask & THEME_SEEN_MENU_DIVIDER))
+        g_theme_mutable.menu_divider = g_theme_mutable.border;
 
     if (ini_path && ini_path[0]) {
         strncpy(s_last_path, ini_path, sizeof(s_last_path) - 1);
