@@ -30,8 +30,8 @@
 #define SIGTERM 15
 #endif
 
-#define TM_DEFAULT_W      580
-#define TM_DEFAULT_H      440
+#define TM_DEFAULT_W      596
+#define TM_DEFAULT_H      456
 #define TM_REFRESH_MS     1000
 #define MAX_TASKS         64
 
@@ -720,7 +720,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    vanilla_window_t *win = vanilla_create_window(client, "Task Manager", 160, 100,
+    vanilla_window_t *win = vanilla_create_window(client, "Task Manager", 648, 58,
                                                   TM_DEFAULT_W, TM_DEFAULT_H,
                                                   WINDOW_FLAG_RESIZABLE);
     if (!win) {

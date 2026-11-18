@@ -185,7 +185,9 @@ void dock_recompute_geometry(dock_state_t *dock, int32_t screen_w, int32_t scree
         content_w -= item_gap;
 
     dock->width = content_w + (pad_x * 2);
-    dock->height = item_sz + (pad_y * 2);
+    dock->height = THEME_PX(DOCK_HEIGHT_PX);
+    if (dock->height < item_sz + (pad_y * 2))
+        dock->height = item_sz + (pad_y * 2);
     dock->x = (screen_w - dock->width) / 2;
     dock->y = screen_h - dock->height - THEME_PX(12);
 }
@@ -305,15 +307,17 @@ void dock_render(dock_state_t *dock)
                              badge, bsz, APP_FONT_BOLD, g_theme->fg_primary);
         }
 
-        /* Active/running AA indicator pill centered below the icon */
+        /* Active/running AA indicator pill centered cleanly inside capsule */
         if (item->is_mapped || item->window_id != 0) {
             uint32_t dot_color = item->is_minimized ? THEME_COLOR_SLATE : THEME_COLOR_FROST_CYAN;
-            int32_t dot_w = item->is_focused ? THEME_PX(12) : THEME_PX(5);
-            int32_t dot_h = THEME_PX(4);
+            int32_t dot_w = item->is_focused ? THEME_PX(14) : THEME_PX(6);
+            int32_t dot_h = THEME_PX(3);
+            if (dot_h < 2)
+                dot_h = 2;
             int32_t dot_r = dot_h / 2;
             int32_t dot_x = item->x_offset + (item_sz - dot_w) / 2;
-            int32_t dot_y = pad_y + item_sz + THEME_PX(2);
-            if (dot_y + dot_h <= h) {
+            int32_t dot_y = pad_y + item_sz + THEME_PX(4);
+            if (dot_y + dot_h <= h - THEME_PX(2)) {
                 dock_fill_rounded_rect(surf, dot_x, dot_y, dot_w, dot_h, dot_r, dot_color);
             }
         }
@@ -364,6 +368,7 @@ void dock_sync_windows(dock_state_t *dock, const void *win_list_ptr, int32_t scr
                 continue;
 
             if (match_app_name(we->title, we->exec_name, pinned->name) ||
+                match_app_name(we->title, we->exec_name, pinned->icon_name) ||
                 (pinned->window_id != 0 && pinned->window_id == we->window_id)) {
                 pinned->window_id = we->window_id;
                 pinned->is_mapped = we->is_mapped;
@@ -391,13 +396,22 @@ void dock_sync_windows(dock_state_t *dock, const void *win_list_ptr, int32_t scr
         }
 
         int exists = 0;
-        for (int w = 0; w < wl->count; w++) {
-            if (wl->windows[w].window_id == dock->items[idx].window_id) {
-                dock->items[idx].is_mapped = wl->windows[w].is_mapped;
-                dock->items[idx].is_focused = wl->windows[w].is_focused;
-                dock->items[idx].is_minimized = wl->windows[w].is_minimized;
-                exists = 1;
+        int owned_by_pinned = 0;
+        for (int pi = 0; pi < DOCK_PINNED_COUNT; pi++) {
+            if (dock->items[pi].window_id == dock->items[idx].window_id) {
+                owned_by_pinned = 1;
                 break;
+            }
+        }
+        if (!owned_by_pinned) {
+            for (int w = 0; w < wl->count; w++) {
+                if (wl->windows[w].window_id == dock->items[idx].window_id) {
+                    dock->items[idx].is_mapped = wl->windows[w].is_mapped;
+                    dock->items[idx].is_focused = wl->windows[w].is_focused;
+                    dock->items[idx].is_minimized = wl->windows[w].is_minimized;
+                    exists = 1;
+                    break;
+                }
             }
         }
 

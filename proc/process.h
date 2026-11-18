@@ -194,6 +194,9 @@ struct process {
     process_t *rq_next;
     process_t *parent_next_child;
     process_t *children_head;
+
+    uint8_t fpu_state[512] __attribute__((aligned(16)));
+    int fpu_initialized;
 };
 
 #define PROC_CREATED PROCESS_CREATED

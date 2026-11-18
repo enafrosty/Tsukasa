@@ -43,6 +43,19 @@
 #include "../drv/pit.h"
 
 #define CPU_COUNT_MAX 32
+
+_Static_assert((offsetof(process_t, fpu_state) % 16) == 0,
+               "process_t fpu_state must be 16-byte aligned");
+_Static_assert((sizeof(process_t) % 16) == 0,
+               "process_t size must preserve 16-byte alignment in g_processes");
+
+static void fpu_init_state(uint8_t *buf)
+{
+    for (size_t i = 0; i < 512; i++)
+        buf[i] = 0;
+    *(uint16_t *)(buf + 0) = 0x037Fu;
+    *(uint32_t *)(buf + 24) = 0x1F80u;
+}
 #define WAIT_STATUS_EXIT(code)   (((code) & 0xFF) << 8)
 #define WAIT_STATUS_SIGNAL(sig)  ((sig) & 0x7F)
 #define WAIT_EXIT_CODE(st)       (((st) >> 8) & 0xFF)
@@ -170,6 +183,7 @@ static void process_init_sched_state(process_t *p, process_t *parent)
     p->prev_queue = NULL;
     p->parent = parent;
     p->child_count = 0;
+    p->fpu_initialized = 0;
 
     p->main_thread.tid = p->pid;
     p->main_thread.cpu_id = p->cpu_id;
@@ -1051,6 +1065,7 @@ int process_exec(int pid, process_entry_t entry, const char *name)
     p->shm_attachment_count = 0;
 
     p->entry = entry;
+    p->fpu_initialized = 0;
     p->signal_pending = 0;
     p->signal_mask = 0;
     for (int i = 0; i < PROCESS_MAX_SIGNALS; i++)
@@ -1592,6 +1607,18 @@ uint64_t process_schedule_tick(uint64_t current_rsp)
         vmm_switch_pml4(next->vm_space.pml4_phys);
     else if (vmm_get_kernel_pml4())
         vmm_switch_pml4(vmm_get_kernel_pml4());
+
+    if (next && next != cur) {
+        if (cur) {
+            __asm__ volatile("fxsave (%0)" : : "r"(cur->fpu_state) : "memory");
+            cur->fpu_initialized = 1;
+        }
+        if (!next->fpu_initialized) {
+            fpu_init_state(next->fpu_state);
+            next->fpu_initialized = 1;
+        }
+        __asm__ volatile("fxrstor (%0)" : : "r"(next->fpu_state) : "memory");
+    }
 
     next_rsp = next ? next->kernel_rsp : current_rsp;
     spin_unlock(&g_sched_lock);

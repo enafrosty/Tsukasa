@@ -884,7 +884,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    vanilla_window_t *win = vanilla_create_window(client, "Notepad", 120, 90,
+    vanilla_window_t *win = vanilla_create_window(client, "Notepad", 240, 100,
                                                   NOTE_DEFAULT_W, NOTE_DEFAULT_H,
                                                   WINDOW_FLAG_RESIZABLE);
     if (!win) {

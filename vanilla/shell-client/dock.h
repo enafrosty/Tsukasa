@@ -25,10 +25,10 @@
 #include "../libvanilla/icon.h"
 
 #define DOCK_MAX_ITEMS 24
-#define DOCK_ITEM_SIZE 36
+#define DOCK_ITEM_SIZE 32
 #define DOCK_ITEM_GAP  8
 #define DOCK_PAD_X     12
-#define DOCK_PAD_Y     8
+#define DOCK_PAD_Y     7
 
 #define DOCK_PINNED_COUNT 6
 

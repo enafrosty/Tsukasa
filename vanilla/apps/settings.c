@@ -253,10 +253,26 @@ static int ipc_open_debug_conn(void)
 
     vanilla_msg_hdr_t ack_hdr;
     vanilla_msg_hello_ack_t ack_body;
-    if (ipc_read_exact(fd, &ack_hdr, sizeof(ack_hdr)) < 0 ||
-        ack_hdr.magic != VANILLA_IPC_MAGIC ||
-        ack_hdr.msg_type != MSG_HELLO_ACK ||
-        ack_hdr.payload_len < sizeof(ack_body) ||
+    int skipped = 0;
+    for (;;) {
+        if (ipc_read_exact(fd, &ack_hdr, sizeof(ack_hdr)) < 0 ||
+            ack_hdr.magic != VANILLA_IPC_MAGIC) {
+            close(fd);
+            return -1;
+        }
+        if (ack_hdr.msg_type == MSG_HELLO_ACK)
+            break;
+        if (ack_hdr.payload_len > 0 &&
+            ipc_discard_exact(fd, ack_hdr.payload_len) < 0) {
+            close(fd);
+            return -1;
+        }
+        if (++skipped > 64) {
+            close(fd);
+            return -1;
+        }
+    }
+    if (ack_hdr.payload_len < sizeof(ack_body) ||
         ipc_read_exact(fd, &ack_body, sizeof(ack_body)) < 0) {
         close(fd);
         return -1;
@@ -293,6 +309,7 @@ static int ipc_query_theme(vanilla_theme_t *out_th)
         return -1;
     }
 
+    int skipped = 0;
     for (;;) {
         vanilla_msg_hdr_t rhdr;
         if (ipc_read_exact(fd, &rhdr, sizeof(rhdr)) < 0 ||
@@ -300,8 +317,12 @@ static int ipc_query_theme(vanilla_theme_t *out_th)
             close(fd);
             return -1;
         }
-        if (rhdr.msg_type != MSG_DEBUG_QUERY) {
+        if (rhdr.msg_type != MSG_DEBUG_QUERY_RESP) {
             if (rhdr.payload_len > 0 && ipc_discard_exact(fd, rhdr.payload_len) < 0) {
+                close(fd);
+                return -1;
+            }
+            if (++skipped > 64) {
                 close(fd);
                 return -1;
             }
@@ -313,6 +334,13 @@ static int ipc_query_theme(vanilla_theme_t *out_th)
             ipc_read_exact(fd, out_th, sizeof(*out_th)) < 0) {
             close(fd);
             return -1;
+        }
+        if (rhdr.payload_len > sizeof(rpayload) + sizeof(vanilla_theme_t)) {
+            size_t rem = rhdr.payload_len - (sizeof(rpayload) + sizeof(vanilla_theme_t));
+            if (ipc_discard_exact(fd, rem) < 0) {
+                close(fd);
+                return -1;
+            }
         }
         close(fd);
         return 0;
@@ -345,6 +373,7 @@ static int ipc_apply_theme(const vanilla_theme_t *th)
         return -1;
     }
 
+    int skipped = 0;
     for (;;) {
         vanilla_msg_hdr_t rhdr;
         if (ipc_read_exact(fd, &rhdr, sizeof(rhdr)) < 0 ||
@@ -352,8 +381,12 @@ static int ipc_apply_theme(const vanilla_theme_t *th)
             close(fd);
             return -1;
         }
-        if (rhdr.msg_type != MSG_DEBUG_QUERY) {
+        if (rhdr.msg_type != MSG_DEBUG_QUERY_RESP) {
             if (rhdr.payload_len > 0 && ipc_discard_exact(fd, rhdr.payload_len) < 0) {
+                close(fd);
+                return -1;
+            }
+            if (++skipped > 64) {
                 close(fd);
                 return -1;
             }
@@ -967,7 +1000,7 @@ int main(int argc, char **argv)
         st.active_theme = *theme_defaults_nord_dark();
     }
 
-    vanilla_window_t *win = vanilla_create_window(client, "Settings", 180, 100,
+    vanilla_window_t *win = vanilla_create_window(client, "Settings", 340, 110,
                                                   SETTINGS_WIDTH, SETTINGS_HEIGHT,
                                                   WINDOW_FLAG_RESIZABLE);
     if (!win) {

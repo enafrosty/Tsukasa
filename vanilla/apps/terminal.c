@@ -25,9 +25,12 @@
 #include <errno.h>
 #include <time.h>
 #include <sys/wait.h>
+#include <sys/poll.h>
 
-#define TERM_WIDTH   640
-#define TERM_HEIGHT  400
+#define TERM_WIDTH   590
+#define TERM_HEIGHT  292
+#define TERM_PAD_X   8
+#define TERM_PAD_Y   6
 
 #define COLOR_TERM_BG     (g_theme ? g_theme->bg_base : 0xFF2E3440u)
 #define COLOR_TERM_FG     (g_theme ? g_theme->fg_primary : 0xFFD8DEE9u)
@@ -44,8 +47,8 @@ static void term_render(vanilla_surface_t *surf, terminal_state_t *st)
     memset(empty_row, ' ', sizeof(empty_row));
 
     for (int r = 0; r < st->rows; r++) {
-        int y = r * CELL_HEIGHT;
-        if (y + CELL_HEIGHT > surf_h)
+        int y = TERM_PAD_Y + r * CELL_HEIGHT;
+        if (y + CELL_HEIGHT > surf_h - TERM_PAD_Y)
             break;
 
         const char *line_chars = NULL;
@@ -73,8 +76,8 @@ static void term_render(vanilla_surface_t *surf, terminal_state_t *st)
             line_chars = empty_row;
 
         for (int c = 0; c < st->cols; c++) {
-            int x = c * CELL_WIDTH;
-            if (x + CELL_WIDTH > surf_w)
+            int x = TERM_PAD_X + c * CELL_WIDTH;
+            if (x + CELL_WIDTH > surf_w - TERM_PAD_X)
                 break;
 
             uint32_t bg = line_bg ? line_bg[c] : 0;
@@ -84,17 +87,17 @@ static void term_render(vanilla_surface_t *surf, terminal_state_t *st)
             char ch = line_chars[c];
             if (ch != ' ' && ch != '\0') {
                 uint32_t fg = line_fg ? line_fg[c] : COLOR_TERM_FG;
-                app_draw_char(surf, x, y + 4, ch, fg);
+                app_draw_char(surf, x, y + 1, ch, fg);
             }
         }
     }
 
     /* Draw cursor if live view and cursor visible */
     if (st->cursor_visible && st->scroll_offset == 0) {
-        int cur_x = st->cursor_col * CELL_WIDTH;
-        int cur_y = st->cursor_row * CELL_HEIGHT;
-        if (cur_x + CELL_WIDTH <= surf_w && cur_y + CELL_HEIGHT <= surf_h)
-            app_fill_rect(surf, cur_x, cur_y + 13, CELL_WIDTH, 2, COLOR_TERM_CURSOR);
+        int cur_x = TERM_PAD_X + st->cursor_col * CELL_WIDTH;
+        int cur_y = TERM_PAD_Y + st->cursor_row * CELL_HEIGHT;
+        if (cur_x + CELL_WIDTH <= surf_w - TERM_PAD_X && cur_y + CELL_HEIGHT <= surf_h - TERM_PAD_Y)
+            app_fill_rect(surf, cur_x, cur_y + CELL_HEIGHT - 3, CELL_WIDTH, 2, COLOR_TERM_CURSOR);
     }
 
     /* Scrollback indicator bar */
@@ -128,7 +131,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    vanilla_window_t *win = vanilla_create_window(client, "Terminal", 80, 80,
+    vanilla_window_t *win = vanilla_create_window(client, "Terminal", 36, 58,
                                                   TERM_WIDTH, TERM_HEIGHT,
                                                   WINDOW_FLAG_RESIZABLE);
     if (!win) {
@@ -195,8 +198,10 @@ int main(int argc, char **argv)
                 running = 0;
                 break;
             } else if (ev.type == VANILLA_EVENT_CONFIGURE) {
-                int new_cols = (int)ev.configure.width / CELL_WIDTH;
-                int new_rows = (int)ev.configure.height / CELL_HEIGHT;
+                int avail_w = (int)ev.configure.width - (TERM_PAD_X * 2);
+                int avail_h = (int)ev.configure.height - (TERM_PAD_Y * 2);
+                int new_cols = (avail_w > 0 ? avail_w : CELL_WIDTH) / CELL_WIDTH;
+                int new_rows = (avail_h > 0 ? avail_h : CELL_HEIGHT) / CELL_HEIGHT;
                 vt_resize(&state, new_rows, new_cols);
                 vanilla_ack_configure(client, win->window_id, ev.configure.serial);
             } else if (ev.type == VANILLA_EVENT_INPUT) {
@@ -285,15 +290,20 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Read output from shell and interpret via VT state machine */
-        ssize_t n = read(state.out_pipe[0], read_buf, sizeof(read_buf));
-        if (n > 0) {
-            vt_process_bytes(&state, read_buf, (size_t)n);
-        } else if (n == 0 && state.shell_pid > 0) {
-            int status = 0;
-            waitpid(state.shell_pid, &status, WNOHANG);
-            state.shell_pid = -1;
-            notify_send("Terminal", "Shell exited", "info", 5000, NULL, 0);
+        /* Drain available shell output bytes before blocking in poll() */
+        for (;;) {
+            ssize_t n = read(state.out_pipe[0], read_buf, sizeof(read_buf));
+            if (n > 0) {
+                vt_process_bytes(&state, read_buf, (size_t)n);
+                continue;
+            }
+            if (n == 0 && state.shell_pid > 0) {
+                int status = 0;
+                waitpid(state.shell_pid, &status, WNOHANG);
+                state.shell_pid = -1;
+                notify_send("Terminal", "Shell exited", "info", 5000, NULL, 0);
+            }
+            break;
         }
 
         if (state.dirty) {
@@ -302,7 +312,36 @@ int main(int argc, char **argv)
             state.dirty = 0;
         }
 
-        usleep(10000); /* 10ms pacing */
+        if (!running)
+            break;
+
+        if (vanilla_client_pending(client) > 0)
+            continue;
+
+        struct pollfd pfds[2];
+        nfds_t nfds = 0;
+        int dpy_fd = vanilla_client_get_fd(client);
+        if (dpy_fd >= 0) {
+            pfds[nfds].fd = dpy_fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+        if (state.out_pipe[0] >= 0 && state.shell_pid > 0) {
+            pfds[nfds].fd = state.out_pipe[0];
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+        if (nfds == 0)
+            break;
+
+        int timeout_ms = (state.shell_pid > 0) ? 250 : -1;
+        int pr = poll(pfds, nfds, timeout_ms);
+        if (pr < 0 && errno != EINTR)
+            break;
+        if (dpy_fd >= 0 && (pfds[0].revents & (POLLERR | POLLHUP)) && !(pfds[0].revents & POLLIN))
+            break;
     }
 
     if (state.shell_pid > 0)

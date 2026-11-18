@@ -30,6 +30,9 @@ static unsigned char pmm_bitmap[PMM_FRAME_COUNT / 8];
 /* Total number of frames we are tracking. */
 static size_t pmm_total_frames;
 
+/* Physical usable RAM frames reported by firmware/bootloader memory map. */
+static size_t pmm_usable_frames;
+
 /* First frame index (after reserved regions). */
 static size_t pmm_first_usable;
 static size_t pmm_free_frames;
@@ -149,6 +152,9 @@ int pmm_init(const void *boot_info)
                 mark_region(base, end, true);
         }
 
+        recompute_free_frames();
+        pmm_usable_frames = pmm_free_frames;
+
         mark_region(0, 0x100000u, false);
 
         {
@@ -193,6 +199,9 @@ int pmm_init(const void *boot_info)
             ptr += (ent->size >= 24) ? ent->size : 24;
         }
     }
+
+    recompute_free_frames();
+    pmm_usable_frames = pmm_free_frames;
 
     mark_region(0, 0x100000u, false);
 
@@ -286,14 +295,15 @@ void pmm_free_pages(uintptr_t phys, size_t count)
 
 uintptr_t pmm_total_page_count(void)
 {
-    return (uintptr_t)pmm_total_frames;
+    return pmm_usable_frames ? (uintptr_t)pmm_usable_frames : (uintptr_t)pmm_total_frames;
 }
 
 uintptr_t pmm_used_page_count(void)
 {
-    if (pmm_total_frames < pmm_free_frames)
+    size_t total = pmm_usable_frames ? pmm_usable_frames : pmm_total_frames;
+    if (total < pmm_free_frames)
         return 0;
-    return (uintptr_t)(pmm_total_frames - pmm_free_frames);
+    return (uintptr_t)(total - pmm_free_frames);
 }
 
 uintptr_t pmm_free_page_count(void)

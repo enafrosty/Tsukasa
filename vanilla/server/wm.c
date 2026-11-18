@@ -860,7 +860,8 @@ static void wm_send_configure(vanilla_server_t *srv, vanilla_server_window_t *w)
     }
 
     for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
-        if (!srv->clients[i].in_use || srv->clients[i].fd == w->client_fd)
+        if (!srv->clients[i].in_use || srv->clients[i].fd == w->client_fd ||
+            srv->clients[i].negotiated_version == 0)
             continue;
         int other_fd = srv->clients[i].fd;
         vanilla_msg_hdr_t b_hdr;
@@ -3721,7 +3722,8 @@ int vanilla_server_focus_window(vanilla_server_t *srv, uint32_t window_id)
             exact_write(old_w->client_fd, &msg, sizeof(msg));
         }
         for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
-            if (srv->clients[i].in_use && srv->clients[i].fd != old_w->client_fd) {
+            if (srv->clients[i].in_use && srv->clients[i].fd != old_w->client_fd &&
+                srv->clients[i].negotiated_version > 0) {
                 hdr.magic = VANILLA_IPC_MAGIC;
                 hdr.msg_type = MSG_WINDOW_FOCUS;
                 hdr.payload_len = (uint16_t)sizeof(msg);
@@ -3749,7 +3751,8 @@ int vanilla_server_focus_window(vanilla_server_t *srv, uint32_t window_id)
             exact_write(new_w->client_fd, &msg, sizeof(msg));
         }
         for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
-            if (srv->clients[i].in_use && srv->clients[i].fd != new_w->client_fd) {
+            if (srv->clients[i].in_use && srv->clients[i].fd != new_w->client_fd &&
+                srv->clients[i].negotiated_version > 0) {
                 hdr.magic = VANILLA_IPC_MAGIC;
                 hdr.msg_type = MSG_WINDOW_FOCUS;
                 hdr.payload_len = (uint16_t)sizeof(msg);
