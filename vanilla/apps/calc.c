@@ -773,7 +773,7 @@ int main(int argc, char **argv)
                 state.running = 0;
                 break;
             }
-            if (ev.type == VANILLA_EVENT_CONFIGURE) {
+            if (ev.type == VANILLA_EVENT_CONFIGURE && ev.window_id == win->window_id) {
                 vanilla_ack_configure(client, win->window_id, ev.configure.serial);
                 ui_widget_invalidate(state.root);
                 force_present = 1;

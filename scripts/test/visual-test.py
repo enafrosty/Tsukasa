@@ -231,6 +231,20 @@ def region_diff_ratio(w, raw_a, raw_b, x0, y0, x1, y1):
     return (changed / total) if total else 0.0
 
 
+def non_color_ratio(w, raw, x0, y0, x1, y1, rgb):
+    total = 0
+    diff = 0
+    tr, tg, tb = rgb
+    for y in range(y0, y1):
+        row_off = y * w * 3
+        for x in range(x0, x1):
+            idx = row_off + x * 3
+            total += 1
+            if raw[idx] != tr or raw[idx + 1] != tg or raw[idx + 2] != tb:
+                diff += 1
+    return (diff / total) if total else 0.0
+
+
 def run_visual_test(args):
     os.makedirs(args.out_dir, exist_ok=True)
     disk = os.path.join(args.out_dir, "visual_disk.img")
@@ -326,7 +340,28 @@ def run_visual_test(args):
 
         # Raise File Manager via dock slot 1.
         qmp.click(580, 759, wait_after=0.6)
-        qmp.screendump(args.out_dir, "06_filemgr")
+        _, _, raw_fm = qmp.screendump(args.out_dir, "06_filemgr")
+
+        # Click File Manager Maximize button at (599, 377), verify SHM resize reflow & work area.
+        qmp.click(599, 377, wait_after=1.0)
+        _, _, raw_fm_max = qmp.screendump(args.out_dir, "06b_filemgr_max")
+        max_non_bg = non_color_ratio(w, raw_fm_max, 800, 54, 1270, 160, (0x2E, 0x34, 0x40))
+        title_btn_non_bg = non_color_ratio(w, raw_fm_max, 1246, 34, 1274, 46, (0x2E, 0x34, 0x40))
+        max_right_diff = region_diff_ratio(w, raw_fm, raw_fm_max, 700, 120, 1260, 710)
+        print(
+            f"[visual] FileMgr maximize non_bg={max_non_bg:.3f}, "
+            f"title_btns={title_btn_non_bg:.3f}, right_diff={max_right_diff:.3f}"
+        )
+        assert max_non_bg > 0.15, f"Maximized File Manager did not reflow expanded UI (non_bg={max_non_bg:.3f})"
+        assert title_btn_non_bg > 0.50, f"Maximized titlebar buttons hidden behind statusbar ({title_btn_non_bg:.3f})"
+        assert max_right_diff > 0.15, f"Maximized right side did not fill work area ({max_right_diff:.3f})"
+
+        # Click Maximize again at (1252, 40) to restore File Manager back to floating bounds.
+        qmp.click(1252, 40, wait_after=1.0)
+        _, _, raw_fm_restored = qmp.screendump(args.out_dir, "06c_filemgr_restore")
+        restore_diff = region_diff_ratio(w, raw_fm_max, raw_fm_restored, 700, 540, 1260, 710)
+        print(f"[visual] FileMgr restore right_diff={restore_diff:.3f}")
+        assert restore_diff > 0.15, f"Restored File Manager did not unmaximize ({restore_diff:.3f})"
 
         # Launch Notepad via dock slot 2 and verify typed text visually.
         qmp.click(620, 759, wait_after=1.6)

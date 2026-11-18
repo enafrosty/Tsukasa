@@ -100,9 +100,12 @@ typedef struct {
     uint32_t height;
     uint32_t serial;
     uint32_t flags;
+    int32_t  shm_id;      /* > 0 when server reallocated backing SHM; 0 = unchanged */
+    uint32_t pitch;       /* bytes per scanline of new SHM buffer */
+    uint32_t buffer_size; /* total byte size of new SHM buffer */
 } __attribute__((packed)) vanilla_msg_window_configure_v2_t;
 
-_Static_assert(sizeof(vanilla_msg_window_configure_v2_t) == 24,
+_Static_assert(sizeof(vanilla_msg_window_configure_v2_t) == 36,
     "vanilla_msg_window_configure_v2_t size mismatch");
 
 #ifndef KEY_F12

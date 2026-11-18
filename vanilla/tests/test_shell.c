@@ -195,6 +195,57 @@ static void test_aero_snap_and_work_area(void)
     ASSERT(w->height == 300, "restored floating height");
 
     compositor_destroy(&srv.compositor);
+
+    /* Modern shell work area: clears top Statusbar and bottom Dock */
+    vanilla_server_t msrv;
+    memset(&msrv, 0, sizeof(msrv));
+    compositor_init_offscreen(&msrv.compositor, 1280, 800);
+
+    vanilla_server_window_t *sb = &msrv.windows[0];
+    sb->in_use = 1;
+    sb->window_id = 1;
+    sb->x = 0;
+    sb->y = 0;
+    sb->width = 1280;
+    sb->height = 28;
+    sb->flags = WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_TRANSPARENT;
+    sb->is_mapped = 1;
+
+    vanilla_server_window_t *dk = &msrv.windows[1];
+    dk->in_use = 1;
+    dk->window_id = 2;
+    dk->x = 512;
+    dk->y = 736;
+    dk->width = 256;
+    dk->height = 52;
+    dk->flags = WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS | WINDOW_FLAG_TRANSPARENT;
+    dk->is_mapped = 1;
+
+    vanilla_server_window_t *mw = &msrv.windows[2];
+    mw->in_use = 1;
+    mw->window_id = 3;
+    mw->x = 36;
+    mw->y = 390;
+    mw->width = 590;
+    mw->height = 332;
+    mw->flags = WINDOW_FLAG_RESIZABLE;
+    mw->is_mapped = 1;
+    mw->is_snapped = SNAP_NONE;
+
+    wm_snap_window(&msrv, 3, SNAP_MAXIMIZE);
+    ASSERT(mw->is_snapped == SNAP_MAXIMIZE, "modern window is maximized");
+    wm_get_frame_rect(mw, &frame);
+    ASSERT(frame.x == 0, "modern maximized frame x is 0");
+    ASSERT(frame.y == 28, "modern maximized frame clears top statusbar");
+    ASSERT(frame.w == 1280, "modern maximized frame w is 1280");
+    ASSERT(frame.y + frame.h <= 736, "modern maximized frame clears bottom dock");
+
+    wm_unsnap_window(&msrv, 3);
+    ASSERT(mw->is_snapped == SNAP_NONE, "modern window restored");
+    ASSERT(mw->x == 36 && mw->y == 390, "modern restored pos matches original");
+    ASSERT(mw->width == 590 && mw->height == 332, "modern restored size matches original");
+
+    compositor_destroy(&msrv.compositor);
     printf("       Passed.\n");
 }
 
