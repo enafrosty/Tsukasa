@@ -144,6 +144,7 @@ typedef struct vanilla_server_window {
     int32_t           pending_y;
     uint32_t          pending_w;
     uint32_t          pending_h;
+    vanilla_surface_t pending_surface;
     uint32_t          configure_timestamp_ms;
 
     /* Protocol v2 frame pacing */

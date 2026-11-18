@@ -197,12 +197,13 @@ int main(int argc, char **argv)
             if (ev.type == VANILLA_EVENT_CLOSE_REQ) {
                 running = 0;
                 break;
-            } else if (ev.type == VANILLA_EVENT_CONFIGURE) {
+            } else if (ev.type == VANILLA_EVENT_CONFIGURE && ev.window_id == win->window_id) {
                 int avail_w = (int)ev.configure.width - (TERM_PAD_X * 2);
                 int avail_h = (int)ev.configure.height - (TERM_PAD_Y * 2);
                 int new_cols = (avail_w > 0 ? avail_w : CELL_WIDTH) / CELL_WIDTH;
                 int new_rows = (avail_h > 0 ? avail_h : CELL_HEIGHT) / CELL_HEIGHT;
                 vt_resize(&state, new_rows, new_cols);
+                state.dirty = 1;
                 vanilla_ack_configure(client, win->window_id, ev.configure.serial);
             } else if (ev.type == VANILLA_EVENT_INPUT) {
                 struct input_event *iev = &ev.input;

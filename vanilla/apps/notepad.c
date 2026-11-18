@@ -984,7 +984,7 @@ int main(int argc, char **argv)
                 state->win_focused = ev.focus.focused ? 1 : 0;
                 ui_widget_invalidate(state->editor);
                 need_present = 1;
-            } else if (ev.type == VANILLA_EVENT_CONFIGURE) {
+            } else if (ev.type == VANILLA_EVENT_CONFIGURE && ev.window_id == win->window_id) {
                 if (ev.configure.serial != 0)
                     vanilla_ack_configure(client, win->window_id, ev.configure.serial);
                 ui_widget_invalidate(state->root);

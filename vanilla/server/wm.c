@@ -745,11 +745,12 @@ void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_
     w->is_mapped = 0;
 
     for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
-        if (!srv->clients[i].in_use)
+        if (!srv->clients[i].in_use || srv->clients[i].negotiated_version == 0)
             continue;
         int other_fd = srv->clients[i].fd;
         vanilla_msg_hdr_t b_hdr;
         vanilla_msg_window_configure_v2_t b_cfg;
+        memset(&b_cfg, 0, sizeof(b_cfg));
         b_hdr.magic = VANILLA_IPC_MAGIC;
         b_hdr.msg_type = MSG_WINDOW_CONFIGURE;
         b_hdr.payload_len = (uint16_t)sizeof(b_cfg);
@@ -767,6 +768,7 @@ void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_
     }
 
     wm_invalidate_window(srv, w);
+    surface_destroy(&w->pending_surface);
     surface_destroy(&w->surface);
     w->in_use = 0;
     wm_update_hover(srv);
@@ -824,10 +826,55 @@ static void wm_send_configure(vanilla_server_t *srv, vanilla_server_window_t *w)
 
         vanilla_msg_hdr_t hdr;
         vanilla_msg_window_configure_v2_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
         hdr.magic = VANILLA_IPC_MAGIC;
         hdr.msg_type = MSG_WINDOW_CONFIGURE;
         hdr.payload_len = (uint16_t)sizeof(cfg);
         hdr.window_id = w->window_id;
+
+        if (w->surface.pixels && w->pending_w > 0 && w->pending_h > 0 &&
+            (w->pending_w != w->surface.width || w->pending_h != w->surface.height)) {
+            vanilla_surface_t new_surf;
+            if (surface_create_shm(&new_surf, w->pending_w, w->pending_h) < 0) {
+                w->pending_x = w->x;
+                w->pending_y = w->y;
+                w->pending_w = w->width;
+                w->pending_h = w->height;
+                return;
+            }
+            if (!(w->flags & WINDOW_FLAG_TRANSPARENT)) {
+                uint32_t new_pitch_px = new_surf.pitch / (uint32_t)sizeof(uint32_t);
+                uint32_t fill_col = g_theme ? g_theme->bg_base : 0xFF2E3440u;
+                size_t total_px = (size_t)new_pitch_px * new_surf.height;
+                for (size_t px = 0; px < total_px; px++)
+                    new_surf.pixels[px] = fill_col;
+            }
+            uint32_t copy_w = w->surface.width < new_surf.width ? w->surface.width : new_surf.width;
+            uint32_t copy_h = w->surface.height < new_surf.height ? w->surface.height : new_surf.height;
+            uint32_t old_pitch_px = w->surface.pitch / (uint32_t)sizeof(uint32_t);
+            uint32_t new_pitch_px = new_surf.pitch / (uint32_t)sizeof(uint32_t);
+            if (old_pitch_px > 0 && new_pitch_px > 0 && copy_w > 0 && copy_h > 0) {
+                for (uint32_t row = 0; row < copy_h; row++) {
+                    memcpy(new_surf.pixels + (size_t)row * new_pitch_px,
+                           w->surface.pixels + (size_t)row * old_pitch_px,
+                           (size_t)copy_w * sizeof(uint32_t));
+                }
+            }
+            if (w->pending_surface.pixels)
+                surface_destroy(&w->pending_surface);
+            w->pending_surface = new_surf;
+            cfg.shm_id = new_surf.shm_id;
+            cfg.pitch = new_surf.pitch;
+            cfg.buffer_size = (uint32_t)new_surf.size;
+        } else if (w->surface.pixels) {
+            if (w->pending_surface.pixels) {
+                surface_destroy(&w->pending_surface);
+                memset(&w->pending_surface, 0, sizeof(w->pending_surface));
+            }
+            cfg.shm_id = w->surface.shm_id;
+            cfg.pitch = w->surface.pitch;
+            cfg.buffer_size = (uint32_t)w->surface.size;
+        }
 
         cfg.x = w->pending_x;
         cfg.y = w->pending_y;
@@ -866,6 +913,7 @@ static void wm_send_configure(vanilla_server_t *srv, vanilla_server_window_t *w)
         int other_fd = srv->clients[i].fd;
         vanilla_msg_hdr_t b_hdr;
         vanilla_msg_window_configure_v2_t b_cfg;
+        memset(&b_cfg, 0, sizeof(b_cfg));
         b_hdr.magic = VANILLA_IPC_MAGIC;
         b_hdr.msg_type = MSG_WINDOW_CONFIGURE;
         b_hdr.payload_len = (uint16_t)sizeof(b_cfg);
@@ -985,6 +1033,7 @@ int handle_msg_create_window(vanilla_server_t *srv, int client_idx, const vanill
     w->pending_y = req->y;
     w->pending_w = req->width;
     w->pending_h = req->height;
+    memset(&w->pending_surface, 0, sizeof(w->pending_surface));
     w->configure_timestamp_ms = 0;
 
     w->frame_serial = 0;
@@ -1292,10 +1341,22 @@ int handle_msg_ack_configure(vanilla_server_t *srv, int client_idx, const vanill
 
     w->configure_pending = 0;
     wm_invalidate_window(srv, w);
-    w->x = w->pending_x;
-    w->y = w->pending_y;
+    if (w->pending_surface.pixels) {
+        surface_destroy(&w->surface);
+        w->surface = w->pending_surface;
+        w->shm_id = w->surface.shm_id;
+        memset(&w->pending_surface, 0, sizeof(w->pending_surface));
+    }
+    if (!(srv->is_dragging && srv->drag_window_id == w->window_id)) {
+        w->x = w->pending_x;
+        w->y = w->pending_y;
+    }
     w->width = w->pending_w;
     w->height = w->pending_h;
+    w->damage.x = 0;
+    w->damage.y = 0;
+    w->damage.w = (int32_t)w->width;
+    w->damage.h = (int32_t)w->height;
     wm_invalidate_window(srv, w);
     printf("[vanilla] ack_configure: window %u serial %u applied\n", w->window_id, ack->serial);
 
@@ -3817,6 +3878,55 @@ int vanilla_server_close_request(vanilla_server_t *srv, uint32_t window_id)
     return 0;
 }
 
+static void wm_get_work_area(const vanilla_server_t *srv, int32_t *out_y, int32_t *out_h)
+{
+    int32_t screen_w = srv ? (int32_t)srv->compositor.width : 1280;
+    int32_t screen_h = srv ? (int32_t)srv->compositor.height : 800;
+    int32_t top = 0;
+    int32_t bottom = screen_h;
+    int found_modern_chrome = 0;
+
+    if (srv) {
+        for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+            const vanilla_server_window_t *cw = &srv->windows[i];
+            if (!cw->in_use || !cw->is_mapped || (cw->flags & WINDOW_FLAG_POPUP))
+                continue;
+            if ((cw->flags & (WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS)) !=
+                (WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS))
+                continue;
+
+            if (cw->y <= 4 && cw->width >= (uint32_t)(screen_w / 2) &&
+                cw->height > 0 && cw->height < (uint32_t)(screen_h / 4)) {
+                int32_t t = cw->y + (int32_t)cw->height;
+                if (t > top)
+                    top = t;
+                found_modern_chrome = 1;
+            } else if (cw->y >= screen_h / 2 &&
+                       cw->y + (int32_t)cw->height >= screen_h - THEME_PX(24) &&
+                       cw->height > 0 && cw->height < (uint32_t)(screen_h / 4)) {
+                int32_t b = cw->y - THEME_PX(4);
+                if (b < bottom)
+                    bottom = b;
+                found_modern_chrome = 1;
+            }
+        }
+    }
+
+    if (!found_modern_chrome)
+        bottom = screen_h - TASKBAR_HEIGHT;
+
+    int32_t work_h = bottom - top;
+    if (work_h < 100) {
+        top = 0;
+        work_h = screen_h;
+    }
+
+    if (out_y)
+        *out_y = top;
+    if (out_h)
+        *out_h = work_h;
+}
+
 void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
 {
     vanilla_server_window_t *w = vanilla_server_find_window(srv, window_id);
@@ -3824,10 +3934,9 @@ void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
         return;
 
     int32_t screen_w = (int32_t)srv->compositor.width;
-    int32_t screen_h = (int32_t)srv->compositor.height;
-    int32_t work_h = screen_h - TASKBAR_HEIGHT;
-    if (work_h < 100)
-        work_h = screen_h;
+    int32_t work_y = 0;
+    int32_t work_h = (int32_t)srv->compositor.height;
+    wm_get_work_area(srv, &work_y, &work_h);
 
     wm_invalidate_window(srv, w);
 
@@ -3858,20 +3967,20 @@ void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
             w->restore_h = w->height;
         }
 
-        int32_t target_fx = 0, target_fy = 0, target_fw = screen_w, target_fh = work_h;
+        int32_t target_fx = 0, target_fy = work_y, target_fw = screen_w, target_fh = work_h;
         if (snap_type == SNAP_MAXIMIZE) {
             target_fx = 0;
-            target_fy = 0;
+            target_fy = work_y;
             target_fw = screen_w;
             target_fh = work_h;
         } else if (snap_type == SNAP_LEFT) {
             target_fx = 0;
-            target_fy = 0;
+            target_fy = work_y;
             target_fw = screen_w / 2;
             target_fh = work_h;
         } else if (snap_type == SNAP_RIGHT) {
             target_fx = screen_w / 2;
-            target_fy = 0;
+            target_fy = work_y;
             target_fw = screen_w - (screen_w / 2);
             target_fh = work_h;
         }
@@ -4028,9 +4137,20 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     if (w && !srv->is_dragging && !srv->is_resizing) {
                         if (srv->drag_threshold_mode == DRAG_MODE_TITLEBAR) {
                             if (w->is_snapped != SNAP_NONE) {
+                                int32_t work_y = 0, work_h = screen_h;
+                                wm_get_work_area(srv, &work_y, &work_h);
+                                (void)work_h;
                                 wm_unsnap_window(srv, w->window_id);
-                                w->x = srv->drag_threshold_start_x - (int32_t)w->width / 2;
-                                w->y = srv->drag_threshold_start_y - g_theme->titlebar_height / 2;
+                                uint32_t uw = w->configure_pending ? w->pending_w : w->width;
+                                int32_t ux = srv->drag_threshold_start_x - (int32_t)uw / 2;
+                                int32_t uy = srv->drag_threshold_start_y - g_theme->titlebar_height / 2;
+                                int32_t min_y = work_y + g_theme->titlebar_height + g_theme->border_width;
+                                if (uy < min_y)
+                                    uy = min_y;
+                                w->x = ux;
+                                w->y = uy;
+                                w->pending_x = ux;
+                                w->pending_y = uy;
                             }
                             srv->is_dragging = 1;
                             srv->drag_window_id = w->window_id;
@@ -4093,25 +4213,25 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     if (g_theme->reduce_motion == 0) {
                         vanilla_rect_t preview_zone;
                         int in_snap_zone = 0;
-                        int32_t work_h = screen_h - TASKBAR_HEIGHT;
-                        if (work_h < 100)
-                            work_h = screen_h;
+                        int32_t work_y = 0;
+                        int32_t work_h = screen_h;
+                        wm_get_work_area(srv, &work_y, &work_h);
 
-                        if (srv->cursor_y <= 16) {
+                        if (srv->cursor_y <= work_y + 16) {
                             preview_zone.x = 0;
-                            preview_zone.y = 0;
+                            preview_zone.y = work_y;
                             preview_zone.w = screen_w;
                             preview_zone.h = work_h;
                             in_snap_zone = 1;
                         } else if (srv->cursor_x <= 16) {
                             preview_zone.x = 0;
-                            preview_zone.y = 0;
+                            preview_zone.y = work_y;
                             preview_zone.w = screen_w / 2;
                             preview_zone.h = work_h;
                             in_snap_zone = 1;
                         } else if (srv->cursor_x >= screen_w - 16) {
                             preview_zone.x = screen_w / 2;
-                            preview_zone.y = 0;
+                            preview_zone.y = work_y;
                             preview_zone.w = screen_w - (screen_w / 2);
                             preview_zone.h = work_h;
                             in_snap_zone = 1;
@@ -4434,8 +4554,11 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
 
                 if (srv->is_dragging) {
                     compositor_snap_preview_hide(&srv->compositor);
+                    int32_t snap_work_y = 0, snap_work_h = screen_h;
+                    wm_get_work_area(srv, &snap_work_y, &snap_work_h);
+                    (void)snap_work_h;
                     /* Evaluate Aero-snap boundary triggers upon release matching preview zone */
-                    if (srv->cursor_y <= 16) {
+                    if (srv->cursor_y <= snap_work_y + 16) {
                         wm_snap_window(srv, srv->drag_window_id, SNAP_MAXIMIZE);
                     } else if (srv->cursor_x <= 16) {
                         wm_snap_window(srv, srv->drag_window_id, SNAP_LEFT);
