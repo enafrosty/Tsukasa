@@ -82,46 +82,78 @@ char *exec_resolve_path(const char *cmd)
     return NULL;
 }
 
+static int wait_status_to_exit_code(int wstatus)
+{
+    if (WIFEXITED(wstatus))
+        return WEXITSTATUS(wstatus);
+    if (WIFSIGNALED(wstatus))
+        return 128 + WTERMSIG(wstatus);
+    return wstatus;
+}
+
+static void restore_stdio(int saved_stdin, int saved_stdout)
+{
+    if (saved_stdin >= 0)
+        dup2(saved_stdin, STDIN_FILENO);
+    if (saved_stdout >= 0)
+        dup2(saved_stdout, STDOUT_FILENO);
+}
+
+static int apply_redirections(const tsh_redir_t *redir)
+{
+    if (!redir)
+        return 0;
+
+    if (redir->infile) {
+        int in_fd = open(redir->infile, O_RDONLY);
+        if (in_fd < 0) {
+            dprintf(STDERR_FILENO, "tsh: %s: %s\n", redir->infile, strerror(errno));
+            return -1;
+        }
+        if (dup2(in_fd, STDIN_FILENO) < 0) {
+            dprintf(STDERR_FILENO, "tsh: dup2: %s\n", strerror(errno));
+            close(in_fd);
+            return -1;
+        }
+        if (in_fd != STDIN_FILENO)
+            close(in_fd);
+    }
+
+    if (redir->outfile) {
+        int flags = O_WRONLY | O_CREAT | (redir->append ? O_APPEND : O_TRUNC);
+        int out_fd = open(redir->outfile, flags, 0644);
+        if (out_fd < 0) {
+            dprintf(STDERR_FILENO, "tsh: %s: %s\n", redir->outfile, strerror(errno));
+            return -1;
+        }
+        if (dup2(out_fd, STDOUT_FILENO) < 0) {
+            dprintf(STDERR_FILENO, "tsh: dup2: %s\n", strerror(errno));
+            close(out_fd);
+            return -1;
+        }
+        if (out_fd != STDOUT_FILENO)
+            close(out_fd);
+    }
+
+    return 0;
+}
+
 static int exec_single_builtin(tsh_cmd_t *cmd)
 {
     int saved_stdin = dup(STDIN_FILENO);
     int saved_stdout = dup(STDOUT_FILENO);
-    int redir_err = 0;
-    int status = 0;
+    int status = 1;
 
-    if (cmd->redir.infile) {
-        int in_fd = open(cmd->redir.infile, O_RDONLY);
-        if (in_fd < 0) {
-            dprintf(STDERR_FILENO, "tsh: %s: %s\n", cmd->redir.infile, strerror(errno));
-            redir_err = 1;
-        } else {
-            dup2(in_fd, STDIN_FILENO);
-            close(in_fd);
-        }
+    if (apply_redirections(&cmd->redir) == 0) {
+        status = builtin_execute(cmd, STDIN_FILENO, STDOUT_FILENO,
+                                 STDERR_FILENO, &g_exit_requested);
     }
 
-    if (!redir_err && cmd->redir.outfile) {
-        int flags = O_WRONLY | O_CREAT | (cmd->redir.append ? O_APPEND : O_TRUNC);
-        int out_fd = open(cmd->redir.outfile, flags, 0644);
-        if (out_fd < 0) {
-            dprintf(STDERR_FILENO, "tsh: %s: %s\n", cmd->redir.outfile, strerror(errno));
-            redir_err = 1;
-        } else {
-            dup2(out_fd, STDOUT_FILENO);
-            close(out_fd);
-        }
-    }
-
-    if (!redir_err) {
-        status = builtin_execute(cmd, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO, &g_exit_requested);
-    } else {
-        status = 1;
-    }
-
-    dup2(saved_stdin, STDIN_FILENO);
-    close(saved_stdin);
-    dup2(saved_stdout, STDOUT_FILENO);
-    close(saved_stdout);
+    restore_stdio(saved_stdin, saved_stdout);
+    if (saved_stdin >= 0)
+        close(saved_stdin);
+    if (saved_stdout >= 0)
+        close(saved_stdout);
 
     g_last_exit_status = status;
     return status;
@@ -132,168 +164,181 @@ int exec_pipeline(tsh_pipeline_t *pipeline)
     if (!pipeline || pipeline->count <= 0)
         return 0;
 
-    /* Optimize single built-in command without subshell */
+    /* Single built-in command runs in-process without spawning */
     if (pipeline->count == 1 && builtin_lookup(pipeline->cmds[0].argv[0])) {
         return exec_single_builtin(&pipeline->cmds[0]);
     }
 
-    /* Fast path: spawn() execution for single external commands without redirection */
+    /* Fast path: single external command without redirection */
     if (pipeline->count == 1 &&
         !pipeline->cmds[0].redir.infile &&
         !pipeline->cmds[0].redir.outfile) {
         char *resolved = exec_resolve_path(pipeline->cmds[0].argv[0]);
         if (!resolved) {
-            dprintf(STDERR_FILENO, "tsh: %s: command not found\n", pipeline->cmds[0].argv[0]);
+            dprintf(STDERR_FILENO, "tsh: %s: command not found\n",
+                    pipeline->cmds[0].argv[0]);
             g_last_exit_status = 127;
             return 127;
         }
 
         pid_t sp_pid = spawn(resolved, pipeline->cmds[0].argv, env_get_all());
+        if (sp_pid <= 0) {
+            dprintf(STDERR_FILENO, "tsh: spawn %s: %s\n",
+                    resolved, strerror(errno));
+            free(resolved);
+            g_last_exit_status = 126;
+            return 126;
+        }
         free(resolved);
 
-        if (sp_pid > 0) {
-            int wstatus = 0;
-            waitpid(sp_pid, &wstatus, 0);
-            if (WIFEXITED(wstatus))
-                g_last_exit_status = WEXITSTATUS(wstatus);
-            else if (WIFSIGNALED(wstatus))
-                g_last_exit_status = 128 + WTERMSIG(wstatus);
-            else
-                g_last_exit_status = wstatus;
-            return g_last_exit_status;
-        }
+        int wstatus = 0;
+        if (waitpid(sp_pid, &wstatus, 0) == sp_pid)
+            g_last_exit_status = wait_status_to_exit_code(wstatus);
+        else
+            g_last_exit_status = 1;
+        return g_last_exit_status;
     }
 
-    /* General pipeline execution: multi-stage or commands requiring I/O redirection */
+    /*
+     * General pipeline or redirected external command via spawn():
+     * vfs_process_inherit copies all parent FDs without FD_CLOEXEC, so we
+     * create each pipe just before its writer stage and restore parent stdio
+     * immediately after each spawn() so no stage inherits earlier pipe ends.
+     */
     int count = pipeline->count;
-    int (*pipefds)[2] = NULL;
-    if (count > 1) {
-        pipefds = (int (*)[2])calloc((size_t)(count - 1), sizeof(int[2]));
-        if (!pipefds) {
-            dprintf(STDERR_FILENO, "tsh: memory allocation failed\n");
-            return 1;
-        }
-
-        for (int i = 0; i < count - 1; i++) {
-            if (pipe(pipefds[i]) != 0) {
-                dprintf(STDERR_FILENO, "tsh: pipe error: %s\n", strerror(errno));
-                for (int k = 0; k < i; k++) {
-                    close(pipefds[k][0]);
-                    close(pipefds[k][1]);
-                }
-                free(pipefds);
-                return 1;
-            }
-        }
+    int saved_stdin = dup(STDIN_FILENO);
+    int saved_stdout = dup(STDOUT_FILENO);
+    if (saved_stdin < 0 || saved_stdout < 0) {
+        dprintf(STDERR_FILENO, "tsh: dup failed: %s\n", strerror(errno));
+        if (saved_stdin >= 0)
+            close(saved_stdin);
+        if (saved_stdout >= 0)
+            close(saved_stdout);
+        g_last_exit_status = 1;
+        return 1;
     }
 
     pid_t *pids = (pid_t *)calloc((size_t)count, sizeof(pid_t));
     if (!pids) {
-        if (pipefds) {
-            for (int k = 0; k < count - 1; k++) {
-                close(pipefds[k][0]);
-                close(pipefds[k][1]);
-            }
-            free(pipefds);
-        }
+        dprintf(STDERR_FILENO, "tsh: memory allocation failed\n");
+        close(saved_stdin);
+        close(saved_stdout);
+        g_last_exit_status = 1;
         return 1;
     }
 
+    int prev_read_fd = -1;
+    int last_status = 0;
+    int pipe_failed = 0;
+
     for (int i = 0; i < count; i++) {
-        pids[i] = fork();
+        int next_read_fd = -1;
+        int stage_err = 0;
 
-        if (pids[i] == 0) {
-            /* Child process: connect pipeline stages */
-            if (i > 0) {
-                dup2(pipefds[i - 1][0], STDIN_FILENO);
-            }
-            if (i < count - 1) {
-                dup2(pipefds[i][1], STDOUT_FILENO);
-            }
+        pids[i] = -1;
 
-            if (pipefds) {
-                for (int k = 0; k < count - 1; k++) {
-                    close(pipefds[k][0]);
-                    close(pipefds[k][1]);
-                }
+        if (prev_read_fd >= 0) {
+            if (dup2(prev_read_fd, STDIN_FILENO) < 0) {
+                dprintf(STDERR_FILENO, "tsh: dup2: %s\n", strerror(errno));
+                stage_err = 1;
             }
+            if (prev_read_fd != STDIN_FILENO)
+                close(prev_read_fd);
+            prev_read_fd = -1;
+        } else {
+            dup2(saved_stdin, STDIN_FILENO);
+        }
 
-            /* Apply file redirections */
-            if (pipeline->cmds[i].redir.infile) {
-                int in_fd = open(pipeline->cmds[i].redir.infile, O_RDONLY);
-                if (in_fd < 0) {
-                    dprintf(STDERR_FILENO, "tsh: %s: %s\n",
-                            pipeline->cmds[i].redir.infile, strerror(errno));
-                    _exit(1);
-                }
-                dup2(in_fd, STDIN_FILENO);
-                close(in_fd);
+        if (i < count - 1) {
+            int pfd[2];
+            if (pipe(pfd) != 0) {
+                dprintf(STDERR_FILENO, "tsh: pipe error: %s\n", strerror(errno));
+                restore_stdio(saved_stdin, saved_stdout);
+                pipe_failed = 1;
+                last_status = 1;
+                break;
             }
-
-            if (pipeline->cmds[i].redir.outfile) {
-                int flags = O_WRONLY | O_CREAT |
-                            (pipeline->cmds[i].redir.append ? O_APPEND : O_TRUNC);
-                int out_fd = open(pipeline->cmds[i].redir.outfile, flags, 0644);
-                if (out_fd < 0) {
-                    dprintf(STDERR_FILENO, "tsh: %s: %s\n",
-                            pipeline->cmds[i].redir.outfile, strerror(errno));
-                    _exit(1);
-                }
-                dup2(out_fd, STDOUT_FILENO);
-                close(out_fd);
+            if (dup2(pfd[1], STDOUT_FILENO) < 0) {
+                dprintf(STDERR_FILENO, "tsh: dup2: %s\n", strerror(errno));
+                close(pfd[0]);
+                close(pfd[1]);
+                restore_stdio(saved_stdin, saved_stdout);
+                pipe_failed = 1;
+                last_status = 1;
+                break;
             }
+            if (pfd[1] != STDOUT_FILENO)
+                close(pfd[1]);
+            next_read_fd = pfd[0];
+        } else {
+            dup2(saved_stdout, STDOUT_FILENO);
+        }
 
-            /* Subshell execution: builtin or binary */
-            if (builtin_lookup(pipeline->cmds[i].argv[0])) {
+        if (!stage_err && apply_redirections(&pipeline->cmds[i].redir) != 0) {
+            stage_err = 1;
+            if (i == count - 1)
+                last_status = 1;
+        }
+
+        if (!stage_err) {
+            tsh_cmd_t *cmd = &pipeline->cmds[i];
+            if (!cmd->argv || !cmd->argv[0]) {
+                if (i == count - 1)
+                    last_status = 1;
+            } else if (builtin_lookup(cmd->argv[0])) {
                 int exit_dummy = 0;
-                int ret = builtin_execute(&pipeline->cmds[i],
-                                          STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO,
-                                          &exit_dummy);
-                _exit(ret);
+                int ret = builtin_execute(cmd, STDIN_FILENO, STDOUT_FILENO,
+                                          STDERR_FILENO, &exit_dummy);
+                if (i == count - 1)
+                    last_status = ret;
+            } else {
+                char *resolved = exec_resolve_path(cmd->argv[0]);
+                if (!resolved) {
+                    dprintf(STDERR_FILENO, "tsh: %s: command not found\n",
+                            cmd->argv[0]);
+                    if (i == count - 1)
+                        last_status = 127;
+                } else {
+                    pid_t pid = spawn(resolved, cmd->argv, env_get_all());
+                    if (pid <= 0) {
+                        dprintf(STDERR_FILENO, "tsh: spawn %s: %s\n",
+                                resolved, strerror(errno));
+                        if (i == count - 1)
+                            last_status = 126;
+                    } else {
+                        pids[i] = pid;
+                    }
+                    free(resolved);
+                }
             }
-
-            char *resolved = exec_resolve_path(pipeline->cmds[i].argv[0]);
-            if (!resolved) {
-                dprintf(STDERR_FILENO, "tsh: %s: command not found\n",
-                        pipeline->cmds[i].argv[0]);
-                _exit(127);
-            }
-
-            execve(resolved, pipeline->cmds[i].argv, env_get_all());
-            dprintf(STDERR_FILENO, "tsh: execve %s: %s\n", resolved, strerror(errno));
-            _exit(126);
-        } else if (pids[i] < 0) {
-            dprintf(STDERR_FILENO, "tsh: fork failed: %s\n", strerror(errno));
-            break;
         }
+
+        /* Restore parent stdio immediately to close this stage's pipe write end */
+        restore_stdio(saved_stdin, saved_stdout);
+        prev_read_fd = next_read_fd;
     }
 
-    /* Parent process: close pipeline pipes */
-    if (pipefds) {
-        for (int k = 0; k < count - 1; k++) {
-            close(pipefds[k][0]);
-            close(pipefds[k][1]);
-        }
-        free(pipefds);
-    }
+    if (prev_read_fd >= 0)
+        close(prev_read_fd);
 
-    /* Wait for child processes and record exit code of last stage */
+    restore_stdio(saved_stdin, saved_stdout);
+    close(saved_stdin);
+    close(saved_stdout);
+
     for (int i = 0; i < count; i++) {
         if (pids[i] > 0) {
             int wstatus = 0;
-            waitpid(pids[i], &wstatus, 0);
-            if (i == count - 1) {
-                if (WIFEXITED(wstatus))
-                    g_last_exit_status = WEXITSTATUS(wstatus);
-                else if (WIFSIGNALED(wstatus))
-                    g_last_exit_status = 128 + WTERMSIG(wstatus);
-                else
-                    g_last_exit_status = wstatus;
+            if (waitpid(pids[i], &wstatus, 0) == pids[i]) {
+                if (i == count - 1 && !pipe_failed)
+                    last_status = wait_status_to_exit_code(wstatus);
+            } else if (i == count - 1 && !pipe_failed) {
+                last_status = 1;
             }
         }
     }
 
     free(pids);
+    g_last_exit_status = last_status;
     return g_last_exit_status;
 }
 

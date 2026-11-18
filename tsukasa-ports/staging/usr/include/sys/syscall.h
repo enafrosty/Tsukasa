@@ -34,6 +34,7 @@
 #define SYS_rt_sigprocmask 14
 #define SYS_ioctl          16
 #define SYS_pipe           22
+#define SYS_select         23
 #define SYS_sched_yield    24
 #define SYS_shm_create     29
 #define SYS_shm_attach     30
@@ -67,6 +68,9 @@
 #define SYS_reboot         169
 #define SYS_time           201
 #define SYS_futex          202
+#define SYS_epoll_wait     232
+#define SYS_epoll_ctl      233
+#define SYS_epoll_create1  291
 #define SYS_list           300
 #define SYS_fsize          301
 #define SYS_ftell          302

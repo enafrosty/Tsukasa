@@ -17,8 +17,11 @@
 #include "devfs.h"
 #include "../drv/fb.h"
 #include "../drv/input_dev.h"
+#include "../drv/pit.h"
+#include "../drv/serial.h"
 #include "../tty/tty.h"
 #include "../include/errno.h"
+#include "../include/spinlock.h"
 #include "../include/vfs_abi.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -197,19 +200,63 @@ static const devfs_ops_t g_zero_ops = {
 
 /* /dev/urandom operations */
 
-static uint32_t g_urandom_state = 0x853c49e6;
+static uint64_t g_urandom_state = 0x853c49e69e3779b9ULL;
+static spinlock_t g_urandom_lock = SPINLOCK_INIT;
+
+static uint64_t urandom_rdtsc(void)
+{
+#ifdef __x86_64__
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+#else
+    return 0;
+#endif
+}
+
+static uint64_t urandom_next64(uint64_t *state)
+{
+    uint64_t x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
 
 static size_t dev_urandom_read(void *priv, size_t pos, void *buf, size_t count, int flags)
 {
     (void)priv;
     (void)pos;
     (void)flags;
-    if (!buf)
+    if (!buf || count == 0)
         return 0;
+
+    uint64_t tsc = urandom_rdtsc();
+    uint64_t ticks = pit_ticks();
     uint8_t *b = (uint8_t *)buf;
-    for (size_t i = 0; i < count; i++) {
-        g_urandom_state = g_urandom_state * 1664525u + 1013904223u;
-        b[i] = (uint8_t)(g_urandom_state >> 16);
+
+    unsigned long irqf = spin_lock_irqsave(&g_urandom_lock);
+    g_urandom_state ^= tsc ^ (ticks * 0x9E3779B97F4A7C15ULL) ^ (uint64_t)count;
+    g_urandom_state += 0x9E3779B97F4A7C15ULL;
+    if (g_urandom_state == 0)
+        g_urandom_state = 0xD1B54A32D192ED03ULL;
+
+    uint64_t local_state = urandom_next64(&g_urandom_state);
+    if (local_state == 0)
+        local_state = 0x94D049BB133111EBULL;
+    spin_unlock_irqrestore(&g_urandom_lock, irqf);
+
+    size_t i = 0;
+    while (i < count) {
+        uint64_t r = urandom_next64(&local_state);
+        if (local_state == 0)
+            local_state = 0x94D049BB133111EBULL;
+        for (int k = 0; k < 8 && i < count; k++) {
+            b[i++] = (uint8_t)(r & 0xFFu);
+            r >>= 8;
+        }
     }
     return count;
 }
@@ -218,7 +265,19 @@ static size_t dev_urandom_write(void *priv, size_t pos, const void *buf, size_t 
 {
     (void)priv;
     (void)pos;
-    (void)buf;
+    if (buf && count > 0) {
+        const uint8_t *src = (const uint8_t *)buf;
+        size_t mix_len = (count < 64) ? count : 64;
+        uint64_t mix = urandom_rdtsc();
+        for (size_t i = 0; i < mix_len; i++)
+            mix = (mix * 1315423911ULL) ^ (uint64_t)src[i];
+
+        unsigned long irqf = spin_lock_irqsave(&g_urandom_lock);
+        g_urandom_state ^= mix;
+        if (g_urandom_state == 0)
+            g_urandom_state = 0xD1B54A32D192ED03ULL;
+        spin_unlock_irqrestore(&g_urandom_lock, irqf);
+    }
     return count;
 }
 
@@ -242,6 +301,29 @@ static const devfs_ops_t g_urandom_ops = {
 
 /* /dev/tty operations */
 
+static size_t dev_tty_read(void *priv, size_t pos, void *buf, size_t count, int flags)
+{
+    (void)pos;
+    (void)flags;
+    if (!buf || count == 0)
+        return 0;
+#ifdef __x86_64__
+    int index = (int)(intptr_t)priv;
+    int active = tty_get_active();
+    if (index >= 0 && index != active)
+        return 0;
+
+    size_t got = input_dev_tty_read(buf, count);
+    uint8_t *dst = (uint8_t *)buf;
+    while (got < count && serial_has_rx_port(COM1_BASE))
+        dst[got++] = (uint8_t)serial_getc_port(COM1_BASE);
+    return got;
+#else
+    (void)priv;
+    return 0;
+#endif
+}
+
 static size_t dev_tty_write(void *priv, size_t pos, const void *buf, size_t count)
 {
     (void)pos;
@@ -258,14 +340,24 @@ static size_t dev_tty_write(void *priv, size_t pos, const void *buf, size_t coun
 
 static int dev_tty_poll(void *priv, int events)
 {
+    int revents = events & VFS_POLLOUT;
+#ifdef __x86_64__
+    int index = (int)(intptr_t)priv;
+    int active = tty_get_active();
+    if ((index < 0 || index == active) &&
+        (input_dev_tty_poll_readable() || serial_has_rx_port(COM1_BASE))) {
+        revents |= (events & VFS_POLLIN);
+    }
+#else
     (void)priv;
-    return events & (VFS_POLLIN | VFS_POLLOUT);
+#endif
+    return revents;
 }
 
 static const devfs_ops_t g_tty_ops = {
     .open = NULL,
     .close = NULL,
-    .read = NULL,
+    .read = dev_tty_read,
     .write = dev_tty_write,
     .ioctl = NULL,
     .mmap = NULL,

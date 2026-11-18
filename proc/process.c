@@ -631,6 +631,8 @@ static int signal_pick_lowest(uint64_t mask)
     return -1;
 }
 
+static int g_user_sig_drop_warned;
+
 static int prepare_signal_action_locked(process_t *p, uintptr_t *handler_out, int *sig_out)
 {
     uint64_t pending;
@@ -663,6 +665,19 @@ static int prepare_signal_action_locked(process_t *p, uintptr_t *handler_out, in
         return 0;
     }
 
+    /* Without a user-mode sigreturn trampoline, never invoke a Ring-3 or lower-half handler in Ring 0. */
+    if (p->vm_space.owns_pml4 != 0 || handler < 0xFFFFFFFF80000000ULL) {
+        if (!g_user_sig_drop_warned) {
+            g_user_sig_drop_warned = 1;
+            kprintf("[proc] WARN: dropping user signal %d handler=0x%08x%08x for pid=%u (no user trampoline)\n",
+                    sig,
+                    (uint32_t)(handler >> 32),
+                    (uint32_t)(handler & 0xFFFFFFFFu),
+                    (unsigned)p->pid);
+        }
+        return 0;
+    }
+
     if (handler_out)
         *handler_out = handler;
     if (sig_out)
@@ -673,7 +688,6 @@ static int prepare_signal_action_locked(process_t *p, uintptr_t *handler_out, in
 static process_t *create_kernel_process_locked(const char *name, process_entry_t entry, process_t *parent)
 {
     process_t *p = alloc_process_slot_locked();
-    const vm_space_t *template_space = NULL;
     if (!p)
         return NULL;
 
@@ -698,20 +712,13 @@ static process_t *create_kernel_process_locked(const char *name, process_entry_t
         vfs_process_inherit(p, parent);
     name_copy(p->name, name ? name : "proc", PROCESS_NAME_MAX);
 
-    if (parent)
-        template_space = &parent->vm_space;
-    else if (g_current[sched_this_cpu()])
-        template_space = &g_current[sched_this_cpu()]->vm_space;
-
-    if (template_space && template_space->pml4_phys) {
-        p->vm_space.pml4_phys = template_space->pml4_phys;
-        p->vm_space.user_min = template_space->user_min;
-        p->vm_space.user_max = template_space->user_max;
+    if (vm_space_init_kernel(&p->vm_space) == 0) {
+        uint64_t kernel_pml4 = vmm_get_kernel_pml4();
+        if (kernel_pml4)
+            p->vm_space.pml4_phys = kernel_pml4;
+        else if (g_current[0] && !g_current[0]->vm_space.owns_pml4 && g_current[0]->vm_space.pml4_phys)
+            p->vm_space.pml4_phys = g_current[0]->vm_space.pml4_phys;
         p->vm_space.shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE + (((uintptr_t)p->pid % 64) * 0x01000000ULL);
-        p->vm_space.anon_cursor = (uintptr_t)VM_SPACE_ANON_BASE;
-        p->vm_space.mapped_pages = 0;
-        p->vm_space.shm_pages = 0;
-        p->vm_space.owns_pml4 = 0;
     } else if (vm_space_create(&p->vm_space) != 0) {
         p->used = 0;
         kprintf("[proc] WARN: vm_space init failed for '%s' (pid=%u)\n",
@@ -1515,9 +1522,18 @@ uint64_t process_schedule_tick(uint64_t current_rsp)
 
         if (cur->state == PROCESS_RUNNING &&
             prepare_signal_action_locked(cur, &signal_handler, &delivered_sig)) {
+            if (!cur->vm_space.owns_pml4 && signal_handler >= 0xFFFFFFFF80000000ULL) {
+                process_signal_handler_t fn = (process_signal_handler_t)(uintptr_t)signal_handler;
+                spin_unlock(&g_sched_lock);
+                fn(delivered_sig);
+                spin_lock(&g_sched_lock);
+                cur = g_current[cpu];
+            }
+            signal_handler = 0;
+            delivered_sig = 0;
         }
 
-        if (cur->state == PROCESS_RUNNING) {
+        if (cur && cur->state == PROCESS_RUNNING) {
             int best_pri = runq_best_priority_locked(cpu);
             if (!cur->is_idle && cur->time_slice > 0) {
                 cur->time_slice--;
@@ -1529,10 +1545,6 @@ uint64_t process_schedule_tick(uint64_t current_rsp)
                 next_rsp = cur->kernel_rsp ? cur->kernel_rsp : current_rsp;
                 spin_unlock(&g_sched_lock);
                 irq_restore(flags);
-                if (signal_handler > 1) {
-                    process_signal_handler_t fn = (process_signal_handler_t)(uintptr_t)signal_handler;
-                    fn(delivered_sig);
-                }
                 return next_rsp;
             }
             if (cur->is_idle) {
@@ -1584,11 +1596,6 @@ uint64_t process_schedule_tick(uint64_t current_rsp)
     next_rsp = next ? next->kernel_rsp : current_rsp;
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
-
-    if (signal_handler > 1) {
-        process_signal_handler_t fn = (process_signal_handler_t)(uintptr_t)signal_handler;
-        fn(delivered_sig);
-    }
 
     return next_rsp ? next_rsp : current_rsp;
 }

@@ -19,6 +19,7 @@
 
 #include "mm/vmm_x64.h"
 #include "mm/pmm.h"
+#include "mm/vm_space.h"
 #include "include/kprintf.h"
 #include "include/smp.h"
 #include "include/spinlock.h"
@@ -33,6 +34,8 @@ typedef struct {
 
 #define VMM_X64_ADDR_MASK 0x000FFFFFFFFFF000ULL
 #define VMM_X64_TLB_INVLPG_THRESHOLD 32
+#define VMM_X64_FB_MMIO_BASE  0x0000000030000000ULL
+#define VMM_X64_FB_MMIO_LIMIT 0x0000000040000000ULL
 
 /* concurrent shm attaches). */
 static spinlock_t g_vmm_lock = SPINLOCK_INIT;
@@ -460,6 +463,8 @@ int vmm_destroy_address_space(uint64_t pml4_phys)
             continue;
 
         pdpt_phys = pdpt_entry & VMM_X64_ADDR_MASK;
+        if (!pdpt_phys)
+            continue;
         pdpt = table_virt(pdpt_phys);
         for (uint32_t pdpt_idx = 0; pdpt_idx < 512; pdpt_idx++) {
             uint64_t pd_entry = pdpt->entries[pdpt_idx];
@@ -468,19 +473,53 @@ int vmm_destroy_address_space(uint64_t pml4_phys)
 
             if ((pd_entry & VMM_X64_PTE_PRESENT) == 0)
                 continue;
+            if (pd_entry & (1ULL << 7))
+                continue;
 
             pd_phys = pd_entry & VMM_X64_ADDR_MASK;
+            if (!pd_phys)
+                continue;
             pd = table_virt(pd_phys);
             for (uint32_t pd_idx = 0; pd_idx < 512; pd_idx++) {
                 uint64_t pt_entry = pd->entries[pd_idx];
+                page_table_t *pt;
                 uint64_t pt_phys;
                 if ((pt_entry & VMM_X64_PTE_PRESENT) == 0)
                     continue;
                 if (pt_entry & (1ULL << 7))
                     continue;
                 pt_phys = pt_entry & VMM_X64_ADDR_MASK;
-                if (pt_phys)
-                    pmm_free_pages(pt_phys, 1);
+                if (!pt_phys)
+                    continue;
+
+                /* Reclaim owned user frames before freeing the leaf PT; skip FB MMIO and SHM. */
+                pt = table_virt(pt_phys);
+                for (uint32_t pt_idx = 0; pt_idx < 512; pt_idx++) {
+                    uint64_t leaf_entry = pt->entries[pt_idx];
+                    uint64_t leaf_phys;
+                    uint64_t va;
+
+                    if ((leaf_entry & VMM_X64_PTE_PRESENT) == 0)
+                        continue;
+                    if ((leaf_entry & VMM_X64_PTE_USER) == 0)
+                        continue;
+
+                    va = ((uint64_t)pml4_idx << 39) |
+                         ((uint64_t)pdpt_idx << 30) |
+                         ((uint64_t)pd_idx << 21) |
+                         ((uint64_t)pt_idx << 12);
+
+                    if (va >= VMM_X64_FB_MMIO_BASE && va < VMM_X64_FB_MMIO_LIMIT)
+                        continue;
+                    if (va >= VM_SPACE_SHM_BASE && va < VM_SPACE_SHM_LIMIT)
+                        continue;
+
+                    leaf_phys = leaf_entry & VMM_X64_ADDR_MASK;
+                    if (leaf_phys)
+                        pmm_free_pages(leaf_phys, 1);
+                }
+
+                pmm_free_pages(pt_phys, 1);
             }
 
             pmm_free_pages(pd_phys, 1);

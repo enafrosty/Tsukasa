@@ -691,6 +691,7 @@ static uintptr_t handle_system(uintptr_t cmd,
     case SYSTEM_CMD_SPAWN:
     {
         const char *path = (const char *)(uintptr_t)arg2;
+        const char *args = (const char *)(uintptr_t)arg3;
         exec_entry_t entry = NULL;
         process_t *child;
         if (!path)
@@ -698,15 +699,17 @@ static uintptr_t handle_system(uintptr_t cmd,
         if (exec_resolve_builtin(path, &entry) == 0 && entry) {
             child = process_spawn_kernel(path, entry);
             if (child)
-                process_set_cmdline((int)child->pid, path);
+                process_set_cmdline((int)child->pid, (args && args[0]) ? args : path);
             return child ? (uintptr_t)child->pid : (uintptr_t)-1;
         }
         /* Not a compiled-in builtin: load an ELF64 binary from the VFS into a fresh private address space and run it. */
         {
             int parent_pid = process_current_pid();
-            int pid = elf64_spawn(path, path);
+            int pid = (args && args[0])
+                          ? elf64_spawn_cmdline(path, args, path)
+                          : elf64_spawn(path, path);
             if (pid >= 0) {
-                process_set_cmdline(pid, path);
+                process_set_cmdline(pid, (args && args[0]) ? args : path);
                 if (parent_pid > 0) {
                     process_clone_fd(pid, 0, parent_pid, 0);
                     process_clone_fd(pid, 1, parent_pid, 1);
@@ -733,12 +736,12 @@ static uintptr_t handle_system(uintptr_t cmd,
             child_pid = (int)child->pid;
         } else {
             /* Not a compiled-in builtin: load an ELF64 binary from the VFS. */
-            child_pid = elf64_spawn(req->path, req->path);
+            child_pid = elf64_spawn_cmdline(req->path, req->args, req->path);
             if (child_pid < 0)
                 return (uintptr_t)-1;
         }
 
-        process_set_cmdline(child_pid, req->args ? req->args : req->path);
+        process_set_cmdline(child_pid, (req->args && req->args[0]) ? req->args : req->path);
         if (req->tty_id >= 0)
             process_set_tty(child_pid, req->tty_id);
 

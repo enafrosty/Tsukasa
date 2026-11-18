@@ -60,6 +60,7 @@
 #define VFS_MAX_OPEN_GLOBAL   128
 #define VFS_MAX_PIPES         32
 #define VFS_PIPE_CAPACITY     4096
+#define VFS_MEMFS_MAX_DIRS    32
 
 
 typedef enum vfs_device_kind {
@@ -148,6 +149,15 @@ static char g_kernel_cwd[VFS_PATH_MAX] = "/";
 static int g_fat12_ok;
 static int g_fat32_ok;
 static int g_initrd_ok;
+static fat32_volume_t *g_fat32_primary_vol;
+
+typedef struct vfs_memfs_dir {
+    int used;
+    const vfs_mount_t *mount;
+    char path[VFS_PATH_MAX];
+} vfs_memfs_dir_t;
+
+static vfs_memfs_dir_t g_memfs_dirs[VFS_MEMFS_MAX_DIRS];
 
 /* String/path helpers */
 
@@ -711,6 +721,170 @@ static vfs_file_t *fd_lookup_on_table(void **tbl, int fd)
 
 /* DevFS operations are handled via fs/devfs.c */
 
+/* MemFS virtual directory tracking */
+
+static void memfs_dirs_reset(void)
+{
+    for (int i = 0; i < VFS_MEMFS_MAX_DIRS; i++) {
+        g_memfs_dirs[i].used = 0;
+        g_memfs_dirs[i].mount = NULL;
+        g_memfs_dirs[i].path[0] = '\0';
+    }
+}
+
+static const char *memfs_sub_to_rel(const char *subpath)
+{
+    const char *p = subpath;
+    if (!p)
+        return "";
+    while (*p == '/')
+        p++;
+    return p;
+}
+
+static int memfs_dir_find(const vfs_mount_t *m, const char *rel)
+{
+    if (!rel || !rel[0])
+        return -1;
+    for (int i = 0; i < VFS_MEMFS_MAX_DIRS; i++) {
+        if (g_memfs_dirs[i].used && g_memfs_dirs[i].mount == m &&
+            kstreq(g_memfs_dirs[i].path, rel)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int memfs_split_parent(const char *rel, char *parent_out, int cap,
+                              const char **leaf_out)
+{
+    int last_slash = -1;
+    int len;
+    if (!rel || !parent_out || cap <= 0 || !leaf_out)
+        return -1;
+    len = kstrlen(rel);
+    if (len == 0)
+        return -1;
+    for (int i = 0; i < len; i++) {
+        if (rel[i] == '/')
+            last_slash = i;
+    }
+    if (last_slash < 0) {
+        parent_out[0] = '\0';
+        *leaf_out = rel;
+        return 0;
+    }
+    if (last_slash >= cap)
+        return -1;
+    for (int i = 0; i < last_slash; i++)
+        parent_out[i] = rel[i];
+    parent_out[last_slash] = '\0';
+    *leaf_out = rel + last_slash + 1;
+    return 0;
+}
+
+static int memfs_has_prefix(const char *entry_rel, const char *dir_rel)
+{
+    int dlen = kstrlen(dir_rel);
+    if (!entry_rel || !dir_rel || dlen == 0)
+        return 0;
+    for (int i = 0; i < dlen; i++) {
+        if (entry_rel[i] != dir_rel[i])
+            return 0;
+    }
+    return (entry_rel[dlen] == '/' && entry_rel[dlen + 1] != '\0');
+}
+
+static int memfs_direct_child(const char *dir_rel, const char *entry_rel,
+                              char *child_out, int cap)
+{
+    const char *rest = entry_rel;
+    if (!entry_rel || !entry_rel[0] || !child_out || cap <= 0)
+        return -1;
+    if (dir_rel && dir_rel[0]) {
+        int dlen = kstrlen(dir_rel);
+        for (int i = 0; i < dlen; i++) {
+            if (entry_rel[i] != dir_rel[i])
+                return -1;
+        }
+        if (entry_rel[dlen] != '/')
+            return -1;
+        rest = entry_rel + dlen + 1;
+    }
+    if (!rest[0])
+        return -1;
+    for (int i = 0; rest[i]; i++) {
+        if (rest[i] == '/')
+            return -1;
+    }
+    return kstrncpy(child_out, rest, cap);
+}
+
+static int memfs_dir_has_children(const vfs_mount_t *m, const char *rel)
+{
+    char mnames[MEMFS_MAX_FILES][MEMFS_MAX_NAME];
+    int n;
+
+    for (int i = 0; i < VFS_MEMFS_MAX_DIRS; i++) {
+        if (g_memfs_dirs[i].used && g_memfs_dirs[i].mount == m &&
+            memfs_has_prefix(g_memfs_dirs[i].path, rel)) {
+            return 1;
+        }
+    }
+
+    n = memfs_list(mnames, MEMFS_MAX_FILES);
+    for (int i = 0; i < n; i++) {
+        if (memfs_has_prefix(mnames[i], rel))
+            return 1;
+    }
+    return 0;
+}
+
+static int memfs_list_dir_entries(const vfs_mount_t *m, const char *rel,
+                                  char names[][VFS_NAME_MAX], int max)
+{
+    char mnames[MEMFS_MAX_FILES][MEMFS_MAX_NAME];
+    char child[VFS_NAME_MAX];
+    int count = 0;
+    int n;
+
+    for (int i = 0; i < VFS_MEMFS_MAX_DIRS && count < max; i++) {
+        if (!g_memfs_dirs[i].used || g_memfs_dirs[i].mount != m)
+            continue;
+        if (memfs_direct_child(rel, g_memfs_dirs[i].path, child, VFS_NAME_MAX) == 0) {
+            int dup = 0;
+            for (int k = 0; k < count; k++) {
+                if (kstreq(names[k], child)) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup) {
+                kstrncpy(names[count], child, VFS_NAME_MAX);
+                count++;
+            }
+        }
+    }
+
+    n = memfs_list(mnames, MEMFS_MAX_FILES);
+    for (int i = 0; i < n && count < max; i++) {
+        if (memfs_direct_child(rel, mnames[i], child, VFS_NAME_MAX) == 0) {
+            int dup = 0;
+            for (int k = 0; k < count; k++) {
+                if (kstreq(names[k], child)) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup) {
+                kstrncpy(names[count], child, VFS_NAME_MAX);
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
 /* Backend stat/list/read helpers */
 
 static int backend_stat(const vfs_mount_t *m, const char *subpath, vfs_stat_t *out)
@@ -731,9 +905,13 @@ static int backend_stat(const vfs_mount_t *m, const char *subpath, vfs_stat_t *o
     case VFS_BACKEND_MEMFS:
     {
         size_t sz = 0;
-        const char *name = subpath;
-        while (*name == '/')
-            name++;
+        const char *name = memfs_sub_to_rel(subpath);
+        if (memfs_dir_find(m, name) >= 0) {
+            out->type = VFS_TYPE_DIR;
+            out->size = 0;
+            out->blocks = 0;
+            return 0;
+        }
         if (memfs_stat(name, &sz) != 0)
             return -1;
         out->type = VFS_TYPE_FILE;
@@ -846,11 +1024,13 @@ void vfs_init(const void *boot_info)
 
     mount_table_reset();
     file_pool_reset();
+    memfs_dirs_reset();
     memfs_init();
     procfs_init();
     sysfs_init();
     devfs_init();
     bootfs_init(boot_info);
+    g_fat32_primary_vol = NULL;
 
     g_fat12_ok = 0;
     if (tsukasa_boot_info_is_valid(boot_info)) {
@@ -909,8 +1089,10 @@ void vfs_init(const void *boot_info)
                     mnt, (uint32_t)(bd->sector_count / 2048u));
     }
     if (blockdev_first_raw_fat32()) {
-        if (fat32_init() == 0)
+        if (fat32_init() == 0) {
             g_fat32_ok = 1;
+            g_fat32_primary_vol = fat32_vol_mount(blockdev_first_raw_fat32());
+        }
         kprintf("[vfs] FAT32 /disk: %s\n", g_fat32_ok ? "ok" : "not found");
     }
 
@@ -950,18 +1132,30 @@ void vfs_init(const void *boot_info)
 
 /* Open/create/close */
 
-static int open_memfs_file(vfs_file_t *f, const char *subpath, int flags)
+static int open_memfs_file(const vfs_mount_t *m, vfs_file_t *f,
+                           const char *subpath, int flags)
 {
-    const char *name = subpath;
+    const char *name = memfs_sub_to_rel(subpath);
     int inode;
-    while (*name == '/')
-        name++;
     if (!name[0])
+        return -1;
+    if (memfs_dir_find(m, name) >= 0)
         return -1;
 
     inode = memfs_open(name);
-    if (inode < 0 && (flags & VFS_O_CREAT))
+    if (inode < 0 && (flags & VFS_O_CREAT)) {
+        char parent[VFS_PATH_MAX];
+        const char *leaf = NULL;
+        if (kstrlen(name) >= MEMFS_MAX_NAME)
+            return -1;
+        if (memfs_split_parent(name, parent, VFS_PATH_MAX, &leaf) != 0)
+            return -1;
+        if (!leaf || !leaf[0])
+            return -1;
+        if (parent[0] && memfs_dir_find(m, parent) < 0)
+            return -1;
         inode = memfs_create(name);
+    }
     if (inode < 0)
         return -1;
     if (flags & VFS_O_TRUNC)
@@ -1014,13 +1208,22 @@ static int open_regular_buffered(vfs_file_t *f, vfs_backend_t backend,
     } else if (backend == VFS_BACKEND_FAT32) {
         fat32_dirent_t de;
         if (fat32_stat(subpath, &de) != 0) {
-            if (flags & VFS_O_CREAT)
+            if (flags & VFS_O_CREAT) {
+                fat32_volume_t *vol = g_fat32_primary_vol;
+                if (!vol && blockdev_first_raw_fat32())
+                    vol = fat32_vol_mount(blockdev_first_raw_fat32());
+                if (!vol || fat32_vol_create_file(vol, subpath) != 0)
+                    return -1;
+                g_fat32_primary_vol = vol;
+                file_size = 0;
+            } else {
                 return -1;
-            return -1;
+            }
+        } else {
+            if (de.is_dir)
+                return -1;
+            file_size = (flags & VFS_O_TRUNC) ? 0 : de.size;
         }
-        if (de.is_dir)
-            return -1;
-        file_size = (flags & VFS_O_TRUNC) ? 0 : de.size;
         if (file_size > 0) {
             buf = (uint8_t *)kmalloc(file_size);
             if (!buf)
@@ -1033,11 +1236,19 @@ static int open_regular_buffered(vfs_file_t *f, vfs_backend_t backend,
     } else if (backend == VFS_BACKEND_FAT32VOL) {
         fat32_volume_t *vol = (fat32_volume_t *)fs_ctx;
         fat32_dirent_t de;
-        if (fat32_vol_stat(vol, subpath, &de) != 0)
-            return -1;
-        if (de.is_dir)
-            return -1;
-        file_size = (flags & VFS_O_TRUNC) ? 0 : de.size;
+        if (fat32_vol_stat(vol, subpath, &de) != 0) {
+            if (flags & VFS_O_CREAT) {
+                if (!vol || fat32_vol_create_file(vol, subpath) != 0)
+                    return -1;
+                file_size = 0;
+            } else {
+                return -1;
+            }
+        } else {
+            if (de.is_dir)
+                return -1;
+            file_size = (flags & VFS_O_TRUNC) ? 0 : de.size;
+        }
         if (file_size > 0) {
             buf = (uint8_t *)kmalloc(file_size);
             if (!buf)
@@ -1095,7 +1306,7 @@ int vfs_open_flags(const char *path, int flags)
 
     switch (m->backend) {
     case VFS_BACKEND_MEMFS:
-        if (open_memfs_file(f, sub, flags) != 0) {
+        if (open_memfs_file(m, f, sub, flags) != 0) {
             file_release(f);
             return -1;
         }
@@ -1254,26 +1465,24 @@ int vfs_unlink(const char *path)
         return -1;
 
     if (m->backend == VFS_BACKEND_MEMFS) {
-        const char *name = sub;
-        while (*name == '/')
-            name++;
+        const char *name = memfs_sub_to_rel(sub);
+        if (!name[0])
+            return -1;
+        if (memfs_dir_find(m, name) >= 0)
+            return -1;
         return memfs_unlink(name);
     }
-    return 0;
+    return -1;
 }
 
 int vfs_rmdir(const char *path)
 {
-    return vfs_unlink(path);
-}
-
-int vfs_mkdir(const char *path, int mode)
-{
-    (void)mode;
     process_t *proc = vfs_current_process();
     const vfs_mount_t *m;
     char abs[VFS_PATH_MAX];
     char sub[VFS_PATH_MAX];
+    const char *rel;
+    int idx;
 
     if (!path)
         return -1;
@@ -1285,7 +1494,75 @@ int vfs_mkdir(const char *path, int mode)
     if (mount_subpath(m, abs, sub, VFS_PATH_MAX) != 0)
         return -1;
 
+    if (m->backend != VFS_BACKEND_MEMFS)
+        return -1;
+
+    rel = memfs_sub_to_rel(sub);
+    if (!rel[0])
+        return -1;
+
+    idx = memfs_dir_find(m, rel);
+    if (idx < 0)
+        return -1;
+    if (memfs_dir_has_children(m, rel))
+        return -1;
+
+    g_memfs_dirs[idx].used = 0;
+    g_memfs_dirs[idx].mount = NULL;
+    g_memfs_dirs[idx].path[0] = '\0';
     return 0;
+}
+
+int vfs_mkdir(const char *path, int mode)
+{
+    (void)mode;
+    process_t *proc = vfs_current_process();
+    const vfs_mount_t *m;
+    char abs[VFS_PATH_MAX];
+    char sub[VFS_PATH_MAX];
+    const char *rel;
+
+    if (!path)
+        return -1;
+    if (normalize_path_for_process(proc, path, abs, VFS_PATH_MAX) != 0)
+        return -1;
+    m = mount_lookup(abs);
+    if (!m || m->read_only)
+        return -1;
+    if (mount_subpath(m, abs, sub, VFS_PATH_MAX) != 0)
+        return -1;
+
+    if (m->backend != VFS_BACKEND_MEMFS)
+        return -1;
+
+    rel = memfs_sub_to_rel(sub);
+    if (!rel[0])
+        return -1;
+    if (unix_find_listener(abs) != NULL)
+        return -1;
+    if (memfs_dir_find(m, rel) >= 0 || memfs_open(rel) >= 0)
+        return -1;
+
+    {
+        char parent[VFS_PATH_MAX];
+        const char *leaf = NULL;
+        if (memfs_split_parent(rel, parent, VFS_PATH_MAX, &leaf) != 0)
+            return -1;
+        if (!leaf || !leaf[0] || kstrlen(leaf) >= VFS_NAME_MAX)
+            return -1;
+        if (parent[0] && memfs_dir_find(m, parent) < 0)
+            return -1;
+    }
+
+    for (int i = 0; i < VFS_MEMFS_MAX_DIRS; i++) {
+        if (!g_memfs_dirs[i].used) {
+            g_memfs_dirs[i].used = 1;
+            g_memfs_dirs[i].mount = m;
+            kstrncpy(g_memfs_dirs[i].path, rel, VFS_PATH_MAX);
+            return 0;
+        }
+    }
+    return -1;
 }
 
 int vfs_rename(const char *old_path, const char *new_path)
@@ -1313,12 +1590,20 @@ int vfs_rename(const char *old_path, const char *new_path)
         return -1;
 
     if (m1->backend == VFS_BACKEND_MEMFS) {
-        const char *n1 = sub1;
-        const char *n2 = sub2;
-        while (*n1 == '/')
-            n1++;
-        while (*n2 == '/')
-            n2++;
+        const char *n1 = memfs_sub_to_rel(sub1);
+        const char *n2 = memfs_sub_to_rel(sub2);
+        char parent[VFS_PATH_MAX];
+        const char *leaf = NULL;
+        if (!n1[0] || !n2[0] || kstrlen(n2) >= MEMFS_MAX_NAME)
+            return -1;
+        if (memfs_dir_find(m1, n1) >= 0 || memfs_dir_find(m1, n2) >= 0)
+            return -1;
+        if (memfs_split_parent(n2, parent, VFS_PATH_MAX, &leaf) != 0)
+            return -1;
+        if (!leaf || !leaf[0])
+            return -1;
+        if (parent[0] && memfs_dir_find(m1, parent) < 0)
+            return -1;
         return memfs_rename(n1, n2);
     }
     if (m1->backend == VFS_BACKEND_FAT32VOL) {
@@ -1935,6 +2220,8 @@ void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t of
     /* Handle anonymous mmap (backing for user heap malloc) */
     if ((flags & VFS_MAP_ANONYMOUS) || fd == -1) {
         uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
+        if (length > SIZE_MAX - page_mask)
+            return (void *)-1;
         size_t page_count = (length + page_mask) / PAGE_SIZE;
         uintptr_t target_va;
 
@@ -1957,12 +2244,15 @@ void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t of
             uintptr_t phys = pmm_alloc_pages(1);
             if (!phys) {
                 for (size_t j = 0; j < i; j++) {
+                    uintptr_t va = target_va + j * PAGE_SIZE;
                     uint64_t q_phys = 0, q_flags = 0;
-                    if (vmm_query_page(proc->vm_space.pml4_phys, target_va + j * PAGE_SIZE, &q_phys, &q_flags) == 0 &&
+                    if (vmm_query_page(proc->vm_space.pml4_phys, va, &q_phys, &q_flags) == 0 &&
                         (q_flags & VMM_X64_PTE_PRESENT)) {
-                        pmm_free_pages(q_phys, 1);
+                        if (vm_space_unmap_user_pages(&proc->vm_space, va, 1) == 0 &&
+                            q_phys != 0 && (q_flags & VMM_X64_PTE_USER)) {
+                            pmm_free_pages((uintptr_t)q_phys, 1);
+                        }
                     }
-                    vm_space_unmap_user_pages(&proc->vm_space, target_va + j * PAGE_SIZE, 1);
                 }
                 return (void *)-1;
             }
@@ -1971,12 +2261,15 @@ void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t of
             if (vm_space_map_user_pages(&proc->vm_space, target_va + i * PAGE_SIZE, phys, 1, map_flags) != 0) {
                 pmm_free_pages(phys, 1);
                 for (size_t j = 0; j < i; j++) {
+                    uintptr_t va = target_va + j * PAGE_SIZE;
                     uint64_t q_phys = 0, q_flags = 0;
-                    if (vmm_query_page(proc->vm_space.pml4_phys, target_va + j * PAGE_SIZE, &q_phys, &q_flags) == 0 &&
+                    if (vmm_query_page(proc->vm_space.pml4_phys, va, &q_phys, &q_flags) == 0 &&
                         (q_flags & VMM_X64_PTE_PRESENT)) {
-                        pmm_free_pages(q_phys, 1);
+                        if (vm_space_unmap_user_pages(&proc->vm_space, va, 1) == 0 &&
+                            q_phys != 0 && (q_flags & VMM_X64_PTE_USER)) {
+                            pmm_free_pages((uintptr_t)q_phys, 1);
+                        }
                     }
-                    vm_space_unmap_user_pages(&proc->vm_space, target_va + j * PAGE_SIZE, 1);
                 }
                 return (void *)-1;
             }
@@ -2004,25 +2297,52 @@ int vfs_munmap(void *addr, size_t length)
         return -1;
 
     uintptr_t p = (uintptr_t)addr;
-    if (p == (uintptr_t)VFS_FB_USER_BASE && length <= fb_byte_size())
-        return fb_munmap(addr, length);
+    uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
+    if (p + length < p || (p + length) > UINTPTR_MAX - page_mask)
+        return -1;
 
-    if (paging_range_is_user(p, length)) {
-        uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
-        size_t page_count = (length + page_mask) / PAGE_SIZE;
-        uintptr_t base = p & ~page_mask;
+    uintptr_t base = p & ~page_mask;
+    uintptr_t end = (p + length + page_mask) & ~page_mask;
+    if (end <= base)
+        return -1;
 
-        for (size_t i = 0; i < page_count; i++) {
-            uint64_t q_phys = 0, q_flags = 0;
-            if (vmm_query_page(proc->vm_space.pml4_phys, base + i * PAGE_SIZE, &q_phys, &q_flags) == 0 &&
-                (q_flags & VMM_X64_PTE_PRESENT)) {
-                pmm_free_pages(q_phys, 1);
-            }
-        }
-        return vm_space_unmap_user_pages(&proc->vm_space, base, page_count);
+    size_t span = (size_t)(end - base);
+    if (!paging_range_is_user(base, span))
+        return -1;
+
+    size_t fb_sz = fb_byte_size();
+    if (fb_sz > 0) {
+        uintptr_t fb_end = (uintptr_t)VFS_FB_USER_BASE +
+                           ((fb_sz + page_mask) & ~page_mask);
+        if (base >= (uintptr_t)VFS_FB_USER_BASE && end <= fb_end)
+            return fb_munmap((void *)base, span);
     }
 
-    return 0;
+    size_t page_count = span / (size_t)PAGE_SIZE;
+    int unmap_err = 0;
+
+    for (size_t i = 0; i < page_count; i++) {
+        uint64_t va = (uint64_t)(base + i * (uintptr_t)PAGE_SIZE);
+        uint64_t q_phys = 0;
+        uint64_t q_flags = 0;
+
+        if (vmm_query_page(proc->vm_space.pml4_phys, (uintptr_t)va,
+                           &q_phys, &q_flags) == 0 &&
+            (q_flags & VMM_X64_PTE_PRESENT)) {
+            if (vm_space_unmap_user_pages(&proc->vm_space,
+                                          (uintptr_t)va, 1) == 0) {
+                /* Unmap PTE first, then only free frames owned by anonymous mmap. */
+                if (va >= VM_SPACE_ANON_BASE && va < VM_SPACE_ANON_LIMIT &&
+                    q_phys != 0 && (q_flags & VMM_X64_PTE_USER)) {
+                    pmm_free_pages((uintptr_t)q_phys, 1);
+                }
+            } else {
+                unmap_err = -1;
+            }
+        }
+    }
+
+    return unmap_err;
 }
 
 static int vfs_file_poll_mask(vfs_file_t *f)
@@ -2127,7 +2447,6 @@ static int vfs_poll_scan(vfs_pollfd_t *fds, size_t nfds)
 
 static void vfs_poll_register_file(vfs_file_t *f, poll_table_t *pt, int16_t events)
 {
-    (void)events;
     if (!f || !pt)
         return;
 
@@ -2149,6 +2468,23 @@ static void vfs_poll_register_file(vfs_file_t *f, poll_table_t *pt, int16_t even
             poll_wtable_queue(&f->u.sock.rx->waitq, pt);
         if (f->u.sock.tx && f->u.sock.tx != f->u.sock.rx)
             poll_wtable_queue(&f->u.sock.tx->waitq, pt);
+        return;
+    }
+
+    if (f->backend == VFS_BACKEND_DEVFS) {
+        const char *sub = f->path;
+        while (*sub == '/')
+            sub++;
+        if ((events & VFS_POLLIN) &&
+            (kstreq(sub, "input/events") || kstreq(sub, "events") ||
+             kstreq(sub, "keyboard") || kstreq(sub, "mouse") ||
+             kstreq(sub, "tty") ||
+             (sub[0] == 't' && sub[1] == 't' && sub[2] == 'y' &&
+              sub[3] >= '0' && sub[3] <= '9' && sub[4] == '\0'))) {
+            wait_queue_head_t *wq = input_dev_get_events_waitq();
+            if (wq)
+                poll_wtable_queue(wq, pt);
+        }
         return;
     }
 
@@ -2517,10 +2853,13 @@ int vfs_list(const char *dir, char names[][VFS_NAME_MAX], int max)
 
     switch (m->backend) {
     case VFS_BACKEND_MEMFS:
-        if (!kstreq(sub, "/"))
+    {
+        const char *rel = memfs_sub_to_rel(sub);
+        if (rel[0] && memfs_dir_find(m, rel) < 0)
             return -1;
-        count = memfs_list(names, max);
+        count = memfs_list_dir_entries(m, rel, names, max);
         break;
+    }
     case VFS_BACKEND_FAT12:
     {
         fat12_dirent_t entries[FAT12_MAX_DIRENT];

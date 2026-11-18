@@ -152,8 +152,35 @@ double tan(double x)
     return sin(x) / c;
 }
 
+static inline int dbl_signbit(double x)
+{
+    union {
+        double d;
+        uint64_t u;
+    } v = { .d = x };
+    return (int)(v.u >> 63);
+}
+
+static inline double sqrt_1m_x2(double x)
+{
+    double a = fabs(x);
+    double d = (a > 0.5) ? (1.0 - a) * (1.0 + a) : (1.0 - x * x);
+    return sqrt(d);
+}
+
 static double atan_kernel(double t)
 {
+    const double TAN_PI_12 = 0.267949192431122707; /* 2 - sqrt(3) */
+    const double SQRT3 = 1.7320508075688772935;
+    const double PI_OVER_6 = M_PI / 6.0;
+    double offset = 0.0;
+
+    /* Reduce t > (2 - sqrt(3)) using atan(t) = pi/6 + atan((sqrt(3)*t - 1) / (sqrt(3) + t)) */
+    if (t > TAN_PI_12) {
+        t = (SQRT3 * t - 1.0) / (SQRT3 + t);
+        offset = PI_OVER_6;
+    }
+
     double t2 = t * t;
     double num = t;
     double sum = 0.0;
@@ -166,26 +193,34 @@ static double atan_kernel(double t)
         denom += 2.0;
         sign = -sign;
     }
-    return sum;
+    return offset + sum;
 }
 
 double atan2(double y, double x)
 {
     if (x != x || y != y)
         return NAN;
+
+    int y_neg = dbl_signbit(y);
+    int x_neg = dbl_signbit(x);
+
     if (x == 0.0) {
         if (y > 0.0)
             return M_PI_2;
         if (y < 0.0)
             return -M_PI_2;
-        return 0.0;
+        if (x_neg)
+            return y_neg ? -M_PI : M_PI;
+        return y_neg ? -0.0 : 0.0;
     }
 
     double r;
     double abs_y = fabs(y);
     double abs_x = fabs(x);
 
-    if (abs_y <= abs_x) {
+    if (abs_x == INFINITY && abs_y == INFINITY) {
+        r = M_PI / 4.0;
+    } else if (abs_y <= abs_x) {
         double t = abs_y / abs_x;
         r = atan_kernel(t);
     } else {
@@ -193,9 +228,9 @@ double atan2(double y, double x)
         r = M_PI_2 - atan_kernel(t);
     }
 
-    if (x < 0.0)
+    if (x_neg)
         r = M_PI - r;
-    if (y < 0.0)
+    if (y_neg)
         r = -r;
 
     return r;
@@ -210,14 +245,14 @@ double asin(double x)
 {
     if (x < -1.0 || x > 1.0 || x != x)
         return NAN;
-    return atan2(x, sqrt(1.0 - x * x));
+    return atan2(x, sqrt_1m_x2(x));
 }
 
 double acos(double x)
 {
     if (x < -1.0 || x > 1.0 || x != x)
         return NAN;
-    return atan2(sqrt(1.0 - x * x), x);
+    return atan2(sqrt_1m_x2(x), x);
 }
 
 double log(double x)

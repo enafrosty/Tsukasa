@@ -229,12 +229,14 @@ static int test_damage_tracking_and_coalescing(void)
 
 static int test_z_order_and_wm_raise(void)
 {
-    vanilla_server_t srv;
+    static vanilla_server_t srv;
     memset(&srv, 0, sizeof(srv));
 
     int rc = compositor_init_offscreen(&srv.compositor, 400, 300);
     TEST_ASSERT(rc == 0, "compositor_init_offscreen failed");
     srv.compositor.bg_color = 0xFF101010;
+    srv.cursor_x = 350;
+    srv.cursor_y = 250;
 
     /* Window 1: 100x100 at (50, 50), filled with Red (0xFFFF0000) */
     vanilla_server_window_t *w1 = &srv.windows[0];
@@ -250,7 +252,7 @@ static int test_z_order_and_wm_raise(void)
     w1->is_mapped = 1;
     w1->surface.width = 100;
     w1->surface.height = 100;
-    w1->surface.pitch = 100;
+    w1->surface.pitch = 100 * (uint32_t)sizeof(uint32_t);
     w1->surface.size = 100 * 100 * sizeof(uint32_t);
     w1->surface.pixels = (uint32_t *)malloc(w1->surface.size);
     TEST_ASSERT(w1->surface.pixels != NULL, "malloc w1 pixels failed");
@@ -271,7 +273,7 @@ static int test_z_order_and_wm_raise(void)
     w2->is_mapped = 1;
     w2->surface.width = 100;
     w2->surface.height = 100;
-    w2->surface.pitch = 100;
+    w2->surface.pitch = 100 * (uint32_t)sizeof(uint32_t);
     w2->surface.size = 100 * 100 * sizeof(uint32_t);
     w2->surface.pixels = (uint32_t *)malloc(w2->surface.size);
     TEST_ASSERT(w2->surface.pixels != NULL, "malloc w2 pixels failed");
@@ -326,12 +328,14 @@ static int test_z_order_and_wm_raise(void)
 
 static int test_negative_coordinate_clipping(void)
 {
-    vanilla_server_t srv;
+    static vanilla_server_t srv;
     memset(&srv, 0, sizeof(srv));
 
     int rc = compositor_init_offscreen(&srv.compositor, 400, 300);
     TEST_ASSERT(rc == 0, "compositor_init_offscreen failed");
     srv.compositor.bg_color = 0xFF050505;
+    srv.cursor_x = 350;
+    srv.cursor_y = 250;
 
     /* Window partially off-screen at negative coordinates: (-25, -15), size 80x60 */
     vanilla_server_window_t *w = &srv.windows[0];
@@ -347,7 +351,7 @@ static int test_negative_coordinate_clipping(void)
     w->is_mapped = 1;
     w->surface.width = 80;
     w->surface.height = 60;
-    w->surface.pitch = 80;
+    w->surface.pitch = 80 * (uint32_t)sizeof(uint32_t);
     w->surface.size = 80 * 60 * sizeof(uint32_t);
     w->surface.pixels = (uint32_t *)malloc(w->surface.size);
     TEST_ASSERT(w->surface.pixels != NULL, "malloc w pixels failed");
@@ -384,12 +388,14 @@ static int test_negative_coordinate_clipping(void)
 
 static int test_drop_shadow_and_decorations(void)
 {
-    vanilla_server_t srv;
+    static vanilla_server_t srv;
     memset(&srv, 0, sizeof(srv));
 
     int rc = compositor_init_offscreen(&srv.compositor, 400, 300);
     TEST_ASSERT(rc == 0, "compositor_init_offscreen failed");
     srv.compositor.bg_color = 0xFFFFFFFF;
+    srv.cursor_x = 350;
+    srv.cursor_y = 250;
 
     /* Window with decorations: at (100, 100), 80x60 */
     vanilla_server_window_t *w = &srv.windows[0];
@@ -406,7 +412,7 @@ static int test_drop_shadow_and_decorations(void)
     w->is_focused = 1;
     w->surface.width = 80;
     w->surface.height = 60;
-    w->surface.pitch = 80;
+    w->surface.pitch = 80 * (uint32_t)sizeof(uint32_t);
     w->surface.size = 80 * 60 * sizeof(uint32_t);
     w->surface.pixels = (uint32_t *)malloc(w->surface.size);
     TEST_ASSERT(w->surface.pixels != NULL, "malloc w pixels failed");
