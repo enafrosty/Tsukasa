@@ -126,11 +126,11 @@ void vanilla_execute_draw_commands(vanilla_surface_t *target,
         case VCMD_TEXT: {
             if (!c->text.text)
                 break;
-            int scale = (int32_t)c->text.font_size / 8;
-            if (scale < 1)
-                scale = 1;
-            app_draw_text_scale(target, c->bounds.x, c->bounds.y,
-                                c->text.text, scale, c->text.color);
+            float fsize = (c->text.font_size > 0.0f) ? c->text.font_size : app_default_font_size();
+            size_t max_b = (c->text.max_bytes > 0) ? (size_t)c->text.max_bytes : (size_t)-1;
+            app_draw_text_clipped_n(target, active_clip, c->bounds.x, c->bounds.y,
+                                    c->text.text, max_b, fsize,
+                                    (app_font_weight_t)c->text.font_weight, c->text.color);
             break;
         }
 

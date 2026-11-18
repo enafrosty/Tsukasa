@@ -48,6 +48,12 @@ typedef struct {
     int              line_gap;
 } vanilla_font_t;
 
+typedef enum {
+    FONT_WEIGHT_REGULAR = 0,
+    FONT_WEIGHT_MEDIUM  = 1,
+    FONT_WEIGHT_BOLD    = 2,
+} vanilla_font_weight_t;
+
 extern const uint8_t default_font_data[];
 extern const size_t  default_font_size;
 
@@ -58,12 +64,36 @@ void font_destroy(vanilla_font_t *font);
 /* Glyph cache lookup and rasterization */
 const vanilla_glyph_t *font_get_glyph(vanilla_font_t *font, uint32_t codepoint, float size_px);
 
+/* Typography metrics and glyph helpers */
+int32_t font_line_height(vanilla_font_t *font, float size_px);
+int32_t font_glyph_advance(vanilla_font_t *font, uint32_t codepoint,
+                           uint32_t next_codepoint, float size_px,
+                           vanilla_font_weight_t weight);
+
 /* Typography drawing and metrics */
+void font_draw_glyph(uint32_t *dst, uint32_t pitch_px, const vanilla_rect_t *clip,
+                     vanilla_font_t *font, uint32_t codepoint,
+                     int32_t x, int32_t y, float size_px,
+                     vanilla_font_weight_t weight, uint32_t color);
+
 void font_draw_text(uint32_t *dst, uint32_t pitch_px, const vanilla_rect_t *clip,
                     vanilla_font_t *font, const char *text, int32_t x, int32_t y,
                     float size_px, uint32_t color);
 
+void font_draw_text_ex(uint32_t *dst, uint32_t pitch_px, const vanilla_rect_t *clip,
+                       vanilla_font_t *font, const char *text, int32_t x, int32_t y,
+                       float size_px, vanilla_font_weight_t weight, uint32_t color);
+
+void font_draw_text_n(uint32_t *dst, uint32_t pitch_px, const vanilla_rect_t *clip,
+                      vanilla_font_t *font, const char *text, size_t max_bytes,
+                      int32_t x, int32_t y, float size_px,
+                      vanilla_font_weight_t weight, uint32_t color);
+
 void font_measure_text(vanilla_font_t *font, const char *text, float size_px,
                        int32_t *out_w, int32_t *out_h);
+
+void font_measure_text_n(vanilla_font_t *font, const char *text, size_t max_bytes,
+                         float size_px, vanilla_font_weight_t weight,
+                         int32_t *out_w, int32_t *out_h);
 
 #endif /* _VANILLA_FONT_H */

@@ -39,6 +39,19 @@ void ui_widget_add_child(ui_widget_t *parent, ui_widget_t *child)
     ui_widget_invalidate(child);
 }
 
+void ui_widget_set_hidden(ui_widget_t *w, int32_t hidden)
+{
+    if (!w)
+        return;
+
+    int32_t nh = hidden ? 1 : 0;
+    if (w->hidden == nh)
+        return;
+
+    w->hidden = nh;
+    ui_widget_invalidate(w);
+}
+
 void ui_widget_invalidate(ui_widget_t *w)
 {
     if (!w)

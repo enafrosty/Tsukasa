@@ -16,6 +16,7 @@
 
 #include "../include/layout.h"
 #include "../include/draw_cmd.h"
+#include "../apps/app_common.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -269,6 +270,7 @@ static int test_draw_command_execution(void)
     src_surf.shm_id = -1;
 
     vanilla_draw_cmd_t cmd_buffer[16];
+    memset(cmd_buffer, 0, sizeof(cmd_buffer));
     vanilla_draw_cmd_array_t cmds;
     cmds.cmds = cmd_buffer;
     cmds.count = 0;
@@ -301,10 +303,10 @@ static int test_draw_command_execution(void)
 
     /* 5. TEXT */
     cmd_buffer[cmds.count].type = VCMD_TEXT;
-    cmd_buffer[cmds.count].bounds = (vanilla_draw_rect_t){8, 35, 40, 10};
+    cmd_buffer[cmds.count].bounds = (vanilla_draw_rect_t){8, 35, 40, 16};
     cmd_buffer[cmds.count].text.text = "OK";
     cmd_buffer[cmds.count].text.color = 0xFFFFFFFF;
-    cmd_buffer[cmds.count].text.font_size = 8.0f;
+    cmd_buffer[cmds.count].text.font_size = 13.0f;
     cmd_buffer[cmds.count].text.font_id = 0;
     cmds.count++;
 
@@ -334,6 +336,16 @@ static int test_draw_command_execution(void)
     TEST_ASSERT(pixels[9 * 64 + 31] == 0xFF778899, "border pixel inner thickness mismatch");
     /* Verify image copied */
     TEST_ASSERT(pixels[40 * 64 + 40] == 0xFFAABBCC, "image pixel mismatch");
+
+    /* Verify TrueType text command painted pixels inside bounds */
+    int text_pixels_drawn = 0;
+    for (int py = 35; py < 51; py++) {
+        for (int px = 8; px < 48; px++) {
+            if (pixels[py * 64 + px] != 0xFF112233)
+                text_pixels_drawn++;
+        }
+    }
+    TEST_ASSERT(text_pixels_drawn > 0, "VCMD_TEXT did not draw TrueType pixels");
 
     /* Deep Verification: Strict scissor clipping */
     memset(pixels, 0, sizeof(pixels));
@@ -426,20 +438,40 @@ static int test_edge_cases(void)
     TEST_ASSERT(elem->computed_w == 0, "negative w clamp failed");
     TEST_ASSERT(elem->computed_h == 0, "negative h clamp failed");
 
-    /* 3. Text element sizing with standard LF */
+    /* 3. Text element sizing with standard LF using TrueType metrics */
     vlayout_reset(ctx);
-    vanilla_elem_t *text_elem = vlayout_text(ctx, "Hello\nWorld", 0xFFFFFFFF, 8.0f);
-    vlayout_compute(ctx, text_elem, 0, 0, 200, 200);
-    /* 5 chars * 8px = 40px wide, 2 lines * 8px + 2px = 18px high */
-    TEST_ASSERT(text_elem->computed_w == 40, "text w mismatch");
-    TEST_ASSERT(text_elem->computed_h == 18, "text h mismatch");
+    int32_t exp_w = 0, exp_h = 0;
+    app_measure_text_ex("Hello\nWorld", 13.0f, APP_FONT_REGULAR, &exp_w, &exp_h);
+    TEST_ASSERT(exp_w > 0 && exp_h > 13, "expected multiline TrueType measurement");
 
-    /* 4. Text element sizing with CRLF (\r\n) */
+    vanilla_elem_t *text_elem = vlayout_text(ctx, "Hello\nWorld", 0xFFFFFFFF, 13.0f);
+    vlayout_compute(ctx, text_elem, 0, 0, 200, 200);
+    TEST_ASSERT(text_elem->computed_w == exp_w, "text w mismatch against stb_truetype");
+    TEST_ASSERT(text_elem->computed_h == exp_h, "text h mismatch against stb_truetype");
+
+    /* 4. Text element sizing with CRLF (\r\n) matches LF */
     vlayout_reset(ctx);
-    vanilla_elem_t *crlf_elem = vlayout_text(ctx, "Hello\r\nWorld", 0xFFFFFFFF, 8.0f);
+    vanilla_elem_t *crlf_elem = vlayout_text(ctx, "Hello\r\nWorld", 0xFFFFFFFF, 13.0f);
     vlayout_compute(ctx, crlf_elem, 0, 0, 200, 200);
-    TEST_ASSERT(crlf_elem->computed_w == 40, "crlf text w must ignore carriage return");
-    TEST_ASSERT(crlf_elem->computed_h == 18, "crlf text h mismatch");
+    TEST_ASSERT(crlf_elem->computed_w == exp_w, "crlf text w must ignore carriage return");
+    TEST_ASSERT(crlf_elem->computed_h == exp_h, "crlf text h mismatch");
+
+    /* 4b. Proportional TrueType metrics and scale / weight regression checks */
+    vlayout_reset(ctx);
+    vanilla_elem_t *wide_elem = vlayout_text(ctx, "MMMM", 0xFFFFFFFF, 14.0f);
+    vanilla_elem_t *narrow_elem = vlayout_text(ctx, "iiii", 0xFFFFFFFF, 14.0f);
+    vanilla_elem_t *large_elem = vlayout_text(ctx, "Hello", 0xFFFFFFFF, 24.0f);
+    vanilla_elem_t *bold_elem = vlayout_text_ex(ctx, "Hello", 0xFFFFFFFF, 14.0f, APP_FONT_BOLD);
+    vanilla_elem_t *reg_elem = vlayout_text_ex(ctx, "Hello", 0xFFFFFFFF, 14.0f, APP_FONT_REGULAR);
+    vlayout_compute(ctx, wide_elem, 0, 0, 200, 200);
+    vlayout_compute(ctx, narrow_elem, 0, 0, 200, 200);
+    vlayout_compute(ctx, large_elem, 0, 0, 200, 200);
+    vlayout_compute(ctx, bold_elem, 0, 0, 200, 200);
+    vlayout_compute(ctx, reg_elem, 0, 0, 200, 200);
+    TEST_ASSERT(wide_elem->computed_w > narrow_elem->computed_w, "MMMM must be wider than iiii");
+    TEST_ASSERT(large_elem->computed_w > reg_elem->computed_w, "24px text must be wider than 14px");
+    TEST_ASSERT(large_elem->computed_h > reg_elem->computed_h, "24px text must be taller than 14px");
+    TEST_ASSERT(bold_elem->computed_w >= reg_elem->computed_w, "bold text width must be >= regular");
 
     /* 5. Defensive emission checks: NULL or zero capacity */
     vanilla_draw_cmd_array_t empty_cmds = { NULL, 0, 0 };

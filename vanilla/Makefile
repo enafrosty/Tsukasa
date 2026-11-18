@@ -119,8 +119,11 @@ TEST_SHELL_OBJS = tests/test_shell.o \
                   shell-client/shell_client.test.o \
                   apps/app_common.o
 
+FONT_OBJS = server/font.o server/default_font.o
+
 TEST_LAYOUT_OBJS = layout/test_layout.o \
-                   apps/app_common.o
+                   apps/app_common.o \
+                   $(FONT_OBJS)
 
 LIBVANILLA_A       = $(LIB_DIR)/libvanilla.a
 LIBVANILLA_UI_A    = $(LIB_DIR)/libvanilla-ui.a
@@ -189,9 +192,9 @@ $(CLIPBOARDD_BIN): $(CRT0) services/clipboardd.o $(LIBVANILLA_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) services/clipboardd.o $(LIBVANILLA_A) $(LIBC_A)
 
-$(NOTIFYD_BIN): $(CRT0) services/notifyd.o $(APP_COMMON_OBJ) $(LIBVANILLA_A) $(LIBC_A)
+$(NOTIFYD_BIN): $(CRT0) services/notifyd.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) services/notifyd.o $(APP_COMMON_OBJ) $(LIBVANILLA_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) services/notifyd.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
 $(TEST_IPC_BIN): $(CRT0) $(TEST_IPC_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
@@ -213,11 +216,11 @@ $(TEST_LAYOUT_BIN): $(CRT0) $(TEST_LAYOUT_OBJS) $(LIBVANILLALAYOUT_A) $(LIBVANIL
 	@mkdir -p $(BIN_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) $(TEST_LAYOUT_OBJS) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-build/test_layout: layout/test_layout.c layout/layout.c layout/draw_consumer.c apps/app_common.c server/blitter.c server/theme.c
+build/test_layout: layout/test_layout.c layout/layout.c layout/draw_consumer.c apps/app_common.c server/font.c server/default_font.c server/blitter.c server/theme.c
 	@mkdir -p build
 	gcc -O2 -Iinclude -I../tsukasa-libc/include -Iinput -Iserver -Iapps -DVANILLA_HOST -o $@ $^ -lm
 
-build/test_ui: libvanilla-ui/test_ui.c $(LIBVANILLA_UI_SRCS) layout/layout.c layout/draw_consumer.c apps/app_common.c server/blitter.c server/theme.c input/keymap.c
+build/test_ui: libvanilla-ui/test_ui.c $(LIBVANILLA_UI_SRCS) layout/layout.c layout/draw_consumer.c apps/app_common.c server/font.c server/default_font.c server/blitter.c server/theme.c input/keymap.c
 	@mkdir -p build
 	gcc -O2 -Iinclude -I../tsukasa-libc/include -Iinput -Iserver -Iapps -Ilibvanilla-ui -DVANILLA_HOST -o $@ $^ -lm
 
@@ -241,48 +244,48 @@ build/test_terminal_vt: tests/test_terminal_vt.c apps/terminal_vt.c
 	@mkdir -p build
 	gcc -O2 -Iapps -DVANILLA_HOST -o $@ $^
 
-build/test_notify: tests/test_notify.c libvanilla/notify.c libvanilla/service.c services/notifyd.c apps/app_common.c server/theme.c
+build/test_notify: tests/test_notify.c libvanilla/notify.c libvanilla/service.c services/notifyd.c apps/app_common.c server/font.c server/default_font.c server/theme.c
 	@mkdir -p build
 ifeq ($(OS),Windows_NT)
-	gcc -O2 -Ihost_emulator/sys_compat -Iinclude -Iinput -Iservices -Ilibvanilla -Iapps -I../scripts/test -DVANILLA_HOST -DVNOTIF_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lws2_32 -lpthread
+	gcc -O2 -Ihost_emulator/sys_compat -Iinclude -Iinput -Iservices -Ilibvanilla -Iserver -Iapps -I../scripts/test -DVANILLA_HOST -DVNOTIF_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lws2_32 -lpthread -lm
 else
-	gcc -O2 -Ihost_emulator/sys_compat -Iinclude -Iinput -Iservices -Ilibvanilla -Iapps -I../scripts/test -DVANILLA_HOST -DVNOTIF_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lpthread
+	gcc -O2 -Ihost_emulator/sys_compat -Iinclude -Iinput -Iservices -Ilibvanilla -Iserver -Iapps -I../scripts/test -DVANILLA_HOST -DVNOTIF_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lpthread -lm
 endif
 
-$(TERMINAL_BIN): $(CRT0) apps/terminal.o apps/terminal_vt.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(TERMINAL_BIN): $(CRT0) apps/terminal.o apps/terminal_vt.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/terminal.o apps/terminal_vt.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/terminal.o apps/terminal_vt.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-$(NOTEPAD_BIN): $(CRT0) apps/notepad.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(NOTEPAD_BIN): $(CRT0) apps/notepad.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/notepad.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/notepad.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-$(CALC_BIN): $(CRT0) apps/calc.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(CALC_BIN): $(CRT0) apps/calc.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/calc.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/calc.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-$(FILEMGR_BIN): $(CRT0) apps/filemgr.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(FILEMGR_BIN): $(CRT0) apps/filemgr.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/filemgr.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/filemgr.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-$(SETTINGS_BIN): $(CRT0) apps/settings.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(SETTINGS_BIN): $(CRT0) apps/settings.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/settings.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/settings.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-$(TASKMGR_BIN): $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(TASKMGR_BIN): $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) apps/taskmgr.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLA_UI_A) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
-$(SHELL_BIN): $(CRT0) shell-client/shell_client.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+$(SHELL_BIN): $(CRT0) shell-client/shell_client.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) shell-client/shell_client.o $(APP_COMMON_OBJ) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) shell-client/shell_client.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
 $(SUPERVISOR_BIN): supervisor/supervisor.c supervisor/supervisor.h supervisor/Makefile
 	$(MAKE) -C supervisor all
 	@mkdir -p $(BIN_DIR)
 	cp $@ $(BIN_DIR)/supervsd.elf
 
-$(DEVTOOLS_BIN): $(LIBVANILLA_A) $(APP_COMMON_OBJ)
+$(DEVTOOLS_BIN): $(LIBVANILLA_A) $(APP_COMMON_OBJ) $(FONT_OBJS)
 	$(MAKE) -C devtools all
 	@mkdir -p $(BIN_DIR)
 	cp $@ $(BIN_DIR)/devtools.elf
