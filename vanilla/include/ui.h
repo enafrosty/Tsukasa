@@ -43,6 +43,7 @@ typedef enum {
     UI_WIDGET_TAB_BAR,
     UI_WIDGET_MODAL_DIALOG,
     UI_WIDGET_TOAST,
+    UI_WIDGET_PROGRESS_BAR,
 } ui_widget_type_t;
 
 typedef enum {
@@ -53,6 +54,30 @@ typedef enum {
     UI_EVENT_FOCUS_LOST,
     UI_EVENT_KEY_DOWN,
 } ui_event_type_t;
+
+#define UI_MENU_ITEM_SEPARATOR (1u << 0)
+#define UI_MENU_ITEM_DISABLED  (1u << 1)
+#define UI_MENU_ITEM_CHECKED   (1u << 2)
+#define UI_MENU_ITEM_SUBMENU   (1u << 3)
+
+typedef struct {
+    const char *label;
+    const char *shortcut;
+    uint32_t    flags;
+    uint32_t    id;
+} ui_menu_item_t;
+
+typedef enum {
+    UI_DIALOG_INFO = 0,
+    UI_DIALOG_CONFIRM = 1,
+    UI_DIALOG_INPUT = 2,
+} ui_dialog_kind_t;
+
+typedef enum {
+    UI_DIALOG_RES_NONE = 0,
+    UI_DIALOG_RES_OK = 1,
+    UI_DIALOG_RES_CANCEL = 2,
+} ui_dialog_result_t;
 
 typedef struct {
     ui_event_type_t type;
@@ -66,6 +91,8 @@ typedef struct {
 } ui_event_t;
 
 typedef void (*ui_event_cb_t)(ui_widget_t *widget, const ui_event_t *ev, void *userdata);
+typedef int  (*ui_clipboard_set_fn_t)(const char *text, size_t len);
+typedef int  (*ui_clipboard_get_fn_t)(char *out_buf, size_t max_len);
 
 struct ui_widget_t {
     ui_widget_type_t type;
@@ -77,6 +104,7 @@ struct ui_widget_t {
 
     int32_t          focusable;
     int32_t          focused;
+    int32_t          hidden;
 
     int32_t          dirty;
     vanilla_draw_rect_t dirty_rect;
@@ -85,15 +113,27 @@ struct ui_widget_t {
     void            *userdata;
 
     union {
-        struct { const char *label; int32_t pressed; }                    button;
+        struct { const char *label; int32_t pressed; int32_t hovered; } button;
         struct { const char *text; uint32_t color; }                      label;
         struct {
-            char    buf[256];
-            int32_t cursor_pos;
-            int32_t sel_start;
-            int32_t sel_end;
-            int32_t scroll_x;
-            int64_t caret_ms;
+            char     buf[256];
+            int32_t  cursor_pos;
+            int32_t  sel_start;
+            int32_t  sel_end;
+            int32_t  scroll_x;
+            int64_t  caret_ms;
+            int32_t  multiline;
+            int32_t  show_line_numbers;
+            int32_t  read_only;
+            int32_t  scroll_y;
+            int32_t  sel_anchor;
+            int32_t  sb_dragging;
+            int32_t  sb_drag_off;
+            int32_t  ensure_cursor_visible;
+            float    font_size;
+            char    *ml_buf;
+            int32_t  ml_len;
+            int32_t  ml_cap;
         }                                                                  text_field;
         struct { int32_t checked; const char *label; }                     checkbox;
         struct { int32_t checked; const char *label; int32_t group_id; }   radio;
@@ -103,21 +143,73 @@ struct ui_widget_t {
             int32_t      count;
             int32_t      selected;
             int32_t      scroll_top;
+            int32_t      hovered;
+            int32_t      sb_dragging;
+            int32_t      sb_drag_off;
         }                                                                  list;
-        struct { int32_t tab_count; int32_t active_tab; const char **labels; } tab_bar;
+        struct {
+            int32_t tab_count;
+            int32_t active_tab;
+            const char **labels;
+            int32_t hovered_tab;
+        }                                                                  tab_bar;
         struct { const char *message; int32_t timeout_ms; int64_t shown_ms; } toast;
-        struct { const char *title; const char *body; const char *ok_label; } modal;
-        struct { int32_t scroll_y; int32_t content_h; }                      scroll_view;
-        struct { const char **items; int32_t count; int32_t selected; }      menu;
+        struct {
+            const char        *title;
+            const char        *body;
+            const char        *ok_label;
+            const char        *cancel_label;
+            ui_dialog_kind_t   kind;
+            ui_dialog_result_t result;
+            ui_widget_t       *input_field;
+            int32_t            hovered_btn;
+            int32_t            pressed_btn;
+        }                                                                  modal;
+        struct {
+            int32_t scroll_y;
+            int32_t content_h;
+            int32_t sb_dragging;
+            int32_t sb_drag_off;
+        }                                                                  scroll_view;
+        struct {
+            const char           **items;
+            const ui_menu_item_t  *rich_items;
+            int32_t                count;
+            int32_t                selected;
+            int32_t                hovered;
+            int32_t                is_bar;
+            int32_t                floating;
+            int32_t                float_x;
+            int32_t                float_y;
+        }                                                                  menu;
+        struct {
+            float    value;
+            float    max_val;
+            uint32_t bar_color;
+            int32_t  show_label;
+            char     label_buf[32];
+        }                                                                  progress_bar;
     };
 };
 
 ui_ctx_t *ui_ctx_init(void *arena, size_t arena_size, vanilla_layout_t *layout_ctx);
 
+void ui_ctx_set_clipboard_ops(ui_ctx_t *ctx,
+                              ui_clipboard_set_fn_t set_fn,
+                              ui_clipboard_get_fn_t get_fn);
+
+void ui_ctx_show_popup(ui_ctx_t *ctx, ui_widget_t *menu, int32_t x, int32_t y);
+void ui_ctx_hide_popup(ui_ctx_t *ctx);
+ui_widget_t *ui_ctx_get_popup(ui_ctx_t *ctx);
+
+void ui_ctx_show_modal(ui_ctx_t *ctx, ui_widget_t *modal);
+void ui_ctx_hide_modal(ui_ctx_t *ctx);
+ui_widget_t *ui_ctx_get_modal(ui_ctx_t *ctx);
+
 ui_widget_t *ui_alloc_widget(ui_ctx_t *ctx, ui_widget_type_t type);
 
 void ui_widget_add_child(ui_widget_t *parent, ui_widget_t *child);
-
+void ui_widget_set_hidden(ui_widget_t *w, int32_t hidden);
 void ui_widget_invalidate(ui_widget_t *w);
 
 void ui_handle_event(ui_ctx_t *ctx, ui_widget_t *root, const struct input_event *ev);

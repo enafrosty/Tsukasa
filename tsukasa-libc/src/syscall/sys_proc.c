@@ -28,8 +28,39 @@ pid_t fork(void)
 
 pid_t spawn(const char *path, char *const argv[], char *const envp[])
 {
+    char args_buf[512];
+    int64_t args_ptr = 0;
+
+    if (argv && argv[0] && argv[1]) {
+        size_t pos = 0;
+        for (int i = 0; argv[i]; i++) {
+            const char *s = argv[i];
+            int quote = (*s == '\0');
+            size_t slen = 0;
+            while (s[slen]) {
+                if (s[slen] == ' ' || s[slen] == '\t')
+                    quote = 1;
+                slen++;
+            }
+            size_t need = (i > 0 ? 1u : 0u) + (quote ? 2u : 0u) + slen;
+            if (pos + need >= sizeof(args_buf))
+                break;
+            if (i > 0)
+                args_buf[pos++] = ' ';
+            if (quote)
+                args_buf[pos++] = '"';
+            for (size_t j = 0; j < slen; j++)
+                args_buf[pos++] = s[j];
+            if (quote)
+                args_buf[pos++] = '"';
+        }
+        args_buf[pos] = '\0';
+        if (pos > 0)
+            args_ptr = (int64_t)(uintptr_t)args_buf;
+    }
+
     return (pid_t)__syscall_check(__syscall4(SYS_spawn, (int64_t)(uintptr_t)path,
-                                             (int64_t)(uintptr_t)argv, (int64_t)(uintptr_t)envp, 0));
+                                             args_ptr, (int64_t)(uintptr_t)envp, 0));
 }
 
 int spawn_ex(const struct tsukasa_spawn_request *req)
@@ -91,25 +122,25 @@ int raise(int sig)
 
 static sighandler_t g_signal_handlers[32];
 
-sighandler_t signal(int signum, sighandler_t handler)
-{
-    if (signum < 0 || signum >= 32) {
-        errno = EINVAL;
-        return SIG_ERR;
-    }
-    sighandler_t old = g_signal_handlers[signum];
-    g_signal_handlers[signum] = handler;
-    return old;
-}
-
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 {
-    if (signum < 0 || signum >= 32) {
+    if (signum <= 0 || signum >= 32) {
         errno = EINVAL;
         return -1;
     }
+
+    sighandler_t prev = g_signal_handlers[signum];
+    int64_t rc = __syscall4(SYS_rt_sigaction,
+                            (int64_t)signum,
+                            (int64_t)(uintptr_t)act,
+                            (int64_t)(uintptr_t)oldact,
+                            (int64_t)sizeof(sigset_t));
+    if (__syscall_check(rc) < 0) {
+        return -1;
+    }
+
     if (oldact) {
-        oldact->sa_handler = g_signal_handlers[signum];
+        oldact->sa_handler = prev;
         oldact->sa_mask = 0;
         oldact->sa_flags = 0;
     }
@@ -117,6 +148,20 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
         g_signal_handlers[signum] = act->sa_handler;
     }
     return 0;
+}
+
+sighandler_t signal(int signum, sighandler_t handler)
+{
+    struct sigaction act;
+    struct sigaction oldact;
+
+    act.sa_handler = handler;
+    act.sa_mask = 0;
+    act.sa_flags = 0;
+    if (sigaction(signum, &act, &oldact) < 0) {
+        return SIG_ERR;
+    }
+    return oldact.sa_handler;
 }
 
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)

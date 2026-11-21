@@ -43,18 +43,25 @@ static int user_ok(long ptr, long len, int need_write)
     return vmm_validate_user_ptr((const void *)(uintptr_t)ptr, (size_t)len, need_write);
 }
 
-static int user_str_ok(long ptr)
+static int user_str_ok_len(long ptr, size_t max_len)
 {
     uintptr_t p = (uintptr_t)ptr;
-    if (!p)
+    if (!p || max_len == 0)
         return 0;
-    for (size_t len = 0; len < VFS_PATH_MAX; len++) {
+    for (size_t len = 0; len < max_len; len++) {
+        if (p + len < p)
+            return 0;
         if (!vmm_validate_user_ptr((const void *)(p + len), 1, 0))
             return 0;
         if (*(const char *)(p + len) == '\0')
             return 1;
     }
     return 0;
+}
+
+static int user_str_ok(long ptr)
+{
+    return user_str_ok_len(ptr, VFS_PATH_MAX);
 }
 
 static long sys_futex(long uaddr, long op, long val,
@@ -544,11 +551,12 @@ static long sys_exists(long path, long a2, long a3, long a4, long a5, long a6)
                             (uintptr_t)&st, 0, 0) == 0) ? 1 : 0;
 }
 
-static long sys_spawn(long path, long argv, long envp, long flags, long a5, long a6)
+static long sys_spawn(long path, long args, long envp, long flags, long a5, long a6)
 {
-    (void)argv; (void)envp; (void)flags; (void)a5; (void)a6;
+    (void)envp; (void)flags; (void)a5; (void)a6;
     if (!user_str_ok(path)) return -EFAULT;
-    return mux_sys(SYSTEM_CMD_SPAWN, path, 0, 0);
+    if (args && !user_str_ok_len(args, 512)) return -EFAULT;
+    return mux_sys(SYSTEM_CMD_SPAWN, path, args, 0);
 }
 
 static long sys_spawn_ex(long req_ptr, long a2, long a3, long a4, long a5, long a6)
@@ -559,6 +567,8 @@ static long sys_spawn_ex(long req_ptr, long a2, long a3, long a4, long a5, long 
     const struct tsukasa_spawn_request *req =
         (const struct tsukasa_spawn_request *)(uintptr_t)req_ptr;
     if (!user_str_ok((long)(uintptr_t)req->path))
+        return -EFAULT;
+    if (req->args && !user_str_ok_len((long)(uintptr_t)req->args, 512))
         return -EFAULT;
     return mux_sys(SYSTEM_CMD_SPAWN_EX, req_ptr, 0, 0);
 }

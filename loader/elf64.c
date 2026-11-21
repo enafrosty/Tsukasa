@@ -67,18 +67,37 @@ typedef struct {
 #define PT_LOAD_64 1
 #define ET_EXEC_64 2
 #define EM_X86_64  62
+#define PF_X_64    0x1U
+#define PF_W_64    0x2U
+#define PF_R_64    0x4U
 
-/* ponytail: single-slot handoff: one elf64_spawn in flight at a time; make it a queue if concurrent user... */
-#define ELF64_CMDLINE_MAX 256
-static char g_pending_path[ELF64_PATH_MAX];
-static char g_pending_args[ELF64_CMDLINE_MAX];
-static volatile int g_pending_valid = 0;
+/* Multi-slot pending handoff table keyed by child PID (or parent PID before child_pid publish). */
+#define ELF64_CMDLINE_MAX   256
+#define ELF64_PENDING_SLOTS 32
+
+typedef struct {
+    int used;
+    int parent_pid;
+    int child_pid;
+    uint64_t seq;
+    char path[ELF64_PATH_MAX];
+    char args[ELF64_CMDLINE_MAX];
+} elf64_pending_slot_t;
+
+static elf64_pending_slot_t g_pending_slots[ELF64_PENDING_SLOTS];
+static uint64_t g_pending_next_seq = 1;
 static spinlock_t g_pending_lock = SPINLOCK_INIT;
 
 static int stream_load_segment(process_t *p, int fd, const elf64_phdr_t *ph)
 {
     if (!ph || ph->p_memsz == 0)
         return 0;
+
+    uint64_t map_flags = PAGING_MAP_READ | PAGING_MAP_USER;
+    if (ph->p_flags & PF_W_64)
+        map_flags |= PAGING_MAP_WRITE;
+    if (ph->p_flags & PF_X_64)
+        map_flags |= PAGING_MAP_EXEC;
 
     uint64_t start = ph->p_vaddr & ~(VMM_X64_PAGE_SIZE - 1);
     uint64_t end = (ph->p_vaddr + ph->p_memsz + VMM_X64_PAGE_SIZE - 1) & ~(VMM_X64_PAGE_SIZE - 1);
@@ -90,6 +109,17 @@ static int stream_load_segment(process_t *p, int fd, const elf64_phdr_t *ph)
         uint8_t *kva = NULL;
 
         if (vmm_query_page(p->vm_space.pml4_phys, (uintptr_t)page, &phys, &flags) == 0) {
+            uint64_t cur_flags = PAGING_MAP_READ | PAGING_MAP_USER;
+            if (flags & VMM_X64_PTE_WRITABLE)
+                cur_flags |= PAGING_MAP_WRITE;
+            if ((flags & VMM_X64_PTE_NO_EXEC) == 0)
+                cur_flags |= PAGING_MAP_EXEC;
+            uint64_t merged_flags = cur_flags | map_flags;
+            if (merged_flags != cur_flags) {
+                if (vm_space_protect_user_pages(&p->vm_space, (uintptr_t)page, 1,
+                                                merged_flags) != 0)
+                    return -1;
+            }
             kva = (uint8_t *)vmm_phys_to_virt(phys);
         } else {
             uintptr_t new_phys = pmm_alloc_pages(1);
@@ -98,8 +128,7 @@ static int stream_load_segment(process_t *p, int fd, const elf64_phdr_t *ph)
             kva = (uint8_t *)vmm_phys_to_virt(new_phys);
             k_memset(kva, 0, VMM_X64_PAGE_SIZE);
             if (vm_space_map_user_pages(&p->vm_space, (uintptr_t)page, new_phys, 1,
-                                        PAGING_MAP_READ | PAGING_MAP_WRITE |
-                                        PAGING_MAP_EXEC | PAGING_MAP_USER) != 0) {
+                                        map_flags) != 0) {
                 pmm_free_pages(new_phys, 1);
                 return -1;
             }
@@ -139,7 +168,7 @@ static int map_zero_pages(process_t *p, uint64_t va, uint64_t size)
         k_memset(kva, 0, VMM_X64_PAGE_SIZE);
         if (vm_space_map_user_pages(&p->vm_space, (uintptr_t)page, new_phys, 1,
                                     PAGING_MAP_READ | PAGING_MAP_WRITE |
-                                    PAGING_MAP_EXEC | PAGING_MAP_USER) != 0) {
+                                    PAGING_MAP_USER) != 0) {
             pmm_free_pages(new_phys, 1);
             return -1;
         }
@@ -170,23 +199,54 @@ static void __attribute__((noreturn)) enter_ring3(uint64_t entry, uint64_t rsp)
     __builtin_unreachable();
 }
 
+static int claim_pending_slot(int self_pid, int self_ppid,
+                              char *path_out, char *args_out)
+{
+    unsigned long irq_flags = spin_lock_irqsave(&g_pending_lock);
+    int idx = -1;
+
+    for (int i = 0; i < ELF64_PENDING_SLOTS; i++) {
+        if (g_pending_slots[i].used && g_pending_slots[i].child_pid == self_pid) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        for (int i = 0; i < ELF64_PENDING_SLOTS; i++) {
+            if (g_pending_slots[i].used &&
+                g_pending_slots[i].child_pid < 0 &&
+                g_pending_slots[i].parent_pid == self_ppid) {
+                idx = i;
+                break;
+            }
+        }
+    }
+
+    if (idx < 0) {
+        spin_unlock_irqrestore(&g_pending_lock, irq_flags);
+        return -1;
+    }
+
+    k_memcpy(path_out, g_pending_slots[idx].path, ELF64_PATH_MAX);
+    k_memcpy(args_out, g_pending_slots[idx].args, ELF64_CMDLINE_MAX);
+    g_pending_slots[idx].used = 0;
+    g_pending_slots[idx].parent_pid = -1;
+    g_pending_slots[idx].child_pid = -1;
+    g_pending_slots[idx].seq = 0;
+    spin_unlock_irqrestore(&g_pending_lock, irq_flags);
+    return 0;
+}
+
 static void elf64_bootstrap(void)
 {
     char path[ELF64_PATH_MAX];
     char args[ELF64_CMDLINE_MAX];
+    process_t *self = process_current();
 
-    spin_lock(&g_pending_lock);
-    if (!g_pending_valid) {
-        spin_unlock(&g_pending_lock);
+    if (!self || claim_pending_slot((int)self->pid, (int)self->ppid, path, args) != 0) {
         kprintf("[elf64] bootstrap without pending path\n");
         process_exit(-1);
     }
-    for (int i = 0; i < ELF64_PATH_MAX; i++)
-        path[i] = g_pending_path[i];
-    for (int i = 0; i < ELF64_CMDLINE_MAX; i++)
-        args[i] = g_pending_args[i];
-    g_pending_valid = 0;
-    spin_unlock(&g_pending_lock);
 
     int fd = vfs_open(path);
     if (fd < 0) {
@@ -237,7 +297,6 @@ static void elf64_bootstrap(void)
         process_exit(-1);
     }
 
-    process_t *self = process_current();
     for (uint16_t i = 0; i < eh.e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD_64)
             continue;
@@ -328,38 +387,67 @@ int elf64_spawn_cmdline(const char *path, const char *args, const char *name)
     if (!path)
         return -1;
 
+    process_t *cur = process_current();
+    int parent_pid = cur ? (int)cur->pid : 0;
+    elf64_pending_slot_t *slot = NULL;
+    uint64_t my_seq = 0;
+
     for (int retry = 0; retry < 100; retry++) {
-        spin_lock(&g_pending_lock);
-        if (!g_pending_valid)
+        unsigned long irq_flags = spin_lock_irqsave(&g_pending_lock);
+        for (int s = 0; s < ELF64_PENDING_SLOTS; s++) {
+            if (!g_pending_slots[s].used) {
+                slot = &g_pending_slots[s];
+                my_seq = g_pending_next_seq++;
+                slot->used = 1;
+                slot->parent_pid = parent_pid;
+                slot->child_pid = -1;
+                slot->seq = my_seq;
+
+                int i = 0;
+                while (path[i] && i < ELF64_PATH_MAX - 1) {
+                    slot->path[i] = path[i];
+                    i++;
+                }
+                slot->path[i] = '\0';
+
+                i = 0;
+                if (args) {
+                    while (args[i] && i < ELF64_CMDLINE_MAX - 1) {
+                        slot->args[i] = args[i];
+                        i++;
+                    }
+                }
+                slot->args[i] = '\0';
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&g_pending_lock, irq_flags);
+        if (slot)
             break;
-        spin_unlock(&g_pending_lock);
         process_yield();
     }
-    if (g_pending_valid)
+
+    if (!slot)
         return -1;
-    int i = 0;
-    while (path[i] && i < ELF64_PATH_MAX - 1) {
-        g_pending_path[i] = path[i];
-        i++;
-    }
-    g_pending_path[i] = '\0';
-    i = 0;
-    if (args) {
-        while (args[i] && i < ELF64_CMDLINE_MAX - 1) {
-            g_pending_args[i] = args[i];
-            i++;
-        }
-    }
-    g_pending_args[i] = '\0';
-    g_pending_valid = 1;
-    spin_unlock(&g_pending_lock);
 
     process_t *p = process_spawn_kernel(name ? name : "elf64", elf64_bootstrap);
+    int child_pid = p ? (int)p->pid : -1;
+
+    unsigned long irq_flags = spin_lock_irqsave(&g_pending_lock);
     if (!p) {
-        g_pending_valid = 0;
+        if (slot->used && slot->seq == my_seq) {
+            slot->used = 0;
+            slot->parent_pid = -1;
+            slot->child_pid = -1;
+            slot->seq = 0;
+        }
+        spin_unlock_irqrestore(&g_pending_lock, irq_flags);
         return -1;
     }
-    return (int)p->pid;
+    if (slot->used && slot->seq == my_seq)
+        slot->child_pid = child_pid;
+    spin_unlock_irqrestore(&g_pending_lock, irq_flags);
+    return child_pid;
 }
 
 int elf64_spawn(const char *path, const char *name)

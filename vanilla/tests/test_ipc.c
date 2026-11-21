@@ -212,15 +212,52 @@ static int run_server_loop(vanilla_server_t *srv)
     return 0;
 }
 
+static vanilla_server_t g_loopback_srv;
+static vanilla_server_t g_main_srv;
+
+static int drain_payload_fd(int fd, size_t len)
+{
+    uint8_t discard[64];
+    size_t rem = len;
+
+    while (rem > 0) {
+        size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+        if (exact_read_fd(fd, discard, chunk) < 0)
+            return -1;
+        rem -= chunk;
+    }
+    return 0;
+}
+
+static int read_msg_draining_configure(int fd, vanilla_msg_hdr_t *hdr)
+{
+    for (int i = 0; i < 16; i++) {
+        if (exact_read_fd(fd, hdr, sizeof(*hdr)) < 0)
+            return -1;
+        if (hdr->magic != VANILLA_IPC_MAGIC)
+            return -1;
+        if (hdr->msg_type != MSG_WINDOW_CONFIGURE &&
+            hdr->msg_type != MSG_FRAME_BEGIN &&
+            hdr->msg_type != MSG_BUFFER_RELEASED) {
+            return 0;
+        }
+        if (drain_payload_fd(fd, hdr->payload_len) < 0)
+            return -1;
+    }
+    return -1;
+}
+
 static int run_inprocess_loopback(const char *sock_path)
 {
-    vanilla_server_t srv;
+    vanilla_server_t *srv = &g_loopback_srv;
     int cfd = -1;
     int client_idx = -1;
     vanilla_surface_t client_surf;
+
+    memset(srv, 0, sizeof(*srv));
     memset(&client_surf, 0, sizeof(client_surf));
 
-    if (vanilla_server_init(&srv, sock_path) < 0) {
+    if (vanilla_server_init(srv, sock_path) < 0) {
         printf("[FAIL] 1. Failed to start and bind server socket\n");
         return 1;
     }
@@ -229,7 +266,7 @@ static int run_inprocess_loopback(const char *sock_path)
     cfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (cfd < 0) {
         printf("[FAIL] 2. Failed to create client socket\n");
-        vanilla_server_close(&srv);
+        vanilla_server_close(srv);
         return 2;
     }
 
@@ -241,15 +278,15 @@ static int run_inprocess_loopback(const char *sock_path)
     if (connect(cfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         printf("[FAIL] 2. Failed to connect client socket\n");
         close(cfd);
-        vanilla_server_close(&srv);
+        vanilla_server_close(srv);
         return 2;
     }
 
-    client_idx = vanilla_server_accept(&srv);
+    client_idx = vanilla_server_accept(srv);
     if (client_idx < 0) {
         printf("[FAIL] 2. Server failed to accept client\n");
         close(cfd);
-        vanilla_server_close(&srv);
+        vanilla_server_close(srv);
         return 2;
     }
 
@@ -273,21 +310,26 @@ static int run_inprocess_loopback(const char *sock_path)
         goto fail;
     }
 
-    if (vanilla_server_dispatch_client(&srv, client_idx) < 0) {
+    if (vanilla_server_dispatch_client(srv, client_idx) < 0) {
         printf("[FAIL] 3. Server dispatch MSG_HELLO failed\n");
         goto fail;
     }
 
     vanilla_msg_hdr_t ack_hdr;
     vanilla_msg_hello_ack_t ack_body;
-    if (exact_read_fd(cfd, &ack_hdr, sizeof(ack_hdr)) < 0 ||
-        exact_read_fd(cfd, &ack_body, sizeof(ack_body)) < 0) {
-        printf("[FAIL] 3. Failed to receive MSG_HELLO_ACK\n");
+    if (exact_read_fd(cfd, &ack_hdr, sizeof(ack_hdr)) < 0) {
+        printf("[FAIL] 3. Failed to receive MSG_HELLO_ACK header\n");
         goto fail;
     }
 
     if (ack_hdr.magic != VANILLA_IPC_MAGIC ||
         ack_hdr.msg_type != MSG_HELLO_ACK ||
+        ack_hdr.payload_len != sizeof(ack_body)) {
+        printf("[FAIL] 3. Invalid MSG_HELLO_ACK header\n");
+        goto fail;
+    }
+
+    if (exact_read_fd(cfd, &ack_body, sizeof(ack_body)) < 0 ||
         ack_body.status != 0) {
         printf("[FAIL] 3. Invalid MSG_HELLO_ACK\n");
         goto fail;
@@ -317,20 +359,25 @@ static int run_inprocess_loopback(const char *sock_path)
         goto fail;
     }
 
-    if (vanilla_server_dispatch_client(&srv, client_idx) < 0) {
+    if (vanilla_server_dispatch_client(srv, client_idx) < 0) {
         printf("[FAIL] 4. Server dispatch MSG_CREATE_WINDOW failed\n");
         goto fail;
     }
 
     vanilla_msg_create_window_ack_t create_ack;
-    if (exact_read_fd(cfd, &ack_hdr, sizeof(ack_hdr)) < 0 ||
-        exact_read_fd(cfd, &create_ack, sizeof(create_ack)) < 0) {
-        printf("[FAIL] 4. Failed to receive MSG_CREATE_WINDOW_ACK\n");
+    if (exact_read_fd(cfd, &ack_hdr, sizeof(ack_hdr)) < 0) {
+        printf("[FAIL] 4. Failed to receive MSG_CREATE_WINDOW_ACK header\n");
         goto fail;
     }
 
     if (ack_hdr.magic != VANILLA_IPC_MAGIC ||
         ack_hdr.msg_type != MSG_CREATE_WINDOW_ACK ||
+        ack_hdr.payload_len != sizeof(create_ack)) {
+        printf("[FAIL] 4. Invalid MSG_CREATE_WINDOW_ACK header\n");
+        goto fail;
+    }
+
+    if (exact_read_fd(cfd, &create_ack, sizeof(create_ack)) < 0 ||
         create_ack.status != 0 || create_ack.shm_id <= 0) {
         printf("[FAIL] 4. Invalid MSG_CREATE_WINDOW_ACK\n");
         goto fail;
@@ -377,12 +424,12 @@ static int run_inprocess_loopback(const char *sock_path)
         goto fail;
     }
 
-    if (vanilla_server_dispatch_client(&srv, client_idx) < 0) {
+    if (vanilla_server_dispatch_client(srv, client_idx) < 0) {
         printf("[FAIL] 6. Server dispatch MSG_PRESENT failed\n");
         goto fail;
     }
 
-    vanilla_server_window_t *srv_win = vanilla_server_find_window(&srv, win_id);
+    vanilla_server_window_t *srv_win = vanilla_server_find_window(srv, win_id);
     if (!srv_win) {
         printf("[FAIL] 6. Window not found on server\n");
         goto fail;
@@ -428,7 +475,7 @@ static int run_inprocess_loopback(const char *sock_path)
         goto fail;
     }
 
-    if (vanilla_server_dispatch_client(&srv, client_idx) < 0) {
+    if (vanilla_server_dispatch_client(srv, client_idx) < 0) {
         printf("[FAIL] 7. Server dispatch MSG_MOVE_RESIZE failed\n");
         goto fail;
     }
@@ -439,22 +486,26 @@ static int run_inprocess_loopback(const char *sock_path)
     }
 
     /* Step 8: Focus and input event notifications */
-    if (vanilla_server_focus_window(&srv, win_id) < 0) {
+    if (vanilla_server_focus_window(srv, win_id) < 0) {
         printf("[FAIL] 8. Focus notification failed\n");
         goto fail;
     }
 
-    vanilla_msg_window_focus_t foc;
-    if (exact_read_fd(cfd, &ack_hdr, sizeof(ack_hdr)) < 0 ||
-        exact_read_fd(cfd, &foc, sizeof(foc)) < 0) {
+    if (read_msg_draining_configure(cfd, &ack_hdr) < 0) {
         printf("[FAIL] 8. Failed to read focus event\n");
         goto fail;
     }
 
+    vanilla_msg_window_focus_t foc;
     if (ack_hdr.magic != VANILLA_IPC_MAGIC ||
         ack_hdr.msg_type != MSG_WINDOW_FOCUS ||
-        ack_hdr.window_id != win_id ||
-        foc.focused != 1) {
+        ack_hdr.payload_len != sizeof(foc) ||
+        ack_hdr.window_id != win_id) {
+        printf("[FAIL] 8. Invalid focus header\n");
+        goto fail;
+    }
+
+    if (exact_read_fd(cfd, &foc, sizeof(foc)) < 0 || foc.focused != 1) {
         printf("[FAIL] 8. Invalid focus payload\n");
         goto fail;
     }
@@ -465,22 +516,45 @@ static int run_inprocess_loopback(const char *sock_path)
     send_ev.code = KEY_A;
     send_ev.value = 1;
 
-    if (vanilla_server_send_input(&srv, win_id, &send_ev) < 0) {
+    if (vanilla_server_send_input(srv, win_id, &send_ev) < 0) {
         printf("[FAIL] 8. Input notification failed\n");
         goto fail;
     }
 
-    struct input_event recv_ev;
-    if (exact_read_fd(cfd, &ack_hdr, sizeof(ack_hdr)) < 0 ||
-        exact_read_fd(cfd, &recv_ev, sizeof(recv_ev)) < 0) {
+    if (read_msg_draining_configure(cfd, &ack_hdr) < 0) {
         printf("[FAIL] 8. Failed to read input event\n");
         goto fail;
     }
 
-    if (ack_hdr.magic != VANILLA_IPC_MAGIC ||
-        ack_hdr.msg_type != MSG_INPUT_EVENT ||
-        ack_hdr.window_id != win_id ||
-        recv_ev.type != EV_KEY ||
+    struct input_event recv_ev;
+    memset(&recv_ev, 0, sizeof(recv_ev));
+    if (ack_hdr.magic != VANILLA_IPC_MAGIC || ack_hdr.window_id != win_id) {
+        printf("[FAIL] 8. Invalid input header\n");
+        goto fail;
+    }
+
+    if (ack_hdr.msg_type == MSG_INPUT_EVENT_V2) {
+        vanilla_msg_input_event_v2_t in_v2;
+        if (ack_hdr.payload_len != sizeof(in_v2) ||
+            exact_read_fd(cfd, &in_v2, sizeof(in_v2)) < 0) {
+            printf("[FAIL] 8. Failed to read input v2 event\n");
+            goto fail;
+        }
+        recv_ev = in_v2.event;
+    } else if (ack_hdr.msg_type == MSG_INPUT_EVENT) {
+        vanilla_msg_input_event_t in_v1;
+        if (ack_hdr.payload_len != sizeof(in_v1) ||
+            exact_read_fd(cfd, &in_v1, sizeof(in_v1)) < 0) {
+            printf("[FAIL] 8. Failed to read input v1 event\n");
+            goto fail;
+        }
+        recv_ev = in_v1.event;
+    } else {
+        printf("[FAIL] 8. Unexpected input message type %u\n", (unsigned)ack_hdr.msg_type);
+        goto fail;
+    }
+
+    if (recv_ev.type != EV_KEY ||
         recv_ev.code != KEY_A ||
         recv_ev.value != 1) {
         printf("[FAIL] 8. Invalid input payload\n");
@@ -503,21 +577,22 @@ static int run_inprocess_loopback(const char *sock_path)
         goto fail;
     }
 
-    if (vanilla_server_dispatch_client(&srv, client_idx) < 0) {
+    if (vanilla_server_dispatch_client(srv, client_idx) < 0) {
         printf("[FAIL] 9. Server dispatch MSG_DESTROY_WINDOW failed\n");
         goto fail;
     }
 
-    if (vanilla_server_find_window(&srv, win_id) != NULL) {
+    if (vanilla_server_find_window(srv, win_id) != NULL) {
         printf("[FAIL] 9. Window still active in server table\n");
         goto fail;
     }
 
+    surface_detach(&client_surf);
     close(cfd);
     cfd = -1;
-    vanilla_server_remove_client(&srv, client_idx);
+    vanilla_server_remove_client(srv, client_idx);
     client_idx = -1;
-    vanilla_server_close(&srv);
+    vanilla_server_close(srv);
 
     printf("[PASS] 6. Clean disconnection, resource release, and shutdown verified.\n");
     printf("========================================================\n");
@@ -526,11 +601,12 @@ static int run_inprocess_loopback(const char *sock_path)
     return 0;
 
 fail:
+    surface_detach(&client_surf);
     if (cfd >= 0)
         close(cfd);
     if (client_idx >= 0)
-        vanilla_server_remove_client(&srv, client_idx);
-    vanilla_server_close(&srv);
+        vanilla_server_remove_client(srv, client_idx);
+    vanilla_server_close(srv);
     return 1;
 }
 
@@ -552,8 +628,8 @@ int main(int argc, char **argv)
         printf(" Project Vanilla - Phase 4, Step 4.1 IPC & SHM Test\n");
         printf("========================================================\n");
 
-        vanilla_server_t srv;
-        if (vanilla_server_init(&srv, sock_path) < 0) {
+        memset(&g_main_srv, 0, sizeof(g_main_srv));
+        if (vanilla_server_init(&g_main_srv, sock_path) < 0) {
             printf("[FAIL] 1. Failed to start and bind server socket\n");
             TSK_TEST_FAIL("ipc", "server_bind", "Failed to start and bind server socket");
             return 1;
@@ -564,16 +640,16 @@ int main(int argc, char **argv)
             return run_client(sock_path);
         } else if (pid > 0) {
             printf("[PASS] 1. Server started and bound socket at %s\n", sock_path);
-            int srv_rc = run_server_loop(&srv);
+            int srv_rc = run_server_loop(&g_main_srv);
             int status = 0;
             waitpid(pid, &status, 0);
-            vanilla_server_close(&srv);
+            vanilla_server_close(&g_main_srv);
 
             if (srv_rc != 0 || status != 0)
                 res = 1;
         } else {
             /* Single-process environment (fork unsupported): run synchronous loopback */
-            vanilla_server_close(&srv);
+            vanilla_server_close(&g_main_srv);
             res = run_inprocess_loopback(sock_path);
         }
     }

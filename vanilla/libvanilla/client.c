@@ -211,6 +211,42 @@ int vanilla_client_get_fd(const vanilla_client_t *client)
     return client ? client->socket_fd : -1;
 }
 
+int vanilla_client_pending(const vanilla_client_t *client)
+{
+    if (!client)
+        return 0;
+    return (int)client->event_count;
+}
+
+static void client_apply_configure(vanilla_window_t *target_win,
+                                   int32_t x, int32_t y,
+                                   uint32_t width, uint32_t height,
+                                   uint32_t flags,
+                                   int32_t shm_id, uint32_t pitch,
+                                   uint32_t buffer_size)
+{
+    if (!target_win)
+        return;
+
+    if (shm_id > 0 && shm_id != target_win->surface.shm_id &&
+        width > 0 && height > 0 && pitch > 0 && buffer_size > 0) {
+        vanilla_surface_t new_surf;
+        memset(&new_surf, 0, sizeof(new_surf));
+        if (surface_attach_shm(&new_surf, shm_id, width, height,
+                               pitch, (size_t)buffer_size) == 0) {
+            surface_detach(&target_win->surface);
+            target_win->surface = new_surf;
+        }
+    }
+
+    target_win->x = x;
+    target_win->y = y;
+    target_win->width = width;
+    target_win->height = height;
+    if (flags != 0)
+        target_win->flags = flags;
+}
+
 int vanilla_ack_configure(vanilla_client_t *client, uint32_t window_id, uint32_t serial)
 {
     if (!client || client->socket_fd < 0)
@@ -406,6 +442,9 @@ vanilla_window_t *vanilla_create_window(vanilla_client_t *client, const char *ti
             ev.type = VANILLA_EVENT_CONFIGURE;
             ev.window_id = ack_hdr.window_id;
             uint32_t cfg_serial = 0;
+            int32_t cfg_shm_id = 0;
+            uint32_t cfg_pitch = 0;
+            uint32_t cfg_buf_size = 0;
             if (ack_hdr.payload_len >= sizeof(vanilla_msg_window_configure_v2_t)) {
                 vanilla_msg_window_configure_v2_t c_msg;
                 if (exact_read(client->socket_fd, &c_msg, sizeof(c_msg)) < 0)
@@ -417,6 +456,9 @@ vanilla_window_t *vanilla_create_window(vanilla_client_t *client, const char *ti
                 ev.configure.serial = c_msg.serial;
                 ev.configure.flags = c_msg.flags;
                 cfg_serial = c_msg.serial;
+                cfg_shm_id = c_msg.shm_id;
+                cfg_pitch = c_msg.pitch;
+                cfg_buf_size = c_msg.buffer_size;
                 if (ack_hdr.payload_len > sizeof(c_msg)) {
                     uint8_t discard[128];
                     size_t rem = ack_hdr.payload_len - sizeof(c_msg);
@@ -449,14 +491,10 @@ vanilla_window_t *vanilla_create_window(vanilla_client_t *client, const char *ti
                 }
             }
             vanilla_window_t *target_win = find_window(client, ack_hdr.window_id);
-            if (target_win) {
-                target_win->x = ev.configure.x;
-                target_win->y = ev.configure.y;
-                target_win->width = ev.configure.width;
-                target_win->height = ev.configure.height;
-                if (ev.configure.flags != 0)
-                    target_win->flags = ev.configure.flags;
-            }
+            client_apply_configure(target_win, ev.configure.x, ev.configure.y,
+                                   ev.configure.width, ev.configure.height,
+                                   ev.configure.flags, cfg_shm_id,
+                                   cfg_pitch, cfg_buf_size);
             if (cfg_serial != 0) {
                 vanilla_ack_configure(client, ack_hdr.window_id, cfg_serial);
             }
@@ -854,6 +892,9 @@ int vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev)
             return 1;
         }
 
+        if (client->socket_fd < 0)
+            return -1;
+
         pfd.fd = client->socket_fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
@@ -862,8 +903,11 @@ int vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev)
         if (ret <= 0)
             return ret;
 
-        if (!(pfd.revents & POLLIN))
+        if (!(pfd.revents & POLLIN)) {
+            if (pfd.revents & (POLLERR | POLLHUP))
+                return -1;
             return 0;
+        }
 
         if (exact_read(client->socket_fd, &hdr, sizeof(hdr)) < 0)
             return -1;
@@ -949,6 +993,9 @@ int vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev)
         if (hdr.msg_type == MSG_WINDOW_CONFIGURE) {
             out_ev->type = VANILLA_EVENT_CONFIGURE;
             uint32_t cfg_serial = 0;
+            int32_t cfg_shm_id = 0;
+            uint32_t cfg_pitch = 0;
+            uint32_t cfg_buf_size = 0;
             if (hdr.payload_len >= sizeof(vanilla_msg_window_configure_v2_t)) {
                 vanilla_msg_window_configure_v2_t c_msg;
                 if (exact_read(client->socket_fd, &c_msg, sizeof(c_msg)) < 0)
@@ -960,6 +1007,9 @@ int vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev)
                 out_ev->configure.serial = c_msg.serial;
                 out_ev->configure.flags = c_msg.flags;
                 cfg_serial = c_msg.serial;
+                cfg_shm_id = c_msg.shm_id;
+                cfg_pitch = c_msg.pitch;
+                cfg_buf_size = c_msg.buffer_size;
                 if (hdr.payload_len > sizeof(c_msg)) {
                     uint8_t discard[128];
                     size_t rem = hdr.payload_len - sizeof(c_msg);
@@ -992,14 +1042,10 @@ int vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev)
                 }
             }
             vanilla_window_t *target_win = find_window(client, hdr.window_id);
-            if (target_win) {
-                target_win->x = out_ev->configure.x;
-                target_win->y = out_ev->configure.y;
-                target_win->width = out_ev->configure.width;
-                target_win->height = out_ev->configure.height;
-                if (out_ev->configure.flags != 0)
-                    target_win->flags = out_ev->configure.flags;
-            }
+            client_apply_configure(target_win, out_ev->configure.x, out_ev->configure.y,
+                                   out_ev->configure.width, out_ev->configure.height,
+                                   out_ev->configure.flags, cfg_shm_id,
+                                   cfg_pitch, cfg_buf_size);
             if (cfg_serial != 0) {
                 vanilla_ack_configure(client, hdr.window_id, cfg_serial);
             }
@@ -1173,19 +1219,29 @@ int vanilla_wait_event(vanilla_client_t *client, vanilla_event_t *out_ev)
     if (!client || !out_ev)
         return -1;
 
-    ret = vanilla_poll_event(client, out_ev);
-    if (ret != 0)
-        return ret;
+    for (;;) {
+        ret = vanilla_poll_event(client, out_ev);
+        if (ret != 0)
+            return ret;
 
-    pfd.fd = client->socket_fd;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
+        if (client->socket_fd < 0)
+            return -1;
 
-    ret = poll(&pfd, 1, -1);
-    if (ret <= 0)
-        return -1;
+        pfd.fd = client->socket_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
 
-    return vanilla_poll_event(client, out_ev);
+        ret = poll(&pfd, 1, -1);
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (ret == 0)
+            continue;
+        if (!(pfd.revents & POLLIN) && (pfd.revents & (POLLERR | POLLHUP)))
+            return -1;
+    }
 }
 
 int vanilla_show_submenu(vanilla_client_t *client, vanilla_window_t *win,

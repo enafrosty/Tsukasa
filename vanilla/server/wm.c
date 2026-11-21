@@ -408,6 +408,97 @@ void wm_invalidate_window(vanilla_server_t *srv, const vanilla_server_window_t *
     compositor_add_damage(&srv->compositor, &dirty);
 }
 
+static int wm_get_chrome_btn_rect(vanilla_server_t *srv,
+                                  uint32_t win_id,
+                                  vanilla_chrome_btn_kind_t kind,
+                                  vanilla_rect_t *out_rect)
+{
+    if (!srv || win_id == 0 || kind == CHROME_BTN_NONE || !out_rect)
+        return 0;
+
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, win_id);
+    if (!w || !w->in_use || !w->is_mapped || (w->flags & WINDOW_FLAG_BORDERLESS))
+        return 0;
+
+    vanilla_rect_t frame;
+    wm_get_frame_rect(w, &frame);
+    chrome_btn_rects_t btns = chrome_metrics(&frame);
+
+    if (kind == CHROME_BTN_CLOSE) {
+        *out_rect = btns.close_btn;
+        return 1;
+    }
+    if (kind == CHROME_BTN_MAX) {
+        *out_rect = btns.max_btn;
+        return 1;
+    }
+    if (kind == CHROME_BTN_MIN) {
+        *out_rect = btns.min_btn;
+        return 1;
+    }
+    return 0;
+}
+
+static void wm_hit_test_chrome_btn(vanilla_server_t *srv,
+                                   int32_t px,
+                                   int32_t py,
+                                   uint32_t *out_win_id,
+                                   vanilla_chrome_btn_kind_t *out_kind)
+{
+    *out_win_id = 0;
+    *out_kind = CHROME_BTN_NONE;
+
+    if (!srv || srv->context_menu_depth > 0 || srv->alttab_visible ||
+        srv->is_dragging || srv->is_resizing) {
+        return;
+    }
+
+    vanilla_server_window_t *hit = wm_window_at(srv, px, py);
+    if (!hit || !hit->in_use || !hit->is_mapped || (hit->flags & WINDOW_FLAG_BORDERLESS))
+        return;
+
+    vanilla_rect_t frame;
+    wm_get_frame_rect(hit, &frame);
+    if (py >= frame.y + g_theme->titlebar_height + g_theme->border_width)
+        return;
+
+    chrome_btn_rects_t btns = chrome_metrics(&frame);
+    if (vanilla_rect_contains(&btns.close_btn, px, py)) {
+        *out_win_id = hit->window_id;
+        *out_kind = CHROME_BTN_CLOSE;
+    } else if (vanilla_rect_contains(&btns.max_btn, px, py)) {
+        *out_win_id = hit->window_id;
+        *out_kind = CHROME_BTN_MAX;
+    } else if (vanilla_rect_contains(&btns.min_btn, px, py)) {
+        *out_win_id = hit->window_id;
+        *out_kind = CHROME_BTN_MIN;
+    }
+}
+
+void wm_update_hover(vanilla_server_t *srv)
+{
+    if (!srv)
+        return;
+
+    uint32_t new_win_id = 0;
+    vanilla_chrome_btn_kind_t new_kind = CHROME_BTN_NONE;
+    wm_hit_test_chrome_btn(srv, srv->cursor_x, srv->cursor_y, &new_win_id, &new_kind);
+
+    if (new_win_id == srv->hovered_btn_win_id && new_kind == srv->hovered_btn_kind)
+        return;
+
+    vanilla_rect_t old_rect;
+    if (wm_get_chrome_btn_rect(srv, srv->hovered_btn_win_id, srv->hovered_btn_kind, &old_rect))
+        compositor_invalidate_rect(&srv->compositor, &old_rect);
+
+    vanilla_rect_t new_rect;
+    if (wm_get_chrome_btn_rect(srv, new_win_id, new_kind, &new_rect))
+        compositor_invalidate_rect(&srv->compositor, &new_rect);
+
+    srv->hovered_btn_win_id = new_win_id;
+    srv->hovered_btn_kind = new_kind;
+}
+
 void wm_raise_window(vanilla_server_t *srv, uint32_t window_id)
 {
     if (!srv || window_id == 0)
@@ -428,6 +519,7 @@ void wm_raise_window(vanilla_server_t *srv, uint32_t window_id)
     target->z_index = max_z + 1;
 
     wm_invalidate_window(srv, target);
+    wm_update_hover(srv);
 }
 
 void wm_lower_window(vanilla_server_t *srv, uint32_t window_id)
@@ -449,6 +541,7 @@ void wm_lower_window(vanilla_server_t *srv, uint32_t window_id)
 
     target->z_index = min_z - 1;
     wm_invalidate_window(srv, target);
+    wm_update_hover(srv);
 }
 
 static void update_mod_state(vanilla_server_t *srv, uint16_t bit, int toggle, int value)
@@ -640,6 +733,10 @@ void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_
     if (srv->drag_threshold_pending && srv->drag_threshold_window_id == w->window_id) {
         srv->drag_threshold_pending = 0;
     }
+    if (srv->hovered_btn_win_id == w->window_id) {
+        srv->hovered_btn_win_id = 0;
+        srv->hovered_btn_kind = CHROME_BTN_NONE;
+    }
     dnd_window_destroyed(srv, w->window_id);
     w->resize_has_target = 0;
     w->anim_state = ANIM_IDLE;
@@ -648,11 +745,12 @@ void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_
     w->is_mapped = 0;
 
     for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
-        if (!srv->clients[i].in_use)
+        if (!srv->clients[i].in_use || srv->clients[i].negotiated_version == 0)
             continue;
         int other_fd = srv->clients[i].fd;
         vanilla_msg_hdr_t b_hdr;
         vanilla_msg_window_configure_v2_t b_cfg;
+        memset(&b_cfg, 0, sizeof(b_cfg));
         b_hdr.magic = VANILLA_IPC_MAGIC;
         b_hdr.msg_type = MSG_WINDOW_CONFIGURE;
         b_hdr.payload_len = (uint16_t)sizeof(b_cfg);
@@ -670,8 +768,10 @@ void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_
     }
 
     wm_invalidate_window(srv, w);
+    surface_destroy(&w->pending_surface);
     surface_destroy(&w->surface);
     w->in_use = 0;
+    wm_update_hover(srv);
 }
 
 void vanilla_server_remove_client(vanilla_server_t *srv, int client_idx)
@@ -726,10 +826,55 @@ static void wm_send_configure(vanilla_server_t *srv, vanilla_server_window_t *w)
 
         vanilla_msg_hdr_t hdr;
         vanilla_msg_window_configure_v2_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
         hdr.magic = VANILLA_IPC_MAGIC;
         hdr.msg_type = MSG_WINDOW_CONFIGURE;
         hdr.payload_len = (uint16_t)sizeof(cfg);
         hdr.window_id = w->window_id;
+
+        if (w->surface.pixels && w->pending_w > 0 && w->pending_h > 0 &&
+            (w->pending_w != w->surface.width || w->pending_h != w->surface.height)) {
+            vanilla_surface_t new_surf;
+            if (surface_create_shm(&new_surf, w->pending_w, w->pending_h) < 0) {
+                w->pending_x = w->x;
+                w->pending_y = w->y;
+                w->pending_w = w->width;
+                w->pending_h = w->height;
+                return;
+            }
+            if (!(w->flags & WINDOW_FLAG_TRANSPARENT)) {
+                uint32_t new_pitch_px = new_surf.pitch / (uint32_t)sizeof(uint32_t);
+                uint32_t fill_col = g_theme ? g_theme->bg_base : 0xFF2E3440u;
+                size_t total_px = (size_t)new_pitch_px * new_surf.height;
+                for (size_t px = 0; px < total_px; px++)
+                    new_surf.pixels[px] = fill_col;
+            }
+            uint32_t copy_w = w->surface.width < new_surf.width ? w->surface.width : new_surf.width;
+            uint32_t copy_h = w->surface.height < new_surf.height ? w->surface.height : new_surf.height;
+            uint32_t old_pitch_px = w->surface.pitch / (uint32_t)sizeof(uint32_t);
+            uint32_t new_pitch_px = new_surf.pitch / (uint32_t)sizeof(uint32_t);
+            if (old_pitch_px > 0 && new_pitch_px > 0 && copy_w > 0 && copy_h > 0) {
+                for (uint32_t row = 0; row < copy_h; row++) {
+                    memcpy(new_surf.pixels + (size_t)row * new_pitch_px,
+                           w->surface.pixels + (size_t)row * old_pitch_px,
+                           (size_t)copy_w * sizeof(uint32_t));
+                }
+            }
+            if (w->pending_surface.pixels)
+                surface_destroy(&w->pending_surface);
+            w->pending_surface = new_surf;
+            cfg.shm_id = new_surf.shm_id;
+            cfg.pitch = new_surf.pitch;
+            cfg.buffer_size = (uint32_t)new_surf.size;
+        } else if (w->surface.pixels) {
+            if (w->pending_surface.pixels) {
+                surface_destroy(&w->pending_surface);
+                memset(&w->pending_surface, 0, sizeof(w->pending_surface));
+            }
+            cfg.shm_id = w->surface.shm_id;
+            cfg.pitch = w->surface.pitch;
+            cfg.buffer_size = (uint32_t)w->surface.size;
+        }
 
         cfg.x = w->pending_x;
         cfg.y = w->pending_y;
@@ -762,11 +907,13 @@ static void wm_send_configure(vanilla_server_t *srv, vanilla_server_window_t *w)
     }
 
     for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
-        if (!srv->clients[i].in_use || srv->clients[i].fd == w->client_fd)
+        if (!srv->clients[i].in_use || srv->clients[i].fd == w->client_fd ||
+            srv->clients[i].negotiated_version == 0)
             continue;
         int other_fd = srv->clients[i].fd;
         vanilla_msg_hdr_t b_hdr;
         vanilla_msg_window_configure_v2_t b_cfg;
+        memset(&b_cfg, 0, sizeof(b_cfg));
         b_hdr.magic = VANILLA_IPC_MAGIC;
         b_hdr.msg_type = MSG_WINDOW_CONFIGURE;
         b_hdr.payload_len = (uint16_t)sizeof(b_cfg);
@@ -886,6 +1033,7 @@ int handle_msg_create_window(vanilla_server_t *srv, int client_idx, const vanill
     w->pending_y = req->y;
     w->pending_w = req->width;
     w->pending_h = req->height;
+    memset(&w->pending_surface, 0, sizeof(w->pending_surface));
     w->configure_timestamp_ms = 0;
 
     w->frame_serial = 0;
@@ -974,6 +1122,10 @@ int handle_msg_destroy_window(vanilla_server_t *srv, int client_idx, const vanil
         if (srv->drag_threshold_pending && srv->drag_threshold_window_id == w->window_id) {
             srv->drag_threshold_pending = 0;
         }
+        if (srv->hovered_btn_win_id == w->window_id) {
+            srv->hovered_btn_win_id = 0;
+            srv->hovered_btn_kind = CHROME_BTN_NONE;
+        }
         w->resize_has_target = 0;
 
         if (g_theme->reduce_motion != 0 || !w->is_mapped) {
@@ -1035,6 +1187,10 @@ int handle_msg_unmap_window(vanilla_server_t *srv, int client_idx, const vanilla
         if (srv->drag_threshold_pending && srv->drag_threshold_window_id == w->window_id) {
             srv->drag_threshold_pending = 0;
         }
+        if (srv->hovered_btn_win_id == w->window_id) {
+            srv->hovered_btn_win_id = 0;
+            srv->hovered_btn_kind = CHROME_BTN_NONE;
+        }
         w->resize_has_target = 0;
         w->anim_state = ANIM_IDLE;
         w->anim_destroy_on_done = 0;
@@ -1048,6 +1204,7 @@ int handle_msg_unmap_window(vanilla_server_t *srv, int client_idx, const vanilla
         if (srv->focused_window_id == w->window_id)
             srv->focused_window_id = 0;
         wm_send_configure(srv, w);
+        wm_update_hover(srv);
     }
     return 0;
 }
@@ -1184,10 +1341,22 @@ int handle_msg_ack_configure(vanilla_server_t *srv, int client_idx, const vanill
 
     w->configure_pending = 0;
     wm_invalidate_window(srv, w);
-    w->x = w->pending_x;
-    w->y = w->pending_y;
+    if (w->pending_surface.pixels) {
+        surface_destroy(&w->surface);
+        w->surface = w->pending_surface;
+        w->shm_id = w->surface.shm_id;
+        memset(&w->pending_surface, 0, sizeof(w->pending_surface));
+    }
+    if (!(srv->is_dragging && srv->drag_window_id == w->window_id)) {
+        w->x = w->pending_x;
+        w->y = w->pending_y;
+    }
     w->width = w->pending_w;
     w->height = w->pending_h;
+    w->damage.x = 0;
+    w->damage.y = 0;
+    w->damage.w = (int32_t)w->width;
+    w->damage.h = (int32_t)w->height;
     wm_invalidate_window(srv, w);
     printf("[vanilla] ack_configure: window %u serial %u applied\n", w->window_id, ack->serial);
 
@@ -2412,6 +2581,7 @@ void wm_context_menu_close_stack(vanilla_server_t *srv, uint32_t result_item_id)
 
     srv->context_menu_depth = 0;
     srv->context_menu_pool_count = 0;
+    wm_update_hover(srv);
 }
 
 int handle_msg_show_context_menu(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
@@ -2582,6 +2752,7 @@ int wm_context_menu_open_desktop(vanilla_server_t *srv, int32_t x, int32_t y)
     srv->context_menu_pool_count = 1;
 
     wm_context_menu_damage(srv, m);
+    wm_update_hover(srv);
     return 0;
 }
 
@@ -2630,6 +2801,7 @@ int wm_context_menu_open_taskbar(vanilla_server_t *srv, int32_t x, int32_t y, ui
     srv->context_menu_pool_count = 1;
 
     wm_context_menu_damage(srv, m);
+    wm_update_hover(srv);
     return 0;
 }
 
@@ -3261,6 +3433,121 @@ int vanilla_server_dispatch_client(vanilla_server_t *srv, int client_idx)
     return 0;
 }
 
+static void wm_clamp_min_timeout(int *cur_timeout, int candidate_ms)
+{
+    if (!cur_timeout || candidate_ms < 0)
+        return;
+    if (*cur_timeout < 0 || candidate_ms < *cur_timeout)
+        *cur_timeout = candidate_ms;
+}
+
+static int wm_ticks_to_ms_ceil(uint64_t ticks, uint32_t freq)
+{
+    if (ticks == 0)
+        return 0;
+    if (freq == 0)
+        freq = 1000;
+    uint64_t ms = (ticks * 1000ULL + (uint64_t)freq - 1ULL) / (uint64_t)freq;
+    if (ms == 0)
+        ms = 1;
+    if (ms > 60000ULL)
+        ms = 60000ULL;
+    return (int)ms;
+}
+
+static int wm_compute_poll_timeout(vanilla_server_t *srv, int idle_timeout_ms,
+                                   int64_t now_ms, uint64_t now_ticks)
+{
+    int eff = idle_timeout_ms;
+    uint32_t freq = pit_frequency();
+    if (freq == 0)
+        freq = 1000;
+
+    int frame_ms = (int)(1000 / COMPOSITOR_TARGET_FPS);
+    if (frame_ms < 1)
+        frame_ms = 1;
+
+    if (srv->compositor.dirty_count > 0 || compositor_has_active_animations(srv)) {
+        if (srv->compositor.dirty_count > 0 && compositor_frame_due(&srv->compositor)) {
+            wm_clamp_min_timeout(&eff, 0);
+        } else if (srv->compositor.last_frame_ticks == 0 ||
+                   now_ticks < srv->compositor.last_frame_ticks) {
+            wm_clamp_min_timeout(&eff, 0);
+        } else {
+            uint64_t elapsed = now_ticks - srv->compositor.last_frame_ticks;
+            if (elapsed >= srv->compositor.frame_target_ticks) {
+                wm_clamp_min_timeout(&eff, srv->compositor.dirty_count > 0 ? 0 : frame_ms);
+            } else {
+                uint64_t rem_ticks = srv->compositor.frame_target_ticks - elapsed;
+                int rem_ms = wm_ticks_to_ms_ceil(rem_ticks, freq);
+                if (rem_ms > frame_ms)
+                    rem_ms = frame_ms;
+                wm_clamp_min_timeout(&eff, rem_ms);
+            }
+        }
+    }
+
+    if (srv->context_menu_depth > 0) {
+        const vanilla_context_menu_t *m = &srv->context_menu_stack[srv->context_menu_depth - 1];
+        if (m->active && m->hover_item_idx >= 0 && m->hover_timer_start > 0) {
+            uint64_t timeout_ticks = ((uint64_t)freq * 300ULL) / 1000ULL;
+            if (timeout_ticks == 0)
+                timeout_ticks = 1;
+            uint64_t elapsed = (now_ticks >= m->hover_timer_start) ? (now_ticks - m->hover_timer_start) : 0;
+            if (elapsed >= timeout_ticks) {
+                wm_clamp_min_timeout(&eff, 0);
+            } else {
+                int rem_ms = wm_ticks_to_ms_ceil(timeout_ticks - elapsed, freq);
+                if (rem_ms > 300)
+                    rem_ms = 300;
+                wm_clamp_min_timeout(&eff, rem_ms);
+            }
+        }
+    }
+
+    if (dnd_get_state() == DND_DROPPING)
+        wm_clamp_min_timeout(&eff, 100);
+
+    for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+        const vanilla_server_window_t *w = &srv->windows[i];
+        if (w->in_use && w->configure_pending) {
+            int64_t elapsed = now_ms - (int64_t)w->configure_timestamp_ms;
+            if (elapsed > 500) {
+                wm_clamp_min_timeout(&eff, 0);
+            } else {
+                int rem_ms = (int)(501 - elapsed);
+                if (rem_ms < 1)
+                    rem_ms = 1;
+                wm_clamp_min_timeout(&eff, rem_ms);
+            }
+        }
+    }
+
+    uint64_t long_press_ticks = (uint64_t)freq / 2ULL;
+    if (long_press_ticks == 0)
+        long_press_ticks = 1;
+    for (int b = 0; b < 3; b++) {
+        if (((srv->mouse_buttons >> b) & 1u) && !srv->long_press_fired[b]) {
+            int dx = srv->cursor_x - srv->btn_down_x[b];
+            int dy = srv->cursor_y - srv->btn_down_y[b];
+            int chebyshev = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
+            if (chebyshev <= 4) {
+                uint64_t held = (now_ticks >= srv->btn_down_ticks[b]) ? (now_ticks - srv->btn_down_ticks[b]) : 0;
+                if (held >= long_press_ticks) {
+                    wm_clamp_min_timeout(&eff, 0);
+                } else {
+                    int rem_ms = wm_ticks_to_ms_ceil(long_press_ticks - held, freq);
+                    if (rem_ms > 500)
+                        rem_ms = 500;
+                    wm_clamp_min_timeout(&eff, rem_ms);
+                }
+            }
+        }
+    }
+
+    return eff;
+}
+
 int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
 {
     struct pollfd fds[2 + VANILLA_MAX_CLIENTS];
@@ -3344,6 +3631,9 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
         }
     }
 
+    if (srv->compositor.dirty_count == 0 && compositor_has_active_animations(srv))
+        compositor_animate_windows(srv);
+
     fds[0].fd = srv->listen_fd;
     fds[0].events = POLLIN;
     fds[0].revents = 0;
@@ -3367,13 +3657,15 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
         }
     }
 
-    (void)timeout_ms;
-    int frame_ms = (int)(1000 / COMPOSITOR_TARGET_FPS);
-    ret = poll(fds, (nfds_t)nfds, frame_ms);
+    int eff_timeout = wm_compute_poll_timeout(srv, timeout_ms, now_ms, now_ticks);
+    ret = poll(fds, (nfds_t)nfds, eff_timeout);
 
     wm_context_menu_check_timers(srv);
+    dnd_check_timeout(srv);
 
     if (ret <= 0) {
+        if (srv->compositor.dirty_count == 0 && compositor_has_active_animations(srv))
+            compositor_animate_windows(srv);
         if (srv->compositor.dirty_count > 0) {
             if (compositor_frame_due(&srv->compositor)) {
                 vanilla_server_send_frame_begin(srv);
@@ -3405,6 +3697,10 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
     }
 
     wm_context_menu_check_timers(srv);
+    dnd_check_timeout(srv);
+
+    if (srv->compositor.dirty_count == 0 && compositor_has_active_animations(srv))
+        compositor_animate_windows(srv);
 
     if (srv->compositor.dirty_count > 0) {
         if (compositor_frame_due(&srv->compositor)) {
@@ -3487,7 +3783,8 @@ int vanilla_server_focus_window(vanilla_server_t *srv, uint32_t window_id)
             exact_write(old_w->client_fd, &msg, sizeof(msg));
         }
         for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
-            if (srv->clients[i].in_use && srv->clients[i].fd != old_w->client_fd) {
+            if (srv->clients[i].in_use && srv->clients[i].fd != old_w->client_fd &&
+                srv->clients[i].negotiated_version > 0) {
                 hdr.magic = VANILLA_IPC_MAGIC;
                 hdr.msg_type = MSG_WINDOW_FOCUS;
                 hdr.payload_len = (uint16_t)sizeof(msg);
@@ -3515,7 +3812,8 @@ int vanilla_server_focus_window(vanilla_server_t *srv, uint32_t window_id)
             exact_write(new_w->client_fd, &msg, sizeof(msg));
         }
         for (int i = 0; i < VANILLA_MAX_CLIENTS; i++) {
-            if (srv->clients[i].in_use && srv->clients[i].fd != new_w->client_fd) {
+            if (srv->clients[i].in_use && srv->clients[i].fd != new_w->client_fd &&
+                srv->clients[i].negotiated_version > 0) {
                 hdr.magic = VANILLA_IPC_MAGIC;
                 hdr.msg_type = MSG_WINDOW_FOCUS;
                 hdr.payload_len = (uint16_t)sizeof(msg);
@@ -3537,6 +3835,7 @@ int vanilla_server_focus_window(vanilla_server_t *srv, uint32_t window_id)
         srv->focused_window_id = 0;
     }
 
+    wm_update_hover(srv);
     return 0;
 }
 
@@ -3579,6 +3878,55 @@ int vanilla_server_close_request(vanilla_server_t *srv, uint32_t window_id)
     return 0;
 }
 
+static void wm_get_work_area(const vanilla_server_t *srv, int32_t *out_y, int32_t *out_h)
+{
+    int32_t screen_w = srv ? (int32_t)srv->compositor.width : 1280;
+    int32_t screen_h = srv ? (int32_t)srv->compositor.height : 800;
+    int32_t top = 0;
+    int32_t bottom = screen_h;
+    int found_modern_chrome = 0;
+
+    if (srv) {
+        for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
+            const vanilla_server_window_t *cw = &srv->windows[i];
+            if (!cw->in_use || !cw->is_mapped || (cw->flags & WINDOW_FLAG_POPUP))
+                continue;
+            if ((cw->flags & (WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS)) !=
+                (WINDOW_FLAG_ALWAYS_TOP | WINDOW_FLAG_BORDERLESS))
+                continue;
+
+            if (cw->y <= 4 && cw->width >= (uint32_t)(screen_w / 2) &&
+                cw->height > 0 && cw->height < (uint32_t)(screen_h / 4)) {
+                int32_t t = cw->y + (int32_t)cw->height;
+                if (t > top)
+                    top = t;
+                found_modern_chrome = 1;
+            } else if (cw->y >= screen_h / 2 &&
+                       cw->y + (int32_t)cw->height >= screen_h - THEME_PX(24) &&
+                       cw->height > 0 && cw->height < (uint32_t)(screen_h / 4)) {
+                int32_t b = cw->y - THEME_PX(4);
+                if (b < bottom)
+                    bottom = b;
+                found_modern_chrome = 1;
+            }
+        }
+    }
+
+    if (!found_modern_chrome)
+        bottom = screen_h - TASKBAR_HEIGHT;
+
+    int32_t work_h = bottom - top;
+    if (work_h < 100) {
+        top = 0;
+        work_h = screen_h;
+    }
+
+    if (out_y)
+        *out_y = top;
+    if (out_h)
+        *out_h = work_h;
+}
+
 void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
 {
     vanilla_server_window_t *w = vanilla_server_find_window(srv, window_id);
@@ -3586,10 +3934,9 @@ void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
         return;
 
     int32_t screen_w = (int32_t)srv->compositor.width;
-    int32_t screen_h = (int32_t)srv->compositor.height;
-    int32_t work_h = screen_h - TASKBAR_HEIGHT;
-    if (work_h < 100)
-        work_h = screen_h;
+    int32_t work_y = 0;
+    int32_t work_h = (int32_t)srv->compositor.height;
+    wm_get_work_area(srv, &work_y, &work_h);
 
     wm_invalidate_window(srv, w);
 
@@ -3620,20 +3967,20 @@ void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
             w->restore_h = w->height;
         }
 
-        int32_t target_fx = 0, target_fy = 0, target_fw = screen_w, target_fh = work_h;
+        int32_t target_fx = 0, target_fy = work_y, target_fw = screen_w, target_fh = work_h;
         if (snap_type == SNAP_MAXIMIZE) {
             target_fx = 0;
-            target_fy = 0;
+            target_fy = work_y;
             target_fw = screen_w;
             target_fh = work_h;
         } else if (snap_type == SNAP_LEFT) {
             target_fx = 0;
-            target_fy = 0;
+            target_fy = work_y;
             target_fw = screen_w / 2;
             target_fh = work_h;
         } else if (snap_type == SNAP_RIGHT) {
             target_fx = screen_w / 2;
-            target_fy = 0;
+            target_fy = work_y;
             target_fw = screen_w - (screen_w / 2);
             target_fh = work_h;
         }
@@ -3670,6 +4017,8 @@ void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
         wm_send_configure(srv, w);
         wm_invalidate_window(srv, w);
     }
+
+    wm_update_hover(srv);
 }
 
 void wm_unsnap_window(vanilla_server_t *srv, uint32_t window_id)
@@ -3788,9 +4137,20 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     if (w && !srv->is_dragging && !srv->is_resizing) {
                         if (srv->drag_threshold_mode == DRAG_MODE_TITLEBAR) {
                             if (w->is_snapped != SNAP_NONE) {
+                                int32_t work_y = 0, work_h = screen_h;
+                                wm_get_work_area(srv, &work_y, &work_h);
+                                (void)work_h;
                                 wm_unsnap_window(srv, w->window_id);
-                                w->x = srv->drag_threshold_start_x - (int32_t)w->width / 2;
-                                w->y = srv->drag_threshold_start_y - g_theme->titlebar_height / 2;
+                                uint32_t uw = w->configure_pending ? w->pending_w : w->width;
+                                int32_t ux = srv->drag_threshold_start_x - (int32_t)uw / 2;
+                                int32_t uy = srv->drag_threshold_start_y - g_theme->titlebar_height / 2;
+                                int32_t min_y = work_y + g_theme->titlebar_height + g_theme->border_width;
+                                if (uy < min_y)
+                                    uy = min_y;
+                                w->x = ux;
+                                w->y = uy;
+                                w->pending_x = ux;
+                                w->pending_y = uy;
                             }
                             srv->is_dragging = 1;
                             srv->drag_window_id = w->window_id;
@@ -3840,6 +4200,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             if (srv->context_menu_depth > 0) {
                 wm_context_menu_handle_motion(srv, srv->cursor_x, srv->cursor_y);
             }
+            wm_update_hover(srv);
 
             if (srv->is_dragging) {
                 vanilla_server_window_t *w = vanilla_server_find_window(srv, srv->drag_window_id);
@@ -3852,25 +4213,25 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     if (g_theme->reduce_motion == 0) {
                         vanilla_rect_t preview_zone;
                         int in_snap_zone = 0;
-                        int32_t work_h = screen_h - TASKBAR_HEIGHT;
-                        if (work_h < 100)
-                            work_h = screen_h;
+                        int32_t work_y = 0;
+                        int32_t work_h = screen_h;
+                        wm_get_work_area(srv, &work_y, &work_h);
 
-                        if (srv->cursor_y <= 16) {
+                        if (srv->cursor_y <= work_y + 16) {
                             preview_zone.x = 0;
-                            preview_zone.y = 0;
+                            preview_zone.y = work_y;
                             preview_zone.w = screen_w;
                             preview_zone.h = work_h;
                             in_snap_zone = 1;
                         } else if (srv->cursor_x <= 16) {
                             preview_zone.x = 0;
-                            preview_zone.y = 0;
+                            preview_zone.y = work_y;
                             preview_zone.w = screen_w / 2;
                             preview_zone.h = work_h;
                             in_snap_zone = 1;
                         } else if (srv->cursor_x >= screen_w - 16) {
                             preview_zone.x = screen_w / 2;
-                            preview_zone.y = 0;
+                            preview_zone.y = work_y;
                             preview_zone.w = screen_w - (screen_w / 2);
                             preview_zone.h = work_h;
                             in_snap_zone = 1;
@@ -4047,12 +4408,17 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
 
                         /* Minimize button [_] */
                         if (vanilla_rect_contains(&btns.min_btn, srv->cursor_x, srv->cursor_y)) {
+                            if (srv->hovered_btn_win_id == hit->window_id) {
+                                srv->hovered_btn_win_id = 0;
+                                srv->hovered_btn_kind = CHROME_BTN_NONE;
+                            }
                             if (g_theme->reduce_motion != 0) {
                                 hit->is_mapped = 0;
                                 hit->is_focused = 0;
                                 if (srv->focused_window_id == hit->window_id)
                                     srv->focused_window_id = 0;
                                 wm_invalidate_window(srv, hit);
+                                wm_update_hover(srv);
                             } else {
                                 vanilla_rect_t fr;
                                 wm_get_frame_rect(hit, &fr);
@@ -4182,13 +4548,17 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     vanilla_rect_t cur_box;
                     cursor_get_rect(srv->cursor_x, srv->cursor_y, &cur_box);
                     compositor_add_damage(&srv->compositor, &cur_box);
+                    wm_update_hover(srv);
                     return 0;
                 }
 
                 if (srv->is_dragging) {
                     compositor_snap_preview_hide(&srv->compositor);
+                    int32_t snap_work_y = 0, snap_work_h = screen_h;
+                    wm_get_work_area(srv, &snap_work_y, &snap_work_h);
+                    (void)snap_work_h;
                     /* Evaluate Aero-snap boundary triggers upon release matching preview zone */
-                    if (srv->cursor_y <= 16) {
+                    if (srv->cursor_y <= snap_work_y + 16) {
                         wm_snap_window(srv, srv->drag_window_id, SNAP_MAXIMIZE);
                     } else if (srv->cursor_x <= 16) {
                         wm_snap_window(srv, srv->drag_window_id, SNAP_LEFT);
@@ -4211,6 +4581,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     vanilla_rect_t cur_box;
                     cursor_get_rect(srv->cursor_x, srv->cursor_y, &cur_box);
                     compositor_add_damage(&srv->compositor, &cur_box);
+                    wm_update_hover(srv);
                     return 0;
                 }
 

@@ -63,6 +63,8 @@ typedef struct {
 #define O_NONBLOCK 0x4000
 #endif
 int sched_yield(void);
+#elif defined(__linux__)
+#include <sched.h>
 #endif
 
 #ifndef VANILLA_MAX_CLIENTS
@@ -144,6 +146,7 @@ typedef struct vanilla_server_window {
     int32_t           pending_y;
     uint32_t          pending_w;
     uint32_t          pending_h;
+    vanilla_surface_t pending_surface;
     uint32_t          configure_timestamp_ms;
 
     /* Protocol v2 frame pacing */
@@ -200,6 +203,13 @@ typedef struct {
     uint32_t version;
     uint32_t negotiated_version;
 } vanilla_client_conn_t;
+
+typedef enum {
+    CHROME_BTN_NONE = 0,
+    CHROME_BTN_CLOSE = 1,
+    CHROME_BTN_MAX = 2,
+    CHROME_BTN_MIN = 3
+} vanilla_chrome_btn_kind_t;
 
 typedef struct vanilla_server {
     int                     listen_fd;
@@ -265,6 +275,10 @@ typedef struct vanilla_server {
     int                     context_menu_depth;
     vanilla_context_menu_t  context_menu_pool[CONTEXT_MENU_POOL_SIZE];
     int                     context_menu_pool_count;
+
+    /* Titlebar chrome button hover state */
+    uint32_t                  hovered_btn_win_id;
+    vanilla_chrome_btn_kind_t hovered_btn_kind;
 } vanilla_server_t;
 
 /* Server lifecycle */
@@ -286,6 +300,7 @@ void wm_raise_window(vanilla_server_t *srv, uint32_t window_id);
 void wm_lower_window(vanilla_server_t *srv, uint32_t window_id);
 void wm_get_frame_rect(const vanilla_server_window_t *win, vanilla_rect_t *out_frame);
 void wm_invalidate_window(vanilla_server_t *srv, const vanilla_server_window_t *win);
+void wm_update_hover(vanilla_server_t *srv);
 void vanilla_server_broadcast_theme_changed(vanilla_server_t *srv);
 void vanilla_server_send_frame_begin(vanilla_server_t *srv);
 void vanilla_server_release_buffers(vanilla_server_t *srv);

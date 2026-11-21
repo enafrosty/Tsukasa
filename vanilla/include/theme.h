@@ -64,6 +64,11 @@ typedef struct {
     uint32_t taskbar_item_open;      /* open but unfocused app */
     uint32_t taskbar_text;           /* taskbar text */
 
+    /* Menus */
+    uint32_t menu_bg;                /* popup/context menu surface */
+    uint32_t menu_border;            /* menu outer border */
+    uint32_t menu_divider;           /* menu horizontal separator line */
+
     /* Metric tokens */
     int32_t  titlebar_height;        /* px: replaces TITLEBAR_HEIGHT macro */
     int32_t  border_width;           /* px: replaces WINDOW_BORDER_WIDTH */
@@ -72,6 +77,7 @@ typedef struct {
     int32_t  radius_sm;              /* px corner radius: small (4) */
     int32_t  radius_md;              /* px corner radius: medium (8) */
     int32_t  radius_lg;              /* px corner radius: large (12) */
+    int32_t  radius_menu;            /* px corner radius: menus (0 = sharp) */
     int32_t  shadow_radius;          /* px shadow spread */
     uint8_t  shadow_alpha;           /* 0-255 shadow opacity */
     int32_t  space_1;                /* baseline spacing unit (4 px at 1x) */
@@ -101,6 +107,19 @@ extern const vanilla_theme_t *g_theme;
  */
 #define THEME_PX(n)  ((int32_t)((float)(n) * g_theme->scale_factor))
 #define THEME_F(f)   ((f) * g_theme->scale_factor)
+
+/* Modern shell design tokens */
+#define STATUSBAR_HEIGHT_PX          28
+#define DOCK_HEIGHT_PX               52
+#define DOCK_RADIUS_PX               8
+#define MENU_RADIUS_PX               0
+#define THEME_COLOR_STATUSBAR_BG     0xD02E3440u
+#define THEME_COLOR_STATUSBAR_BORDER 0x2088C0D0u
+#define THEME_COLOR_DOCK_BG          0xCC232831u
+#define THEME_COLOR_DOCK_BORDER      0x4088C0D0u
+#define THEME_COLOR_DOCK_PILL        0x3088C0D0u
+#define THEME_COLOR_FROST_CYAN       0xFF88C0D0u
+#define THEME_COLOR_SLATE            0xFF4C566Au
 
 /*
  * Load theme from an INI file. Returns 0 on success, -1 on parse error.

@@ -19,10 +19,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#if defined(_WIN32)
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/poll.h>
 #include <unistd.h>
+#endif
 
 
 #define HOST_MAX_SHM_SLOTS 256
@@ -70,6 +72,15 @@ int shm_destroy(int shm_id)
     return 0;
 }
 
+pid_t spawn(const char *path, char *const argv[], char *const envp[])
+{
+    (void)argv;
+    (void)envp;
+    printf("[Host Emulator] Spawn requested for application: %s\n", path ? path : "(null)");
+    return 1;
+}
+
+#if defined(_WIN32)
 struct tm *gmtime_r(const time_t *timer, struct tm *result)
 {
     if (!timer || !result)
@@ -83,15 +94,7 @@ struct tm *gmtime_r(const time_t *timer, struct tm *result)
     return NULL;
 }
 
-pid_t spawn(const char *path, char *const argv[], char *const envp[])
-{
-    (void)argv;
-    (void)envp;
-    printf("[Host Emulator] Spawn requested for application: %s\n", path ? path : "(null)");
-    return 1;
-}
-
-/* Stubs for POSIX networking and IPC calls unused in host prototype mode */
+/* Stubs for POSIX networking and IPC calls unused on Windows host builds */
 int socket(int domain, int type, int protocol)
 {
     (void)domain;
@@ -160,3 +163,4 @@ int sched_yield(void)
 {
     return 0;
 }
+#endif

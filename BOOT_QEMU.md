@@ -2,6 +2,20 @@
 
 Tsukasa boots via the Limine bootloader on x86_64.
 
+## Install QEMU (Linux / Fedora)
+
+```bash
+sudo dnf install -y qemu-system-x86 qemu-img
+```
+
+Or install the full toolchain via `./setup_fedora.sh`.
+
+## Install QEMU (Debian / Ubuntu)
+
+```bash
+sudo apt-get install -y qemu-system-x86 qemu-utils
+```
+
 ## Install QEMU (Windows)
 
 - **Chocolatey:** `choco install qemu`
@@ -12,7 +26,13 @@ Tsukasa boots via the Limine bootloader on x86_64.
 
 From the project directory (where `tsukasa.iso` is):
 
-```powershell
+```bash
+./run_qemu.sh
+```
+
+Or run QEMU directly (`bash` or `powershell`):
+
+```bash
 qemu-system-x86_64 -cdrom tsukasa.iso -hda disk.img -m 256 -smp 2 -vga std -serial stdio
 ```
 

@@ -194,10 +194,16 @@ static void render_toast(notif_entry_t *n)
     uint32_t fg_primary = g_theme ? g_theme->fg_primary : 0xFFECEFF4;
     uint32_t fg_muted = g_theme ? g_theme->fg_muted : 0xFF888888;
 
+    float fsize = app_default_font_size();
+    float body_size = (fsize > 11.0f) ? (fsize - 1.0f) : fsize;
+
     app_fill_rect(surf, 0, 0, TOAST_WIDTH, n->height, bg_col);
     app_draw_rect(surf, 0, 0, TOAST_WIDTH, n->height, border_col);
 
-    app_draw_text(surf, TOAST_WIDTH - 18, 8, "x", fg_muted);
+    int32_t xw = 0, xh = 0;
+    app_measure_text_ex("x", fsize, APP_FONT_MEDIUM, &xw, &xh);
+    app_draw_text_ex(surf, TOAST_WIDTH - 14 - xw / 2, 12 - xh / 2, "x",
+                     fsize, APP_FONT_MEDIUM, fg_muted);
 
     uint32_t icon_bg = g_theme ? g_theme->accent : 0xFF3B82F6;
     const char *symbol = "i";
@@ -214,33 +220,68 @@ static void render_toast(notif_entry_t *n)
     }
 
     app_fill_rect(surf, 12, 14, 24, 24, icon_bg);
-    app_draw_text(surf, 20, 22, symbol, 0xFFFFFFFF);
+    int32_t sw = 0, sh = 0;
+    app_measure_text_ex(symbol, fsize, APP_FONT_BOLD, &sw, &sh);
+    app_draw_text_ex(surf, 12 + (24 - sw) / 2, 14 + (24 - sh) / 2, symbol,
+                     fsize, APP_FONT_BOLD, 0xFFFFFFFF);
 
-    app_draw_text(surf, 44, 14, n->title, fg_primary);
+    int32_t text_x = 44;
+    int32_t max_title_w = TOAST_WIDTH - text_x - 24;
+    int32_t max_body_w = TOAST_WIDTH - text_x - 12;
+    int32_t title_h = 0;
+    app_measure_text_ex("Ag", fsize, APP_FONT_BOLD, NULL, &title_h);
+    if (title_h <= 0)
+        title_h = (int32_t)fsize;
+
+    vanilla_rect_t title_clip = { text_x, 8, max_title_w, title_h + 6 };
+    app_draw_text_clipped(surf, &title_clip, text_x, 11, n->title,
+                          fsize, APP_FONT_BOLD, fg_primary);
 
     if (n->body[0] != '\0') {
-        size_t blen = strlen(n->body);
-        if (blen <= 32) {
-            app_draw_text(surf, 44, 34, n->body, fg_muted);
-        } else {
-            char line1[33];
-            size_t split = 32;
-            while (split > 20 && n->body[split] != ' ')
-                split--;
-            if (split <= 20)
-                split = 32;
-            memcpy(line1, n->body, split);
-            line1[split] = '\0';
-            app_draw_text(surf, 44, 32, line1, fg_muted);
+        int32_t bw = 0, bh = 0;
+        app_measure_text_ex(n->body, body_size, APP_FONT_REGULAR, &bw, &bh);
+        if (bh <= 0)
+            bh = (int32_t)body_size;
 
-            const char *rem = n->body + split;
+        if (bw <= max_body_w) {
+            vanilla_rect_t body_clip = { text_x, 30, max_body_w, bh + 4 };
+            app_draw_text_clipped(surf, &body_clip, text_x, 32, n->body,
+                                  body_size, APP_FONT_REGULAR, fg_muted);
+        } else {
+            size_t blen = strlen(n->body);
+            size_t fit = blen;
+            size_t last_space = 0;
+            for (size_t i = 1; i <= blen; i++) {
+                if ((n->body[i] & 0xC0) == 0x80)
+                    continue;
+                int32_t pw = 0;
+                app_measure_text_n(n->body, i, body_size, APP_FONT_REGULAR, &pw, NULL);
+                if (pw > max_body_w) {
+                    fit = i - 1;
+                    while (fit > 0 && (n->body[fit] & 0xC0) == 0x80)
+                        fit--;
+                    break;
+                }
+                if (n->body[i - 1] == ' ')
+                    last_space = i - 1;
+            }
+            if (fit == 0)
+                fit = 1;
+            if (last_space > 0 && last_space >= fit / 2)
+                fit = last_space;
+
+            vanilla_rect_t l1_clip = { text_x, 28, max_body_w, bh + 4 };
+            app_draw_text_clipped_n(surf, &l1_clip, text_x, 30, n->body, fit,
+                                    body_size, APP_FONT_REGULAR, fg_muted);
+
+            const char *rem = n->body + fit;
             while (*rem == ' ')
                 rem++;
             if (*rem != '\0') {
-                char line2[33];
-                strncpy(line2, rem, 32);
-                line2[32] = '\0';
-                app_draw_text(surf, 44, 46, line2, fg_muted);
+                int32_t l2_y = 30 + bh + 2;
+                vanilla_rect_t l2_clip = { text_x, l2_y - 2, max_body_w, bh + 4 };
+                app_draw_text_clipped(surf, &l2_clip, text_x, l2_y, rem,
+                                      body_size, APP_FONT_REGULAR, fg_muted);
             }
         }
     }

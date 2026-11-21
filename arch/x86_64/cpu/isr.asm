@@ -194,16 +194,18 @@ isr_x64_128:
     swapgs
 .from_kernel:
     PUSH_GPRS
-    push qword [rsp + 64]
-    mov r9,  [rsp + 56 + 8]
-    mov r8,  [rsp + 72 + 8]
-    mov rcx, [rsp + 24 + 8]
-    mov rdx, [rsp + 32 + 8]
-    mov rsi, [rsp + 40 + 8]
-    mov rdi, [rsp + 0 + 8]
+    ; Maintain 16-byte stack alignment across the 7th C argument push before call.
+    sub rsp, 8
+    push qword [rsp + 72]
+    mov r9,  [rsp + 56 + 16]
+    mov r8,  [rsp + 72 + 16]
+    mov rcx, [rsp + 24 + 16]
+    mov rdx, [rsp + 32 + 16]
+    mov rsi, [rsp + 40 + 16]
+    mov rdi, [rsp + 0 + 16]
     cld
     call syscall_dispatch
-    add rsp, 8
+    add rsp, 16
     mov [rsp + 0], rax
     POP_GPRS
     test qword [rsp + 8], 3

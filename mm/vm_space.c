@@ -117,54 +117,139 @@ int vm_space_contains_user_range(const vm_space_t *space, uintptr_t base, size_t
             ((uint64_t)base + (uint64_t)size - 1ULL) <= (uint64_t)space->user_max) ? 1 : 0;
 }
 
-uintptr_t vm_space_reserve_shm_range(vm_space_t *space, size_t page_count)
+#define VM_SPACE_ANON_RECLAIM_THRESHOLD 0x10000000ULL
+
+static int va_page_is_mapped(uint64_t pml4_phys, uintptr_t va)
+{
+    uint64_t phys = 0;
+    uint64_t flags = 0;
+
+    if (!pml4_phys)
+        return 0;
+    if (vmm_query_page(pml4_phys, va, &phys, &flags) == 0 &&
+        (flags & VMM_X64_PTE_PRESENT) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static uintptr_t scan_free_va_run(uint64_t pml4_phys,
+                                  uintptr_t scan_start,
+                                  uintptr_t scan_limit,
+                                  size_t page_count)
+{
+    uint64_t span = (uint64_t)page_count * (uint64_t)PAGE_SIZE;
+    uintptr_t candidate = scan_start;
+
+    while (candidate <= scan_limit &&
+           (uint64_t)(scan_limit - candidate) >= span) {
+        size_t run = 0;
+        while (run < page_count) {
+            uintptr_t probe = candidate + (uintptr_t)(run * (size_t)PAGE_SIZE);
+            if (va_page_is_mapped(pml4_phys, probe)) {
+                candidate = probe + (uintptr_t)PAGE_SIZE;
+                break;
+            }
+            run++;
+        }
+        if (run == page_count)
+            return candidate;
+    }
+
+    return 0;
+}
+
+static uintptr_t vm_space_reserve_region(vm_space_t *space,
+                                         uintptr_t *cursor_io,
+                                         uintptr_t region_base,
+                                         uintptr_t region_limit,
+                                         size_t page_count,
+                                         int prefer_reclaim)
 {
     uint64_t span;
-    uintptr_t base;
+    uint64_t region_span;
+    uintptr_t start;
+    uintptr_t found;
     uintptr_t next;
 
-    if (!space || page_count == 0)
+    if (!space || !cursor_io || page_count == 0)
+        return 0;
+    if (region_limit <= region_base)
+        return 0;
+    if (page_count > ((size_t)-1 / (size_t)PAGE_SIZE))
         return 0;
 
     span = (uint64_t)page_count * (uint64_t)PAGE_SIZE;
-    if (span == 0 || span > (uint64_t)SIZE_MAX)
+    region_span = (uint64_t)region_limit - (uint64_t)region_base;
+    if (span == 0 || span > region_span)
         return 0;
 
-    base = align_up_page(space->shm_cursor);
-    next = (uintptr_t)((uint64_t)base + span);
-    if (next < base)
+    start = (*cursor_io < region_base || *cursor_io >= region_limit)
+                ? region_base
+                : align_up_page(*cursor_io);
+    if (start < region_base || start >= region_limit)
+        start = region_base;
+
+    /* Reclaim from base when sparse churn drifts far ahead of mapped pages. */
+    if (prefer_reclaim && start > region_base) {
+        found = scan_free_va_run(space->pml4_phys, region_base, region_limit, page_count);
+        if (!found)
+            return 0;
+        next = (uintptr_t)((uint64_t)found + span);
+        *cursor_io = (next >= region_limit || next < found) ? region_base : next;
+        return found;
+    }
+
+    found = scan_free_va_run(space->pml4_phys, start, region_limit, page_count);
+    if (!found && start > region_base) {
+        uint64_t tail = (uint64_t)start + span - (uint64_t)PAGE_SIZE;
+        uintptr_t wrap_limit = (tail < (uint64_t)region_limit && tail >= (uint64_t)start)
+                                   ? (uintptr_t)tail
+                                   : region_limit;
+        found = scan_free_va_run(space->pml4_phys, region_base, wrap_limit, page_count);
+    }
+
+    if (!found)
         return 0;
 
-    if (base < (uintptr_t)VM_SPACE_SHM_BASE || next > (uintptr_t)VM_SPACE_SHM_LIMIT)
+    next = (uintptr_t)((uint64_t)found + span);
+    *cursor_io = (next >= region_limit || next < found) ? region_base : next;
+    return found;
+}
+
+uintptr_t vm_space_reserve_shm_range(vm_space_t *space, size_t page_count)
+{
+    if (!space)
         return 0;
 
-    space->shm_cursor = next;
-    return base;
+    return vm_space_reserve_region(space,
+                                   &space->shm_cursor,
+                                   (uintptr_t)VM_SPACE_SHM_BASE,
+                                   (uintptr_t)VM_SPACE_SHM_LIMIT,
+                                   page_count,
+                                   0);
 }
 
 uintptr_t vm_space_reserve_anon_range(vm_space_t *space, size_t page_count)
 {
-    uint64_t span;
-    uintptr_t base;
-    uintptr_t next;
+    int reclaim = 0;
 
-    if (!space || page_count == 0)
+    if (!space)
         return 0;
 
-    span = (uint64_t)page_count * (uint64_t)PAGE_SIZE;
-    if (span == 0 || span > (uint64_t)SIZE_MAX)
-        return 0;
+    if (space->anon_cursor > (uintptr_t)VM_SPACE_ANON_BASE) {
+        uint64_t drift = (uint64_t)space->anon_cursor - (uint64_t)VM_SPACE_ANON_BASE;
+        uint64_t live_bytes = (uint64_t)space->mapped_pages * (uint64_t)PAGE_SIZE;
+        if (drift >= VM_SPACE_ANON_RECLAIM_THRESHOLD && drift > live_bytes * 2ULL)
+            reclaim = 1;
+    }
 
-    base = align_up_page(space->anon_cursor);
-    next = (uintptr_t)((uint64_t)base + span);
-    if (next < base)
-        return 0;
-
-    if (base < (uintptr_t)VM_SPACE_ANON_BASE || next > (uintptr_t)VM_SPACE_ANON_LIMIT)
-        return 0;
-
-    space->anon_cursor = next;
-    return base;
+    return vm_space_reserve_region(space,
+                                   &space->anon_cursor,
+                                   (uintptr_t)VM_SPACE_ANON_BASE,
+                                   (uintptr_t)VM_SPACE_ANON_LIMIT,
+                                   page_count,
+                                   reclaim);
 }
 
 int vm_space_map_user_pages(vm_space_t *space,

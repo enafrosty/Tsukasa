@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "../include/vfs_abi.h"
+#include "../sys/wait_queue.h"
 
 /* Standard input devices */
 #define INPUT_DEV_KEYBOARD 0
@@ -42,6 +43,13 @@ size_t input_dev_read_events(void *buf, size_t count, int flags);
 
 /* Poll readiness for /dev/input/events. */
 int input_dev_poll_events(int events);
+
+/* Wait queue for blocking/poll readers on /dev/input/events. */
+wait_queue_head_t *input_dev_get_events_waitq(void);
+
+/* Non-blocking TTY character ring helpers for /dev/tty*. */
+size_t input_dev_tty_read(void *buf, size_t count);
+int input_dev_tty_poll_readable(void);
 
 /* Backward compatibility helpers for /dev/keyboard and /dev/mouse. */
 size_t input_dev_read(int dev, void *buf, size_t count);

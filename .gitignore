@@ -51,3 +51,16 @@ sdk/
 
 # Generated kernel symbols table
 lib/ksymbols_table.c
+
+# Uppercase guest ELF binaries (case-sensitive filesystems)
+*.ELF
+
+# Generated initrd assets copied from vanilla/ during build
+initrd_files/TSUKASA.VCO
+initrd_files/ICONS/TSUKASA.VCO
+initrd_files/WALLPAP.BMP
+initrd_files/WALLPAP.PNG
+
+# Host emulator and QMP visual test outputs
+vanilla/host_emulator/bin/
+tmp-visual-test/

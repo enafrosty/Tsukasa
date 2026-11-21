@@ -29,6 +29,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <math.h>
 
 #ifndef FBIOPUT_VSCREENINFO
 #define FBIOPUT_VSCREENINFO 0x4601
@@ -43,6 +44,7 @@ __attribute__((weak)) uint64_t pit_ticks(void)
 }
 #else
 #include <time.h>
+#include <math.h>
 __attribute__((weak)) uint64_t pit_ticks(void)
 {
     struct timespec ts;
@@ -175,6 +177,260 @@ void compositor_frame_rendered(vanilla_compositor_t *comp)
         comp->last_frame_ticks = 1;
 }
 
+static float aa_minf(float a, float b)
+{
+    return (a < b) ? a : b;
+}
+
+static float aa_clampf(float v, float lo, float hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static float aa_dist_point_to_segment(float px, float py,
+                                      float ax, float ay,
+                                      float bx, float by)
+{
+    float abx = bx - ax;
+    float aby = by - ay;
+    float apx = px - ax;
+    float apy = py - ay;
+    float denom = abx * abx + aby * aby;
+    float t = 0.0f;
+    if (denom > 1e-6f)
+        t = aa_clampf((apx * abx + apy * aby) / denom, 0.0f, 1.0f);
+    float dx = apx - t * abx;
+    float dy = apy - t * aby;
+    return sqrtf(dx * dx + dy * dy);
+}
+
+static void aa_blend_pixel_cov(uint32_t *dst_px, uint32_t fg_argb, float cov)
+{
+    if (!dst_px || cov <= 0.0f)
+        return;
+
+    uint32_t fg_a = (fg_argb >> 24) & 0xFFu;
+    float eff = aa_clampf(cov * ((float)fg_a / 255.0f), 0.0f, 1.0f);
+    if (eff <= 0.0f)
+        return;
+
+    if (eff >= 0.996f) {
+        *dst_px = 0xFF000000u | (fg_argb & 0x00FFFFFFu);
+        return;
+    }
+
+    uint32_t dst = *dst_px;
+    uint32_t dr = (dst >> 16) & 0xFFu;
+    uint32_t dg = (dst >> 8) & 0xFFu;
+    uint32_t db = dst & 0xFFu;
+    uint32_t sr = (fg_argb >> 16) & 0xFFu;
+    uint32_t sg = (fg_argb >> 8) & 0xFFu;
+    uint32_t sb = fg_argb & 0xFFu;
+
+    uint32_t out_r = (uint32_t)((float)dr + ((float)sr - (float)dr) * eff + 0.5f);
+    uint32_t out_g = (uint32_t)((float)dg + ((float)sg - (float)dg) * eff + 0.5f);
+    uint32_t out_b = (uint32_t)((float)db + ((float)sb - (float)db) * eff + 0.5f);
+    if (out_r > 255u) out_r = 255u;
+    if (out_g > 255u) out_g = 255u;
+    if (out_b > 255u) out_b = 255u;
+
+    *dst_px = 0xFF000000u | (out_r << 16) | (out_g << 8) | out_b;
+}
+
+static uint32_t aa_lerp_argb(uint32_t c0, uint32_t c1, float t)
+{
+    t = aa_clampf(t, 0.0f, 1.0f);
+    uint32_t a0 = (c0 >> 24) & 0xFFu, a1 = (c1 >> 24) & 0xFFu;
+    uint32_t r0 = (c0 >> 16) & 0xFFu, r1 = (c1 >> 16) & 0xFFu;
+    uint32_t g0 = (c0 >> 8) & 0xFFu,  g1 = (c1 >> 8) & 0xFFu;
+    uint32_t b0 = c0 & 0xFFu,         b1 = c1 & 0xFFu;
+    uint32_t a = (uint32_t)((float)a0 + ((float)a1 - (float)a0) * t + 0.5f);
+    uint32_t r = (uint32_t)((float)r0 + ((float)r1 - (float)r0) * t + 0.5f);
+    uint32_t g = (uint32_t)((float)g0 + ((float)g1 - (float)g0) * t + 0.5f);
+    uint32_t b = (uint32_t)((float)b0 + ((float)b1 - (float)b0) * t + 0.5f);
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+static void aa_draw_chrome_button(vanilla_compositor_t *comp,
+                                  const vanilla_rect_t *btn,
+                                  const vanilla_rect_t *dirty,
+                                  vanilla_chrome_btn_kind_t btn_kind,
+                                  int is_hovered,
+                                  float win_alpha)
+{
+    vanilla_rect_t vis_btn;
+    if (!vanilla_rect_intersect(btn, dirty, &vis_btn))
+        return;
+
+    uint32_t base_bg;
+    if (btn_kind == CHROME_BTN_CLOSE) {
+        if (is_hovered) {
+            base_bg = aa_lerp_argb(g_theme->danger, g_theme->titlebar_btn_icon, 0.22f);
+        } else {
+            base_bg = g_theme->danger;
+        }
+    } else {
+        base_bg = is_hovered ? g_theme->titlebar_btn_bg_hover : g_theme->titlebar_btn_bg;
+    }
+
+    uint32_t icon_col = g_theme->titlebar_btn_icon;
+    if (win_alpha < 1.0f) {
+        uint32_t ba = (uint32_t)(((base_bg >> 24) & 0xFFu) * win_alpha);
+        uint32_t ia = (uint32_t)(((icon_col >> 24) & 0xFFu) * win_alpha);
+        base_bg = (ba << 24) | (base_bg & 0x00FFFFFFu);
+        icon_col = (ia << 24) | (icon_col & 0x00FFFFFFu);
+    }
+
+    int32_t btn_radius = THEME_PX(3);
+    int32_t max_r = (btn->w < btn->h ? btn->w : btn->h) / 2;
+    if (btn_radius > max_r)
+        btn_radius = max_r;
+    if (btn_radius < 1)
+        btn_radius = 1;
+
+    blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
+                             btn->x, btn->y, btn->w, btn->h,
+                             btn_radius, base_bg, BLT_CORNER_ALL, dirty);
+
+    float s = (float)btn->w / 12.0f;
+    float cx = (float)btn->w * 0.5f;
+    float cy = (float)btn->h * 0.5f;
+
+    float half_w = (btn_kind == CHROME_BTN_CLOSE) ? (0.65f * s) : (0.55f * s);
+    float ext_x = 2.6f * s;
+    float ext_box = 2.5f * s;
+
+    for (int32_t py = vis_btn.y; py < vis_btn.y + vis_btn.h; py++) {
+        float fy = (float)(py - btn->y) + 0.5f;
+        uint32_t *row = &comp->backbuffer[(size_t)py * comp->pitch_px];
+        for (int32_t px = vis_btn.x; px < vis_btn.x + vis_btn.w; px++) {
+            float fx = (float)(px - btn->x) + 0.5f;
+            float d = 1e6f;
+
+            if (btn_kind == CHROME_BTN_CLOSE) {
+                float d1 = aa_dist_point_to_segment(fx, fy, cx - ext_x, cy - ext_x, cx + ext_x, cy + ext_x);
+                float d2 = aa_dist_point_to_segment(fx, fy, cx + ext_x, cy - ext_x, cx - ext_x, cy + ext_x);
+                d = aa_minf(d1, d2);
+            } else if (btn_kind == CHROME_BTN_MAX) {
+                float x0 = cx - ext_box;
+                float x1 = cx + ext_box;
+                float y0 = cy - ext_box;
+                float y1 = cy + ext_box;
+                float dt = aa_dist_point_to_segment(fx, fy, x0, y0, x1, y0);
+                float db = aa_dist_point_to_segment(fx, fy, x0, y1, x1, y1);
+                float dl = aa_dist_point_to_segment(fx, fy, x0, y0, x0, y1);
+                float dr = aa_dist_point_to_segment(fx, fy, x1, y0, x1, y1);
+                d = aa_minf(aa_minf(dt, db), aa_minf(dl, dr));
+            } else if (btn_kind == CHROME_BTN_MIN) {
+                float x0 = cx - ext_box;
+                float x1 = cx + ext_box;
+                float y_bar = cy + ext_box;
+                d = aa_dist_point_to_segment(fx, fy, x0, y_bar, x1, y_bar);
+            }
+
+            float cov = aa_clampf(half_w + 0.5f - d, 0.0f, 1.0f);
+            if (cov > 0.0f)
+                aa_blend_pixel_cov(&row[px], icon_col, cov);
+        }
+    }
+}
+
+static int generate_nordic_wallpaper(vanilla_image_t *img, int32_t target_w, int32_t target_h)
+{
+    if (!img)
+        return -1;
+
+    int32_t w = target_w > 0 ? target_w : 640;
+    int32_t h = target_h > 0 ? target_h : 400;
+    if (w > 1280) w = 1280;
+    if (h > 800) h = 800;
+
+    uint32_t *pixels = (uint32_t *)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
+    if (!pixels)
+        return -1;
+
+    for (int32_t y = 0; y < h; y++) {
+        float v = (h > 1) ? ((float)y / (float)(h - 1)) : 0.0f;
+        uint32_t sky = (v < 0.55f)
+                       ? aa_lerp_argb(0xFF121620u, 0xFF1E2430u, v / 0.55f)
+                       : aa_lerp_argb(0xFF1E2430u, 0xFF2A3242u, (v - 0.55f) / 0.45f);
+        for (int32_t x = 0; x < w; x++) {
+            float u = (w > 1) ? ((float)x / (float)(w - 1)) : 0.0f;
+
+            float ax = (u - 0.62f) * 1.5f;
+            float ay = (v - 0.30f) * 2.4f;
+            float glow = 1.0f / (1.0f + (ax * ax + ay * ay) * 3.0f);
+            uint32_t col = aa_lerp_argb(sky, 0xFF569AAEu, glow * 0.42f);
+
+            float bx = (u - 0.28f) * 1.8f;
+            float by = (v - 0.44f) * 2.6f;
+            float glow2 = 1.0f / (1.0f + (bx * bx + by * by) * 3.2f);
+            col = aa_lerp_argb(col, 0xFF447E88u, glow2 * 0.30f);
+
+            float ridge_y = 0.78f + 0.04f * (u - 0.5f) * (u - 0.5f);
+            if (v >= ridge_y)
+                col = aa_lerp_argb(col, 0xFF171B26u, aa_clampf((v - ridge_y) * 24.0f, 0.0f, 1.0f));
+
+            pixels[(size_t)y * (size_t)w + (size_t)x] = col;
+        }
+    }
+
+    img->pixels = pixels;
+    img->width = w;
+    img->height = h;
+    img->channels = 4;
+    return 0;
+}
+
+int compositor_load_default_wallpaper(vanilla_compositor_t *comp)
+{
+    if (!comp)
+        return -1;
+
+    if (comp->has_wallpaper) {
+        image_destroy(&comp->wallpaper);
+        comp->has_wallpaper = 0;
+    }
+
+    static const char *const wallpaper_paths[] = {
+        "/fat12/WALLPAP.PNG",
+        "/fat12/wallpap.png",
+        "/WALLPAP.PNG",
+        "/assets/wallpaper.png",
+        "assets/wallpaper.png",
+        "vanilla/assets/wallpaper.png",
+        "../assets/wallpaper.png",
+        "../../assets/wallpaper.png",
+        "/fat12/WALLPAP.BMP",
+        "/fat12/wallpap.bmp",
+        "/WALLPAP.BMP",
+        "/assets/wallpaper.bmp",
+        "assets/wallpaper.bmp",
+        "vanilla/assets/wallpaper.bmp",
+        "../assets/wallpaper.bmp",
+        "../../assets/wallpaper.bmp"
+    };
+
+    size_t num_paths = sizeof(wallpaper_paths) / sizeof(wallpaper_paths[0]);
+    for (size_t i = 0; i < num_paths; i++) {
+        if (image_load_file(&comp->wallpaper, wallpaper_paths[i]) == 0) {
+            comp->has_wallpaper = 1;
+            compositor_damage_all(comp);
+            return 0;
+        }
+    }
+
+    if (generate_nordic_wallpaper(&comp->wallpaper, (int32_t)comp->width, (int32_t)comp->height) == 0) {
+        comp->has_wallpaper = 1;
+        compositor_damage_all(comp);
+        return 0;
+    }
+
+    return -1;
+}
+
 int compositor_init_offscreen(vanilla_compositor_t *comp, uint32_t width, uint32_t height)
 {
     if (!comp || width == 0 || height == 0)
@@ -233,21 +489,15 @@ int compositor_init(vanilla_compositor_t *comp, const char *fb_dev)
     comp->last_frame_ticks = 0;
     comp->panning_enabled = 0;
 
-    if (image_load_file(&comp->wallpaper, "/assets/wallpaper.bmp") == 0 ||
-        image_load_file(&comp->wallpaper, "assets/wallpaper.bmp") == 0) {
-        comp->has_wallpaper = 1;
-    }
-
     const char *dev_path = fb_dev ? fb_dev : "/dev/fb0";
     int fd = open(dev_path, O_RDWR, 0);
     if (fd < 0) {
         printf("[vanilla] Warning: Failed to open %s (errno=%d), falling back to offscreen\n", dev_path, errno);
-        if (comp->has_wallpaper) {
-            image_destroy(&comp->wallpaper);
-            comp->has_wallpaper = 0;
-        }
         font_destroy(&comp->font);
-        return compositor_init_offscreen(comp, 1024, 768);
+        int rc = compositor_init_offscreen(comp, 1024, 768);
+        if (rc == 0)
+            compositor_load_default_wallpaper(comp);
+        return rc;
     }
 
     ioctl(fd, KDSETMODE, (void *)KD_GRAPHICS);
@@ -258,23 +508,21 @@ int compositor_init(vanilla_compositor_t *comp, const char *fb_dev)
         ioctl(fd, FBIOGET_FSCREENINFO, &finfo) < 0) {
         printf("[vanilla] Warning: Failed to query fb info, falling back to offscreen\n");
         close(fd);
-        if (comp->has_wallpaper) {
-            image_destroy(&comp->wallpaper);
-            comp->has_wallpaper = 0;
-        }
         font_destroy(&comp->font);
-        return compositor_init_offscreen(comp, 1024, 768);
+        int rc = compositor_init_offscreen(comp, 1024, 768);
+        if (rc == 0)
+            compositor_load_default_wallpaper(comp);
+        return rc;
     }
 
     if (vinfo.bits_per_pixel != 32) {
         printf("[vanilla] Error: Unsupported bpp %u (must be 32 bpp), falling back to offscreen\n", vinfo.bits_per_pixel);
         close(fd);
-        if (comp->has_wallpaper) {
-            image_destroy(&comp->wallpaper);
-            comp->has_wallpaper = 0;
-        }
         font_destroy(&comp->font);
-        return compositor_init_offscreen(comp, 1024, 768);
+        int rc = compositor_init_offscreen(comp, 1024, 768);
+        if (rc == 0)
+            compositor_load_default_wallpaper(comp);
+        return rc;
     }
 
     comp->width = vinfo.xres;
@@ -291,12 +539,11 @@ int compositor_init(vanilla_compositor_t *comp, const char *fb_dev)
         comp->fb_mem = NULL;
         close(fd);
         comp->fb_fd = -1;
-        if (comp->has_wallpaper) {
-            image_destroy(&comp->wallpaper);
-            comp->has_wallpaper = 0;
-        }
         font_destroy(&comp->font);
-        return compositor_init_offscreen(comp, comp->width, comp->height);
+        int rc = compositor_init_offscreen(comp, comp->width, comp->height);
+        if (rc == 0)
+            compositor_load_default_wallpaper(comp);
+        return rc;
     }
 
     printf("[vanilla] Framebuffer mapped: %ux%u @ %u bpp, pitch=%u px, size=%u bytes\n",
@@ -320,13 +567,10 @@ int compositor_init(vanilla_compositor_t *comp, const char *fb_dev)
         close(comp->fb_fd);
         comp->fb_fd = -1;
         font_destroy(&comp->font);
-        if (comp->has_wallpaper) {
-            image_destroy(&comp->wallpaper);
-            comp->has_wallpaper = 0;
-        }
         return -1;
     }
 
+    compositor_load_default_wallpaper(comp);
     compositor_damage_all(comp);
     return 0;
 }
@@ -406,6 +650,11 @@ void compositor_add_damage(vanilla_compositor_t *comp, const vanilla_rect_t *rec
     }
 
     comp->dirty_rects[comp->dirty_count++] = clipped;
+}
+
+void compositor_invalidate_rect(vanilla_compositor_t *comp, const vanilla_rect_t *rect)
+{
+    compositor_add_damage(comp, rect);
 }
 
 void compositor_merge_damage(vanilla_compositor_t *comp)
@@ -874,68 +1123,27 @@ void compositor_render_frame(struct vanilla_server *srv)
                                              g_theme->radius_sm, tb_color,
                                              BLT_CORNER_TOP, dirty);
 
-                    /* Titlebar buttons */
+                    /* Anti-aliased titlebar buttons */
                     chrome_btn_rects_t btns = chrome_metrics(&frame_rect);
-
-                    vanilla_rect_t vis_btn;
-                    int32_t btn_glyph_pad = THEME_PX(2);
-                    int32_t btn_glyph_end = btns.close_btn.w - 1 - btn_glyph_pad;
-
-                    if (vanilla_rect_intersect(&btns.close_btn, dirty, &vis_btn)) {
-                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, g_theme->danger);
-                        for (int k = btn_glyph_pad; k <= btn_glyph_end; k++) {
-                            int32_t px1 = btns.close_btn.x + k;
-                            int32_t py1 = btns.close_btn.y + k;
-                            int32_t px2 = btns.close_btn.x + (btns.close_btn.w - 1 - k);
-                            int32_t py2 = btns.close_btn.y + k;
-                            if (px1 >= dirty->x && px1 < dirty->x + dirty->w &&
-                                py1 >= dirty->y && py1 < dirty->y + dirty->h)
-                                comp->backbuffer[py1 * comp->pitch_px + px1] = g_theme->titlebar_btn_icon;
-                            if (px2 >= dirty->x && px2 < dirty->x + dirty->w &&
-                                py2 >= dirty->y && py2 < dirty->y + dirty->h)
-                                comp->backbuffer[py2 * comp->pitch_px + px2] = g_theme->titlebar_btn_icon;
-                        }
+                    float btn_alpha = 1.0f;
+                    if (win->anim_state != ANIM_IDLE && win->anim_state != ANIM_FOCUS &&
+                        g_theme->reduce_motion == 0 && win->anim_current_alpha < 1.0f) {
+                        btn_alpha = win->anim_current_alpha;
                     }
 
-                    /* Maximize button [] */
-                    if (vanilla_rect_intersect(&btns.max_btn, dirty, &vis_btn)) {
-                        uint32_t btn_bg = g_theme->titlebar_btn_bg;
-                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, btn_bg);
-                        int32_t top_y = btns.max_btn.y + btn_glyph_pad;
-                        int32_t bot_y = btns.max_btn.y + btn_glyph_end;
-                        int32_t left_x = btns.max_btn.x + btn_glyph_pad;
-                        int32_t right_x = btns.max_btn.x + btn_glyph_end;
-                        for (int k = btn_glyph_pad; k <= btn_glyph_end; k++) {
-                            int32_t px = btns.max_btn.x + k;
-                            if (px >= dirty->x && px < dirty->x + dirty->w) {
-                                if (top_y >= dirty->y && top_y < dirty->y + dirty->h)
-                                    comp->backbuffer[top_y * comp->pitch_px + px] = g_theme->titlebar_btn_icon;
-                                if (bot_y >= dirty->y && bot_y < dirty->y + dirty->h)
-                                    comp->backbuffer[bot_y * comp->pitch_px + px] = g_theme->titlebar_btn_icon;
-                            }
-                            int32_t py = btns.max_btn.y + k;
-                            if (py >= dirty->y && py < dirty->y + dirty->h) {
-                                if (left_x >= dirty->x && left_x < dirty->x + dirty->w)
-                                    comp->backbuffer[py * comp->pitch_px + left_x] = g_theme->titlebar_btn_icon;
-                                if (right_x >= dirty->x && right_x < dirty->x + dirty->w)
-                                    comp->backbuffer[py * comp->pitch_px + right_x] = g_theme->titlebar_btn_icon;
-                            }
-                        }
-                    }
+                    int close_hovered = (srv->hovered_btn_win_id == win->window_id &&
+                                         srv->hovered_btn_kind == CHROME_BTN_CLOSE);
+                    int max_hovered = (srv->hovered_btn_win_id == win->window_id &&
+                                       srv->hovered_btn_kind == CHROME_BTN_MAX);
+                    int min_hovered = (srv->hovered_btn_win_id == win->window_id &&
+                                       srv->hovered_btn_kind == CHROME_BTN_MIN);
 
-                    /* Minimize button [_] */
-                    if (vanilla_rect_intersect(&btns.min_btn, dirty, &vis_btn)) {
-                        uint32_t btn_bg = g_theme->titlebar_btn_bg;
-                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_btn, btn_bg);
-                        int32_t py = btns.min_btn.y + btn_glyph_end;
-                        if (py >= dirty->y && py < dirty->y + dirty->h) {
-                            for (int k = btn_glyph_pad; k <= btn_glyph_end; k++) {
-                                int32_t px = btns.min_btn.x + k;
-                                if (px >= dirty->x && px < dirty->x + dirty->w)
-                                    comp->backbuffer[py * comp->pitch_px + px] = g_theme->titlebar_btn_icon;
-                            }
-                        }
-                    }
+                    aa_draw_chrome_button(comp, &btns.close_btn, dirty,
+                                          CHROME_BTN_CLOSE, close_hovered, btn_alpha);
+                    aa_draw_chrome_button(comp, &btns.max_btn, dirty,
+                                          CHROME_BTN_MAX, max_hovered, btn_alpha);
+                    aa_draw_chrome_button(comp, &btns.min_btn, dirty,
+                                          CHROME_BTN_MIN, min_hovered, btn_alpha);
 
                     /* Vector text title rendering */
                     if (win->title[0] != '\0' && comp->font.info) {
@@ -1008,8 +1216,9 @@ void compositor_render_frame(struct vanilla_server *srv)
 
                     vanilla_rect_t vis_client;
                     if (vanilla_rect_intersect(&client_rect, dirty, &vis_client)) {
-                        /* Fill client background for areas where surface is smaller than window container */
-                        blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_client, g_theme->bg_base);
+                        /* Fill client background for opaque surfaces or undersized buffers */
+                        if (!(win->flags & WINDOW_FLAG_TRANSPARENT))
+                            blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_client, g_theme->bg_base);
 
                         /* Intersect visible client rectangle with actual allocated surface bounds */
                         int32_t surf_w = (int32_t)win->surface.width;
@@ -1273,9 +1482,16 @@ void compositor_paint_context_menus(vanilla_server_t *srv, const vanilla_rect_t 
 
         float alpha = m->anim_alpha;
         uint8_t sh_alpha = (uint8_t)((float)g_theme->shadow_alpha * alpha);
-        uint32_t bg_col = color_modulate_alpha(g_theme->bg_elevated, alpha);
-        uint32_t border_col = color_modulate_alpha(g_theme->border, alpha);
+        uint32_t raw_bg = g_theme->menu_bg ? g_theme->menu_bg : g_theme->bg_elevated;
+        uint32_t raw_border = g_theme->menu_border ? g_theme->menu_border : g_theme->border;
+        uint32_t raw_divider = g_theme->menu_divider ? g_theme->menu_divider : raw_border;
+        uint32_t bg_col = color_modulate_alpha(raw_bg, alpha);
+        uint32_t border_col = color_modulate_alpha(raw_border, alpha);
+        uint32_t divider_col = color_modulate_alpha(raw_divider, alpha);
         uint32_t accent_col = color_modulate_alpha(g_theme->accent, alpha);
+        int32_t menu_radius = g_theme->radius_menu;
+        if (menu_radius < 0)
+            menu_radius = 0;
 
         vanilla_rect_t vis_menu;
         if (!vanilla_rect_intersect(&menu_rect, dirty, &vis_menu))
@@ -1289,11 +1505,11 @@ void compositor_paint_context_menus(vanilla_server_t *srv, const vanilla_rect_t 
                                    g_theme->shadow_radius, sh_alpha);
         }
 
-        /* Elevated background panel */
+        /* Sharp menu background panel */
         blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
                                  menu_rect.x, menu_rect.y, menu_rect.w, menu_rect.h,
-                                 g_theme->radius_sm, bg_col,
-                                 BLT_CORNER_ALL, dirty);
+                                 menu_radius, bg_col,
+                                 menu_radius > 0 ? BLT_CORNER_ALL : 0, dirty);
 
         /* 1px border */
         int32_t bw = g_theme->border_width;
@@ -1318,19 +1534,22 @@ void compositor_paint_context_menus(vanilla_server_t *srv, const vanilla_rect_t 
                 break;
 
             if (it->flags & MENU_ITEM_SEPARATOR) {
-                vanilla_rect_t sep_line = { menu_rect.x + 8, iy + row_h / 2, menu_rect.w - 16, 1 };
-                blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
-                                         sep_line.x, sep_line.y, sep_line.w, sep_line.h,
-                                         0, border_col, 0, dirty);
+                if (menu_rect.w > 16) {
+                    vanilla_rect_t sep_line = { menu_rect.x + 8, iy + row_h / 2, menu_rect.w - 16, 1 };
+                    blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
+                                             sep_line.x, sep_line.y, sep_line.w, sep_line.h,
+                                             0, divider_col, 0, dirty);
+                }
                 continue;
             }
 
             int is_highlighted = (i == m->highlighted) && (it->flags & MENU_ITEM_ENABLED);
             if (is_highlighted) {
+                int32_t row_radius = menu_radius > 4 ? 4 : menu_radius;
                 blt_rounded_rect_clipped(comp->backbuffer, comp->pitch_px,
                                          row_rect.x, row_rect.y, row_rect.w, row_rect.h,
-                                         g_theme->radius_sm > 4 ? 4 : g_theme->radius_sm,
-                                         accent_col, BLT_CORNER_ALL, dirty);
+                                         row_radius, accent_col,
+                                         row_radius > 0 ? BLT_CORNER_ALL : 0, dirty);
             }
 
             if (comp->font.info) {

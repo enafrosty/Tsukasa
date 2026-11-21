@@ -10,8 +10,7 @@ DISK_IMAGE="disk.img"
 
 if [ ! -f "$ISO_IMAGE" ]; then
     echo "[!] $ISO_IMAGE not found. Building ISO first..."
-    make initrd
-    make ARCH=x86_64 iso
+    make iso-x86_64
 fi
 
 if [ ! -f "$DISK_IMAGE" ]; then

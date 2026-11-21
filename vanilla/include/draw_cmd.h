@@ -46,7 +46,9 @@ typedef struct {
             const char *text;
             uint32_t    color;
             float       font_size;
-            int32_t     font_id;    /* 0 = default server font               */
+            int32_t     font_id;     /* 0 = default server font              */
+            int32_t     font_weight; /* 0 = regular, 1 = medium, 2 = bold    */
+            uint32_t    max_bytes;   /* 0 = full NUL-terminated string       */
         }                                                       text;
         struct {
             vanilla_surface_t *src;
