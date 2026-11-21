@@ -116,6 +116,21 @@ tsukasa/
 
   
 
+### Linux / Fedora
+
+Install the required toolchain, image tools, QEMU, and SDL2 development headers:
+
+```bash
+sudo dnf install -y clang lld llvm nasm xorriso mtools dosfstools qemu-system-x86 qemu-img SDL2-devel gcc make git binutils gdb patch python3
+```
+
+Or run the automated setup script in the repository root:
+
+```bash
+chmod +x setup_fedora.sh
+./setup_fedora.sh
+```
+
 ### Linux / Ubuntu / Debian / WSL2
 
   
