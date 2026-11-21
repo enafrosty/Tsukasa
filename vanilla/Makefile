@@ -249,7 +249,7 @@ build/test_notify: tests/test_notify.c libvanilla/notify.c libvanilla/service.c 
 ifeq ($(OS),Windows_NT)
 	gcc -O2 -Ihost_emulator/sys_compat -Iinclude -Iinput -Iservices -Ilibvanilla -Iserver -Iapps -I../scripts/test -DVANILLA_HOST -DVNOTIF_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lws2_32 -lpthread -lm
 else
-	gcc -O2 -Ihost_emulator/sys_compat -Iinclude -Iinput -Iservices -Ilibvanilla -Iserver -Iapps -I../scripts/test -DVANILLA_HOST -DVNOTIF_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lpthread -lm
+	gcc -O2 -idirafter host_emulator/sys_compat -Iinclude -Iinput -Iservices -Ilibvanilla -Iserver -Iapps -I../scripts/test -DVANILLA_HOST -DVNOTIF_TEST_NO_MAIN -DVREG_TEST_NO_MAIN -o $@ $^ -lpthread -lm
 endif
 
 $(TERMINAL_BIN): $(CRT0) apps/terminal.o apps/terminal_vt.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)

@@ -63,6 +63,8 @@ typedef struct {
 #define O_NONBLOCK 0x4000
 #endif
 int sched_yield(void);
+#elif defined(__linux__)
+#include <sched.h>
 #endif
 
 #ifndef VANILLA_MAX_CLIENTS
