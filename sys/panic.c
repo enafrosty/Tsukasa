@@ -87,6 +87,12 @@ volatile bool g_in_panic = false;
 
 void kernel_panic(interrupt_frame_t *regs, const char *error_name) {
     asm volatile("cli");
+    if (g_in_panic) {
+        kprintf("*** [RECURSIVE KERNEL PANIC] ***\n");
+        while (1) {
+            asm volatile("cli; hlt");
+        }
+    }
     g_in_panic = true;
 
     uint64_t cr0, cr2, cr3, cr4;
@@ -141,7 +147,8 @@ void kernel_panic(interrupt_frame_t *regs, const char *error_name) {
     pline("backtrace:", COL_HIGHLIGHT);
     uint64_t rbp_val = regs ? regs->rbp : (uint64_t)__builtin_frame_address(0);
     uint64_t rip_hint = regs ? regs->rip : (uint64_t)__builtin_return_address(0);
-    k_backtrace_custom(rbp_val, rip_hint, 16, panic_emit_line);
+    int max_frames = (regs && regs->int_no == 8) ? 1 : 16;
+    k_backtrace_custom(rbp_val, rip_hint, max_frames, panic_emit_line);
 
     pline("", COL_WHITE);
     pline("The CPU has been halted. Power off the machine.", COL_WHITE);

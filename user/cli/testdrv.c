@@ -19,6 +19,9 @@
 
 #define TSK_WIFEXITED(status)   (((status) & 0x7f) == 0)
 #define TSK_WEXITSTATUS(status) (((status) >> 8) & 0xff)
+#define TSK_WIFSIGNALED(status) (((status) & 0x7f) != 0 && ((status) & 0x7f) != 0x7f)
+#define TSK_WTERMSIG(status)    ((status) & 0x7f)
+#define TSK_SIGSEGV             11
 #define TSK_EINVAL_RC           (-22)
 
 struct test_spawn_request {
@@ -507,6 +510,38 @@ static void test_tsh_pipeline(void)
     dprintf(1, "[TEST] tsh_pipeline PASS\n");
 }
 
+static void test_ring3_fault_isolation(void)
+{
+    int status = 0;
+    long detail = 0;
+    int rc = spawn_and_wait("/fat12/fault.elf", NULL, &status, &detail);
+    if (rc == -1) {
+        dprintf(1, "[TEST] ring3_fault_isolation FAIL: SYS_spawn failed (rc=%ld)\n", detail);
+        return;
+    }
+    if (rc == -2) {
+        dprintf(1, "[TEST] ring3_fault_isolation FAIL: wait timeout (pid=%ld)\n", detail);
+        return;
+    }
+    if (TSK_WIFEXITED(status) || !TSK_WIFSIGNALED(status) ||
+        TSK_WTERMSIG(status) != TSK_SIGSEGV) {
+        dprintf(1, "[TEST] ring3_fault_isolation FAIL: expected SIGSEGV, status=0x%x sig=%d\n",
+                (unsigned)status, TSK_WTERMSIG(status));
+        return;
+    }
+
+    status = 0;
+    detail = 0;
+    rc = spawn_and_wait("/fat12/exit7.elf", NULL, &status, &detail);
+    if (rc != 0 || !TSK_WIFEXITED(status) || TSK_WEXITSTATUS(status) != 7) {
+        dprintf(1, "[TEST] ring3_fault_isolation FAIL: post-fault spawn rc=%d status=0x%x\n",
+                rc, (unsigned)status);
+        return;
+    }
+
+    dprintf(1, "[TEST] ring3_fault_isolation PASS\n");
+}
+
 static void run_kernel_regression_tests(void)
 {
     test_spawn_argv();
@@ -515,6 +550,7 @@ static void run_kernel_regression_tests(void)
     test_urandom_entropy();
     test_vfs_tmp_crud();
     test_tsh_pipeline();
+    test_ring3_fault_isolation();
 }
 
 static int is_vanilla_test(const char *bin_path)

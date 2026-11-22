@@ -67,7 +67,14 @@ struct tss64 {
     uint16_t iomap_base;
 } __attribute__((packed));
 
+_Static_assert(sizeof(struct tss64) == 104, "x86_64 TSS must be 104 bytes");
+_Static_assert(offsetof(struct tss64, rsp0) == 4, "TSS rsp0 offset mismatch");
+_Static_assert(offsetof(struct tss64, ist1) == 36, "TSS ist1 offset mismatch");
+_Static_assert(offsetof(struct tss64, iomap_base) == 102, "TSS iomap_base offset mismatch");
+
 #define X64_GDT_MAX_APS 64
+#define X64_IST1_STACK_PAGES 4u
+#define X64_IST1_STACK_SIZE  (X64_IST1_STACK_PAGES * PAGE_SIZE)
 
 static struct {
     struct gdt_entry entries[5];
@@ -79,6 +86,7 @@ static struct gdt_ptr gdtp;
 static struct tss64 tss;
 static struct tss64 *ap_tss = NULL;
 static uint32_t ap_tss_count = 0;
+static uint8_t bsp_ist1_stack[X64_IST1_STACK_SIZE] __attribute__((aligned(16)));
 
 extern char x64_boot_stack_top[];
 
@@ -122,12 +130,22 @@ void tss_set_rsp0_x64(uint64_t rsp0)
     __asm__ volatile ("movq %0, %%gs:40" : : "r"(rsp0) : "memory");
 }
 
+uint64_t tss_get_ist1_x64(uint32_t cpu_id)
+{
+    if (cpu_id == 0)
+        return tss.ist1;
+    if (ap_tss && (cpu_id - 1) < ap_tss_count)
+        return ap_tss[cpu_id - 1].ist1;
+    return 0;
+}
+
 void gdt_init_x64(void)
 {
     for (size_t i = 0; i < sizeof(tss); i++)
         ((uint8_t *)&tss)[i] = 0;
 
     tss.rsp0 = (uint64_t)(uintptr_t)x64_boot_stack_top;
+    tss.ist1 = (uint64_t)(uintptr_t)(bsp_ist1_stack + sizeof(bsp_ist1_stack));
     tss.iomap_base = (uint16_t)sizeof(tss);
 
     set_seg(0, 0x00u, 0x00u);
@@ -172,6 +190,15 @@ void gdt_init_ap_tss(uint32_t cpu_count)
         uintptr_t stack_phys = pmm_alloc_pages(16);
         if (stack_phys) {
             ap_tss[i].rsp0 = (uint64_t)(uintptr_t)vmm_phys_to_virt(stack_phys + 16 * PAGE_SIZE);
+        }
+
+        uintptr_t ist1_phys = pmm_alloc_pages(X64_IST1_STACK_PAGES);
+        if (ist1_phys) {
+            void *ist1_base = (void *)(uintptr_t)vmm_phys_to_virt(ist1_phys);
+            memset(ist1_base, 0, X64_IST1_STACK_SIZE);
+            ap_tss[i].ist1 = (uint64_t)(uintptr_t)vmm_phys_to_virt(ist1_phys + X64_IST1_STACK_SIZE);
+        } else {
+            ap_tss[i].ist1 = tss.ist1;
         }
 
         set_tss_desc(7 + (i * 2), (uint64_t)(uintptr_t)&ap_tss[i], (uint32_t)(sizeof(struct tss64) - 1));

@@ -22,6 +22,7 @@
 
 void idt_init_x64(void);
 void idt_load(void);
+uint8_t idt_get_gate_ist_x64(uint8_t vec);
 void idt_exception_handler_x64(interrupt_frame_t *frame);
 
 #endif

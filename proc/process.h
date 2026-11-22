@@ -43,6 +43,10 @@
 #define PROCESS_SIG_IGN        ((uintptr_t)1)
 
 #define PROCESS_SIGINT         2
+#define PROCESS_SIGILL         4
+#define PROCESS_SIGTRAP        5
+#define PROCESS_SIGBUS         7
+#define PROCESS_SIGFPE         8
 #define PROCESS_SIGKILL        9
 #define PROCESS_SIGUSR1        10
 #define PROCESS_SIGSEGV        11
