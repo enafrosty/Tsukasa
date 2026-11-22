@@ -199,6 +199,9 @@ struct process {
     process_t *parent_next_child;
     process_t *children_head;
 
+    uint64_t sleep_deadline_ms;
+    process_t *sleep_next;
+
     uint8_t fpu_state[512] __attribute__((aligned(16)));
     int fpu_initialized;
 };
@@ -249,10 +252,21 @@ int process_signal_pending(int pid, uint64_t *pending_out);
 int process_signal_send(int pid, int sig);
 
 uint64_t process_schedule_tick(uint64_t current_rsp);
+uint64_t process_schedule_yield(uint64_t current_rsp);
 uint64_t process_schedule_ipi(uint64_t current_rsp);
 void process_idle_loop_note(void);
 void process_yield(void);
+int process_sleep_ms(uint64_t ms);
+int process_reparent(process_t *child, int parent_pid);
 uint64_t process_ticks(void);
+
+typedef struct process_cpu_stats {
+    uint32_t cpu_count;
+    uint64_t total_ticks[32];
+    uint64_t idle_ticks[32];
+} process_cpu_stats_t;
+
+void process_get_cpu_stats(process_cpu_stats_t *out);
 
 void process_start_scheduler(void) __attribute__((noreturn));
 
@@ -273,6 +287,8 @@ void process_run_guide16_selftests(void);
 
 /* process_block_current marks the CALLER blocked (both state fields) without descheduling — the caller... */
 void process_block_current(void);
+void process_set_poll_blocked(uint64_t deadline_ms);
+void process_clear_poll_deadline(void);
 void process_block_on_poll(uint64_t deadline_ms);
 int process_wake_blocked(process_t *p);
 void process_dump_memory_state(void);

@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/poll.h>
 #include <time.h>
 
 #if defined(_WIN32)
@@ -58,7 +59,12 @@ static int exact_write_fd(int fd, const void *buf, size_t count)
             return -1;
         } else {
             if (errno == EAGAIN || errno == EINTR) {
-                usleep(1000);
+                struct pollfd pfd;
+                pfd.fd = fd;
+                pfd.events = POLLOUT;
+                pfd.revents = 0;
+                if (poll(&pfd, 1, 50) < 0 && errno != EINTR)
+                    return -1;
                 continue;
             }
             return -1;
@@ -80,9 +86,14 @@ static int exact_read_fd(int fd, void *buf, size_t count)
             return -1;
         } else {
             if (errno == EAGAIN || errno == EINTR) {
-                if (++retries > 1000)
+                if (++retries > 20)
                     return -1;
-                usleep(1000);
+                struct pollfd pfd;
+                pfd.fd = fd;
+                pfd.events = POLLIN;
+                pfd.revents = 0;
+                if (poll(&pfd, 1, 50) < 0 && errno != EINTR)
+                    return -1;
                 continue;
             }
             return -1;
@@ -745,11 +756,13 @@ int main(int argc, char **argv)
 
     int mouse_x = 0;
     int mouse_y = 0;
+    int needs_render = 1;
     uint64_t last_query_tick = get_now_ms();
 
     while (st.running) {
         vanilla_event_t ev;
         while (vanilla_poll_event(st.client, &ev) > 0) {
+            needs_render = 1;
             if (ev.type == VANILLA_EVENT_CLOSE_REQ) {
                 st.running = 0;
                 break;
@@ -789,46 +802,71 @@ int main(int argc, char **argv)
             }
         }
 
+        if (!st.running)
+            break;
+
         uint64_t now = get_now_ms();
         if (now - last_query_tick >= DEVTOOLS_QUERY_INTERVAL) {
             dbg_query_windows(&st);
             dbg_query_compositor(&st);
             last_query_tick = now;
+            needs_render = 1;
         }
 
-        /* Build immediate-mode UI */
-        render_devtools_ui(&st);
+        if (needs_render) {
+            /* Build immediate-mode UI */
+            render_devtools_ui(&st);
 
-        /* Render microui commands to surface */
-        g_render_surf = st.surface;
-        g_clip_rect = mu_rect(0, 0, st.win->width, st.win->height);
+            /* Render microui commands to surface */
+            g_render_surf = st.surface;
+            g_clip_rect = mu_rect(0, 0, st.win->width, st.win->height);
 
-        /* Fill window base background */
-        app_fill_rect(st.surface, 0, 0, st.win->width, st.win->height, 0xFF242933u);
+            /* Fill window base background */
+            app_fill_rect(st.surface, 0, 0, st.win->width, st.win->height, 0xFF242933u);
 
-        mu_Command *cmd = NULL;
-        while (mu_next_command(&st.mu_ctx, &cmd)) {
-            switch (cmd->type) {
-            case MU_COMMAND_TEXT:
-                mu_renderer_draw_text(cmd->text.str, cmd->text.pos, cmd->text.color);
-                break;
-            case MU_COMMAND_RECT:
-                mu_renderer_draw_rect(cmd->rect.rect, cmd->rect.color);
-                break;
-            case MU_COMMAND_ICON:
-                mu_renderer_draw_icon(cmd->icon.id, cmd->icon.rect, cmd->icon.color);
-                break;
-            case MU_COMMAND_CLIP:
-                g_clip_rect = intersect_rects(cmd->clip.rect,
-                                              mu_rect(0, 0, st.win->width, st.win->height));
-                break;
-            default:
-                break;
+            mu_Command *cmd = NULL;
+            while (mu_next_command(&st.mu_ctx, &cmd)) {
+                switch (cmd->type) {
+                case MU_COMMAND_TEXT:
+                    mu_renderer_draw_text(cmd->text.str, cmd->text.pos, cmd->text.color);
+                    break;
+                case MU_COMMAND_RECT:
+                    mu_renderer_draw_rect(cmd->rect.rect, cmd->rect.color);
+                    break;
+                case MU_COMMAND_ICON:
+                    mu_renderer_draw_icon(cmd->icon.id, cmd->icon.rect, cmd->icon.color);
+                    break;
+                case MU_COMMAND_CLIP:
+                    g_clip_rect = intersect_rects(cmd->clip.rect,
+                                                  mu_rect(0, 0, st.win->width, st.win->height));
+                    break;
+                default:
+                    break;
+                }
+            }
+
+            vanilla_present(st.win, NULL);
+            needs_render = 0;
+        }
+
+        if (vanilla_client_pending(st.client) == 0) {
+            uint64_t cur_ms = get_now_ms();
+            uint64_t elapsed = (cur_ms >= last_query_tick) ? (cur_ms - last_query_tick) : DEVTOOLS_QUERY_INTERVAL;
+            int timeout_ms = (elapsed < DEVTOOLS_QUERY_INTERVAL)
+                                 ? (int)(DEVTOOLS_QUERY_INTERVAL - elapsed) : 0;
+            if (timeout_ms > 0) {
+                int sfd = vanilla_client_get_fd(st.client);
+                if (sfd >= 0) {
+                    struct pollfd pfd;
+                    pfd.fd = sfd;
+                    pfd.events = POLLIN;
+                    pfd.revents = 0;
+                    poll(&pfd, 1, timeout_ms);
+                } else {
+                    poll(NULL, 0, timeout_ms);
+                }
             }
         }
-
-        vanilla_present(st.win, NULL);
-        usleep(16000);
     }
 
     if (st.theme_loaded && !st.theme_saved) {

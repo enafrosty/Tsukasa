@@ -161,6 +161,10 @@ uint64_t irq_handler_x64(unsigned int vector, uint64_t context_rsp)
         return next_rsp;
     }
 
+    if (vector == 64) {
+        return process_schedule_yield(context_rsp);
+    }
+
     if (vector == 65) {
         /* LAPIC-domain interrupt: EOI goes to the local APIC, not the PIC, and precedes the reschedule to mirror the... */
         lapic_eoi();

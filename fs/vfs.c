@@ -38,6 +38,7 @@
 #include "../include/kprintf.h"
 #include "../include/kutils.h"
 #include "../include/multiboot.h"
+#include "../include/spinlock.h"
 #include "../ipc/unix_socket.h"
 #include "../mm/heap.h"
 #include "../proc/process.h"
@@ -142,6 +143,29 @@ typedef struct vfs_file {
 static vfs_mount_t g_mounts[VFS_MAX_MOUNTS];
 static vfs_file_t g_open_files[VFS_MAX_OPEN_GLOBAL];
 static vfs_pipe_t g_pipes[VFS_MAX_PIPES];
+static spinlock_t g_vfs_alloc_lock = SPINLOCK_INIT;
+static spinlock_t g_pipe_lock = SPINLOCK_INIT;
+
+static inline unsigned long vfs_irq_save_disable(void)
+{
+    unsigned long flags = 0;
+#ifdef __x86_64__
+    __asm__ volatile ("pushfq\n\tpopq %0\n\tcli" : "=r"(flags) : : "memory");
+#endif
+    return flags;
+}
+
+static inline void vfs_irq_restore(unsigned long flags)
+{
+#ifdef __x86_64__
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" : : : "memory");
+    else
+        __asm__ volatile ("cli" : : : "memory");
+#else
+    (void)flags;
+#endif
+}
 
 static void *g_kernel_open_files[PROCESS_MAX_OPEN_FILES];
 static char g_kernel_cwd[VFS_PATH_MAX] = "/";
@@ -474,6 +498,7 @@ static void file_pool_reset(void)
 
 static vfs_file_t *file_alloc(void)
 {
+    unsigned long flags = spin_lock_irqsave(&g_vfs_alloc_lock);
     for (int i = 0; i < VFS_MAX_OPEN_GLOBAL; i++) {
         vfs_file_t *f = &g_open_files[i];
         if (!f->used) {
@@ -481,14 +506,17 @@ static vfs_file_t *file_alloc(void)
                 ((uint8_t *)f)[j] = 0;
             f->used = 1;
             f->refcount = 1;
+            spin_unlock_irqrestore(&g_vfs_alloc_lock, flags);
             return f;
         }
     }
+    spin_unlock_irqrestore(&g_vfs_alloc_lock, flags);
     return NULL;
 }
 
 static vfs_pipe_t *pipe_alloc(void)
 {
+    unsigned long flags = spin_lock_irqsave(&g_vfs_alloc_lock);
     for (int i = 0; i < VFS_MAX_PIPES; i++) {
         vfs_pipe_t *p = &g_pipes[i];
         if (!p->used) {
@@ -499,10 +527,22 @@ static vfs_pipe_t *pipe_alloc(void)
             p->readers = 0;
             p->writers = 0;
             wait_queue_init(&p->waitq);
+            spin_unlock_irqrestore(&g_vfs_alloc_lock, flags);
             return p;
         }
     }
+    spin_unlock_irqrestore(&g_vfs_alloc_lock, flags);
     return NULL;
+}
+
+static void pipe_free_slot(vfs_pipe_t *p)
+{
+    unsigned long flags;
+    if (!p)
+        return;
+    flags = spin_lock_irqsave(&g_vfs_alloc_lock);
+    p->used = 0;
+    spin_unlock_irqrestore(&g_vfs_alloc_lock, flags);
 }
 
 static size_t pipe_ring_read(vfs_pipe_t *p, void *buf, size_t count)
@@ -536,15 +576,20 @@ static size_t pipe_ring_write(vfs_pipe_t *p, const void *buf, size_t count)
 /* Drop one end's claim on a socket pipe; free the slot when both sides are gone (the exact rule file_release uses). */
 static void sock_drop_pipe_claim(vfs_pipe_t *p, int drop_reader, int drop_writer)
 {
+    unsigned long pflags;
+    int empty_claims;
     if (!p)
         return;
+    pflags = spin_lock_irqsave(&g_pipe_lock);
     if (drop_reader && p->readers > 0)
         p->readers--;
     if (drop_writer && p->writers > 0)
         p->writers--;
+    empty_claims = (p->readers == 0 && p->writers == 0);
+    spin_unlock_irqrestore(&g_pipe_lock, pflags);
     wait_queue_wake_all(&p->waitq);
-    if (p->readers == 0 && p->writers == 0)
-        p->used = 0;
+    if (empty_claims)
+        pipe_free_slot(p);
 }
 
 static int ensure_regular_capacity(vfs_file_t *f, size_t need)
@@ -600,24 +645,37 @@ static int flush_regular_file(vfs_file_t *f)
 
 static void file_release(vfs_file_t *f)
 {
-    if (!f || !f->used)
+    unsigned long aflags;
+    if (!f)
         return;
-    if (f->refcount > 1) {
-        f->refcount--;
+
+    aflags = spin_lock_irqsave(&g_vfs_alloc_lock);
+    if (!f->used) {
+        spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
         return;
     }
+    if (f->refcount > 1) {
+        f->refcount--;
+        spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
+        return;
+    }
+    f->refcount = 0;
+    spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
 
     (void)flush_regular_file(f);
 
     if (f->backend == VFS_BACKEND_PIPE && f->u.pipe.pipe) {
         vfs_pipe_t *p = f->u.pipe.pipe;
+        unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
         if (f->u.pipe.can_read && p->readers > 0)
             p->readers--;
         if (f->u.pipe.can_write && p->writers > 0)
             p->writers--;
+        int empty_claims = (p->readers == 0 && p->writers == 0);
+        spin_unlock_irqrestore(&g_pipe_lock, pflags);
         wait_queue_wake_all(&p->waitq);
-        if (p->readers == 0 && p->writers == 0)
-            p->used = 0;
+        if (empty_claims)
+            pipe_free_slot(p);
     }
 
     if (f->backend == VFS_BACKEND_UNIXSOCK) {
@@ -656,8 +714,9 @@ static void file_release(vfs_file_t *f)
         f->u.epoll.count = 0;
     }
 
+    aflags = spin_lock_irqsave(&g_vfs_alloc_lock);
     f->used = 0;
-    f->refcount = 0;
+    spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
 }
 
 static int process_fd_alloc(process_t *proc)
@@ -1644,16 +1703,23 @@ size_t vfs_read(int fd, void *buf, size_t count)
             return 0;
 
         for (;;) {
+            unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
             if (p->size > 0) {
                 size_t got = pipe_ring_read(p, buf, count);
+                spin_unlock_irqrestore(&g_pipe_lock, pflags);
                 if (got > 0)
                     wait_queue_wake_all(&p->waitq);
                 return got;
             }
-            if (p->writers == 0)
+            if (p->writers == 0) {
+                spin_unlock_irqrestore(&g_pipe_lock, pflags);
                 return 0; /* All writers closed and buffer drained: true EOF */
-            if (f->flags & VFS_O_NONBLOCK)
+            }
+            if (f->flags & VFS_O_NONBLOCK) {
+                spin_unlock_irqrestore(&g_pipe_lock, pflags);
                 return (size_t)-EAGAIN;
+            }
+            spin_unlock_irqrestore(&g_pipe_lock, pflags);
 #ifdef __x86_64__
             process_t *proc = vfs_current_process();
             if (!proc)
@@ -1661,13 +1727,20 @@ size_t vfs_read(int fd, void *buf, size_t count)
             wait_queue_entry_t wqe;
             wqe.proc = proc;
             wqe.next = NULL;
-            wait_queue_prepare_to_wait(&p->waitq, &wqe);
-            if (p->size > 0 || p->writers == 0) {
-                wait_queue_finish_wait(&p->waitq, &wqe);
+            wait_queue_add(&p->waitq, &wqe);
+            unsigned long irqf = vfs_irq_save_disable();
+            pflags = spin_lock_irqsave(&g_pipe_lock);
+            int ready_now = (p->size > 0 || p->writers == 0);
+            spin_unlock_irqrestore(&g_pipe_lock, pflags);
+            if (ready_now) {
+                vfs_irq_restore(irqf);
+                wait_queue_remove(&p->waitq, &wqe);
                 continue;
             }
+            process_block_current();
             process_yield();
-            wait_queue_finish_wait(&p->waitq, &wqe);
+            vfs_irq_restore(irqf);
+            wait_queue_remove(&p->waitq, &wqe);
 #else
             return 0;
 #endif
@@ -1679,16 +1752,23 @@ size_t vfs_read(int fd, void *buf, size_t count)
             return 0;
         vfs_pipe_t *rx = f->u.sock.rx;
         for (;;) {
+            unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
             if (rx->size > 0) {
                 size_t got = pipe_ring_read(rx, buf, count);
+                spin_unlock_irqrestore(&g_pipe_lock, pflags);
                 if (got > 0)
                     wait_queue_wake_all(&rx->waitq);
                 return got;
             }
-            if (rx->writers == 0)
+            if (rx->writers == 0) {
+                spin_unlock_irqrestore(&g_pipe_lock, pflags);
                 return 0;
-            if (f->flags & VFS_O_NONBLOCK)
+            }
+            if (f->flags & VFS_O_NONBLOCK) {
+                spin_unlock_irqrestore(&g_pipe_lock, pflags);
                 return (size_t)-EAGAIN;
+            }
+            spin_unlock_irqrestore(&g_pipe_lock, pflags);
 #ifdef __x86_64__
             process_t *p = vfs_current_process();
             if (!p)
@@ -1696,13 +1776,20 @@ size_t vfs_read(int fd, void *buf, size_t count)
             wait_queue_entry_t wqe;
             wqe.proc = p;
             wqe.next = NULL;
-            wait_queue_prepare_to_wait(&rx->waitq, &wqe);
-            if (rx->size > 0 || rx->writers == 0) {
-                wait_queue_finish_wait(&rx->waitq, &wqe);
+            wait_queue_add(&rx->waitq, &wqe);
+            unsigned long irqf = vfs_irq_save_disable();
+            pflags = spin_lock_irqsave(&g_pipe_lock);
+            int ready_now = (rx->size > 0 || rx->writers == 0);
+            spin_unlock_irqrestore(&g_pipe_lock, pflags);
+            if (ready_now) {
+                vfs_irq_restore(irqf);
+                wait_queue_remove(&rx->waitq, &wqe);
                 continue;
             }
+            process_block_current();
             process_yield();
-            wait_queue_finish_wait(&rx->waitq, &wqe);
+            vfs_irq_restore(irqf);
+            wait_queue_remove(&rx->waitq, &wqe);
 #else
             return 0;
 #endif
@@ -1762,32 +1849,43 @@ size_t vfs_write(int fd, const void *buf, size_t count)
 
     if (f->backend == VFS_BACKEND_PIPE) {
         vfs_pipe_t *p = f->u.pipe.pipe;
-        if (!p || !f->u.pipe.can_write || p->readers == 0)
+        if (!p || !f->u.pipe.can_write)
             return (size_t)-EPIPE;
         for (;;) {
+            unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
+            if (p->readers == 0) {
+                spin_unlock_irqrestore(&g_pipe_lock, pflags);
+                return (size_t)-EPIPE;
+            }
             size_t wr = pipe_ring_write(p, buf, count);
+            spin_unlock_irqrestore(&g_pipe_lock, pflags);
             if (wr > 0) {
                 wait_queue_wake_all(&p->waitq);
                 return wr;
             }
-            if (p->readers == 0)
-                return (size_t)-EPIPE;
             if (f->flags & VFS_O_NONBLOCK)
                 return (size_t)-EAGAIN;
 #ifdef __x86_64__
-            process_t *proc = vfs_current_process();
-            if (!proc)
+            process_t *curp = vfs_current_process();
+            if (!curp)
                 return 0;
             wait_queue_entry_t wqe;
-            wqe.proc = proc;
+            wqe.proc = curp;
             wqe.next = NULL;
-            wait_queue_prepare_to_wait(&p->waitq, &wqe);
-            if (p->size < VFS_PIPE_CAPACITY || p->readers == 0) {
-                wait_queue_finish_wait(&p->waitq, &wqe);
+            wait_queue_add(&p->waitq, &wqe);
+            unsigned long irqf = vfs_irq_save_disable();
+            pflags = spin_lock_irqsave(&g_pipe_lock);
+            int ready_now = (p->size < VFS_PIPE_CAPACITY || p->readers == 0);
+            spin_unlock_irqrestore(&g_pipe_lock, pflags);
+            if (ready_now) {
+                vfs_irq_restore(irqf);
+                wait_queue_remove(&p->waitq, &wqe);
                 continue;
             }
+            process_block_current();
             process_yield();
-            wait_queue_finish_wait(&p->waitq, &wqe);
+            vfs_irq_restore(irqf);
+            wait_queue_remove(&p->waitq, &wqe);
 #else
             return 0;
 #endif
@@ -1798,11 +1896,16 @@ size_t vfs_write(int fd, const void *buf, size_t count)
         /* Connected socket: write this end's tx pipe. */
         if (f->u.sock.is_listener || !f->u.sock.tx)
             return 0;
-        if (f->u.sock.tx->readers == 0)
+        vfs_pipe_t *tx = f->u.sock.tx;
+        unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
+        if (tx->readers == 0) {
+            spin_unlock_irqrestore(&g_pipe_lock, pflags);
             return (size_t)-EPIPE;
-        size_t wr = pipe_ring_write(f->u.sock.tx, buf, count);
+        }
+        size_t wr = pipe_ring_write(tx, buf, count);
+        spin_unlock_irqrestore(&g_pipe_lock, pflags);
         if (wr > 0)
-            wait_queue_wake_all(&f->u.sock.tx->waitq);
+            wait_queue_wake_all(&tx->waitq);
         return wr;
     }
 
@@ -1887,11 +1990,19 @@ size_t vfs_size(int fd)
     if (f->backend == VFS_BACKEND_PIPE) {
         if (!f->u.pipe.pipe)
             return 0;
-        return f->u.pipe.pipe->size;
+        unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
+        size_t sz = f->u.pipe.pipe->size;
+        spin_unlock_irqrestore(&g_pipe_lock, pflags);
+        return sz;
     }
-    if (f->backend == VFS_BACKEND_UNIXSOCK)
-        return (!f->u.sock.is_listener && f->u.sock.rx)
-                   ? f->u.sock.rx->size : 0;
+    if (f->backend == VFS_BACKEND_UNIXSOCK) {
+        if (f->u.sock.is_listener || !f->u.sock.rx)
+            return 0;
+        unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
+        size_t sz = f->u.sock.rx->size;
+        spin_unlock_irqrestore(&g_pipe_lock, pflags);
+        return sz;
+    }
     if (f->backend == VFS_BACKEND_DEVFS)
         return (f->u.device.ops && f->u.device.ops->size) ? f->u.device.ops->size(f->u.device.priv) : 0;
     return f->u.regular.size;
@@ -1907,7 +2018,9 @@ int vfs_dup(int oldfd)
     int newfd = process_fd_alloc(proc);
     if (!f || newfd < 0)
         return -1;
+    unsigned long aflags = spin_lock_irqsave(&g_vfs_alloc_lock);
     f->refcount++;
+    spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
     tbl[newfd] = f;
     return newfd;
 }
@@ -1922,7 +2035,9 @@ int vfs_dup2(int oldfd, int newfd)
     if (oldfd == newfd)
         return newfd;
     fd_close_on_table(tbl, newfd);
+    unsigned long aflags = spin_lock_irqsave(&g_vfs_alloc_lock);
     f->refcount++;
+    spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
     tbl[newfd] = f;
     return newfd;
 }
@@ -1960,7 +2075,7 @@ int vfs_pipe(int pipefd[2])
         if (fw)
             file_release(fw);
         if (p)
-            p->used = 0;
+            pipe_free_slot(p);
         tbl[fd_r] = NULL;
         tbl[fd_w] = NULL;
         return -1;
@@ -2082,9 +2197,9 @@ int vfs_socket_connect(int fd, const char *path)
     s2c = pipe_alloc();
     if (!c2s || !s2c) {
         if (c2s)
-            c2s->used = 0;
+            pipe_free_slot(c2s);
         if (s2c)
-            s2c->used = 0;
+            pipe_free_slot(s2c);
         return -ENOMEM;
     }
     /* Count BOTH sides' claims now: client = reader(s2c) + writer(c2s); the pending record carries the server... */
@@ -2098,8 +2213,8 @@ int vfs_socket_connect(int fd, const char *path)
     pc.client_pid = proc ? (int)proc->pid : 0;
     pc.client_fd = fd;
     if (unix_enqueue_pending(l, &pc) != 0) {
-        c2s->used = 0;
-        s2c->used = 0;
+        pipe_free_slot(c2s);
+        pipe_free_slot(s2c);
         return -ECONNREFUSED;
     }
     
@@ -2138,8 +2253,15 @@ int vfs_socket_accept(int fd)
         wqe.proc = proc;
         wqe.next = NULL;
         wait_queue_add(wq, &wqe);
+        unsigned long irqf = vfs_irq_save_disable();
+        if (unix_dequeue_pending(f->u.sock.listener, &pc) == 0) {
+            vfs_irq_restore(irqf);
+            wait_queue_remove(wq, &wqe);
+            break;
+        }
         process_block_current();
         process_yield();
+        vfs_irq_restore(irqf);
         wait_queue_remove(wq, &wqe);
 #else
         return -EAGAIN;
@@ -2355,6 +2477,7 @@ static int vfs_file_poll_mask(vfs_file_t *f)
         vfs_pipe_t *p = f->u.pipe.pipe;
         if (!p)
             return VFS_POLLERR;
+        unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
         if (f->u.pipe.can_read) {
             if (p->size > 0)
                 mask |= VFS_POLLIN;
@@ -2367,6 +2490,7 @@ static int vfs_file_poll_mask(vfs_file_t *f)
             else if (p->size < VFS_PIPE_CAPACITY)
                 mask |= VFS_POLLOUT;
         }
+        spin_unlock_irqrestore(&g_pipe_lock, pflags);
         return mask;
     }
 
@@ -2378,6 +2502,7 @@ static int vfs_file_poll_mask(vfs_file_t *f)
         }
         if (!f->u.sock.rx || !f->u.sock.tx)
             return VFS_POLLERR;
+        unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
         if (f->u.sock.rx->size > 0)
             mask |= VFS_POLLIN;
         if (f->u.sock.rx->writers == 0)
@@ -2386,6 +2511,7 @@ static int vfs_file_poll_mask(vfs_file_t *f)
             mask |= VFS_POLLHUP;
         else if (f->u.sock.tx->size < VFS_PIPE_CAPACITY)
             mask |= VFS_POLLOUT;
+        spin_unlock_irqrestore(&g_pipe_lock, pflags);
         return mask;
     }
 
@@ -2526,19 +2652,19 @@ int vfs_poll(vfs_pollfd_t *fds, size_t nfds, int timeout_ms)
     if (nfds == 0) {
         if (timeout_ms == 0)
             return 0;
-        uint64_t deadline = (timeout_ms > 0) ? pit_ticks_ms() + (uint64_t)timeout_ms : 0;
+        if (timeout_ms > 0)
+            return process_sleep_ms((uint64_t)timeout_ms);
         for (;;) {
-            if (timeout_ms > 0 && pit_ticks_ms() >= deadline)
-                break;
-            process_block_on_poll(deadline);
-            if (proc && proc->signal_pending)
+            unsigned long irqf = vfs_irq_save_disable();
+            if (proc && (proc->signal_pending & ~proc->signal_mask)) {
+                vfs_irq_restore(irqf);
                 return -EINTR;
-            if (timeout_ms > 0 && pit_ticks_ms() >= deadline)
-                break;
-            if (timeout_ms < 0)
-                continue;
+            }
+            process_set_poll_blocked(0);
+            process_yield();
+            vfs_irq_restore(irqf);
+            process_clear_poll_deadline();
         }
-        return 0;
     }
 
     if (!fds)
@@ -2557,34 +2683,33 @@ int vfs_poll(vfs_pollfd_t *fds, size_t nfds, int timeout_ms)
     poll_wtable_init_with_capacity(&wt, proc, cap);
     vfs_poll_register(fds, nfds, &wt.pt);
 
-    /* Double check after registration to avoid lost wakeup race */
-    ready = vfs_poll_scan(fds, nfds);
-    if (ready > 0) {
-        poll_wtable_unregister_all(&wt);
-        return ready;
+    /* Phase 3: sleep without lost-wakeup window across scan -> block -> yield */
+    uint64_t deadline = 0;
+    if (timeout_ms > 0) {
+        uint64_t now_ms = pit_ticks_ms();
+        uint64_t tms = (uint64_t)timeout_ms;
+        deadline = (tms > UINT64_MAX - now_ms) ? UINT64_MAX : (now_ms + tms);
     }
-
-    /* Phase 3: sleep */
-    uint64_t deadline = (timeout_ms > 0) ? pit_ticks_ms() + (uint64_t)timeout_ms : 0;
     for (;;) {
-        if (timeout_ms > 0 && pit_ticks_ms() >= deadline)
-            break;
-
-        process_block_on_poll(deadline);
-
+        unsigned long irqf = vfs_irq_save_disable();
         ready = vfs_poll_scan(fds, nfds);
-        if (ready > 0)
+        if (ready > 0) {
+            vfs_irq_restore(irqf);
             break;
-
-        if (proc && proc->signal_pending) {
+        }
+        if (proc && (proc->signal_pending & ~proc->signal_mask)) {
+            vfs_irq_restore(irqf);
             poll_wtable_unregister_all(&wt);
             return -EINTR;
         }
-
-        if (timeout_ms > 0 && pit_ticks_ms() >= deadline)
+        if (timeout_ms > 0 && pit_ticks_ms() >= deadline) {
+            vfs_irq_restore(irqf);
             break;
-        if (timeout_ms < 0)
-            continue;
+        }
+        process_set_poll_blocked(deadline);
+        process_yield();
+        vfs_irq_restore(irqf);
+        process_clear_poll_deadline();
     }
 
     /* Phase 4: deregister and return final scan */
@@ -2960,7 +3085,9 @@ int vfs_process_inherit(struct process *dst, const struct process *src)
         vfs_file_t *f = fd_lookup_on_table(src_tbl, i);
         if (!f)
             continue;
+        unsigned long aflags = spin_lock_irqsave(&g_vfs_alloc_lock);
         f->refcount++;
+        spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
         dst_tbl[i] = f;
     }
     return 0;
@@ -2984,7 +3111,9 @@ int vfs_process_dup2(struct process *dst,
         return -1;
 
     fd_close_on_table(dst_tbl, dst_fd);
+    unsigned long aflags = spin_lock_irqsave(&g_vfs_alloc_lock);
     f->refcount++;
+    spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
     dst_tbl[dst_fd] = f;
     return 0;
 }

@@ -113,7 +113,7 @@ void network_poll(void)
 static void net_wait_tick(void)
 {
     network_pump();
-    process_yield();
+    process_sleep_ms(10);
 }
 
 int network_dhcp_acquire(void)

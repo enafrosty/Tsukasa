@@ -115,10 +115,30 @@ static inline long sys_unlink(const char *path)
     return ret;
 }
 
+static inline long sys_nanosleep(long ms)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(35L), "D"(ms)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long sys_ticks(void)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(320L)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
 static int wait_for_pid(long pid, int *wstatus_out)
 {
     int status = 0;
-    for (int wait_loop = 0; wait_loop < 200000; wait_loop++) {
+    for (int fast = 0; fast < 64; fast++) {
         long ret = sys_wait4(pid, &status, 1 /* WNOHANG */);
         if (ret == pid) {
             if (wstatus_out)
@@ -126,6 +146,15 @@ static int wait_for_pid(long pid, int *wstatus_out)
             return 0;
         }
         sched_yield();
+    }
+    for (int wait_loop = 0; wait_loop < 3000; wait_loop++) {
+        long ret = sys_wait4(pid, &status, 1 /* WNOHANG */);
+        if (ret == pid) {
+            if (wstatus_out)
+                *wstatus_out = status;
+            return 0;
+        }
+        (void)sys_nanosleep(10);
     }
     return -1;
 }
@@ -542,6 +571,107 @@ static void test_ring3_fault_isolation(void)
     dprintf(1, "[TEST] ring3_fault_isolation PASS\n");
 }
 
+static int has_substr(const char *haystack, const char *needle)
+{
+    if (!haystack || !needle || !needle[0])
+        return 0;
+    for (size_t i = 0; haystack[i]; i++) {
+        size_t j = 0;
+        while (needle[j] && haystack[i + j] == needle[j])
+            j++;
+        if (needle[j] == '\0')
+            return 1;
+    }
+    return 0;
+}
+
+static long read_self_ticks(void)
+{
+    int fd = open("/proc/self/status", TSK_O_RDONLY);
+    char buf[512];
+    long n;
+    if (fd < 0)
+        return -1;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = '\0';
+
+    const char *key = "ticks: ";
+    for (long i = 0; i < n; i++) {
+        int match = (i == 0 || buf[i - 1] == '\n');
+        size_t j = 0;
+        if (!match)
+            continue;
+        while (key[j] && (i + (long)j) < n && buf[i + (long)j] == key[j])
+            j++;
+        if (key[j] == '\0') {
+            long val = 0;
+            const char *p = buf + i + j;
+            while (*p >= '0' && *p <= '9') {
+                val = val * 10 + (*p - '0');
+                p++;
+            }
+            return val;
+        }
+    }
+    return -1;
+}
+
+static void test_yield_no_tick_forge(void)
+{
+    long t0 = sys_ticks();
+    for (int i = 0; i < 200; i++)
+        sched_yield();
+    long dt = sys_ticks() - t0;
+    if (dt < 0 || dt >= 25) {
+        dprintf(1, "[TEST] yield_no_tick_forge FAIL: dt=%ld\n", dt);
+        return;
+    }
+    dprintf(1, "[TEST] yield_no_tick_forge PASS\n");
+}
+
+static void test_nanosleep_blocking(void)
+{
+    long t0 = sys_ticks();
+    long p0 = read_self_ticks();
+    long rc = sys_nanosleep(200);
+    long dt = sys_ticks() - t0;
+    long p1 = read_self_ticks();
+    long pdt = (p0 >= 0 && p1 >= p0) ? (p1 - p0) : -1;
+
+    if (rc != 0 || dt < 18 || dt > 80 || pdt < 0 || pdt > 3) {
+        dprintf(1, "[TEST] nanosleep_blocking FAIL: rc=%ld dt=%ld pdt=%ld\n",
+                rc, dt, pdt);
+        return;
+    }
+    dprintf(1, "[TEST] nanosleep_blocking PASS\n");
+}
+
+static void test_proc_stat(void)
+{
+    int fd = open("/proc/stat", TSK_O_RDONLY);
+    char buf[512];
+    long n;
+    if (fd < 0) {
+        dprintf(1, "[TEST] proc_stat FAIL: open failed (rc=%d)\n", fd);
+        return;
+    }
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) {
+        dprintf(1, "[TEST] proc_stat FAIL: short read (n=%ld)\n", n);
+        return;
+    }
+    buf[n] = '\0';
+    if (!has_substr(buf, "cpu ") || !has_substr(buf, "cpu0 ")) {
+        dprintf(1, "[TEST] proc_stat FAIL: missing cpu/cpu0 fields\n");
+        return;
+    }
+    dprintf(1, "[TEST] proc_stat PASS\n");
+}
+
 static void run_kernel_regression_tests(void)
 {
     test_spawn_argv();
@@ -551,6 +681,9 @@ static void run_kernel_regression_tests(void)
     test_vfs_tmp_crud();
     test_tsh_pipeline();
     test_ring3_fault_isolation();
+    test_yield_no_tick_forge();
+    test_nanosleep_blocking();
+    test_proc_stat();
 }
 
 static int is_vanilla_test(const char *bin_path)
@@ -629,7 +762,7 @@ int main(int argc, char **argv)
             for (int wait_sock = 0; wait_sock < 500; wait_sock++) {
                 if (sys_stat("/tmp/vanilla.sock", stat_buf) == 0)
                     break;
-                sched_yield();
+                (void)sys_nanosleep(20);
             }
             vanilla_ready = 1;
         }

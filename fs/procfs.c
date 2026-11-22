@@ -272,6 +272,10 @@ int procfs_stat(const char *path, vfs_stat_t *out)
         out->type = VFS_TYPE_FILE;
         return 0;
     }
+    if (kstreq(path, "/stat")) {
+        out->type = VFS_TYPE_FILE;
+        return 0;
+    }
     if (is_pid_dir(path, &pid) && process_get_info((int)pid, NULL) == 0) {
         out->type = VFS_TYPE_DIR;
         return 0;
@@ -296,6 +300,8 @@ int procfs_list(const char *path, char names[][VFS_NAME_MAX], int max)
         kstrncpy(names[count++], "processes", VFS_NAME_MAX);
         if (count < max)
             kstrncpy(names[count++], "self", VFS_NAME_MAX);
+        if (count < max)
+            kstrncpy(names[count++], "stat", VFS_NAME_MAX);
         procs = (process_snapshot_t *)kmalloc(sizeof(process_snapshot_t) * PROCESS_MAX_COUNT);
         if (!procs)
             return count;
@@ -384,6 +390,33 @@ int procfs_read_file(const char *path, uint8_t **buf_out, size_t *size_out)
             goto fail;
         if (fill_status((uint32_t)cur, &ob) != 0)
             goto fail;
+    } else if (kstreq(path, "/stat")) {
+        process_cpu_stats_t cs;
+        uint64_t total_active = 0;
+        uint64_t total_idle = 0;
+        process_get_cpu_stats(&cs);
+        for (uint32_t c = 0; c < cs.cpu_count; c++) {
+            uint64_t active = (cs.total_ticks[c] >= cs.idle_ticks[c])
+                                  ? (cs.total_ticks[c] - cs.idle_ticks[c]) : 0;
+            total_active += active;
+            total_idle += cs.idle_ticks[c];
+        }
+        if (out_append_str(&ob, "cpu ") != 0) goto fail;
+        if (out_append_u64(&ob, total_active) != 0) goto fail;
+        if (out_append_str(&ob, " 0 0 ") != 0) goto fail;
+        if (out_append_u64(&ob, total_idle) != 0) goto fail;
+        if (out_append_str(&ob, "\n") != 0) goto fail;
+        for (uint32_t c = 0; c < cs.cpu_count; c++) {
+            uint64_t active = (cs.total_ticks[c] >= cs.idle_ticks[c])
+                                  ? (cs.total_ticks[c] - cs.idle_ticks[c]) : 0;
+            if (out_append_str(&ob, "cpu") != 0) goto fail;
+            if (out_append_u64(&ob, c) != 0) goto fail;
+            if (out_append_str(&ob, " ") != 0) goto fail;
+            if (out_append_u64(&ob, active) != 0) goto fail;
+            if (out_append_str(&ob, " 0 0 ") != 0) goto fail;
+            if (out_append_u64(&ob, cs.idle_ticks[c]) != 0) goto fail;
+            if (out_append_str(&ob, "\n") != 0) goto fail;
+        }
     } else if (is_pid_status(path, &pid)) {
         if (fill_status(pid, &ob) != 0)
             goto fail;

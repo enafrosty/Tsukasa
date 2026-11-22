@@ -65,7 +65,9 @@ syscall_entry_x64:
     mov rdi, rax                ; nr (syscall number)
     
     cld
+    sti
     call syscall_dispatch
+    cli
     add rsp, 8                  ; Pop 7th C argument
     
     ; Restore user argument registers (RAX preserved as return value)

@@ -51,9 +51,9 @@ void kconsole_set_active(bool active) {
 }
 
 void kconsole_set_color(uint32_t color) {
-    spin_lock(&console_lock);
+    unsigned long flags = spin_lock_irqsave(&console_lock);
     text_color = color;
-    spin_unlock(&console_lock);
+    spin_unlock_irqrestore(&console_lock, flags);
 }
 
 static void kconsole_scroll(void) {
@@ -95,24 +95,24 @@ static void kconsole_putc_nolock(char c) {
 }
 
 void kconsole_putc(char c) {
-    spin_lock(&console_lock);
+    unsigned long flags = spin_lock_irqsave(&console_lock);
     kconsole_putc_nolock(c);
-    spin_unlock(&console_lock);
+    spin_unlock_irqrestore(&console_lock, flags);
 }
 
 void kconsole_write(const char *s) {
     if (!s) return;
 
-    spin_lock(&console_lock);
+    unsigned long flags = spin_lock_irqsave(&console_lock);
     if (!kconsole_active) {
-        spin_unlock(&console_lock);
+        spin_unlock_irqrestore(&console_lock, flags);
         return;
     }
 
     while (*s) {
         kconsole_putc_nolock(*s++);
     }
-    spin_unlock(&console_lock);
+    spin_unlock_irqrestore(&console_lock, flags);
 }
 
 void log_ok(const char *msg) {

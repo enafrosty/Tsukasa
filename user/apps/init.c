@@ -162,16 +162,13 @@ static int init_main(int argc, char **argv)
     /* Continuous PID 1 zombie reaping loop */
     for (;;) {
         int status = 0;
-        int reaped_pid = 0;
-
-        /* Drain all terminated child processes currently available */
-        while ((reaped_pid = waitpid(-1, &status, WNOHANG)) > 0)
+        int reaped_pid = waitpid(-1, &status, 0);
+        if (reaped_pid > 0) {
             dprintf(1, "[init] reaped child pid=%d status=%d\n", reaped_pid, status);
-
-        /* Sleep when idle to avoid 100% CPU spinning */
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = 50000000; /* 50ms */
+            continue;
+        }
+        /* Fallback pause only when PID 1 currently has no child processes */
+        struct timespec ts = { 0, 500000000 }; /* 500ms */
         nanosleep(&ts, NULL);
     }
 

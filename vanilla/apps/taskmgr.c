@@ -68,6 +68,9 @@ typedef struct {
     int               prev_tick_count;
     int64_t           prev_sample_ms;
     int64_t           last_refresh_ms;
+    uint64_t          prev_cpu_total;
+    uint64_t          prev_cpu_active;
+    int               has_prev_cpu;
 
     unsigned long     mem_used_mb;
     unsigned long     mem_total_mb;
@@ -203,6 +206,45 @@ static unsigned long tm_read_proc_ticks(int pid)
     return tm_read_key_val(path, "ticks");
 }
 
+static int tm_read_proc_stat_cpu(uint64_t *active_out, uint64_t *total_out)
+{
+    FILE *fp = fopen("/proc/stat", "r");
+    if (!fp)
+        return -1;
+
+    char line[256];
+    int ok = -1;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "cpu ", 4) == 0) {
+            const char *p = line + 4;
+            uint64_t cols[10];
+            int ncols = 0;
+            while (*p && ncols < 10) {
+                while (*p == ' ' || *p == '\t')
+                    p++;
+                if (*p < '0' || *p > '9')
+                    break;
+                cols[ncols++] = (uint64_t)strtoull(p, (char **)&p, 10);
+            }
+            if (ncols >= 4) {
+                uint64_t total = 0;
+                for (int i = 0; i < ncols; i++)
+                    total += cols[i];
+                uint64_t idle = cols[3] + (ncols >= 5 ? cols[4] : 0ULL);
+                uint64_t active = (total >= idle) ? (total - idle) : 0ULL;
+                if (active_out)
+                    *active_out = active;
+                if (total_out)
+                    *total_out = total;
+                ok = 0;
+            }
+            break;
+        }
+    }
+    fclose(fp);
+    return ok;
+}
+
 static unsigned long tm_find_prev_ticks(const taskmgr_state_t *st, int pid, int *found)
 {
     for (int i = 0; i < st->prev_tick_count; i++) {
@@ -329,7 +371,27 @@ static void tm_refresh(taskmgr_state_t *st)
         fclose(fp);
     }
 
-    if (st->prev_sample_ms > 0 && now_ms > st->prev_sample_ms) {
+    uint64_t stat_active = 0;
+    uint64_t stat_total = 0;
+    if (tm_read_proc_stat_cpu(&stat_active, &stat_total) == 0) {
+        if (st->has_prev_cpu && stat_total > st->prev_cpu_total) {
+            uint64_t dt_total = stat_total - st->prev_cpu_total;
+            uint64_t dt_active = (stat_active >= st->prev_cpu_active)
+                                     ? (stat_active - st->prev_cpu_active) : 0ULL;
+            uint64_t pct = (dt_active * 100ULL) / dt_total;
+            if (pct > 100ULL)
+                pct = 100ULL;
+            st->cpu_pct = (int)pct;
+        } else if (!st->has_prev_cpu) {
+            uint64_t pct = (stat_total > 0) ? ((stat_active * 100ULL) / stat_total) : 0ULL;
+            if (pct > 100ULL)
+                pct = 100ULL;
+            st->cpu_pct = (int)pct;
+        }
+        st->prev_cpu_active = stat_active;
+        st->prev_cpu_total = stat_total;
+        st->has_prev_cpu = 1;
+    } else if (st->prev_sample_ms > 0 && now_ms > st->prev_sample_ms) {
         int64_t elapsed_ms = now_ms - st->prev_sample_ms;
         unsigned long wall_ticks = (unsigned long)(elapsed_ms / 10);
         if (wall_ticks > 0) {
@@ -339,9 +401,7 @@ static void tm_refresh(taskmgr_state_t *st)
             st->cpu_pct = (int)pct;
         }
     } else {
-        st->cpu_pct = (st->running_cnt > 0) ? (st->running_cnt * 12) : 4;
-        if (st->cpu_pct > 100)
-            st->cpu_pct = 100;
+        st->cpu_pct = 0;
     }
 
     st->prev_tick_count = st->task_count;

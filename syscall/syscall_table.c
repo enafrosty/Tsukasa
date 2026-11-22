@@ -351,10 +351,11 @@ static long sys_dup2(long oldfd, long newfd, long a3, long a4, long a5, long a6)
 static long sys_nanosleep(long ms, long a2, long a3, long a4, long a5, long a6)
 {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
-    uint64_t target = process_ticks() + ((uint64_t)ms + 9) / 10;
-    while (process_ticks() < target)
-        process_yield();
-    return 0;
+    if (ms < 0)
+        return -EINVAL;
+    if (ms == 0)
+        return 0;
+    return process_sleep_ms((uint64_t)ms);
 }
 
 static long sys_getpid(long a1, long a2, long a3, long a4, long a5, long a6)
@@ -885,8 +886,20 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [330] = sys_netcall,
 };
 
+static volatile uint64_t g_ring3_syscall_if_on;
+static volatile uint64_t g_ring3_syscall_if_off;
+
 long syscall_dispatch(long nr, long a1, long a2, long a3, long a4, long a5, long a6)
 {
+    process_t *cur = process_current();
+    if (cur && cur->vm_space.owns_pml4) {
+        uint64_t rf = 0;
+        __asm__ volatile ("pushfq; popq %0" : "=r"(rf));
+        if (rf & (1ULL << 9))
+            __atomic_fetch_add(&g_ring3_syscall_if_on, 1ULL, __ATOMIC_RELAXED);
+        else
+            __atomic_fetch_add(&g_ring3_syscall_if_off, 1ULL, __ATOMIC_RELAXED);
+    }
     if (nr < 0 || nr >= SYSCALL_TABLE_SIZE || !syscall_table[nr])
         return -ENOSYS;
     return syscall_table[nr](a1, a2, a3, a4, a5, a6);
@@ -1123,11 +1136,76 @@ static void c01_test_entry(void)
                     pid, wr, (unsigned)status);
     }
 
+    {
+        process_t *self = process_current();
+        uint64_t ticks0 = self ? self->ticks : 0;
+        uint64_t t0 = pit_ticks_ms();
+        long bad_rc = syscall_dispatch(35, -1, 0, 0, 0, 0, 0);
+        long rc = syscall_dispatch(35, 120, 0, 0, 0, 0, 0);
+        uint64_t dt_ms = pit_ticks_ms() - t0;
+        uint64_t proc_dt = (self ? self->ticks : 0) - ticks0;
+        if (bad_rc == -EINVAL && rc == 0 && dt_ms >= 100ULL && proc_dt <= 3ULL)
+            kprintf("[selftest] nanosleep blocking PASS dt_ms=%llu proc_dt=%llu\n",
+                    (unsigned long long)dt_ms, (unsigned long long)proc_dt);
+        else
+            kprintf("[selftest] nanosleep blocking FAIL bad=%ld rc=%ld dt_ms=%llu proc_dt=%llu\n",
+                    bad_rc, rc, (unsigned long long)dt_ms, (unsigned long long)proc_dt);
+    }
+
+    {
+        uint64_t on_cnt = __atomic_load_n(&g_ring3_syscall_if_on, __ATOMIC_RELAXED);
+        uint64_t off_cnt = __atomic_load_n(&g_ring3_syscall_if_off, __ATOMIC_RELAXED);
+        if (on_cnt > 0ULL && off_cnt == 0ULL)
+            kprintf("[selftest] ring3 syscall IF=1 PASS on=%llu\n", (unsigned long long)on_cnt);
+        else
+            kprintf("[selftest] ring3 syscall IF=1 FAIL on=%llu off=%llu\n",
+                    (unsigned long long)on_cnt, (unsigned long long)off_cnt);
+    }
+
+    {
+        int fd = vfs_open_flags("/proc/stat", VFS_O_RDONLY);
+        char sbuf[256];
+        size_t rd = 0;
+        int ok = 0;
+        if (fd >= 0) {
+            rd = vfs_read(fd, sbuf, sizeof(sbuf) - 1);
+            vfs_close(fd);
+            if (rd > 0 && rd < sizeof(sbuf)) {
+                sbuf[rd] = '\0';
+                if (k_strstr(sbuf, "cpu ") && k_strstr(sbuf, "cpu0 "))
+                    ok = 1;
+            }
+        }
+        if (ok)
+            kprintf("[selftest] procfs /proc/stat PASS bytes=%llu\n", (unsigned long long)rd);
+        else
+            kprintf("[selftest] procfs /proc/stat FAIL fd=%d rd=%llu\n",
+                    fd, (unsigned long long)rd);
+    }
+
     vfs_stat_t st;
-    for (int i = 0; i < 500; i++) {
+    uint64_t wait_start_ms = pit_ticks_ms();
+    while ((pit_ticks_ms() - wait_start_ms) < 15000ULL) {
         if (vfs_stat("/tmp/vanilla.sock", &st) == 0)
             break;
-        process_yield();
+        process_sleep_ms(20);
+    }
+    process_sleep_ms(300);
+
+    {
+        uint8_t ta = idt_get_gate_type_attr_x64(IDT_VEC_YIELD);
+        uint64_t pit0 = pit_ticks();
+        uint64_t sched0 = process_ticks();
+        for (int i = 0; i < 500; i++)
+            process_yield();
+        uint64_t pit_dt = pit_ticks() - pit0;
+        uint64_t sched_dt = process_ticks() - sched0;
+        if ((ta & 0x60u) == 0u && pit_dt < 100ULL && sched_dt < 100ULL)
+            kprintf("[selftest] yield vector PASS ta=0x%02x pit_dt=%llu sched_dt=%llu\n",
+                    (unsigned)ta, (unsigned long long)pit_dt, (unsigned long long)sched_dt);
+        else
+            kprintf("[selftest] yield vector FAIL ta=0x%02x pit_dt=%llu sched_dt=%llu\n",
+                    (unsigned)ta, (unsigned long long)pit_dt, (unsigned long long)sched_dt);
     }
 
     kprintf("[selftest] ALL DONE\n");
