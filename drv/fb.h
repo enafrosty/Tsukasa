@@ -66,4 +66,7 @@ void fb_set_kd_mode(int mode);
 /* Double-buffer panning probe. */
 int fb_try_enable_panning(void);
 
+/* Last PTE flags observed on user /dev/fb0 mmap. */
+uint64_t fb_last_user_mmap_pte_flags(void);
+
 #endif /* FB_H */

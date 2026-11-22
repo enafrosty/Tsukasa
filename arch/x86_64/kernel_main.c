@@ -286,14 +286,21 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
         size_t fb_size = (size_t)fb_info.pitch * (size_t)fb_info.height;
 
         if (boot_info)
-            vmm_map_io_region(boot_info->framebuffer_addr, fb_size, &fb_mapped);
+            vmm_map_wc_region(boot_info->framebuffer_addr, fb_size, &fb_mapped);
         if (fb_mapped)
             fb_info.addr = (void *)fb_mapped;
 
-        kprintf("[boot:x64] framebuffer %ux%u bpp=%u\n",
+        uint64_t fb_pa = 0, fb_fl = 0;
+        int fb_q = vmm_query_page(vmm_get_current_pml4(),
+                                  (uintptr_t)fb_info.addr & ~(uintptr_t)(PAGE_SIZE - 1),
+                                  &fb_pa, &fb_fl);
+        kprintf("[boot:x64] framebuffer %ux%u bpp=%u pat=0x%08x%08x fb_flags=0x%08x%08x q=%d\n",
                 fb_info.width,
                 fb_info.height,
-                fb_info.bpp);
+                fb_info.bpp,
+                (uint32_t)(vmm_x64_pat_msr() >> 32), (uint32_t)vmm_x64_pat_msr(),
+                (uint32_t)(fb_fl >> 32), (uint32_t)fb_fl,
+                fb_q);
     } else {
         kprintf("[boot:x64] framebuffer unavailable\n");
     }

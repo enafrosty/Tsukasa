@@ -41,6 +41,13 @@
 
 struct fb_info fb_info = { NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 static int g_kd_mode = VFS_KD_TEXT;
+static volatile uint64_t g_fb_user_mmap_pte_flags = 0;
+static int g_fb_user_mmap_logged = 0;
+
+uint64_t fb_last_user_mmap_pte_flags(void)
+{
+    return g_fb_user_mmap_pte_flags;
+}
 
 /*
  * Double-buffer panning probe.
@@ -293,6 +300,7 @@ void *fb_mmap(void *addr, size_t length, int prot, int flags, size_t offset)
 
         if (vmm_query_page(proc->vm_space.pml4_phys, target_va, &q_phys, &q_flags) == 0 &&
             (q_flags & VMM_X64_PTE_PRESENT)) {
+            g_fb_user_mmap_pte_flags = q_flags;
             return (void *)(target_va + (offset & page_mask));
         }
 
@@ -302,8 +310,18 @@ void *fb_mmap(void *addr, size_t length, int prot, int flags, size_t offset)
                                     phys_start,
                                     page_count,
                                     PAGING_MAP_READ | PAGING_MAP_WRITE |
-                                    PAGING_MAP_USER) != 0) {
+                                    PAGING_MAP_USER | PAGING_MAP_WC) != 0) {
             return (void *)-1;
+        }
+        if (vmm_query_page(proc->vm_space.pml4_phys, target_va, &q_phys, &q_flags) == 0) {
+            g_fb_user_mmap_pte_flags = q_flags;
+            if (!g_fb_user_mmap_logged) {
+                g_fb_user_mmap_logged = 1;
+                kprintf("[fb] user /dev/fb0 mmap va=0x%08x%08x pages=%u pte_flags=0x%08x%08x\n",
+                        (uint32_t)((uint64_t)target_va >> 32), (uint32_t)(uint64_t)target_va,
+                        (uint32_t)page_count,
+                        (uint32_t)(q_flags >> 32), (uint32_t)q_flags);
+            }
         }
         return (void *)(target_va + (offset & page_mask));
     }

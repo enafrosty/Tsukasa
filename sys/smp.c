@@ -28,6 +28,11 @@
 #include "mm/pmm.h"
 #include "mm/heap.h"
 
+_Static_assert(offsetof(cpu_state_t, syscall_rsp) == X64_CPU_SYSCALL_RSP_OFF,
+               "cpu_state_t syscall_rsp offset mismatch");
+_Static_assert(offsetof(cpu_state_t, user_rsp) == X64_CPU_USER_RSP_OFF,
+               "cpu_state_t user_rsp offset mismatch");
+
 static cpu_state_t *cpu_states = NULL;
 static uint32_t total_cpus = 0;
 static uint32_t bsp_lapic_id = 0;
@@ -95,6 +100,9 @@ static void ap_entry(struct limine_smp_info *info)
     uint64_t kernel_cr3 = vmm_get_current_pml4();
     __asm__ volatile ("mov %0, %%cr3" : : "r"(kernel_cr3));
 
+    (void)vmm_x64_init_pat_cpu();
+    cpu_states[my_id].pat_msr = vmm_x64_read_pat_cpu();
+
     lapic_enable();
 
     cpu_states[my_id].self = &cpu_states[my_id];
@@ -140,6 +148,7 @@ void smp_init_bsp(void)
     bsp_cpu_state.online = true;
     bsp_cpu_state.kernel_stack = (uint64_t)(uintptr_t)x64_boot_stack_top;
     bsp_cpu_state.syscall_rsp = bsp_cpu_state.kernel_stack;
+    bsp_cpu_state.pat_msr = vmm_x64_read_pat_cpu();
     bsp_lapic_id = bsp_cpu_state.lapic_id;
 
     wrmsr(MSR_GS_BASE, (uint64_t)(uintptr_t)&bsp_cpu_state);

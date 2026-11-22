@@ -32,6 +32,8 @@
 #define PAGING_MAP_USER    (1ULL << 3)
 #define PAGING_MAP_GLOBAL  (1ULL << 4)
 #define PAGING_MAP_DEVICE  (1ULL << 5)
+#define PAGING_MAP_WC      (1ULL << 6)
+#define MMU_FLAG_WC        PAGING_MAP_WC
 
 /* Canonical x64 mapping boundaries used for validation. */
 #define PAGING_USER_VA_MIN    0x0000000000100000ULL

@@ -37,11 +37,25 @@ typedef struct {
 #define VMM_X64_FB_MMIO_BASE  0x0000000030000000ULL
 #define VMM_X64_FB_MMIO_LIMIT 0x0000000040000000ULL
 
+#define PAT_MEM_UC       0x00ULL
+#define PAT_MEM_WC       0x01ULL
+#define PAT_MEM_WT       0x04ULL
+#define PAT_MEM_WB       0x06ULL
+#define PAT_MEM_UC_MINUS 0x07ULL
+
+#define VMM_X64_PTE_CACHE_MASK (VMM_X64_PTE_PAT | VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_WRITE_THROUGH)
+#define VMM_X64_PDE_CACHE_MASK (VMM_X64_PDE_PAT | VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_WRITE_THROUGH)
+
+_Static_assert(
+    ((PAT_MEM_WB << 0) | (PAT_MEM_WT << 8) | (PAT_MEM_UC_MINUS << 16) | (PAT_MEM_UC << 24) |
+     (PAT_MEM_WC << 32) | (PAT_MEM_WT << 40) | (PAT_MEM_UC_MINUS << 48) | (PAT_MEM_UC << 56)) ==
+    VMM_X64_PAT_VALUE,
+    "VMM_X64_PAT_VALUE must encode PA0=WB, PA3=UC, PA4=WC");
+
 /* concurrent shm attaches). */
 static spinlock_t g_vmm_lock = SPINLOCK_INIT;
+static volatile int g_pat_supported = 0;
 
-static int query_page_nolock(uint64_t pml4_phys, uintptr_t virt_addr,
-                             uint64_t *phys_out, uint64_t *pte_flags_out);
 static int map_pages_nolock(uint64_t pml4_phys, uintptr_t virt_addr,
                             uint64_t phys_addr, size_t page_count,
                             uint64_t map_flags);
@@ -142,9 +156,15 @@ static uint64_t pte_flags_from_map(uint64_t map_flags)
     if (map_flags & PAGING_MAP_USER)
         pte |= VMM_X64_PTE_USER;
     if (map_flags & PAGING_MAP_GLOBAL)
-        pte |= (1ULL << 8);
-    if (map_flags & PAGING_MAP_DEVICE)
+        pte |= VMM_X64_PTE_GLOBAL;
+    if (map_flags & PAGING_MAP_DEVICE) {
         pte |= VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_WRITE_THROUGH;
+    } else if (map_flags & PAGING_MAP_WC) {
+        if (g_pat_supported)
+            pte |= VMM_X64_PTE_PAT;
+        else
+            pte |= VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_WRITE_THROUGH;
+    }
     if ((map_flags & PAGING_MAP_EXEC) == 0)
         pte |= VMM_X64_PTE_NO_EXEC;
 
@@ -161,10 +181,12 @@ static uint64_t map_flags_from_legacy(uint64_t legacy_flags)
         map |= PAGING_MAP_USER;
     if ((legacy_flags & VMM_X64_PTE_NO_EXEC) == 0)
         map |= PAGING_MAP_EXEC;
-    if (legacy_flags & (1ULL << 8))
+    if (legacy_flags & VMM_X64_PTE_GLOBAL)
         map |= PAGING_MAP_GLOBAL;
     if (legacy_flags & (VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_WRITE_THROUGH))
         map |= PAGING_MAP_DEVICE;
+    else if (legacy_flags & VMM_X64_PTE_PAT)
+        map |= PAGING_MAP_WC;
 
     return map;
 }
@@ -218,6 +240,8 @@ static int walk_to_pt(uint64_t pml4_phys,
         if (!new_pd)
             return -1;
         pdpt->entries[pdpt_idx] = new_pd | table_flags;
+    } else if (pdpt->entries[pdpt_idx] & VMM_X64_PDE_PS) {
+        return -1;
     } else if (user && ((pdpt->entries[pdpt_idx] & VMM_X64_PTE_USER) == 0)) {
         return -1;
     }
@@ -231,6 +255,8 @@ static int walk_to_pt(uint64_t pml4_phys,
         if (!new_pt)
             return -1;
         pd->entries[pd_idx] = new_pt | table_flags;
+    } else if (pd->entries[pd_idx] & VMM_X64_PDE_PS) {
+        return -1;
     } else if (user && ((pd->entries[pd_idx] & VMM_X64_PTE_USER) == 0)) {
         return -1;
     }
@@ -270,12 +296,98 @@ static void tlb_flush_range(uint64_t pml4_phys, uintptr_t virt_addr, size_t page
 
 static uint64_t g_boot_kernel_pml4 = 0;
 
+static int cpu_has_pat(void)
+{
+#ifdef __x86_64__
+    uint32_t eax = 1u, ebx = 0u, ecx = 0u, edx = 0u;
+    __asm__ volatile ("cpuid"
+                      : "+a"(eax), "=b"(ebx), "+c"(ecx), "+d"(edx)
+                      :
+                      : "memory");
+    return (edx & (1u << 16)) != 0;
+#else
+    return 0;
+#endif
+}
+
+uint64_t vmm_x64_read_pat_cpu(void)
+{
+#ifdef __x86_64__
+    if (!cpu_has_pat())
+        return 0;
+    return rdmsr(MSR_IA32_PAT);
+#else
+    return 0;
+#endif
+}
+
 void vmm_x64_init(uint64_t hhdm_offset)
 {
     g_hhdm_offset = hhdm_offset;
 #ifdef __x86_64__
     g_boot_kernel_pml4 = read_cr3() & VMM_X64_ADDR_MASK;
+    if (vmm_x64_init_pat_cpu() == 0 && vmm_x64_read_pat_cpu() == VMM_X64_PAT_VALUE)
+        g_pat_supported = 1;
+    else
+        g_pat_supported = 0;
 #endif
+}
+
+int vmm_x64_init_pat_cpu(void)
+{
+#ifdef __x86_64__
+    if (!cpu_has_pat())
+        return -1;
+
+    uint64_t rflags = 0;
+    __asm__ volatile ("pushfq\n\tpopq %0\n\tcli" : "=r"(rflags) : : "memory");
+
+    uint64_t cr0_orig = 0;
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0_orig) : : "memory");
+    uint64_t cr0_nocache = (cr0_orig | (1ULL << 30)) & ~(1ULL << 29);
+    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0_nocache) : "memory");
+
+    __asm__ volatile ("wbinvd" : : : "memory");
+
+    uint64_t cr4 = 0;
+    __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4) : : "memory");
+    if (cr4 & (1ULL << 7)) {
+        __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4 & ~(1ULL << 7)) : "memory");
+        __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4) : "memory");
+    } else {
+        write_cr3(read_cr3());
+    }
+
+    wrmsr(MSR_IA32_PAT, VMM_X64_PAT_VALUE);
+    __asm__ volatile ("wbinvd" : : : "memory");
+
+    if (cr4 & (1ULL << 7)) {
+        __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4 & ~(1ULL << 7)) : "memory");
+        __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4) : "memory");
+    } else {
+        write_cr3(read_cr3());
+    }
+
+    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0_orig) : "memory");
+    uint64_t val = rdmsr(MSR_IA32_PAT);
+
+    if (rflags & (1ULL << 9))
+        __asm__ volatile ("sti" : : : "memory");
+
+    return (val == VMM_X64_PAT_VALUE) ? 0 : -1;
+#else
+    return -1;
+#endif
+}
+
+int vmm_x64_pat_supported(void)
+{
+    return g_pat_supported;
+}
+
+uint64_t vmm_x64_pat_msr(void)
+{
+    return vmm_x64_read_pat_cpu();
 }
 
 uint64_t vmm_x64_hhdm_offset(void)
@@ -537,12 +649,19 @@ int vmm_destroy_address_space(uint64_t pml4_phys)
 }
 
 #ifdef __x86_64__
-static int query_page_nolock(uint64_t pml4_phys,
-                             uintptr_t virt_addr,
-                             uint64_t *phys_out,
-                             uint64_t *pte_flags_out)
+static int query_page_ex_nolock(uint64_t pml4_phys,
+                                uintptr_t virt_addr,
+                                uint64_t *phys_out,
+                                uint64_t *pte_flags_out,
+                                size_t *page_size_out)
 {
+    page_table_t *pml4;
+    page_table_t *pdpt;
+    page_table_t *pd;
     page_table_t *pt;
+    uint64_t pml4_idx;
+    uint64_t pdpt_idx;
+    uint64_t pd_idx;
     uint64_t pt_idx;
     uint64_t entry;
     int user;
@@ -554,10 +673,51 @@ static int query_page_nolock(uint64_t pml4_phys,
         return -1;
 
     user = paging_range_is_user(virt_addr, PAGE_SIZE);
-    if (walk_to_pt(pml4_phys, virt_addr, 0, user, &pt) != 0)
+    pml4_idx = ((uint64_t)virt_addr >> 39) & 0x1FFULL;
+    pdpt_idx = ((uint64_t)virt_addr >> 30) & 0x1FFULL;
+    pd_idx = ((uint64_t)virt_addr >> 21) & 0x1FFULL;
+    pt_idx = ((uint64_t)virt_addr >> 12) & 0x1FFULL;
+
+    pml4 = table_virt(pml4_phys);
+    entry = pml4->entries[pml4_idx];
+    if ((entry & VMM_X64_PTE_PRESENT) == 0)
+        return -1;
+    if (user && (entry & VMM_X64_PTE_USER) == 0)
         return -1;
 
-    pt_idx = ((uint64_t)virt_addr >> 12) & 0x1FFULL;
+    pdpt = table_virt(entry);
+    entry = pdpt->entries[pdpt_idx];
+    if ((entry & VMM_X64_PTE_PRESENT) == 0)
+        return -1;
+    if (user && (entry & VMM_X64_PTE_USER) == 0)
+        return -1;
+    if (entry & VMM_X64_PDE_PS) {
+        if (phys_out)
+            *phys_out = (entry & 0x000FFFFFC0000000ULL) | ((uint64_t)virt_addr & 0x3FFFFFFFULL);
+        if (pte_flags_out)
+            *pte_flags_out = entry & ~0x000FFFFFC0000000ULL;
+        if (page_size_out)
+            *page_size_out = (size_t)(1ULL << 30);
+        return 0;
+    }
+
+    pd = table_virt(entry);
+    entry = pd->entries[pd_idx];
+    if ((entry & VMM_X64_PTE_PRESENT) == 0)
+        return -1;
+    if (user && (entry & VMM_X64_PTE_USER) == 0)
+        return -1;
+    if (entry & VMM_X64_PDE_PS) {
+        if (phys_out)
+            *phys_out = (entry & 0x000FFFFFFFE00000ULL) | ((uint64_t)virt_addr & 0x1FFFFFULL);
+        if (pte_flags_out)
+            *pte_flags_out = entry & ~0x000FFFFFFFE00000ULL;
+        if (page_size_out)
+            *page_size_out = (size_t)(2ULL << 20);
+        return 0;
+    }
+
+    pt = table_virt(entry);
     entry = pt->entries[pt_idx];
     if ((entry & VMM_X64_PTE_PRESENT) == 0)
         return -1;
@@ -566,6 +726,8 @@ static int query_page_nolock(uint64_t pml4_phys,
         *phys_out = entry & VMM_X64_ADDR_MASK;
     if (pte_flags_out)
         *pte_flags_out = entry & ~VMM_X64_ADDR_MASK;
+    if (page_size_out)
+        *page_size_out = (size_t)PAGE_SIZE;
 
     return 0;
 }
@@ -578,7 +740,7 @@ int vmm_query_page(uint64_t pml4_phys,
 {
 #ifdef __x86_64__
     unsigned long irq_flags = spin_lock_irqsave(&g_vmm_lock);
-    int rc = query_page_nolock(pml4_phys, virt_addr, phys_out, pte_flags_out);
+    int rc = query_page_ex_nolock(pml4_phys, virt_addr, phys_out, pte_flags_out, NULL);
     spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
     return rc;
 #else
@@ -586,6 +748,27 @@ int vmm_query_page(uint64_t pml4_phys,
     (void)virt_addr;
     (void)phys_out;
     (void)pte_flags_out;
+    return -1;
+#endif
+}
+
+int vmm_query_page_ex(uint64_t pml4_phys,
+                      uintptr_t virt_addr,
+                      uint64_t *phys_out,
+                      uint64_t *pte_flags_out,
+                      size_t *page_size_out)
+{
+#ifdef __x86_64__
+    unsigned long irq_flags = spin_lock_irqsave(&g_vmm_lock);
+    int rc = query_page_ex_nolock(pml4_phys, virt_addr, phys_out, pte_flags_out, page_size_out);
+    spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
+    return rc;
+#else
+    (void)pml4_phys;
+    (void)virt_addr;
+    (void)phys_out;
+    (void)pte_flags_out;
+    (void)page_size_out;
     return -1;
 #endif
 }
@@ -670,10 +853,13 @@ static int unmap_pages_nolock(uint64_t pml4_phys,
 
     user = paging_range_is_user(virt_addr, page_count * (size_t)PAGE_SIZE) ? 1 : 0;
     for (size_t i = 0; i < page_count; i++) {
-        if (query_page_nolock(pml4_phys,
-                              virt_addr + (uintptr_t)(i * PAGE_SIZE),
-                              NULL,
-                              NULL) != 0) {
+        size_t leaf_size = 0;
+        if (query_page_ex_nolock(pml4_phys,
+                                 virt_addr + (uintptr_t)(i * PAGE_SIZE),
+                                 NULL,
+                                 NULL,
+                                 &leaf_size) != 0 ||
+            leaf_size != (size_t)PAGE_SIZE) {
             return -1;
         }
     }
@@ -738,6 +924,19 @@ int vmm_protect_pages(uint64_t pml4_phys,
     {
         unsigned long irq_flags = spin_lock_irqsave(&g_vmm_lock);
         for (size_t i = 0; i < page_count; i++) {
+            size_t leaf_size = 0;
+            if (query_page_ex_nolock(pml4_phys,
+                                     virt_addr + (uintptr_t)(i * PAGE_SIZE),
+                                     NULL,
+                                     NULL,
+                                     &leaf_size) != 0 ||
+                leaf_size != (size_t)PAGE_SIZE) {
+                spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
+                return -1;
+            }
+        }
+
+        for (size_t i = 0; i < page_count; i++) {
             page_table_t *pt = NULL;
             uintptr_t va = virt_addr + (uintptr_t)(i * PAGE_SIZE);
             uint64_t pt_idx;
@@ -795,19 +994,71 @@ int vmm_unmap_page(uintptr_t virt_addr)
 #endif
 }
 
-int vmm_map_io_region(uint64_t phys_base, size_t size, uintptr_t *virt_base)
+#ifdef __x86_64__
+static int split_1g_page_nolock(page_table_t *pdpt, uint64_t pdpt_idx)
 {
-    if (!virt_base || size == 0)
+    uint64_t entry = pdpt->entries[pdpt_idx];
+    uint64_t base_phys = entry & 0x000FFFFFC0000000ULL;
+    uint64_t leaf_flags = entry & (VMM_X64_PTE_PRESENT | VMM_X64_PTE_WRITABLE |
+                                   VMM_X64_PTE_USER | VMM_X64_PTE_WRITE_THROUGH |
+                                   VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PDE_PS |
+                                   VMM_X64_PTE_GLOBAL | VMM_X64_PDE_PAT |
+                                   VMM_X64_PTE_NO_EXEC);
+    uint64_t new_pd_phys = alloc_table_phys();
+    if (!new_pd_phys)
         return -1;
 
-#ifdef __x86_64__
+    page_table_t *new_pd = table_virt(new_pd_phys);
+    for (uint64_t i = 0; i < 512; i++) {
+        new_pd->entries[i] = (base_phys + (i << 21)) | leaf_flags | VMM_X64_PDE_PS;
+    }
+
+    uint64_t dir_flags = VMM_X64_PTE_PRESENT | VMM_X64_PTE_WRITABLE | (entry & VMM_X64_PTE_USER);
+    pdpt->entries[pdpt_idx] = new_pd_phys | dir_flags;
+    return 0;
+}
+
+static int split_2m_page_nolock(page_table_t *pd, uint64_t pd_idx)
+{
+    uint64_t entry = pd->entries[pd_idx];
+    uint64_t base_phys = entry & 0x000FFFFFFFE00000ULL;
+    uint64_t leaf_flags = entry & (VMM_X64_PTE_PRESENT | VMM_X64_PTE_WRITABLE |
+                                   VMM_X64_PTE_USER | VMM_X64_PTE_WRITE_THROUGH |
+                                   VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_GLOBAL |
+                                   VMM_X64_PTE_NO_EXEC);
+    /* Move PAT from huge-page bit 12 to 4 KiB PTE bit 7 so bit 12 does not pollute PFN. */
+    if (entry & VMM_X64_PDE_PAT)
+        leaf_flags |= VMM_X64_PTE_PAT;
+
+    uint64_t new_pt_phys = alloc_table_phys();
+    if (!new_pt_phys)
+        return -1;
+
+    page_table_t *new_pt = table_virt(new_pt_phys);
+    for (uint64_t i = 0; i < 512; i++) {
+        new_pt->entries[i] = (base_phys + (i << 12)) | leaf_flags;
+    }
+
+    uint64_t dir_flags = VMM_X64_PTE_PRESENT | VMM_X64_PTE_WRITABLE | (entry & VMM_X64_PTE_USER);
+    pd->entries[pd_idx] = new_pt_phys | dir_flags;
+    return 0;
+}
+
+static int map_kernel_phys_region(uint64_t phys_base,
+                                  size_t size,
+                                  uintptr_t *virt_base,
+                                  uint64_t cache_map_flag)
+{
     uint64_t phys_page;
     uint64_t phys_end;
     size_t page_count;
     uintptr_t virt_page;
     uint64_t pml4_phys;
     uint64_t page_offset;
+    int use_wc;
 
+    if (!virt_base || size == 0)
+        return -1;
     if (phys_base + (uint64_t)size - 1ULL < phys_base)
         return -1;
 
@@ -823,46 +1074,150 @@ int vmm_map_io_region(uint64_t phys_base, size_t size, uintptr_t *virt_base)
     if (!paging_range_is_kernel(virt_page, page_count * (size_t)PAGE_SIZE))
         return -1;
 
+    use_wc = ((cache_map_flag & PAGING_MAP_WC) != 0 &&
+              (cache_map_flag & PAGING_MAP_DEVICE) == 0 &&
+              g_pat_supported != 0);
+
     {
         unsigned long irq_flags = spin_lock_irqsave(&g_vmm_lock);
-        for (size_t i = 0; i < page_count; i++) {
+        page_table_t *pml4 = table_virt(pml4_phys);
+        uint64_t table_flags = VMM_X64_PTE_PRESENT | VMM_X64_PTE_WRITABLE;
+        int did_split = 0;
+
+        size_t i = 0;
+        while (i < page_count) {
             uintptr_t va = virt_page + (uintptr_t)(i * (size_t)PAGE_SIZE);
             uint64_t pa = phys_page + ((uint64_t)i * (uint64_t)PAGE_SIZE);
-            uint64_t existing_pa = 0;
+            uint64_t pml4_idx = ((uint64_t)va >> 39) & 0x1FFULL;
+            uint64_t pdpt_idx = ((uint64_t)va >> 30) & 0x1FFULL;
+            uint64_t pd_idx = ((uint64_t)va >> 21) & 0x1FFULL;
+            uint64_t pt_idx = ((uint64_t)va >> 12) & 0x1FFULL;
+            page_table_t *pdpt;
+            page_table_t *pd;
+            page_table_t *pt;
 
-            if (query_page_nolock(pml4_phys, va, &existing_pa, NULL) == 0) {
-                if ((existing_pa & VMM_X64_ADDR_MASK) != (pa & VMM_X64_ADDR_MASK)) {
+            if ((pml4->entries[pml4_idx] & VMM_X64_PTE_PRESENT) == 0) {
+                uint64_t new_pdpt = alloc_table_phys();
+                if (!new_pdpt) {
                     spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
                     return -1;
                 }
-                /* Update existing PTE to ensure cache-disable and write-through flags are set */
-                page_table_t *pt = NULL;
-                if (walk_to_pt(pml4_phys, va, 0, 0, &pt) == 0 && pt) {
-                    uint64_t pt_idx = ((uint64_t)va >> 12) & 0x1FFULL;
-                    pt->entries[pt_idx] |= (VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_WRITE_THROUGH);
-                    invlpg_addr(va);
-                }
-                continue;
+                pml4->entries[pml4_idx] = new_pdpt | table_flags;
             }
 
-            if (map_pages_nolock(pml4_phys,
-                                 va,
-                                 pa,
-                                 1,
-                                 PAGING_MAP_READ | PAGING_MAP_WRITE |
-                                     PAGING_MAP_GLOBAL | PAGING_MAP_DEVICE) != 0) {
-                spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
-                return -1;
+            pdpt = table_virt(pml4->entries[pml4_idx]);
+            if ((pdpt->entries[pdpt_idx] & VMM_X64_PTE_PRESENT) == 0) {
+                uint64_t new_pd = alloc_table_phys();
+                if (!new_pd) {
+                    spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
+                    return -1;
+                }
+                pdpt->entries[pdpt_idx] = new_pd | table_flags;
+            } else if (pdpt->entries[pdpt_idx] & VMM_X64_PDE_PS) {
+                if ((pdpt->entries[pdpt_idx] & 0x000FFFFFC0000000ULL) != (pa & ~0x3FFFFFFFULL)) {
+                    spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
+                    return -1;
+                }
+                if (split_1g_page_nolock(pdpt, pdpt_idx) != 0) {
+                    spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
+                    return -1;
+                }
+                invlpg_addr(va);
+                did_split = 1;
             }
+
+            pd = table_virt(pdpt->entries[pdpt_idx]);
+            if ((pd->entries[pd_idx] & VMM_X64_PTE_PRESENT) == 0) {
+                uint64_t new_pt = alloc_table_phys();
+                if (!new_pt) {
+                    spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
+                    return -1;
+                }
+                pd->entries[pd_idx] = new_pt | table_flags;
+            } else if (pd->entries[pd_idx] & VMM_X64_PDE_PS) {
+                uint64_t huge_pa = pd->entries[pd_idx] & 0x000FFFFFFFE00000ULL;
+                if (huge_pa != (pa & ~0x1FFFFFULL)) {
+                    spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
+                    return -1;
+                }
+                if ((va & 0x1FFFFFULL) == 0 && (pa & 0x1FFFFFULL) == 0 &&
+                    (page_count - i) >= 512) {
+                    uint64_t entry = pd->entries[pd_idx] & ~VMM_X64_PDE_CACHE_MASK;
+                    if (use_wc)
+                        entry |= VMM_X64_PDE_PAT;
+                    else
+                        entry |= VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_WRITE_THROUGH;
+                    entry |= VMM_X64_PTE_WRITABLE | VMM_X64_PTE_NO_EXEC | VMM_X64_PDE_PS;
+                    pd->entries[pd_idx] = entry;
+                    invlpg_addr(va);
+                    i += 512;
+                    continue;
+                }
+                if (split_2m_page_nolock(pd, pd_idx) != 0) {
+                    spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
+                    return -1;
+                }
+                invlpg_addr(va);
+                did_split = 1;
+            }
+
+            pt = table_virt(pd->entries[pd_idx]);
+            if (pt->entries[pt_idx] & VMM_X64_PTE_PRESENT) {
+                if ((pt->entries[pt_idx] & VMM_X64_ADDR_MASK) != (pa & VMM_X64_ADDR_MASK)) {
+                    spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
+                    return -1;
+                }
+                uint64_t entry = pt->entries[pt_idx] & ~VMM_X64_PTE_CACHE_MASK;
+                if (use_wc)
+                    entry |= VMM_X64_PTE_PAT;
+                else
+                    entry |= VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_WRITE_THROUGH;
+                entry |= VMM_X64_PTE_WRITABLE | VMM_X64_PTE_NO_EXEC;
+                pt->entries[pt_idx] = entry;
+            } else {
+                uint64_t pte_flags = pte_flags_from_map(PAGING_MAP_READ | PAGING_MAP_WRITE |
+                                                        PAGING_MAP_GLOBAL | cache_map_flag);
+                pt->entries[pt_idx] = (pa & VMM_X64_ADDR_MASK) | pte_flags | VMM_X64_PTE_PRESENT;
+            }
+            invlpg_addr(va);
+            i++;
         }
+
+        if (did_split)
+            write_cr3(pml4_phys);
+
         spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
     }
 
     *virt_base = virt_page + (uintptr_t)page_offset;
+    return 0;
+}
+#endif /* __x86_64__ */
+
+int vmm_map_io_region(uint64_t phys_base, size_t size, uintptr_t *virt_base)
+{
+    if (!virt_base || size == 0)
+        return -1;
+
+#ifdef __x86_64__
+    return map_kernel_phys_region(phys_base, size, virt_base, PAGING_MAP_DEVICE);
 #else
     *virt_base = (uintptr_t)phys_base;
-#endif
     return 0;
+#endif
+}
+
+int vmm_map_wc_region(uint64_t phys_base, size_t size, uintptr_t *virt_base)
+{
+    if (!virt_base || size == 0)
+        return -1;
+
+#ifdef __x86_64__
+    return map_kernel_phys_region(phys_base, size, virt_base, PAGING_MAP_WC);
+#else
+    *virt_base = (uintptr_t)phys_base;
+    return 0;
+#endif
 }
 
 int vmm_validate_user_ptr(const void *ptr, size_t len, int need_write)
