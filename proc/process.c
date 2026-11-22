@@ -75,6 +75,7 @@ static process_t *g_current[CPU_COUNT_MAX + 1];
 static process_t *g_idle[CPU_COUNT_MAX + 1];
 static process_t *g_runq_head[PROCESS_PRIORITY_LEVELS];
 static process_t *g_runq_tail[PROCESS_PRIORITY_LEVELS];
+static process_t *g_sleepq_head;
 
 static spinlock_t g_sched_lock = SPINLOCK_INIT;
 static uint32_t g_next_pid = 1;
@@ -323,6 +324,71 @@ static void runq_remove_locked(process_t *target)
     }
 }
 
+static void sleepq_remove_locked(process_t *target)
+{
+    process_t *prev = NULL;
+    process_t *cur = g_sleepq_head;
+
+    if (!target)
+        return;
+
+    while (cur) {
+        if (cur == target) {
+            if (prev)
+                prev->sleep_next = cur->sleep_next;
+            else
+                g_sleepq_head = cur->sleep_next;
+            cur->sleep_next = NULL;
+            cur->sleep_deadline_ms = 0;
+            return;
+        }
+        prev = cur;
+        cur = cur->sleep_next;
+    }
+    target->sleep_next = NULL;
+    target->sleep_deadline_ms = 0;
+}
+
+static void sleepq_insert_locked(process_t *p)
+{
+    process_t *prev = NULL;
+    process_t *cur;
+    uint64_t dl;
+
+    if (!p)
+        return;
+
+    dl = p->sleep_deadline_ms;
+    sleepq_remove_locked(p);
+    p->sleep_deadline_ms = dl;
+
+    cur = g_sleepq_head;
+    while (cur && cur->sleep_deadline_ms <= dl) {
+        prev = cur;
+        cur = cur->sleep_next;
+    }
+    p->sleep_next = cur;
+    if (prev)
+        prev->sleep_next = p;
+    else
+        g_sleepq_head = p;
+}
+
+static void sleepq_wake_expired_locked(uint64_t now_ms)
+{
+    while (g_sleepq_head && now_ms >= g_sleepq_head->sleep_deadline_ms) {
+        process_t *p = g_sleepq_head;
+        g_sleepq_head = p->sleep_next;
+        p->sleep_next = NULL;
+        p->sleep_deadline_ms = 0;
+        if (p->used && !p->is_idle && p->state == PROCESS_SLEEPING) {
+            p->state = PROCESS_READY;
+            p->main_thread.state = THREAD_READY;
+            runq_push_locked(p);
+        }
+    }
+}
+
 static void parent_link_child_locked(process_t *parent, process_t *child)
 {
     if (!parent || !child)
@@ -395,6 +461,7 @@ static void reset_process_slot_locked(process_t *p)
 {
     if (!p)
         return;
+    sleepq_remove_locked(p);
     free_process_resources_locked(p);
     p->used = 0;
     p->state = PROCESS_DEAD;
@@ -448,7 +515,7 @@ static int frame_is_resumable(const uint64_t *ctx, uint64_t low, uint64_t high)
     uint64_t rsp = ctx[19];
     uint64_t ss = ctx[20];
 
-    if (cs == X64_GDT_KERNEL_CS && ss == X64_GDT_KERNEL_DS)
+    if (cs == X64_GDT_KERNEL_CS && (ss == X64_GDT_KERNEL_DS || ss == 0))
         return rip != 0 &&
                rsp >= low && rsp <= (high - sizeof(uint64_t));
 
@@ -561,7 +628,7 @@ void process_block_current(void)
     spin_unlock_irqrestore(&g_sched_lock, irqf);
 }
 
-void process_block_on_poll(uint64_t deadline_ms)
+void process_set_poll_blocked(uint64_t deadline_ms)
 {
     unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
     process_t *self = g_current[sched_this_cpu()];
@@ -571,10 +638,12 @@ void process_block_on_poll(uint64_t deadline_ms)
         self->main_thread.state = THREAD_BLOCKED;
     }
     spin_unlock_irqrestore(&g_sched_lock, irqf);
-    process_yield();
+}
 
-    irqf = spin_lock_irqsave(&g_sched_lock);
-    self = g_current[sched_this_cpu()];
+void process_clear_poll_deadline(void)
+{
+    unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
+    process_t *self = g_current[sched_this_cpu()];
     if (self) {
         self->poll_deadline_ms = 0;
         if (self->state == PROCESS_BLOCKED) {
@@ -585,11 +654,22 @@ void process_block_on_poll(uint64_t deadline_ms)
     spin_unlock_irqrestore(&g_sched_lock, irqf);
 }
 
+void process_block_on_poll(uint64_t deadline_ms)
+{
+    uint64_t flags = irq_save_disable();
+    process_set_poll_blocked(deadline_ms);
+    process_yield();
+    irq_restore(flags);
+    process_clear_poll_deadline();
+}
+
 int process_wake_blocked(process_t *p)
 {
     int woke = 0;
     unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
-    if (p && p->used && !p->is_idle && p->state == PROCESS_BLOCKED) {
+    if (p && p->used && !p->is_idle &&
+        (p->state == PROCESS_BLOCKED || p->state == PROCESS_SLEEPING)) {
+        sleepq_remove_locked(p);
         p->poll_deadline_ms = 0;
         p->state = PROCESS_READY;
         p->main_thread.state = THREAD_READY;
@@ -598,6 +678,83 @@ int process_wake_blocked(process_t *p)
     }
     spin_unlock_irqrestore(&g_sched_lock, irqf);
     return woke;
+}
+
+int process_sleep_ms(uint64_t ms)
+{
+    uint64_t start_ms;
+    uint64_t deadline;
+
+    if (ms == 0)
+        return 0;
+
+    start_ms = pit_ticks_ms();
+    deadline = (ms > UINT64_MAX - start_ms) ? UINT64_MAX : (start_ms + ms);
+
+    for (;;) {
+        uint64_t flags = irq_save_disable();
+        spin_lock(&g_sched_lock);
+        process_t *self = g_current[sched_this_cpu()];
+        if (!self || self->is_idle) {
+            spin_unlock(&g_sched_lock);
+            irq_restore(flags);
+            return 0;
+        }
+        if (self->signal_pending & ~self->signal_mask) {
+            sleepq_remove_locked(self);
+            spin_unlock(&g_sched_lock);
+            irq_restore(flags);
+            return -EINTR;
+        }
+        if (pit_ticks_ms() >= deadline) {
+            sleepq_remove_locked(self);
+            spin_unlock(&g_sched_lock);
+            irq_restore(flags);
+            return 0;
+        }
+        self->sleep_deadline_ms = deadline;
+        self->state = PROCESS_SLEEPING;
+        self->main_thread.state = THREAD_SLEEPING;
+        sleepq_insert_locked(self);
+        spin_unlock(&g_sched_lock);
+
+        /* Yield with IF=0 so PIT IRQ0 cannot fire before this task deschedules. */
+        process_yield();
+        irq_restore(flags);
+    }
+}
+
+int process_reparent(process_t *child, int parent_pid)
+{
+    uint64_t flags;
+    process_t *new_parent;
+
+    if (!child || parent_pid <= 0)
+        return -1;
+
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    if (!child->used || child->state == PROCESS_DEAD || (int)child->pid == parent_pid) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -1;
+    }
+    new_parent = find_by_pid_locked(parent_pid);
+    if (!new_parent || !new_parent->used ||
+        new_parent->state == PROCESS_ZOMBIE || new_parent->state == PROCESS_DEAD) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -1;
+    }
+    if (child->parent)
+        parent_unlink_child_locked(child->parent, child);
+    child->ppid = new_parent->pid;
+    parent_link_child_locked(new_parent, child);
+    if (child->state == PROCESS_ZOMBIE)
+        wake_parent_if_waiting_locked(child);
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    return 0;
 }
 
 static void mark_zombie_locked(process_t *p, int wait_status)
@@ -632,6 +789,7 @@ static void mark_zombie_locked(process_t *p, int wait_status)
     p->state = PROCESS_ZOMBIE;
     p->main_thread.state = THREAD_ZOMBIE;
     p->kill_pending = 0;
+    sleepq_remove_locked(p);
     runq_remove_locked(p);
     wake_parent_if_waiting_locked(p);
 }
@@ -791,6 +949,7 @@ void process_init(void)
         g_runq_head[pri] = NULL;
         g_runq_tail[pri] = NULL;
     }
+    g_sleepq_head = NULL;
     g_sched_ticks = 0;
     g_next_pid = 1;
 
@@ -1199,8 +1358,8 @@ int process_waitpid(int caller_pid, int target_pid, int options, int *status_out
             self->state = PROCESS_BLOCKED;
             self->main_thread.state = THREAD_BLOCKED;
             spin_unlock(&g_sched_lock);
-            irq_restore(flags);
             process_yield();
+            irq_restore(flags);
             continue;
         }
 
@@ -1249,7 +1408,9 @@ int process_kill(int pid, int sig)
         mark_zombie_locked(p, WAIT_STATUS_SIGNAL(sig));
     } else {
         p->signal_pending |= (1ULL << (uint32_t)sig);
-        if (p->state == PROCESS_BLOCKED) {
+        if (p->state == PROCESS_BLOCKED || p->state == PROCESS_SLEEPING) {
+            sleepq_remove_locked(p);
+            p->poll_deadline_ms = 0;
             p->state = PROCESS_READY;
             p->main_thread.state = THREAD_READY;
             runq_push_locked(p);
@@ -1282,7 +1443,9 @@ int process_kill_pgid(int pgid, int sig)
             mark_zombie_locked(p, WAIT_STATUS_SIGNAL(sig));
         else {
             p->signal_pending |= (1ULL << (uint32_t)sig);
-            if (p->state == PROCESS_BLOCKED) {
+            if (p->state == PROCESS_BLOCKED || p->state == PROCESS_SLEEPING) {
+                sleepq_remove_locked(p);
+                p->poll_deadline_ms = 0;
                 p->state = PROCESS_READY;
                 p->main_thread.state = THREAD_READY;
                 runq_push_locked(p);
@@ -1491,7 +1654,7 @@ int process_signal_send(int pid, int sig)
     return process_kill(pid, sig);
 }
 
-uint64_t process_schedule_tick(uint64_t current_rsp)
+static uint64_t process_schedule_core(uint64_t current_rsp, int is_timer_tick)
 {
     process_t *cur;
     process_t *next;
@@ -1508,32 +1671,37 @@ uint64_t process_schedule_tick(uint64_t current_rsp)
     }
 
     spin_lock(&g_sched_lock);
-    if (cpu == 0) {
-        g_sched_ticks++;
-        uint64_t now_ms = pit_ticks_ms();
-        for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
-            process_t *p = &g_processes[i];
-            if (p->used && !p->is_idle && p->state == PROCESS_BLOCKED && p->poll_deadline_ms != 0) {
-                if (now_ms >= p->poll_deadline_ms) {
-                    p->poll_deadline_ms = 0;
-                    p->state = PROCESS_READY;
-                    p->main_thread.state = THREAD_READY;
-                    runq_push_locked(p);
+    if (is_timer_tick) {
+        if (cpu == 0) {
+            g_sched_ticks++;
+            uint64_t now_ms = pit_ticks_ms();
+            sleepq_wake_expired_locked(now_ms);
+            for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
+                process_t *p = &g_processes[i];
+                if (p->used && !p->is_idle && p->state == PROCESS_BLOCKED && p->poll_deadline_ms != 0) {
+                    if (now_ms >= p->poll_deadline_ms) {
+                        p->poll_deadline_ms = 0;
+                        p->state = PROCESS_READY;
+                        p->main_thread.state = THREAD_READY;
+                        runq_push_locked(p);
+                    }
                 }
             }
         }
+        g_core_ticks[cpu]++;
     }
-    g_core_ticks[cpu]++;
 
     cur = g_current[cpu];
     if (cur) {
-        if (cur->is_idle)
-            g_idle_seen_ticks[cpu]++;
+        if (is_timer_tick) {
+            if (cur->is_idle)
+                g_idle_seen_ticks[cpu]++;
+            cur->ticks++;
+            cur->sched_ticks++;
+            cur->main_thread.sched_ticks++;
+        }
         cur->kernel_rsp = current_rsp;
-        cur->ticks++;
-        cur->sched_ticks++;
         cur->main_thread.kernel_rsp = current_rsp;
-        cur->main_thread.sched_ticks++;
 
         if (cur->state == PROCESS_RUNNING &&
             prepare_signal_action_locked(cur, &signal_handler, &delivered_sig)) {
@@ -1549,18 +1717,20 @@ uint64_t process_schedule_tick(uint64_t current_rsp)
         }
 
         if (cur && cur->state == PROCESS_RUNNING) {
-            int best_pri = runq_best_priority_locked(cpu);
-            if (!cur->is_idle && cur->time_slice > 0) {
-                cur->time_slice--;
-                cur->main_thread.time_slice = cur->time_slice;
-            }
-            if (!cur->is_idle &&
-                cur->time_slice > 0 &&
-                (best_pri < 0 || cur->priority <= (uint32_t)best_pri)) {
-                next_rsp = cur->kernel_rsp ? cur->kernel_rsp : current_rsp;
-                spin_unlock(&g_sched_lock);
-                irq_restore(flags);
-                return next_rsp;
+            if (is_timer_tick) {
+                int best_pri = runq_best_priority_locked(cpu);
+                if (!cur->is_idle && cur->time_slice > 0) {
+                    cur->time_slice--;
+                    cur->main_thread.time_slice = cur->time_slice;
+                }
+                if (!cur->is_idle &&
+                    cur->time_slice > 0 &&
+                    (best_pri < 0 || cur->priority <= (uint32_t)best_pri)) {
+                    next_rsp = cur->kernel_rsp ? cur->kernel_rsp : current_rsp;
+                    spin_unlock(&g_sched_lock);
+                    irq_restore(flags);
+                    return next_rsp;
+                }
             }
             if (cur->is_idle) {
                 cur->state = PROCESS_READY;
@@ -1627,10 +1797,20 @@ uint64_t process_schedule_tick(uint64_t current_rsp)
     return next_rsp ? next_rsp : current_rsp;
 }
 
+uint64_t process_schedule_tick(uint64_t current_rsp)
+{
+    return process_schedule_core(current_rsp, 1);
+}
+
+uint64_t process_schedule_yield(uint64_t current_rsp)
+{
+    return process_schedule_core(current_rsp, 0);
+}
+
 uint64_t process_schedule_ipi(uint64_t current_rsp)
 {
     g_ipi_ticks[sched_this_cpu()]++;
-    return process_schedule_tick(current_rsp);
+    return process_schedule_core(current_rsp, 1);
 }
 
 void process_idle_loop_note(void)
@@ -1650,7 +1830,34 @@ void process_yield(void)
         cur->time_slice = 0;
         cur->main_thread.time_slice = 0;
     }
-    __asm__ volatile ("int $32");
+    __asm__ volatile ("int $0x40");
+}
+
+void process_get_cpu_stats(process_cpu_stats_t *out)
+{
+    uint64_t flags;
+    uint32_t n;
+
+    if (!out)
+        return;
+
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    n = g_cpu_count;
+    if (n > 32u)
+        n = 32u;
+    out->cpu_count = n;
+    for (uint32_t c = 0; c < 32u; c++) {
+        if (c < n) {
+            out->total_ticks[c] = g_core_ticks[c];
+            out->idle_ticks[c] = g_idle_seen_ticks[c];
+        } else {
+            out->total_ticks[c] = 0;
+            out->idle_ticks[c] = 0;
+        }
+    }
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
 }
 
 uint64_t process_ticks(void)

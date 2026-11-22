@@ -31,6 +31,8 @@
 #else
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/poll.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
 #define close_socket(s) close(s)
@@ -77,9 +79,14 @@ static int vreg_write_exact(int fd, const void *buf, size_t count)
             return -1;
         } else {
             if (errno == EAGAIN || errno == EINTR) {
-                if (++retries > 1000)
+                if (++retries > 20)
                     return -1;
-                sleep_ms(1);
+                struct pollfd pfd;
+                pfd.fd = fd;
+                pfd.events = POLLOUT;
+                pfd.revents = 0;
+                if (poll(&pfd, 1, 50) < 0 && errno != EINTR)
+                    return -1;
                 continue;
             }
             return -1;
@@ -120,9 +127,14 @@ static int vreg_read_exact(int fd, void *buf, size_t count)
             return -1;
         } else {
             if (errno == EAGAIN || errno == EINTR) {
-                if (++retries > 1000)
+                if (++retries > 20)
                     return -1;
-                sleep_ms(1);
+                struct pollfd pfd;
+                pfd.fd = fd;
+                pfd.events = POLLIN;
+                pfd.revents = 0;
+                if (poll(&pfd, 1, 50) < 0 && errno != EINTR)
+                    return -1;
                 continue;
             }
             return -1;
@@ -241,6 +253,7 @@ static void vreg_handle_one(int client_fd)
 
 int registryd_run(const char *sock_path, volatile int *stop_flag)
 {
+    int has_external_stop = (stop_flag != NULL);
     volatile int default_stop = 0;
     if (!stop_flag)
         stop_flag = &default_stop;
@@ -254,6 +267,14 @@ int registryd_run(const char *sock_path, volatile int *stop_flag)
         printf("[registryd] Failed to create socket: %d\n", errno);
         return 1;
     }
+
+#if !(defined(_WIN32) && defined(VANILLA_HOST))
+    {
+        int flags = fcntl(listen_fd, F_GETFL, 0);
+        if (flags >= 0)
+            fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK);
+    }
+#endif
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -275,6 +296,7 @@ int registryd_run(const char *sock_path, volatile int *stop_flag)
     printf("[registryd] Service registry daemon listening on %s\n", sock_path);
     fflush(stdout);
 
+#if defined(_WIN32) && defined(VANILLA_HOST)
     while (!*stop_flag) {
         int client_fd = accept(listen_fd, NULL, NULL);
         if (client_fd >= 0) {
@@ -284,6 +306,25 @@ int registryd_run(const char *sock_path, volatile int *stop_flag)
             sleep_ms(1);
         }
     }
+#else
+    while (!*stop_flag) {
+        int client_fd;
+        while (!*stop_flag && (client_fd = accept(listen_fd, NULL, NULL)) >= 0) {
+            vreg_handle_one(client_fd);
+            close_socket(client_fd);
+        }
+        if (*stop_flag)
+            break;
+
+        struct pollfd pfd;
+        pfd.fd = listen_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, has_external_stop ? 100 : -1);
+        if (pr < 0 && errno != EINTR)
+            break;
+    }
+#endif
 
     close_socket(listen_fd);
     unlink_file(sock_path);
@@ -297,7 +338,6 @@ int main(int argc, char **argv)
     if (argc > 1 && argv[1] && argv[1][0] != '\0')
         sock_path = argv[1];
 
-    volatile int stop_flag = 0;
-    return registryd_run(sock_path, &stop_flag);
+    return registryd_run(sock_path, NULL);
 }
 #endif

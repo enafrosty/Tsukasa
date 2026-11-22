@@ -92,29 +92,31 @@ void lapic_eoi(void)
 void lapic_send_ipi_all(void)
 {
     volatile uint32_t *lapic = lapic_ptr();
+    unsigned long flags;
     if (!lapic)
         return;
 
-    spin_lock(&lapic_lock);
+    flags = spin_lock_irqsave(&lapic_lock);
     lapic_wait();
     lapic[LAPIC_ICR_HIGH] = 0;
     lapic[LAPIC_ICR_LOW] = (0x41u) | (0b11u << 18) | (1u << 14);
     while (lapic[LAPIC_ICR_LOW] & (1u << 12))
         __asm__ volatile ("pause");
-    spin_unlock(&lapic_lock);
+    spin_unlock_irqrestore(&lapic_lock, flags);
 }
 
 void lapic_send_ipi(uint32_t lapic_id, uint8_t vector)
 {
     volatile uint32_t *lapic = lapic_ptr();
+    unsigned long flags;
     if (!lapic)
         return;
 
-    spin_lock(&lapic_lock);
+    flags = spin_lock_irqsave(&lapic_lock);
     lapic_wait();
     lapic[LAPIC_ICR_HIGH] = (lapic_id << 24);
     lapic[LAPIC_ICR_LOW] = (uint32_t)vector | (1u << 14);
     while (lapic[LAPIC_ICR_LOW] & (1u << 12))
         __asm__ volatile ("pause");
-    spin_unlock(&lapic_lock);
+    spin_unlock_irqrestore(&lapic_lock, flags);
 }

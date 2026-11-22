@@ -37,6 +37,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/poll.h>
+#include <limits.h>
 #include <time.h>
 #include <signal.h>
 #define close_socket(s) close(s)
@@ -126,9 +127,14 @@ static int vnotif_write_exact(int fd, const void *buf, size_t count)
             return -1;
         } else {
             if (errno == EAGAIN || errno == EINTR) {
-                if (++retries > 1000)
+                if (++retries > 20)
                     return -1;
-                sleep_ms(1);
+                struct pollfd pfd;
+                pfd.fd = fd;
+                pfd.events = POLLOUT;
+                pfd.revents = 0;
+                if (poll(&pfd, 1, 50) < 0 && errno != EINTR)
+                    return -1;
                 continue;
             }
             return -1;
@@ -171,9 +177,14 @@ static int vnotif_read_exact(int fd, void *buf, size_t count)
             return -1;
         } else {
             if (errno == EAGAIN || errno == EINTR) {
-                if (++retries > 1000)
+                if (++retries > 20)
                     return -1;
-                sleep_ms(1);
+                struct pollfd pfd;
+                pfd.fd = fd;
+                pfd.events = POLLIN;
+                pfd.revents = 0;
+                if (poll(&pfd, 1, 50) < 0 && errno != EINTR)
+                    return -1;
                 continue;
             }
             return -1;
@@ -570,6 +581,7 @@ static void notif_handle_request(int cfd, vanilla_client_t *client, int screen_w
 
 int notifyd_run(const char *sock_path, volatile int *stop_flag)
 {
+    int has_external_stop = (stop_flag != NULL);
     volatile int default_stop = 0;
     if (!stop_flag)
         stop_flag = &default_stop;
@@ -665,8 +677,10 @@ int notifyd_run(const char *sock_path, volatile int *stop_flag)
 
     while (!*stop_flag) {
         /* 1. Accept client requests */
-        int client_fd = accept(listen_fd, NULL, NULL);
-        if (client_fd >= 0) {
+        for (;;) {
+            int client_fd = accept(listen_fd, NULL, NULL);
+            if (client_fd < 0)
+                break;
             notif_handle_request(client_fd, client, screen_w);
         }
 
@@ -741,8 +755,64 @@ int notifyd_run(const char *sock_path, volatile int *stop_flag)
         /* 4. Check auto-dismiss timeouts */
         check_timeouts(client, screen_w);
 
-        /* 5. Frame pacing (~60Hz) */
+        if (*stop_flag)
+            break;
+
+        /* 5. Block until next request, display event, client drop, or toast deadline */
+#if defined(_WIN32) && defined(VANILLA_HOST)
         sleep_ms(16);
+#else
+        if (client && vanilla_client_pending(client) > 0)
+            continue;
+
+        int poll_timeout = has_external_stop ? 50 : -1;
+        uint64_t now_ms = get_monotonic_ms();
+        for (int i = 0; i < NOTIF_MAX_ACTIVE; i++) {
+            if (g_notifs[i].active && g_notifs[i].timeout_ms > 0 && g_notifs[i].start_ms > 0) {
+                uint64_t exp_ms = g_notifs[i].start_ms + (uint64_t)g_notifs[i].timeout_ms;
+                int rem = 0;
+                if (exp_ms > now_ms) {
+                    uint64_t diff = exp_ms - now_ms;
+                    rem = (diff > (uint64_t)INT_MAX) ? INT_MAX : (int)diff;
+                }
+                if (poll_timeout < 0 || rem < poll_timeout)
+                    poll_timeout = rem;
+            }
+        }
+
+        if (poll_timeout != 0) {
+            struct pollfd pfds[2 + NOTIF_MAX_ACTIVE];
+            nfds_t nfds = 0;
+
+            pfds[nfds].fd = listen_fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+
+            if (client) {
+                int cfd = vanilla_client_get_fd(client);
+                if (cfd >= 0) {
+                    pfds[nfds].fd = cfd;
+                    pfds[nfds].events = POLLIN;
+                    pfds[nfds].revents = 0;
+                    nfds++;
+                }
+            }
+
+            for (int i = 0; i < NOTIF_MAX_ACTIVE; i++) {
+                if (g_notifs[i].active && g_notifs[i].source_fd >= 0) {
+                    pfds[nfds].fd = g_notifs[i].source_fd;
+                    pfds[nfds].events = POLLIN | POLLHUP | POLLERR;
+                    pfds[nfds].revents = 0;
+                    nfds++;
+                }
+            }
+
+            int pr = poll(pfds, nfds, poll_timeout);
+            if (pr < 0 && errno != EINTR)
+                break;
+        }
+#endif
     }
 
     if (registered)
@@ -809,7 +879,6 @@ int main(int argc, char **argv)
     if (argc > 1 && argv[1] && argv[1][0] != '\0')
         sock_path = argv[1];
 
-    volatile int stop_flag = 0;
-    return notifyd_run(sock_path, &stop_flag);
+    return notifyd_run(sock_path, NULL);
 }
 #endif

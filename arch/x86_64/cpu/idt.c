@@ -97,6 +97,7 @@ extern void isr_x64_44(void);
 extern void isr_x64_45(void);
 extern void isr_x64_46(void);
 extern void isr_x64_47(void);
+extern void isr_x64_64(void);
 extern void isr_x64_65(void);
 extern void isr_x64_128(void);
 extern void isr_x64_ignore(void);
@@ -134,6 +135,11 @@ static void set_gate(uint8_t vec, void (*handler)(void), uint8_t flags)
 uint8_t idt_get_gate_ist_x64(uint8_t vec)
 {
     return (uint8_t)(idt[vec].ist & 0x07u);
+}
+
+uint8_t idt_get_gate_type_attr_x64(uint8_t vec)
+{
+    return idt[vec].type_attr;
 }
 
 static int exception_vector_to_signal(uint64_t vector)
@@ -326,6 +332,7 @@ void idt_init_x64(void)
     set_gate(45, isr_x64_45, 0x8Eu);
     set_gate(46, isr_x64_46, 0x8Eu);
     set_gate(47, isr_x64_47, 0x8Eu);
+    set_gate(IDT_VEC_YIELD, isr_x64_64, 0x8Eu);
     set_gate(65, isr_x64_65, 0x8Eu);
     set_gate(128, isr_x64_128, 0xEEu);
 

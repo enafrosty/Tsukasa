@@ -137,6 +137,7 @@ int shm_create(size_t size)
     size_t page_count;
     struct shm_region *r;
     int new_id;
+    unsigned long flags;
 
     if (size == 0)
         return -1;
@@ -153,10 +154,10 @@ int shm_create(size_t size)
             kptr[b] = 0;
     }
 
-    spin_lock(&g_shm_lock);
+    flags = spin_lock_irqsave(&g_shm_lock);
     r = shm_alloc_region_locked();
     if (!r) {
-        spin_unlock(&g_shm_lock);
+        spin_unlock_irqrestore(&g_shm_lock, flags);
         pmm_free_pages(phys, page_count);
         return -1;
     }
@@ -173,7 +174,7 @@ int shm_create(size_t size)
     r->page_count = page_count;
     r->ref_count = 0;
     r->destroy_pending = 0;
-    spin_unlock(&g_shm_lock);
+    spin_unlock_irqrestore(&g_shm_lock, flags);
 
     return new_id;
 }
@@ -186,33 +187,34 @@ void *shm_attach(int shm_id)
     uintptr_t virt_addr;
     uintptr_t phys_base;
     size_t page_count;
+    unsigned long flags;
 
     if (!cur || shm_id <= 0)
         return NULL;
 
-    spin_lock(&g_shm_lock);
+    flags = spin_lock_irqsave(&g_shm_lock);
     r = shm_find_region_locked(shm_id);
     if (!r || r->destroy_pending) {
-        spin_unlock(&g_shm_lock);
+        spin_unlock_irqrestore(&g_shm_lock, flags);
         return NULL;
     }
 
     att = shm_find_attachment_locked(cur->pid, shm_id);
     if (att) {
         virt_addr = att->virt_base;
-        spin_unlock(&g_shm_lock);
+        spin_unlock_irqrestore(&g_shm_lock, flags);
         return (void *)virt_addr;
     }
 
     virt_addr = vm_space_reserve_shm_range(&cur->vm_space, r->page_count);
     if (!virt_addr) {
-        spin_unlock(&g_shm_lock);
+        spin_unlock_irqrestore(&g_shm_lock, flags);
         return NULL;
     }
 
     att = shm_alloc_attachment_locked();
     if (!att) {
-        spin_unlock(&g_shm_lock);
+        spin_unlock_irqrestore(&g_shm_lock, flags);
         return NULL;
     }
 
@@ -224,7 +226,7 @@ void *shm_attach(int shm_id)
     att->virt_base = virt_addr;
     att->page_count = page_count;
     r->ref_count++;
-    spin_unlock(&g_shm_lock);
+    spin_unlock_irqrestore(&g_shm_lock, flags);
 
     if (vm_space_map_user_pages(&cur->vm_space,
                                 virt_addr,
@@ -232,14 +234,14 @@ void *shm_attach(int shm_id)
                                 page_count,
                                 PAGING_MAP_READ | PAGING_MAP_WRITE |
                                 PAGING_MAP_USER) != 0) {
-        spin_lock(&g_shm_lock);
+        flags = spin_lock_irqsave(&g_shm_lock);
         att = shm_find_attachment_by_addr_locked(cur->pid, virt_addr);
         if (att)
             att->in_use = 0;
         r = shm_find_region_locked(shm_id);
         if (r && r->ref_count > 0)
             r->ref_count--;
-        spin_unlock(&g_shm_lock);
+        spin_unlock_irqrestore(&g_shm_lock, flags);
         return NULL;
     }
 
@@ -259,15 +261,16 @@ int shm_detach(void *addr)
     int needs_reap = 0;
     int unmap_rc = 0;
     int remaining = 0;
+    unsigned long flags;
 
     if (!cur || !addr)
         return -1;
 
     virt_addr = (uintptr_t)addr;
-    spin_lock(&g_shm_lock);
+    flags = spin_lock_irqsave(&g_shm_lock);
     att = shm_find_attachment_by_addr_locked(cur->pid, virt_addr);
     if (!att) {
-        spin_unlock(&g_shm_lock);
+        spin_unlock_irqrestore(&g_shm_lock, flags);
         return -1;
     }
 
@@ -286,7 +289,7 @@ int shm_detach(void *addr)
         r->ref_count--;
     if (r && r->destroy_pending && r->ref_count == 0)
         needs_reap = 1;
-    spin_unlock(&g_shm_lock);
+    spin_unlock_irqrestore(&g_shm_lock, flags);
 
     unmap_rc = vm_space_unmap_user_pages(&cur->vm_space, virt_addr, page_count);
     vm_space_note_shm_detach(&cur->vm_space, page_count);
@@ -298,11 +301,11 @@ int shm_detach(void *addr)
     }
 
     if (needs_reap) {
-        spin_lock(&g_shm_lock);
+        flags = spin_lock_irqsave(&g_shm_lock);
         r = shm_find_region_locked(shm_id);
         if (r)
             shm_reap_region_locked(r);
-        spin_unlock(&g_shm_lock);
+        spin_unlock_irqrestore(&g_shm_lock, flags);
     }
 
     return unmap_rc;
@@ -321,21 +324,22 @@ int shm_unmap(void *addr)
 int shm_destroy(int shm_id)
 {
     struct shm_region *r;
+    unsigned long flags;
 
     if (shm_id <= 0)
         return -1;
 
-    spin_lock(&g_shm_lock);
+    flags = spin_lock_irqsave(&g_shm_lock);
     r = shm_find_region_locked(shm_id);
     if (!r) {
-        spin_unlock(&g_shm_lock);
+        spin_unlock_irqrestore(&g_shm_lock, flags);
         return -1;
     }
     r->destroy_pending = 1;
     if (r->ref_count == 0) {
         shm_reap_region_locked(r);
     }
-    spin_unlock(&g_shm_lock);
+    spin_unlock_irqrestore(&g_shm_lock, flags);
     return 0;
 }
 
@@ -346,11 +350,12 @@ void shm_process_cleanup(struct process *proc)
     size_t pages[SHM_CLEANUP_BATCH];
     int ids[SHM_CLEANUP_BATCH];
     size_t count = 0;
+    unsigned long flags;
 
     if (!p)
         return;
 
-    spin_lock(&g_shm_lock);
+    flags = spin_lock_irqsave(&g_shm_lock);
     for (int i = 0; i < SHM_MAX_ATTACHMENTS; i++) {
         struct shm_attachment *att = &g_attachments[i];
         struct shm_region *r;
@@ -377,7 +382,7 @@ void shm_process_cleanup(struct process *proc)
             r->destroy_pending = 1;
         }
     }
-    spin_unlock(&g_shm_lock);
+    spin_unlock_irqrestore(&g_shm_lock, flags);
 
     for (size_t i = 0; i < count; i++) {
         vm_space_unmap_user_pages(&p->vm_space, addrs[i], pages[i]);
@@ -386,7 +391,7 @@ void shm_process_cleanup(struct process *proc)
     p->shm_attachment_count = 0;
     p->vm_space.shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE + (((uintptr_t)p->pid % 64) * 0x01000000ULL);
 
-    spin_lock(&g_shm_lock);
+    flags = spin_lock_irqsave(&g_shm_lock);
     for (size_t i = 0; i < count; i++) {
         struct shm_region *r = shm_find_region_locked(ids[i]);
         if (r)
@@ -396,16 +401,17 @@ void shm_process_cleanup(struct process *proc)
         if (g_regions[i].in_use)
             shm_reap_region_locked(&g_regions[i]);
     }
-    spin_unlock(&g_shm_lock);
+    spin_unlock_irqrestore(&g_shm_lock, flags);
 }
 
 void shm_get_stats(struct shm_stats *out)
 {
     struct shm_stats stats = {0};
+    unsigned long flags;
     if (!out)
         return;
 
-    spin_lock(&g_shm_lock);
+    flags = spin_lock_irqsave(&g_shm_lock);
     for (int i = 0; i < SHM_MAX_REGIONS; i++) {
         if (!g_regions[i].in_use)
             continue;
@@ -416,7 +422,7 @@ void shm_get_stats(struct shm_stats *out)
         if (g_attachments[i].in_use)
             stats.attachment_count++;
     }
-    spin_unlock(&g_shm_lock);
+    spin_unlock_irqrestore(&g_shm_lock, flags);
 
     *out = stats;
 }

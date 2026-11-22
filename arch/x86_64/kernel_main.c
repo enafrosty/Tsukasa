@@ -319,8 +319,9 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     kprintf("[boot:x64] userspace app registry ready\n");
 
     int init_pid = -1;
+    int test_mode = is_test_requested(boot_info);
     vfs_stat_t st;
-    if (is_test_requested(boot_info)) {
+    if (test_mode) {
         kprintf("[boot:x64] automated test runner mode enabled\n");
         if (vfs_stat("/fat12/TESTDRV.ELF", &st) == 0 && st.type != VFS_TYPE_DIR)
             init_pid = elf64_spawn("/fat12/TESTDRV.ELF", "testdrv");
@@ -368,6 +369,8 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
         process_t *net_proc = process_spawn_kernel("net-bootstrap", network_bootstrap_entry);
         if (!net_proc)
             kprintf("[boot:x64] WARN: failed to spawn network bootstrap process\n");
+        else if (!test_mode && init_pid > 0)
+            process_reparent(net_proc, init_pid);
     }
 
     if (is_selftest_requested(boot_info)) {

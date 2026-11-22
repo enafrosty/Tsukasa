@@ -28,6 +28,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/poll.h>
+#include <limits.h>
 
 static svc_entry_t g_services[SUPERVISOR_MAX_SERVICES];
 static int         g_service_count = 0;
@@ -542,8 +544,33 @@ int main(int argc, char **argv)
 
         svc_accept_query(query_fd);
 
-        struct timespec ts = { 0, 100000000 }; /* 100ms polling interval */
-        nanosleep(&ts, NULL);
+        now_ms = get_monotonic_ms();
+        int timeout_ms = 1000;
+        for (int i = 0; i < g_service_count; i++) {
+            svc_entry_t *s = &g_services[i];
+            if (s->state == SVC_STATE_BACKOFF) {
+                if (s->restart_after_ms <= now_ms) {
+                    timeout_ms = 0;
+                    break;
+                }
+                uint64_t rem = s->restart_after_ms - now_ms;
+                if (rem < (uint64_t)timeout_ms)
+                    timeout_ms = (int)rem;
+            }
+        }
+
+        if (timeout_ms > 0) {
+            if (query_fd >= 0) {
+                struct pollfd pfd;
+                pfd.fd = query_fd;
+                pfd.events = POLLIN;
+                pfd.revents = 0;
+                if (poll(&pfd, 1, timeout_ms) > 0)
+                    svc_accept_query(query_fd);
+            } else {
+                poll(NULL, 0, timeout_ms);
+            }
+        }
     }
 
     if (query_fd >= 0) {

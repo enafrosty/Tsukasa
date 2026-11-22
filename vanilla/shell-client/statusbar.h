@@ -45,6 +45,9 @@ typedef struct {
     uint32_t          volume_pct;
     char              clock_str[16];
     time_t            last_telemetry_sec;
+    uint64_t          prev_cpu_total;
+    uint64_t          prev_cpu_active;
+    int               has_prev_cpu;
     int               menu_open;
     int               menu_selected_idx;
     vanilla_window_t *menu_win;

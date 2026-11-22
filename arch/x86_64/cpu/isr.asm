@@ -162,6 +162,7 @@ IRQ_STUB 44
 IRQ_STUB 45
 IRQ_STUB 46
 IRQ_STUB 47
+IRQ_STUB 64
 IRQ_STUB 65
 
 isr_exception_common:
@@ -204,7 +205,9 @@ isr_x64_128:
     mov rsi, [rsp + 40 + 16]
     mov rdi, [rsp + 0 + 16]
     cld
+    sti
     call syscall_dispatch
+    cli
     add rsp, 16
     mov [rsp + 0], rax
     POP_GPRS

@@ -122,6 +122,20 @@ int vanilla_poll_event(vanilla_client_t *c, vanilla_event_t *ev)
     return have;
 }
 
+int vanilla_client_get_fd(const vanilla_client_t *c) { (void)c; return -1; }
+
+int vanilla_client_pending(const vanilla_client_t *c)
+{
+    (void)c;
+    int pending;
+    pthread_mutex_lock(&g_mock_ev_lock);
+    pending = (g_mock_ev_tail >= g_mock_ev_head)
+                  ? (g_mock_ev_tail - g_mock_ev_head)
+                  : (MOCK_EV_QUEUE_CAP - g_mock_ev_head + g_mock_ev_tail);
+    pthread_mutex_unlock(&g_mock_ev_lock);
+    return pending;
+}
+
 typedef struct {
     const char *sock_path;
     volatile int stop_flag;

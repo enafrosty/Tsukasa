@@ -30,30 +30,31 @@ static volatile int wq_tail = 0;
 static spinlock_t wq_lock = SPINLOCK_INIT;
 
 void work_queue_submit(work_fn_t fn, void *arg) {
+    unsigned long flags;
     if (!fn) return;
 
-    spin_lock(&wq_lock);
+    flags = spin_lock_irqsave(&wq_lock);
     int next_tail = (wq_tail + 1) % WORK_QUEUE_SIZE;
     if (next_tail == wq_head) {
-        spin_unlock(&wq_lock);
+        spin_unlock_irqrestore(&wq_lock, flags);
         kprintf("[work_queue] overflow, item dropped\n");
         return;
     }
     work_queue[wq_tail].fn = fn;
     work_queue[wq_tail].arg = arg;
     wq_tail = next_tail;
-    spin_unlock(&wq_lock);
+    spin_unlock_irqrestore(&wq_lock, flags);
 }
 
 bool work_queue_drain_one(void) {
-    spin_lock(&wq_lock);
+    unsigned long flags = spin_lock_irqsave(&wq_lock);
     if (wq_head == wq_tail) {
-        spin_unlock(&wq_lock);
+        spin_unlock_irqrestore(&wq_lock, flags);
         return false;
     }
     work_item_t item = work_queue[wq_head];
     wq_head = (wq_head + 1) % WORK_QUEUE_SIZE;
-    spin_unlock(&wq_lock);
+    spin_unlock_irqrestore(&wq_lock, flags);
 
     if (item.fn) {
         item.fn(item.arg);

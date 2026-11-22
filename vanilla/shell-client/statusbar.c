@@ -62,25 +62,43 @@ static unsigned long read_sysfs_key_val(const char *filename, const char *key)
     return val;
 }
 
-static uint32_t count_proc_processes(void)
+static int read_proc_stat_cpu(uint64_t *active_out, uint64_t *total_out)
 {
-    FILE *fp = fopen("/proc/processes", "r");
+    FILE *fp = fopen("/proc/stat", "r");
     if (!fp)
-        return 0;
+        return -1;
 
     char line[256];
-    uint32_t count = 0;
-    int is_header = 1;
-
+    int ok = -1;
     while (fgets(line, sizeof(line), fp)) {
-        if (is_header) {
-            is_header = 0;
-            continue;
+        if (strncmp(line, "cpu ", 4) == 0) {
+            const char *p = line + 4;
+            uint64_t cols[10];
+            int ncols = 0;
+            while (*p && ncols < 10) {
+                while (*p == ' ' || *p == '\t')
+                    p++;
+                if (*p < '0' || *p > '9')
+                    break;
+                cols[ncols++] = (uint64_t)strtoull(p, (char **)&p, 10);
+            }
+            if (ncols >= 4) {
+                uint64_t total = 0;
+                for (int i = 0; i < ncols; i++)
+                    total += cols[i];
+                uint64_t idle = cols[3] + (ncols >= 5 ? cols[4] : 0ULL);
+                uint64_t active = (total >= idle) ? (total - idle) : 0ULL;
+                if (active_out)
+                    *active_out = active;
+                if (total_out)
+                    *total_out = total;
+                ok = 0;
+            }
+            break;
         }
-        count++;
     }
     fclose(fp);
-    return count;
+    return ok;
 }
 
 void statusbar_init(statusbar_state_t *sb)
@@ -93,7 +111,7 @@ void statusbar_init(statusbar_state_t *sb)
     strncpy(sb->active_app_title, "Tsukasa Desktop", sizeof(sb->active_app_title) - 1);
     strncpy(sb->breadcrumb, "Tsukasa OS", sizeof(sb->breadcrumb) - 1);
     strncpy(sb->clock_str, "12:00:00", sizeof(sb->clock_str) - 1);
-    sb->cpu_usage_pct = 2;
+    sb->cpu_usage_pct = 0;
     sb->ram_used_mb = 96;
     sb->ram_total_mb = 256;
     sb->volume_pct = 100;
@@ -147,15 +165,29 @@ void statusbar_update_telemetry(statusbar_state_t *sb)
         sb->ram_used_mb = 96;
     }
 
-    /* Query process count for CPU activity estimation */
-    uint32_t procs = count_proc_processes();
-    if (procs > 0) {
-        uint32_t est = 1 + (procs * 2);
-        if (est > 99)
-            est = 99;
-        sb->cpu_usage_pct = est;
+    /* Query CPU activity delta from /proc/stat */
+    uint64_t stat_active = 0;
+    uint64_t stat_total = 0;
+    if (read_proc_stat_cpu(&stat_active, &stat_total) == 0) {
+        if (sb->has_prev_cpu && stat_total > sb->prev_cpu_total) {
+            uint64_t dt_total = stat_total - sb->prev_cpu_total;
+            uint64_t dt_active = (stat_active >= sb->prev_cpu_active)
+                                     ? (stat_active - sb->prev_cpu_active) : 0ULL;
+            uint32_t pct = (uint32_t)((dt_active * 100ULL) / dt_total);
+            if (pct > 100u)
+                pct = 100u;
+            sb->cpu_usage_pct = pct;
+        } else if (!sb->has_prev_cpu) {
+            uint32_t pct = (stat_total > 0) ? (uint32_t)((stat_active * 100ULL) / stat_total) : 0u;
+            if (pct > 100u)
+                pct = 100u;
+            sb->cpu_usage_pct = pct;
+        }
+        sb->prev_cpu_active = stat_active;
+        sb->prev_cpu_total = stat_total;
+        sb->has_prev_cpu = 1;
     } else {
-        sb->cpu_usage_pct = 3;
+        sb->cpu_usage_pct = 0;
     }
 
     /* Format digital clock */
