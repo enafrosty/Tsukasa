@@ -31,6 +31,9 @@
 #include "../drv/acpi.h"
 #include "../drv/pit.h"
 #include "../include/kutils.h"
+#include "../arch/x86_64/cpu/gdt.h"
+#include "../arch/x86_64/cpu/idt.h"
+#include "../include/smp.h"
 
 #define SYSCALL_TABLE_SIZE 351
 
@@ -1078,6 +1081,47 @@ static void c01_test_entry(void)
     else
         kprintf("[guide05] migrated echo loads FAIL code=%d status=0x%x\n",
                 code, (unsigned)status);
+
+    {
+        int ist_ok = (idt_get_gate_ist_x64(2u) == 1u &&
+                      idt_get_gate_ist_x64(8u) == 1u &&
+                      idt_get_gate_ist_x64(14u) == 0u);
+        uint32_t cpus = smp_cpu_count();
+        uint64_t bsp_ist1 = tss_get_ist1_x64(0u);
+        if (bsp_ist1 == 0 || (bsp_ist1 & 0xFULL) != 0)
+            ist_ok = 0;
+        for (uint32_t c = 1; c < cpus; c++) {
+            uint64_t ap_ist1 = tss_get_ist1_x64(c);
+            if (ap_ist1 == 0 || (ap_ist1 & 0xFULL) != 0 || ap_ist1 == bsp_ist1)
+                ist_ok = 0;
+        }
+        if (ist_ok)
+            kprintf("[selftest] ist1 setup PASS cpus=%u\n", cpus);
+        else
+            kprintf("[selftest] ist1 setup FAIL cpus=%u nmi=%u df=%u pf=%u\n",
+                    cpus,
+                    (unsigned)idt_get_gate_ist_x64(2u),
+                    (unsigned)idt_get_gate_ist_x64(8u),
+                    (unsigned)idt_get_gate_ist_x64(14u));
+    }
+
+    pid = -1;
+    for (int i = 0; i < 200 && pid < 0; i++) {
+        pid = elf64_spawn("/fat12/fault.elf", "fault-victim");
+        if (pid < 0)
+            process_yield();
+    }
+    if (pid < 0) {
+        kprintf("[selftest] ring3 fault-isolation FAIL (spawn)\n");
+    } else {
+        status = -1;
+        int wr = process_waitpid(process_current_pid(), pid, 0, &status);
+        if (wr == pid && (status & 0x7F) == PROCESS_SIGSEGV)
+            kprintf("[selftest] ring3 fault-isolation PASS sig=%d\n", status & 0x7F);
+        else
+            kprintf("[selftest] ring3 fault-isolation FAIL pid=%d wr=%d status=0x%x\n",
+                    pid, wr, (unsigned)status);
+    }
 
     vfs_stat_t st;
     for (int i = 0; i < 500; i++) {

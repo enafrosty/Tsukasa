@@ -27,6 +27,7 @@
 
 void gdt_init_x64(void);
 void tss_set_rsp0_x64(uint64_t rsp0);
+uint64_t tss_get_ist1_x64(uint32_t cpu_id);
 
 void gdt_init_ap_tss(uint32_t cpu_count);
 void gdt_load_ap_tss(uint32_t cpu_id);

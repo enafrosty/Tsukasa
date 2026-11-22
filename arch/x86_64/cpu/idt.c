@@ -114,16 +114,49 @@ static void (*const exception_stubs[32])(void) = {
 
 static struct idt_ptr idtp;
 
-static void set_gate(uint8_t vec, void (*handler)(void), uint8_t flags)
+static void set_gate_ist(uint8_t vec, void (*handler)(void), uint8_t flags, uint8_t ist)
 {
     uint64_t addr = (uint64_t)(uintptr_t)handler;
     idt[vec].offset_low = (uint16_t)(addr & 0xFFFFu);
     idt[vec].selector = 0x08u;
-    idt[vec].ist = 0u;
+    idt[vec].ist = (uint8_t)(ist & 0x07u);
     idt[vec].type_attr = flags;
     idt[vec].offset_mid = (uint16_t)((addr >> 16) & 0xFFFFu);
     idt[vec].offset_high = (uint32_t)((addr >> 32) & 0xFFFFFFFFu);
     idt[vec].reserved = 0u;
+}
+
+static void set_gate(uint8_t vec, void (*handler)(void), uint8_t flags)
+{
+    set_gate_ist(vec, handler, flags, 0u);
+}
+
+uint8_t idt_get_gate_ist_x64(uint8_t vec)
+{
+    return (uint8_t)(idt[vec].ist & 0x07u);
+}
+
+static int exception_vector_to_signal(uint64_t vector)
+{
+    switch (vector) {
+    case 0u:
+    case 7u:
+    case 16u:
+    case 19u:
+        return PROCESS_SIGFPE;
+    case 1u:
+    case 3u:
+        return PROCESS_SIGTRAP;
+    case 6u:
+        return PROCESS_SIGILL;
+    case 17u:
+        return PROCESS_SIGBUS;
+    case 12u:
+    case 13u:
+    case 14u:
+    default:
+        return PROCESS_SIGSEGV;
+    }
 }
 
 static void draw_exception_banner(uint64_t vector, uint64_t error_code, uint64_t rip, uint64_t cr2)
@@ -193,6 +226,37 @@ void idt_exception_handler_x64(interrupt_frame_t *frame)
     __asm__ volatile ("mov %%rsp, %0" : "=r"(k_rsp));
     __asm__ volatile ("cli");
 
+    /* Isolate Ring-3 faults to the offending user process; Ring-0 and fatal #NMI/#DF/#MC still panic. */
+    if ((cs & 3u) == 3u && vector != 2u && vector != 8u && vector != 18u &&
+        cur && !cur->is_idle) {
+        int sig = exception_vector_to_signal(vector);
+        if (vector == 14u) {
+            kwarn("exc",
+                  "user fault pid=%u (%s) cpu=%u vec=%u err=0x%08x%08x rip=0x%08x%08x rsp=0x%08x%08x cr2=0x%08x%08x sig=%d\n",
+                  cur->pid,
+                  cur->name[0] ? cur->name : "none",
+                  cpu,
+                  (uint32_t)vector,
+                  (uint32_t)(error_code >> 32), (uint32_t)(error_code & 0xFFFFFFFFu),
+                  (uint32_t)(rip >> 32), (uint32_t)(rip & 0xFFFFFFFFu),
+                  (uint32_t)(fault_rsp >> 32), (uint32_t)(fault_rsp & 0xFFFFFFFFu),
+                  (uint32_t)(cr2 >> 32), (uint32_t)(cr2 & 0xFFFFFFFFu),
+                  sig);
+        } else {
+            kwarn("exc",
+                  "user fault pid=%u (%s) cpu=%u vec=%u err=0x%08x%08x rip=0x%08x%08x rsp=0x%08x%08x sig=%d\n",
+                  cur->pid,
+                  cur->name[0] ? cur->name : "none",
+                  cpu,
+                  (uint32_t)vector,
+                  (uint32_t)(error_code >> 32), (uint32_t)(error_code & 0xFFFFFFFFu),
+                  (uint32_t)(rip >> 32), (uint32_t)(rip & 0xFFFFFFFFu),
+                  (uint32_t)(fault_rsp >> 32), (uint32_t)(fault_rsp & 0xFFFFFFFFu),
+                  sig);
+        }
+        process_terminate_current(sig);
+    }
+
     kprintf("[x64][exc][cpu%u] pid=%d (%s) vec=%u err=0x%08x%08x rip=0x%08x%08x cs=0x%04x cr2=0x%08x%08x cr3=0x%08x%08x rsp=0x%08x%08x ss=0x%04x krsp=0x%08x%08x\n",
             cpu,
             cur ? (int)cur->pid : -1,
@@ -238,6 +302,10 @@ void idt_init_x64(void)
 {
     for (uint32_t i = 0; i < 32; i++)
         set_gate((uint8_t)i, exception_stubs[i], 0x8Eu);
+
+    /* Route #NMI and #DF onto dedicated TSS IST1 stacks to prevent triple faults on stack overflow. */
+    set_gate_ist(2u, exception_stubs[2], 0x8Eu, 1u);
+    set_gate_ist(8u, exception_stubs[8], 0x8Eu, 1u);
 
     for (uint32_t i = 32; i < IDT_X64_ENTRIES; i++)
         set_gate((uint8_t)i, isr_x64_ignore, 0x8Eu);
