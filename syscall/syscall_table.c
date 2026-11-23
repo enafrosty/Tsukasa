@@ -30,6 +30,7 @@
 #include "../sys/panic.h"
 #include "../drv/acpi.h"
 #include "../drv/pit.h"
+#include "../drv/fb.h"
 #include "../include/kutils.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
@@ -916,6 +917,17 @@ void syscall_gate_x64(interrupt_frame_t *f)
 
 #include "../loader/elf64.h"
 
+static int is_wc_leaf_pte(uint64_t fl, size_t page_size)
+{
+    if ((fl & VMM_X64_PTE_PRESENT) == 0)
+        return 0;
+    if (fl & (VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_WRITE_THROUGH))
+        return 0;
+    if (page_size > (size_t)PAGE_SIZE)
+        return (fl & VMM_X64_PDE_PS) != 0 && (fl & VMM_X64_PDE_PAT) != 0;
+    return (fl & VMM_X64_PTE_PAT) != 0;
+}
+
 static void c01_test_entry(void)
 {
     char kbuf[8];
@@ -1186,7 +1198,8 @@ static void c01_test_entry(void)
     vfs_stat_t st;
     uint64_t wait_start_ms = pit_ticks_ms();
     while ((pit_ticks_ms() - wait_start_ms) < 15000ULL) {
-        if (vfs_stat("/tmp/vanilla.sock", &st) == 0)
+        if (vfs_stat("/tmp/vanilla.sock", &st) == 0 &&
+            fb_last_user_mmap_pte_flags() != 0)
             break;
         process_sleep_ms(20);
     }
@@ -1206,6 +1219,65 @@ static void c01_test_entry(void)
         else
             kprintf("[selftest] yield vector FAIL ta=0x%02x pit_dt=%llu sched_dt=%llu\n",
                     (unsigned)ta, (unsigned long long)pit_dt, (unsigned long long)sched_dt);
+    }
+
+    {
+        uint32_t cpus = smp_cpu_count();
+        uint64_t pat = vmm_x64_read_pat_cpu();
+        int pat_ok = (vmm_x64_pat_supported() == 1 && pat == VMM_X64_PAT_VALUE);
+        uint32_t bad_cpu = 0u;
+        uint64_t bad_pat = pat;
+        for (uint32_t c = 0; c < cpus; c++) {
+            cpu_state_t *cs = smp_get_cpu(c);
+            if (!cs || cs->pat_msr != VMM_X64_PAT_VALUE) {
+                if (pat_ok) {
+                    bad_cpu = c;
+                    bad_pat = cs ? cs->pat_msr : 0ULL;
+                }
+                pat_ok = 0;
+            }
+        }
+        if (pat_ok)
+            kprintf("[selftest] pat msr PASS cpus=%u pat=0x%08x%08x\n",
+                    cpus, (uint32_t)(pat >> 32), (uint32_t)pat);
+        else
+            kprintf("[selftest] pat msr FAIL cpus=%u sup=%d bad_cpu=%u pat=0x%08x%08x\n",
+                    cpus, vmm_x64_pat_supported(), bad_cpu,
+                    (uint32_t)(bad_pat >> 32), (uint32_t)bad_pat);
+    }
+
+    if (fb_info.addr && fb_byte_size() > 0) {
+        uintptr_t first_va = (uintptr_t)fb_info.addr & ~(uintptr_t)(PAGE_SIZE - 1);
+        uintptr_t last_va = ((uintptr_t)fb_info.addr + fb_byte_size() - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
+        uint64_t pa1 = 0, fl1 = 0, pa2 = 0, fl2 = 0;
+        size_t sz1 = 0, sz2 = 0;
+        uint64_t kpml4 = vmm_get_kernel_pml4();
+        int q1 = vmm_query_page_ex(kpml4, first_va, &pa1, &fl1, &sz1);
+        int q2 = vmm_query_page_ex(kpml4, last_va, &pa2, &fl2, &sz2);
+        if (q1 == 0 && q2 == 0 && is_wc_leaf_pte(fl1, sz1) && is_wc_leaf_pte(fl2, sz2))
+            kprintf("[selftest] fb kernel wc PASS first=0x%08x%08x(%uK) last=0x%08x%08x(%uK)\n",
+                    (uint32_t)(fl1 >> 32), (uint32_t)fl1, (unsigned)(sz1 >> 10),
+                    (uint32_t)(fl2 >> 32), (uint32_t)fl2, (unsigned)(sz2 >> 10));
+        else
+            kprintf("[selftest] fb kernel wc FAIL q1=%d fl1=0x%08x%08x(%uK) q2=%d fl2=0x%08x%08x(%uK)\n",
+                    q1, (uint32_t)(fl1 >> 32), (uint32_t)fl1, (unsigned)(sz1 >> 10),
+                    q2, (uint32_t)(fl2 >> 32), (uint32_t)fl2, (unsigned)(sz2 >> 10));
+    }
+
+    {
+        uint64_t ufl = fb_last_user_mmap_pte_flags();
+        int u_ok = (ufl != 0 &&
+                    (ufl & VMM_X64_PTE_PRESENT) != 0 &&
+                    (ufl & VMM_X64_PTE_USER) != 0 &&
+                    (ufl & VMM_X64_PTE_WRITABLE) != 0 &&
+                    (ufl & VMM_X64_PTE_PAT) != 0 &&
+                    (ufl & (VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_WRITE_THROUGH)) == 0);
+        if (u_ok)
+            kprintf("[selftest] fb user wc PASS flags=0x%08x%08x\n",
+                    (uint32_t)(ufl >> 32), (uint32_t)ufl);
+        else
+            kprintf("[selftest] fb user wc FAIL flags=0x%08x%08x\n",
+                    (uint32_t)(ufl >> 32), (uint32_t)ufl);
     }
 
     kprintf("[selftest] ALL DONE\n");
