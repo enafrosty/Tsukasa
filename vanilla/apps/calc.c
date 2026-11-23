@@ -774,7 +774,13 @@ int main(int argc, char **argv)
                 break;
             }
             if (ev.type == VANILLA_EVENT_CONFIGURE && ev.window_id == win->window_id) {
-                vanilla_ack_configure(client, win->window_id, ev.configure.serial);
+                ui_widget_invalidate(state.root);
+                force_present = 1;
+            }
+            if (ev.type == VANILLA_EVENT_THEME_CHANGED) {
+                if (theme_load("/tmp/vanilla_theme.ini") < 0)
+                    theme_reload();
+                state.root->layout_elem->bg_color = g_theme ? g_theme->bg_base : 0xFF2E3440u;
                 ui_widget_invalidate(state.root);
                 force_present = 1;
             }

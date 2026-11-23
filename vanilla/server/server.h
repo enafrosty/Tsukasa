@@ -142,6 +142,7 @@ typedef struct vanilla_server_window {
     /* Protocol v2 configure/ack */
     uint32_t          configure_serial;
     int               configure_pending;
+    int               has_pending_geometry;
     int32_t           pending_x;
     int32_t           pending_y;
     uint32_t          pending_w;
@@ -279,6 +280,7 @@ typedef struct vanilla_server {
     /* Titlebar chrome button hover state */
     uint32_t                  hovered_btn_win_id;
     vanilla_chrome_btn_kind_t hovered_btn_kind;
+    uint32_t                  hovered_window_id;
 } vanilla_server_t;
 
 /* Server lifecycle */

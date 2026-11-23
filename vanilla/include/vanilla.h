@@ -54,6 +54,7 @@ typedef enum {
     VANILLA_EVENT_DND_ENTER = 11,
     VANILLA_EVENT_DND_LEAVE = 12,
     VANILLA_EVENT_DND_DROP = 13,
+    VANILLA_EVENT_THEME_CHANGED = 14,
 } vanilla_event_type_t;
 
 typedef struct vanilla_event {
@@ -132,6 +133,7 @@ int  vanilla_unmap_window(vanilla_window_t *win);
 int  vanilla_move_window(vanilla_window_t *win, int32_t x, int32_t y);
 void vanilla_present(vanilla_window_t *win, const vanilla_rect_t *damage);
 int  vanilla_ack_configure(vanilla_client_t *client, uint32_t window_id, uint32_t serial);
+int  vanilla_window_action(vanilla_client_t *client, uint32_t window_id, uint32_t action);
 int  vanilla_set_size_hints(vanilla_client_t *client, uint32_t window_id,
                             uint32_t min_w, uint32_t min_h,
                             uint32_t max_w, uint32_t max_h,

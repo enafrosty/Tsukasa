@@ -83,6 +83,7 @@ void dock_free_icons(dock_state_t *dock);
 void dock_recompute_geometry(dock_state_t *dock, int32_t screen_w, int32_t screen_h);
 void dock_render(dock_state_t *dock);
 void dock_sync_windows(dock_state_t *dock, const void *win_list_ptr, int32_t screen_w, int32_t screen_h);
+void dock_handle_mouse_motion(dock_state_t *dock, int32_t cx, int32_t cy);
 int  dock_handle_mouse_click(dock_state_t *dock, int32_t cx, int32_t cy, int btn, struct shell_state *st);
 void dock_open_menu(dock_state_t *dock, int item_idx, struct shell_state *st);
 void dock_close_menu(dock_state_t *dock);

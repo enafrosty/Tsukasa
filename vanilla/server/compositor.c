@@ -1001,8 +1001,6 @@ void compositor_render_frame(struct vanilla_server *srv)
     compositor_animate_windows(srv);
     dnd_check_timeout(srv);
 
-    printf("[vanilla] compositor: render\n");
-
     vanilla_compositor_t *comp = &srv->compositor;
     if (g_perf_overlay_enabled) {
         vanilla_rect_t hud_dmg = { THEME_PX(8), THEME_PX(8), THEME_PX(240), THEME_PX(48) };
@@ -1185,7 +1183,7 @@ void compositor_render_frame(struct vanilla_server *srv)
                 vanilla_rect_t b_bottom = { frame_rect.x, frame_rect.y + frame_rect.h - g_theme->border_width, frame_rect.w, g_theme->border_width };
                 if (vanilla_rect_intersect(&b_bottom, dirty, &vis_b))
                     blt_fill_rect(comp->backbuffer, comp->pitch_px, &vis_b, border_color);
-                if (win->has_keyboard_focus && g_theme->reduce_motion == 0) {
+                if (win->has_keyboard_focus) {
                     int32_t ring_w = THEME_PX(2);
                     vanilla_rect_t r_top   = { frame_rect.x, frame_rect.y, frame_rect.w, ring_w };
                     vanilla_rect_t r_bot   = { frame_rect.x, frame_rect.y + frame_rect.h - ring_w, frame_rect.w, ring_w };

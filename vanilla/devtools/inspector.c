@@ -767,8 +767,9 @@ int main(int argc, char **argv)
                 st.running = 0;
                 break;
             } else if (ev.type == VANILLA_EVENT_CONFIGURE) {
-                vanilla_ack_configure(st.client, ev.window_id, ev.configure.serial);
                 st.surface = &st.win->surface;
+            } else if (ev.type == VANILLA_EVENT_THEME_CHANGED) {
+                dbg_query_theme(&st);
             } else if (ev.type == VANILLA_EVENT_INPUT) {
                 if (ev.input.type == EV_REL) {
                     if (ev.input.code == REL_X) mouse_x += ev.input.value;

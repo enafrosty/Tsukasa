@@ -475,7 +475,38 @@ void dock_sync_windows(dock_state_t *dock, const void *win_list_ptr, int32_t scr
     }
 
     dock_recompute_geometry(dock, screen_w, screen_h);
+    if (dock->hovered_idx >= dock->item_count)
+        dock->hovered_idx = -1;
     dock->dirty = 1;
+}
+
+void dock_handle_mouse_motion(dock_state_t *dock, int32_t cx, int32_t cy)
+{
+    if (!dock)
+        return;
+
+    int32_t dock_w = (dock->win && dock->win->surface.width > 0)
+                     ? (int32_t)dock->win->surface.width : dock->width;
+    int32_t dock_h = (dock->win && dock->win->surface.height > 0)
+                     ? (int32_t)dock->win->surface.height : dock->height;
+
+    int new_hovered = -1;
+    if (cx >= 0 && cy >= 0 && cx < dock_w && cy < dock_h) {
+        int32_t item_sz = THEME_PX(DOCK_ITEM_SIZE);
+        for (int i = 0; i < dock->item_count; i++) {
+            if (dock->items[i].type == DOCK_ITEM_SEPARATOR)
+                continue;
+            if (cx >= dock->items[i].x_offset && cx < dock->items[i].x_offset + item_sz) {
+                new_hovered = i;
+                break;
+            }
+        }
+    }
+
+    if (dock->hovered_idx != new_hovered) {
+        dock->hovered_idx = new_hovered;
+        dock->dirty = 1;
+    }
 }
 
 int dock_handle_mouse_click(dock_state_t *dock, int32_t cx, int32_t cy, int btn, shell_state_t *st)
@@ -708,19 +739,8 @@ int dock_handle_menu_click(dock_state_t *dock, int32_t cx, int32_t cy, shell_sta
             shell_spawn_app(item->exec_path);
     } else if (action_idx == 1) {
         /* Maximize */
-        if (item->window_id != 0) {
-            int sfd = vanilla_client_get_fd(st->client);
-            vanilla_msg_hdr_t hdr;
-            hdr.magic = VANILLA_IPC_MAGIC;
-            vanilla_msg_map_window_t m_req;
-            hdr.msg_type = MSG_MAP_WINDOW;
-            hdr.payload_len = (uint16_t)sizeof(m_req);
-            hdr.window_id = item->window_id;
-            m_req.window_id = item->window_id;
-            if (sfd >= 0) {
-                write(sfd, &hdr, sizeof(hdr));
-                write(sfd, &m_req, sizeof(m_req));
-            }
+        if (item->window_id != 0 && st->client) {
+            vanilla_window_action(st->client, item->window_id, WINDOW_ACTION_MAXIMIZE);
             item->is_mapped = 1;
             item->is_focused = 1;
             item->is_minimized = 0;
@@ -737,19 +757,8 @@ int dock_handle_menu_click(dock_state_t *dock, int32_t cx, int32_t cy, shell_sta
         }
     } else if (action_idx == 2) {
         /* Close */
-        if (item->window_id != 0) {
-            int sfd = vanilla_client_get_fd(st->client);
-            vanilla_msg_hdr_t hdr;
-            hdr.magic = VANILLA_IPC_MAGIC;
-            vanilla_msg_destroy_window_t d_req;
-            hdr.msg_type = MSG_DESTROY_WINDOW;
-            hdr.payload_len = (uint16_t)sizeof(d_req);
-            hdr.window_id = item->window_id;
-            d_req.window_id = item->window_id;
-            if (sfd >= 0) {
-                write(sfd, &hdr, sizeof(hdr));
-                write(sfd, &d_req, sizeof(d_req));
-            }
+        if (item->window_id != 0 && st->client) {
+            vanilla_window_action(st->client, item->window_id, WINDOW_ACTION_CLOSE);
         }
     }
 

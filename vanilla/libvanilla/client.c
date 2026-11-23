@@ -273,6 +273,32 @@ int vanilla_ack_configure(vanilla_client_t *client, uint32_t window_id, uint32_t
     return 0;
 }
 
+int vanilla_window_action(vanilla_client_t *client, uint32_t window_id, uint32_t action)
+{
+    if (!client || client->socket_fd < 0 || window_id == 0)
+        return -1;
+
+    if (client->server_version < 2)
+        return 0;
+
+    vanilla_msg_hdr_t hdr;
+    vanilla_msg_window_action_t msg;
+
+    hdr.magic = VANILLA_IPC_MAGIC;
+    hdr.msg_type = MSG_WINDOW_ACTION;
+    hdr.payload_len = (uint16_t)sizeof(msg);
+    hdr.window_id = window_id;
+
+    msg.window_id = window_id;
+    msg.action = action;
+
+    if (exact_write(client->socket_fd, &hdr, sizeof(hdr)) < 0 ||
+        exact_write(client->socket_fd, &msg, sizeof(msg)) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
 int vanilla_set_size_hints(vanilla_client_t *client, uint32_t window_id,
                            uint32_t min_w, uint32_t min_h,
                            uint32_t max_w, uint32_t max_h,
@@ -495,7 +521,7 @@ vanilla_window_t *vanilla_create_window(vanilla_client_t *client, const char *ti
                                    ev.configure.width, ev.configure.height,
                                    ev.configure.flags, cfg_shm_id,
                                    cfg_pitch, cfg_buf_size);
-            if (cfg_serial != 0) {
+            if (cfg_serial != 0 && target_win != NULL) {
                 vanilla_ack_configure(client, ack_hdr.window_id, cfg_serial);
             }
             event_queue_push(client, &ev);
@@ -628,6 +654,7 @@ vanilla_window_t *vanilla_create_window(vanilla_client_t *client, const char *ti
                 }
             }
             vanilla_event_t ev;
+            memset(&ev, 0, sizeof(ev));
             ev.type = VANILLA_EVENT_DND_DROP;
             ev.window_id = ack_hdr.window_id;
             ev.dnd_drop.local_x = drop.local_x;
@@ -635,6 +662,22 @@ vanilla_window_t *vanilla_create_window(vanilla_client_t *client, const char *ti
             memcpy(ev.dnd_drop.mime, drop.mime, sizeof(ev.dnd_drop.mime));
             memcpy(ev.dnd_drop.data, drop.data, sizeof(ev.dnd_drop.data));
             ev.dnd_drop.data_len = drop.data_len;
+            event_queue_push(client, &ev);
+        } else if (ack_hdr.msg_type == MSG_THEME_CHANGED) {
+            if (ack_hdr.payload_len > 0) {
+                uint8_t discard[128];
+                size_t rem = ack_hdr.payload_len;
+                while (rem > 0) {
+                    size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+                    if (exact_read(client->socket_fd, discard, chunk) < 0)
+                        return NULL;
+                    rem -= chunk;
+                }
+            }
+            vanilla_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.type = VANILLA_EVENT_THEME_CHANGED;
+            ev.window_id = ack_hdr.window_id;
             event_queue_push(client, &ev);
         } else {
             if (ack_hdr.payload_len > 0) {
@@ -915,6 +958,7 @@ int vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev)
         if (hdr.magic != VANILLA_IPC_MAGIC)
             return -1;
 
+        memset(out_ev, 0, sizeof(*out_ev));
         out_ev->window_id = hdr.window_id;
 
         if (hdr.msg_type == MSG_INPUT_EVENT_V2) {
@@ -1046,7 +1090,7 @@ int vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev)
                                    out_ev->configure.width, out_ev->configure.height,
                                    out_ev->configure.flags, cfg_shm_id,
                                    cfg_pitch, cfg_buf_size);
-            if (cfg_serial != 0) {
+            if (cfg_serial != 0 && target_win != NULL) {
                 vanilla_ack_configure(client, hdr.window_id, cfg_serial);
             }
             return 1;
@@ -1195,6 +1239,21 @@ int vanilla_poll_event(vanilla_client_t *client, vanilla_event_t *out_ev)
             memcpy(out_ev->dnd_drop.mime, drop.mime, sizeof(out_ev->dnd_drop.mime));
             memcpy(out_ev->dnd_drop.data, drop.data, sizeof(out_ev->dnd_drop.data));
             out_ev->dnd_drop.data_len = drop.data_len;
+            return 1;
+        }
+
+        if (hdr.msg_type == MSG_THEME_CHANGED) {
+            if (hdr.payload_len > 0) {
+                uint8_t discard[128];
+                size_t rem = hdr.payload_len;
+                while (rem > 0) {
+                    size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+                    if (exact_read(client->socket_fd, discard, chunk) < 0)
+                        return -1;
+                    rem -= chunk;
+                }
+            }
+            out_ev->type = VANILLA_EVENT_THEME_CHANGED;
             return 1;
         }
 

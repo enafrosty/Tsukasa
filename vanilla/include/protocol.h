@@ -80,6 +80,10 @@
 #define WINDOW_FLAG_MODAL       (1u << 4)
 #define WINDOW_FLAG_ALWAYS_TOP  (1u << 5)
 
+/* Window action codes for MSG_WINDOW_ACTION */
+#define WINDOW_ACTION_CLOSE     1u
+#define WINDOW_ACTION_MAXIMIZE  2u
+
 /* MSG_PRESENT - extended for v2 (client -> server) */
 typedef struct {
     int32_t  x;
