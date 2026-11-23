@@ -108,6 +108,8 @@ static long sys_read(long fd, long buf, long count, long a4, long a5, long a6)
 {
     (void)a4; (void)a5; (void)a6;
     if (!user_ok(buf, count, 1)) return -EFAULT;
+    if (vfs_fd_has_mode((int)fd, VFS_MODE_READ) != 0) return -EBADF;
+    if (count == 0) return 0;
     return mux_fs(FS_CMD_READ, fd, buf, count);
 }
 
@@ -115,6 +117,8 @@ static long sys_write(long fd, long buf, long count, long a4, long a5, long a6)
 {
     (void)a4; (void)a5; (void)a6;
     if (!user_ok(buf, count, 0)) return -EFAULT;
+    if (vfs_fd_has_mode((int)fd, VFS_MODE_WRITE) != 0) return -EBADF;
+    if (count == 0) return 0;
     return mux_fs(FS_CMD_WRITE, fd, buf, count);
 }
 

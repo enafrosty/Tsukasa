@@ -373,6 +373,28 @@ static void swap_bytes(unsigned char *a, unsigned char *b, size_t size)
     }
 }
 
+static void heap_sift_down(unsigned char *arr, size_t start, size_t end,
+                           size_t size,
+                           int (*compar)(const void *, const void *))
+{
+    size_t root = start;
+    while (end >= 2 && root <= (end - 2) / 2) {
+        size_t child = 2 * root + 1;
+        size_t swap_idx = root;
+
+        if (compar(arr + swap_idx * size, arr + child * size) < 0)
+            swap_idx = child;
+        if (child + 1 < end &&
+            compar(arr + swap_idx * size, arr + (child + 1) * size) < 0)
+            swap_idx = child + 1;
+        if (swap_idx == root)
+            return;
+
+        swap_bytes(arr + root * size, arr + swap_idx * size, size);
+        root = swap_idx;
+    }
+}
+
 void qsort(void *base, size_t nmemb, size_t size,
            int (*compar)(const void *, const void *))
 {
@@ -380,13 +402,12 @@ void qsort(void *base, size_t nmemb, size_t size,
     if (!arr || !compar || size == 0 || nmemb < 2)
         return;
 
-    for (size_t i = 0; i + 1 < nmemb; i++) {
-        for (size_t j = 0; j + 1 < nmemb - i; j++) {
-            unsigned char *a = arr + j * size;
-            unsigned char *b = arr + (j + 1) * size;
-            if (compar(a, b) > 0)
-                swap_bytes(a, b, size);
-        }
+    for (size_t start = nmemb / 2; start > 0; start--)
+        heap_sift_down(arr, start - 1, nmemb, size, compar);
+
+    for (size_t end = nmemb; end > 1; end--) {
+        swap_bytes(arr, arr + (end - 1) * size, size);
+        heap_sift_down(arr, 0, end - 1, size, compar);
     }
 }
 

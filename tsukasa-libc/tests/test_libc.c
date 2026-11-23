@@ -28,13 +28,25 @@ static int cmp_int(const void *a, const void *b)
     return (ia > ib) - (ia < ib);
 }
 
+struct sort_item_12 {
+    int key;
+    unsigned char pad[8];
+};
+
+static int cmp_item_12(const void *a, const void *b)
+{
+    const struct sort_item_12 *ia = (const struct sort_item_12 *)a;
+    const struct sort_item_12 *ib = (const struct sort_item_12 *)b;
+    return (ia->key > ib->key) - (ia->key < ib->key);
+}
+
 int main(int argc, char **argv, char **envp)
 {
     (void)argc;
     (void)argv;
     (void)envp;
     int passed = 0;
-    int total = 4;
+    int total = 5;
 
     /* 1. String Operations */
     const char *orig = "Hello, Tsukasa OS!";
@@ -183,6 +195,70 @@ int main(int argc, char **argv, char **envp)
     }
     TSK_TEST_PASS("libc", "utilities");
     passed++;
+
+    /* 5. qsort stress (N=2048 reverse, random, duplicates, non-power-of-two structs) */
+    {
+        enum { N_QSORT = 2048 };
+        int *qarr = (int *)malloc((size_t)N_QSORT * sizeof(int));
+        struct sort_item_12 *sarr = (struct sort_item_12 *)malloc(
+            (size_t)N_QSORT * sizeof(struct sort_item_12));
+        if (!qarr || !sarr) {
+            free(qarr);
+            free(sarr);
+            TSK_TEST_FAIL("libc", "qsort_stress", "malloc failed");
+            return 20;
+        }
+
+        /* Reverse-sorted */
+        for (int i = 0; i < N_QSORT; i++)
+            qarr[i] = N_QSORT - 1 - i;
+        qsort(qarr, N_QSORT, sizeof(int), cmp_int);
+        for (int i = 0; i < N_QSORT; i++) {
+            if (qarr[i] != i) {
+                free(qarr);
+                free(sarr);
+                TSK_TEST_FAIL("libc", "qsort_stress", "reverse array sort mismatch");
+                return 21;
+            }
+        }
+
+        /* Deterministic pseudo-random with heavy duplicates */
+        unsigned int seed = 0x12345678u;
+        for (int i = 0; i < N_QSORT; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            qarr[i] = (int)((seed >> 16) % 128u) - 64;
+        }
+        qsort(qarr, N_QSORT, sizeof(int), cmp_int);
+        for (int i = 0; i + 1 < N_QSORT; i++) {
+            if (qarr[i] > qarr[i + 1]) {
+                free(qarr);
+                free(sarr);
+                TSK_TEST_FAIL("libc", "qsort_stress", "random/duplicate array not sorted");
+                return 22;
+            }
+        }
+
+        /* Non-power-of-two 12-byte structs */
+        for (int i = 0; i < N_QSORT; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            sarr[i].key = (int)(seed >> 8);
+            sarr[i].pad[0] = (unsigned char)(i & 0xFF);
+        }
+        qsort(sarr, N_QSORT, sizeof(struct sort_item_12), cmp_item_12);
+        for (int i = 0; i + 1 < N_QSORT; i++) {
+            if (sarr[i].key > sarr[i + 1].key) {
+                free(qarr);
+                free(sarr);
+                TSK_TEST_FAIL("libc", "qsort_stress", "12-byte struct sort mismatch");
+                return 23;
+            }
+        }
+
+        free(qarr);
+        free(sarr);
+        TSK_TEST_PASS("libc", "qsort_stress");
+        passed++;
+    }
 
     TSK_TEST_DONE("libc", passed, total);
     return 0;

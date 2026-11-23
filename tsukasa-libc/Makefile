@@ -99,6 +99,14 @@ src/stdio/sscanf.o: src/stdio/sscanf.c
 	@mkdir -p $(dir $@)
 	$(CC) $(MATH_CFLAGS) -c -o $@ $<
 
+src/stdio/printf.o: src/stdio/printf.c
+	@mkdir -p $(dir $@)
+	$(CC) $(MATH_CFLAGS) -c -o $@ $<
+
+src/stdio/stdio.o: src/stdio/stdio.c
+	@mkdir -p $(dir $@)
+	$(CC) $(MATH_CFLAGS) -c -o $@ $<
+
 src/math/%.o: src/math/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(MATH_CFLAGS) -c -o $@ $<
@@ -116,6 +124,10 @@ $(LIBM_A): $(MATH_OBJS)
 	$(AR) rcs $@ $^
 
 tests/test_math.o: tests/test_math.c
+	@mkdir -p $(dir $@)
+	$(CC) $(MATH_CFLAGS) -c -o $@ $<
+
+tests/test_stdio.o: tests/test_stdio.c
 	@mkdir -p $(dir $@)
 	$(CC) $(MATH_CFLAGS) -c -o $@ $<
 
