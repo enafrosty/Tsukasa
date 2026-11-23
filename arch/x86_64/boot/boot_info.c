@@ -87,6 +87,13 @@ volatile struct limine_smp_request smp_request = {
     .flags = 0,
 };
 
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_rsdp_request rsdp_request = {
+    .id = LIMINE_RSDP_REQUEST,
+    .revision = 0,
+    .response = NULL,
+};
+
 __attribute__((used, section(".limine_requests_end")))
 static volatile uint64_t limine_requests_end_marker = 0;
 
@@ -138,9 +145,17 @@ static void populate_boot_info(void)
 
     g_boot_info.module_count = 0;
     g_boot_info.modules = g_modules;
+    g_boot_info.rsdp_addr = 0;
 
     if (hhdm_request.response)
         g_boot_info.hhdm_offset = hhdm_request.response->offset;
+
+    if (rsdp_request.response && rsdp_request.response->address) {
+        uint64_t rsdp_addr = (uint64_t)(uintptr_t)rsdp_request.response->address;
+        if (g_boot_info.hhdm_offset && rsdp_addr >= g_boot_info.hhdm_offset)
+            rsdp_addr -= g_boot_info.hhdm_offset;
+        g_boot_info.rsdp_addr = rsdp_addr;
+    }
 
     if (framebuffer_request.response && framebuffer_request.response->framebuffer_count > 0) {
         struct limine_framebuffer *fb = framebuffer_request.response->framebuffers[0];
