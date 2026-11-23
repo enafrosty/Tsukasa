@@ -52,7 +52,7 @@ static int real_main(int argc, char **argv, char **envp)
     (void)argv;
     (void)envp;
     int passed = 0;
-    int total = 8;
+    int total = 9;
 
     /* Test 1: Stack frame alignment (rsp % 16 == 8 on function entry). */
     if ((s_entry_rsp & 0xF) != 8) {
@@ -361,6 +361,88 @@ static int real_main(int argc, char **argv, char **envp)
     close(epfd);
     TSK_TEST_PASS("syscalls", "epoll_facility");
     passed++;
+
+    /* Test 9: Zero-length read/write and user pointer validation. */
+    {
+        const char *zpath = "/tmp/test_zlen.tmp";
+        int zfd = open(zpath, O_RDWR | O_CREAT | O_TRUNC);
+        if (zfd < 0) {
+            TSK_TEST_FAIL("syscalls", "zero_len_user_ptr", "open temp file failed");
+            return 32;
+        }
+
+        char zbuf[4] = {0};
+        if (write(zfd, zbuf, 0) != 0 || read(zfd, zbuf, 0) != 0) {
+            close(zfd);
+            unlink(zpath);
+            TSK_TEST_FAIL("syscalls", "zero_len_user_ptr", "zero-len read/write on file failed");
+            return 33;
+        }
+
+        int zp[2];
+        if (pipe(zp) != 0) {
+            close(zfd);
+            unlink(zpath);
+            TSK_TEST_FAIL("syscalls", "zero_len_user_ptr", "pipe creation failed");
+            return 34;
+        }
+        if (read(zp[0], zbuf, 0) != 0 || write(zp[1], zbuf, 0) != 0) {
+            close(zp[0]);
+            close(zp[1]);
+            close(zfd);
+            unlink(zpath);
+            TSK_TEST_FAIL("syscalls", "zero_len_user_ptr", "zero-len read/write on pipe failed");
+            return 35;
+        }
+        close(zp[0]);
+        close(zp[1]);
+
+        errno = 0;
+        if (read(-1, zbuf, 0) != -1 || errno != EBADF) {
+            close(zfd);
+            unlink(zpath);
+            TSK_TEST_FAIL("syscalls", "zero_len_user_ptr", "read(-1, buf, 0) did not fail EBADF");
+            return 36;
+        }
+        errno = 0;
+        if (write(-1, zbuf, 0) != -1 || errno != EBADF) {
+            close(zfd);
+            unlink(zpath);
+            TSK_TEST_FAIL("syscalls", "zero_len_user_ptr", "write(-1, buf, 0) did not fail EBADF");
+            return 37;
+        }
+
+        void *kptr = (void *)(uintptr_t)0xFFFFFFFF80000000ULL;
+        void *unmapped_ptr = (void *)(uintptr_t)0x0000000050000000ULL;
+        int ptr_ok = 1;
+
+        errno = 0;
+        if (read(zfd, kptr, 4) != -1 || errno != EFAULT) ptr_ok = 0;
+        errno = 0;
+        if (write(zfd, kptr, 4) != -1 || errno != EFAULT) ptr_ok = 0;
+        errno = 0;
+        if (read(zfd, kptr, 0) != -1 || errno != EFAULT) ptr_ok = 0;
+        errno = 0;
+        if (write(zfd, kptr, 0) != -1 || errno != EFAULT) ptr_ok = 0;
+        errno = 0;
+        if (read(zfd, NULL, 0) != -1 || errno != EFAULT) ptr_ok = 0;
+        errno = 0;
+        if (write(zfd, NULL, 0) != -1 || errno != EFAULT) ptr_ok = 0;
+        errno = 0;
+        if (read(zfd, unmapped_ptr, 4) != -1 || errno != EFAULT) ptr_ok = 0;
+        errno = 0;
+        if (write(zfd, unmapped_ptr, 4) != -1 || errno != EFAULT) ptr_ok = 0;
+
+        close(zfd);
+        unlink(zpath);
+
+        if (!ptr_ok) {
+            TSK_TEST_FAIL("syscalls", "zero_len_user_ptr", "bad user pointer did not return EFAULT");
+            return 38;
+        }
+        TSK_TEST_PASS("syscalls", "zero_len_user_ptr");
+        passed++;
+    }
 
     TSK_TEST_DONE("syscalls", passed, total);
     return 0;

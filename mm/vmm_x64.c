@@ -1223,8 +1223,10 @@ int vmm_map_wc_region(uint64_t phys_base, size_t size, uintptr_t *virt_base)
 int vmm_validate_user_ptr(const void *ptr, size_t len, int need_write)
 {
     uintptr_t p = (uintptr_t)ptr;
-    if (!p || len == 0)
+    if (!p)
         return 0;
+    if (len == 0)
+        return (p >= PAGING_USER_VA_MIN && p <= PAGING_USER_VA_MAX) ? 1 : 0;
     if (p < PAGING_USER_VA_MIN || p + len > PAGING_USER_VA_MAX || (p + len < p))
         return 0;
 #ifdef __x86_64__

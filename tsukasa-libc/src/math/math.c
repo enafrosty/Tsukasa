@@ -16,6 +16,7 @@
 
 #include "math.h"
 #include <stdint.h>
+#include <string.h>
 
 #define LN2 0.693147180559945309417
 
@@ -368,22 +369,174 @@ float cosf(float x)
     return (float)cos((double)x);
 }
 
+static uint64_t dbl_to_u64(double x)
+{
+    uint64_t u;
+    memcpy(&u, &x, sizeof(u));
+    return u;
+}
+
+static double u64_to_dbl(uint64_t u)
+{
+    double x;
+    memcpy(&x, &u, sizeof(x));
+    return x;
+}
+
+static uint32_t flt_to_u32(float x)
+{
+    uint32_t u;
+    memcpy(&u, &x, sizeof(u));
+    return u;
+}
+
+static float u32_to_flt(uint32_t u)
+{
+    float x;
+    memcpy(&x, &u, sizeof(x));
+    return x;
+}
+
 double ldexp(double x, int exp)
 {
-    return __builtin_ldexp(x, exp);
+    uint64_t bits = dbl_to_u64(x);
+    uint64_t sign = bits & (1ULL << 63);
+    uint64_t abs_bits = bits & 0x7FFFFFFFFFFFFFFFULL;
+    int e_bits = (int)(abs_bits >> 52);
+    uint64_t mant = abs_bits & 0x000FFFFFFFFFFFFFULL;
+
+    if (abs_bits == 0 || e_bits == 0x7FF || exp == 0)
+        return x;
+
+    int64_t e = (int64_t)e_bits;
+    if (e == 0) {
+        e = 1;
+        while ((mant & (1ULL << 52)) == 0) {
+            mant <<= 1;
+            e--;
+        }
+    } else {
+        mant |= (1ULL << 52);
+    }
+
+    e += (int64_t)exp;
+    if (e >= 2047)
+        return u64_to_dbl(sign | 0x7FF0000000000000ULL);
+    if (e >= 1)
+        return u64_to_dbl(sign | ((uint64_t)e << 52) | (mant & 0x000FFFFFFFFFFFFFULL));
+
+    int64_t shift = 1 - e;
+    if (shift > 53)
+        return u64_to_dbl(sign);
+
+    uint64_t kept = mant >> (unsigned)shift;
+    uint64_t half = 1ULL << (unsigned)(shift - 1);
+    uint64_t rem = mant & ((1ULL << (unsigned)shift) - 1ULL);
+    if (rem > half || (rem == half && (kept & 1ULL) != 0))
+        kept++;
+
+    return u64_to_dbl(sign | kept);
 }
 
 float ldexpf(float x, int exp)
 {
-    return __builtin_ldexpf(x, exp);
+    uint32_t bits = flt_to_u32(x);
+    uint32_t sign = bits & 0x80000000U;
+    uint32_t abs_bits = bits & 0x7FFFFFFFU;
+    int e_bits = (int)(abs_bits >> 23);
+    uint32_t mant = abs_bits & 0x007FFFFFU;
+
+    if (abs_bits == 0 || e_bits == 0xFF || exp == 0)
+        return x;
+
+    int64_t e = (int64_t)e_bits;
+    if (e == 0) {
+        e = 1;
+        while ((mant & (1U << 23)) == 0) {
+            mant <<= 1;
+            e--;
+        }
+    } else {
+        mant |= (1U << 23);
+    }
+
+    e += (int64_t)exp;
+    if (e >= 255)
+        return u32_to_flt(sign | 0x7F800000U);
+    if (e >= 1)
+        return u32_to_flt(sign | ((uint32_t)e << 23) | (mant & 0x007FFFFFU));
+
+    int64_t shift = 1 - e;
+    if (shift > 24)
+        return u32_to_flt(sign);
+
+    uint32_t kept = mant >> (unsigned)shift;
+    uint32_t half = 1U << (unsigned)(shift - 1);
+    uint32_t rem = mant & ((1U << (unsigned)shift) - 1U);
+    if (rem > half || (rem == half && (kept & 1U) != 0))
+        kept++;
+
+    return u32_to_flt(sign | kept);
 }
 
 double frexp(double x, int *exp)
 {
-    return __builtin_frexp(x, exp);
+    uint64_t bits = dbl_to_u64(x);
+    uint64_t sign = bits & (1ULL << 63);
+    uint64_t abs_bits = bits & 0x7FFFFFFFFFFFFFFFULL;
+    int e_bits = (int)(abs_bits >> 52);
+    uint64_t mant = abs_bits & 0x000FFFFFFFFFFFFFULL;
+
+    if (abs_bits == 0 || e_bits == 0x7FF) {
+        if (exp)
+            *exp = 0;
+        return x;
+    }
+
+    int out_exp;
+    if (e_bits == 0) {
+        int shift = 0;
+        while ((mant & (1ULL << 52)) == 0) {
+            mant <<= 1;
+            shift++;
+        }
+        out_exp = 1 - 1022 - shift;
+    } else {
+        out_exp = e_bits - 1022;
+    }
+
+    if (exp)
+        *exp = out_exp;
+    return u64_to_dbl(sign | (1022ULL << 52) | (mant & 0x000FFFFFFFFFFFFFULL));
 }
 
 float frexpf(float x, int *exp)
 {
-    return __builtin_frexpf(x, exp);
+    uint32_t bits = flt_to_u32(x);
+    uint32_t sign = bits & 0x80000000U;
+    uint32_t abs_bits = bits & 0x7FFFFFFFU;
+    int e_bits = (int)(abs_bits >> 23);
+    uint32_t mant = abs_bits & 0x007FFFFFU;
+
+    if (abs_bits == 0 || e_bits == 0xFF) {
+        if (exp)
+            *exp = 0;
+        return x;
+    }
+
+    int out_exp;
+    if (e_bits == 0) {
+        int shift = 0;
+        while ((mant & (1U << 23)) == 0) {
+            mant <<= 1;
+            shift++;
+        }
+        out_exp = 1 - 126 - shift;
+    } else {
+        out_exp = e_bits - 126;
+    }
+
+    if (exp)
+        *exp = out_exp;
+    return u32_to_flt(sign | (126U << 23) | (mant & 0x007FFFFFU));
 }

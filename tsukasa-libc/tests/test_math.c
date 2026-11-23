@@ -17,8 +17,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdint.h>
+#include <string.h>
+#include <limits.h>
+#include <float.h>
 #include <math.h>
 #include "../../scripts/test/tsk_test.h"
+
+static uint64_t dbl_bits(double x)
+{
+    uint64_t u;
+    memcpy(&u, &x, sizeof(u));
+    return u;
+}
+
+static uint32_t flt_bits(float x)
+{
+    uint32_t u;
+    memcpy(&u, &x, sizeof(u));
+    return u;
+}
 
 static int approx_eq(double a, double b, double eps)
 {
@@ -31,7 +49,7 @@ int main(int argc, char **argv)
     (void)argc;
     (void)argv;
     int passed = 0;
-    int total = 8;
+    int total = 10;
 
     /* 1. fabs */
     if (fabs(-42.5) == 42.5 && fabs(13.37) == 13.37 && fabsf(-5.5f) == 5.5f) {
@@ -133,6 +151,85 @@ int main(int argc, char **argv)
     } else {
         TSK_TEST_FAIL("math", "pow", "power function mismatch");
         return 8;
+    }
+
+    /* 9. ldexp / ldexpf */
+    {
+        double sub_d = ldexp(1.0, -1074);
+        float sub_f = ldexpf(1.0f, -149);
+        double ld_nan = ldexp((double)NAN, 5);
+        float lf_nan = ldexpf(NAN, 3);
+        if (ldexp(1.5, 3) == 12.0 &&
+            ldexp(-3.0, -2) == -0.75 &&
+            ldexp(1.0, 0) == 1.0 &&
+            dbl_bits(ldexp(0.0, 100)) == 0ULL &&
+            dbl_bits(ldexp(-0.0, 100)) == (1ULL << 63) &&
+            ldexp((double)INFINITY, -50) == (double)INFINITY &&
+            ldexp(-(double)INFINITY, 50) == -(double)INFINITY &&
+            (ld_nan != ld_nan) &&
+            sub_d > 0.0 &&
+            ldexp(sub_d, 1) == ldexp(1.0, -1073) &&
+            ldexp(DBL_MIN, -1) == DBL_MIN * 0.5 &&
+            ldexp(DBL_MIN * 0.5, 1) == DBL_MIN &&
+            ldexp(1.0, 1024) == (double)INFINITY &&
+            ldexp(-1.0, INT_MAX) == -(double)INFINITY &&
+            dbl_bits(ldexp(1.0, -1075)) == 0ULL &&
+            dbl_bits(ldexp(-1.0, INT_MIN)) == (1ULL << 63) &&
+            ldexpf(1.5f, 3) == 12.0f &&
+            ldexpf(-3.0f, -2) == -0.75f &&
+            flt_bits(ldexpf(0.0f, 50)) == 0U &&
+            flt_bits(ldexpf(-0.0f, 50)) == (1U << 31) &&
+            ldexpf(INFINITY, -10) == INFINITY &&
+            ldexpf(-INFINITY, 10) == -INFINITY &&
+            (lf_nan != lf_nan) &&
+            sub_f > 0.0f &&
+            ldexpf(sub_f, 1) == ldexpf(1.0f, -148) &&
+            ldexpf(1.0f, INT_MAX) == INFINITY &&
+            flt_bits(ldexpf(-1.0f, INT_MIN)) == (1U << 31)) {
+            TSK_TEST_PASS("math", "ldexp_ldexpf");
+            passed++;
+        } else {
+            TSK_TEST_FAIL("math", "ldexp_ldexpf", "ldexp/ldexpf mismatch");
+            return 9;
+        }
+    }
+
+    /* 10. frexp / frexpf */
+    {
+        int e = 99;
+        int ok = 1;
+        if (frexp(6.0, &e) != 0.75 || e != 3) ok = 0;
+        if (frexp(-0.5, &e) != -0.5 || e != 0) ok = 0;
+        e = 99;
+        if (dbl_bits(frexp(0.0, &e)) != 0ULL || e != 0) ok = 0;
+        e = 99;
+        if (dbl_bits(frexp(-0.0, &e)) != (1ULL << 63) || e != 0) ok = 0;
+        e = 99;
+        if (frexp((double)INFINITY, &e) != (double)INFINITY || e != 0) ok = 0;
+        e = 99;
+        if (frexp(-(double)INFINITY, &e) != -(double)INFINITY || e != 0) ok = 0;
+        e = 99;
+        double fn = frexp((double)NAN, &e);
+        if (!(fn != fn) || e != 0) ok = 0;
+        if (frexp(ldexp(1.0, -1074), &e) != 0.5 || e != -1073) ok = 0;
+        if (frexp(-ldexp(3.0, -1074), &e) != -0.75 || e != -1072) ok = 0;
+        if (frexpf(6.0f, &e) != 0.75f || e != 3) ok = 0;
+        e = 99;
+        if (flt_bits(frexpf(-0.0f, &e)) != (1U << 31) || e != 0) ok = 0;
+        e = 99;
+        if (frexpf(INFINITY, &e) != INFINITY || e != 0) ok = 0;
+        e = 99;
+        float fnf = frexpf(NAN, &e);
+        if (!(fnf != fnf) || e != 0) ok = 0;
+        if (frexpf(ldexpf(1.0f, -149), &e) != 0.5f || e != -148) ok = 0;
+
+        if (ok) {
+            TSK_TEST_PASS("math", "frexp_frexpf");
+            passed++;
+        } else {
+            TSK_TEST_FAIL("math", "frexp_frexpf", "frexp/frexpf mismatch");
+            return 10;
+        }
     }
 
     TSK_TEST_DONE("math", passed, total);

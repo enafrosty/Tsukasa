@@ -57,6 +57,7 @@ void srand(unsigned int seed);
 int  rand(void);
 
 void abort(void);
+int  atexit(void (*func)(void));
 void exit(int status);
 void _exit(int status);
 

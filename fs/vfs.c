@@ -1684,11 +1684,22 @@ void vfs_close(int fd)
 
 /* Read/write/seek */
 
+int vfs_fd_has_mode(int fd, int mode)
+{
+    process_t *proc = vfs_current_process();
+    vfs_file_t *f = fd_lookup(proc, fd);
+    if (!f || (f->mode & mode) != mode)
+        return -EBADF;
+    return 0;
+}
+
 size_t vfs_read(int fd, void *buf, size_t count)
 {
     process_t *proc = vfs_current_process();
     vfs_file_t *f = fd_lookup(proc, fd);
     if (!f || !buf || !(f->mode & VFS_MODE_READ))
+        return 0;
+    if (count == 0)
         return 0;
 
     if (f->backend == VFS_BACKEND_MEMFS) {
@@ -1832,6 +1843,8 @@ size_t vfs_write(int fd, const void *buf, size_t count)
     process_t *proc = vfs_current_process();
     vfs_file_t *f = fd_lookup(proc, fd);
     if (!f || !buf || !(f->mode & VFS_MODE_WRITE))
+        return 0;
+    if (count == 0)
         return 0;
 
     if (f->flags & VFS_O_APPEND) {

@@ -117,6 +117,7 @@ int vfs_rename(const char *old_path, const char *new_path);
 
 size_t vfs_read(int fd, void *buf, size_t count);
 size_t vfs_write(int fd, const void *buf, size_t count);
+int    vfs_fd_has_mode(int fd, int mode);
 size_t vfs_seek(int fd, size_t offset, int whence);
 size_t vfs_tell(int fd);
 size_t vfs_size(int fd);

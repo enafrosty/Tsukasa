@@ -241,6 +241,21 @@ int reboot(int cmd)
     return (int)__syscall_check(__syscall4(SYS_reboot, 0xfee1dead, 672274793, (int64_t)cmd, 0));
 }
 
+#define ATEXIT_MAX 32
+
+static void (*g_atexit_funcs[ATEXIT_MAX])(void);
+static size_t g_atexit_count = 0;
+static int g_exiting = 0;
+static int g_flushed = 0;
+
+int atexit(void (*func)(void))
+{
+    if (!func || g_atexit_count >= ATEXIT_MAX)
+        return -1;
+    g_atexit_funcs[g_atexit_count++] = func;
+    return 0;
+}
+
 void _exit(int status)
 {
     __syscall1(SYS_exit, status);
@@ -250,5 +265,17 @@ void _exit(int status)
 
 void exit(int status)
 {
+    if (!g_exiting) {
+        g_exiting = 1;
+        while (g_atexit_count > 0) {
+            void (*fn)(void) = g_atexit_funcs[--g_atexit_count];
+            if (fn)
+                fn();
+        }
+    }
+    if (!g_flushed) {
+        g_flushed = 1;
+        fflush(NULL);
+    }
     _exit(status);
 }
