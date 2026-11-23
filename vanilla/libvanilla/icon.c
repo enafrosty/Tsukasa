@@ -79,13 +79,8 @@ static const app_alias_t g_app_aliases[] = {
 };
 
 static const char *g_search_dirs[] = {
-    "/fat12/",
-    "/bin/",
-    "/fat12/ICONS/",
-    "/fat12/icons/",
+    "/usr/share/vanilla/icons/",
     "/icons/",
-    "fat12/ICONS/",
-    "fat12/icons/",
     "icons/",
     "vanilla/icons/builtin/",
     "icons/builtin/",
@@ -93,6 +88,7 @@ static const char *g_search_dirs[] = {
     "assets/icons/",
     "/assets/",
     "assets/",
+    "/bin/",
     "/",
     "",
 };

@@ -22,6 +22,8 @@
 
 #include "vfs.h"   /* vfs_stat_t, VFS_PATH_MAX, VFS_NAME_MAX */
 
+struct tmpfs_fs;
+
 /* One indexed archive member. */
 typedef struct tar_inode {
     char           path[VFS_PATH_MAX];
@@ -52,5 +54,10 @@ int tar_list_dir(const tar_fs_t *fs, const char *path,
 /* Bounds-checked read of an indexed file straight from the archive buffer. */
 uint64_t tar_read(const tar_fs_t *fs, const tar_inode_t *ino,
                   uint64_t pos, void *buf, uint64_t count);
+
+/* Unpack a USTAR/GNU-tar archive into a writable tmpfs instance.
+ * Returns number of unpacked entries on success, or negative errno on error. */
+int tar_unpack_to_tmpfs(const void *archive, uint64_t archive_size,
+                        struct tmpfs_fs *fs);
 
 #endif /* TAR_H */

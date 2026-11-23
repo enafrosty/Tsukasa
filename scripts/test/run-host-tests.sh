@@ -179,3 +179,16 @@ $CC -O2 \
     -lpthread -lm
 
 "${BUILD_DIR}/test_notify" 2>&1 | tee -a "$LOG"
+
+# 9. LZ4 frame packer and kernel decompressor tests
+$CC -O2 -Wall -Wextra -Werror \
+    -o "${BUILD_DIR}/lz4pack" \
+    "${REPO_ROOT}/tools/lz4pack.c"
+
+$CC -O2 -Wall -Wextra -Werror \
+    -I"${REPO_ROOT}" \
+    -o "${BUILD_DIR}/test_lz4" \
+    "${REPO_ROOT}/scripts/test/test_lz4.c" \
+    "${REPO_ROOT}/lib/lz4.c"
+
+"${BUILD_DIR}/test_lz4" "${BUILD_DIR}/lz4pack" 2>&1 | tee -a "$LOG"

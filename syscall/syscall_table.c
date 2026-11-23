@@ -1016,7 +1016,7 @@ static void c01_test_entry(void)
     /* elf64_spawn is a single-slot handoff; retry while another spawn (e.g. */
     int pid = -1;
     for (int i = 0; i < 200 && pid < 0; i++) {
-        pid = elf64_spawn("/fat12/hello.elf", "hello-elf");
+        pid = elf64_spawn("/bin/hello.elf", "hello-elf");
         if (pid < 0)
             process_yield();
     }
@@ -1036,7 +1036,7 @@ static void c01_test_entry(void)
 
     pid = -1;
     for (int i = 0; i < 200 && pid < 0; i++) {
-        pid = elf64_spawn("/fat12/hello_sc.elf", "hello-syscall");
+        pid = elf64_spawn("/bin/hello_sc.elf", "hello-syscall");
         if (pid < 0)
             process_yield();
     }
@@ -1055,7 +1055,7 @@ static void c01_test_entry(void)
 
     pid = -1;
     for (int i = 0; i < 200 && pid < 0; i++) {
-        pid = elf64_spawn("/fat12/hellosdk.elf", "hello-sdk");
+        pid = elf64_spawn("/bin/hellosdk.elf", "hello-sdk");
         if (pid < 0)
             process_yield();
     }
@@ -1074,7 +1074,7 @@ static void c01_test_entry(void)
 
     pid = -1;
     for (int i = 0; i < 200 && pid < 0; i++) {
-        pid = elf64_spawn_cmdline("/fat12/argvchk.elf",
+        pid = elf64_spawn_cmdline("/bin/argvchk.elf",
                                   "argvchk alpha beta gamma", "argvchk");
         if (pid < 0)
             process_yield();
@@ -1094,7 +1094,7 @@ static void c01_test_entry(void)
 
     pid = -1;
     for (int i = 0; i < 200 && pid < 0; i++) {
-        pid = elf64_spawn("/fat12/echo.elf", "echo-sdk");
+        pid = elf64_spawn("/bin/echo.elf", "echo-sdk");
         if (pid < 0)
             process_yield();
     }
@@ -1136,7 +1136,7 @@ static void c01_test_entry(void)
 
     pid = -1;
     for (int i = 0; i < 200 && pid < 0; i++) {
-        pid = elf64_spawn("/fat12/fault.elf", "fault-victim");
+        pid = elf64_spawn("/bin/fault.elf", "fault-victim");
         if (pid < 0)
             process_yield();
     }

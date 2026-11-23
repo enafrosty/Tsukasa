@@ -27,8 +27,12 @@ BOOT_DIR = $(ISO_DIR)/boot
 LIMINE_BOOT_DIR = $(BOOT_DIR)/limine
 EFI_BOOT_DIR = $(ISO_DIR)/EFI/BOOT
 
-INITRD_IMG = initrd.img
-INITRD_FILES = initrd_files
+INITRD_DIR = build/initrd
+INITRD_BIN = $(INITRD_DIR)/bin
+INITRD_TAR = build/initrd.tar
+INITRD_IMG = build/initrd.tar.lz4
+HOST_CC ?= cc
+LZ4PACK = build/tools/lz4pack
 
 LIMINE_DIR = .limine
 LIMINE_REPO = https://github.com/limine-bootloader/limine.git
@@ -39,10 +43,10 @@ COMMON_OBJS = vga.o \
     drv/fb.o drv/pic.o drv/pit.o drv/ps2kbd.o drv/irq.o drv/ps2mouse.o \
     drv/serial.o drv/ata.o drv/blockdev.o drv/diskmgr.o drv/rtc.o \
     drv/input_dev.o \
-    fs/vfs.o fs/devfs.o fs/initrd.o fs/fat12.o fs/fat32.o fs/mkfs_fat32.o fs/memfs.o fs/procfs.o fs/sysfs.o fs/bootfs.o \
+    fs/vfs.o fs/devfs.o fs/initrd.o fs/fat32.o fs/mkfs_fat32.o fs/tmpfs.o fs/procfs.o fs/sysfs.o fs/bootfs.o \
     fs/tar.o fs/tar_testdata.o \
     loader/elf.o loader/exec.o loader/elf64.o \
-    lib/kprintf.o lib/kutils.o lib/compiler_rt.o lib/ksymbols.o lib/backtrace.o lib/stack_chk.o \
+    lib/kprintf.o lib/kutils.o lib/lz4.o lib/compiler_rt.o lib/ksymbols.o lib/backtrace.o lib/stack_chk.o \
     gfx/blit.o gfx/font.o gfx/font_8x8.o
 
 USER_LIB_OBJS = $(patsubst user/%.c,user/%.o,$(wildcard user/lib/*.c))
@@ -147,23 +151,23 @@ $(KERNEL_BIN): $(OBJS) lib/ksymbols_table.o
 	$(CC) $(CFLAGS) -c -o lib/ksymbols_table.o lib/ksymbols_table.c
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) lib/ksymbols_table.o
 
-$(INITRD_FILES)/hello.elf: user_elf/hello64.asm
-	@mkdir -p $(INITRD_FILES)
+$(INITRD_BIN)/hello.elf: user_elf/hello64.asm
+	@mkdir -p $(INITRD_BIN)
 	nasm -f elf64 -o user_elf/hello64.o user_elf/hello64.asm
 	$(LD) $(USER_ELF_LDFLAGS) -o $@ user_elf/hello64.o
 
-$(INITRD_FILES)/hello_sc.elf: user_elf/hello_syscall64.asm
-	@mkdir -p $(INITRD_FILES)
+$(INITRD_BIN)/hello_sc.elf: user_elf/hello_syscall64.asm
+	@mkdir -p $(INITRD_BIN)
 	nasm -f elf64 -o user_elf/hello_syscall64.o user_elf/hello_syscall64.asm
 	$(LD) $(USER_ELF_LDFLAGS) -o $@ user_elf/hello_syscall64.o
 
-$(INITRD_FILES)/fault.elf: user_elf/fault64.asm
-	@mkdir -p $(INITRD_FILES)
+$(INITRD_BIN)/fault.elf: user_elf/fault64.asm
+	@mkdir -p $(INITRD_BIN)
 	nasm -f elf64 -o user_elf/fault64.o user_elf/fault64.asm
 	$(LD) $(USER_ELF_LDFLAGS) -o $@ user_elf/fault64.o
 
-$(INITRD_FILES)/exit7.elf: user_elf/exit7.asm
-	@mkdir -p $(INITRD_FILES)
+$(INITRD_BIN)/exit7.elf: user_elf/exit7.asm
+	@mkdir -p $(INITRD_BIN)
 	nasm -f elf64 -o user_elf/exit7.o user_elf/exit7.asm
 	$(LD) $(USER_ELF_LDFLAGS) -o $@ user_elf/exit7.o
 
@@ -186,14 +190,14 @@ user/crt/stdio_lite.o: user/crt/stdio_lite.c user/crt/tsukasa_sdk.h
 	$(SDK_CC) $(SDK_CFLAGS) -c -o $@ $<
 
 
-$(INITRD_FILES)/%.elf: user/cli/%.c $(SDK_OBJS) user/crt/tsukasa_app.ld
-	@mkdir -p $(INITRD_FILES)
+$(INITRD_BIN)/%.elf: user/cli/%.c $(SDK_OBJS) user/crt/tsukasa_app.ld
+	@mkdir -p $(INITRD_BIN)
 	$(SDK_CC) $(SDK_CFLAGS) -c -o user/cli/$*.o $<
 	$(LD) -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
 	    -o $@ user/crt/crt0.o user/cli/$*.o user/crt/syscalls.o user/crt/stdio_lite.o
 
-$(INITRD_FILES)/hellosdk.elf: user/examples/hello.c $(SDK_OBJS) user/crt/tsukasa_app.ld
-	@mkdir -p $(INITRD_FILES)
+$(INITRD_BIN)/hellosdk.elf: user/examples/hello.c $(SDK_OBJS) user/crt/tsukasa_app.ld
+	@mkdir -p $(INITRD_BIN)
 	$(SDK_CC) $(SDK_CFLAGS) -c -o user/examples/hello.o user/examples/hello.c
 	$(LD) -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
 	    -o $@ user/crt/crt0.o user/examples/hello.o user/crt/syscalls.o
@@ -210,8 +214,8 @@ user/lib/libwidget.sdk.o: user/lib/libwidget.c user/include/libwidget.h
 gfx/font_8x8.sdk.o: gfx/font_8x8.c gfx/font_8x8.h
 	$(SDK_CC) $(SDK_CFLAGS) -c -o $@ $<
 
-$(INITRD_FILES)/wdemo16.elf: user/cli/wdemo16.c $(SDK_OBJS) $(TK_OBJS) user/crt/tsukasa_app.ld
-	@mkdir -p $(INITRD_FILES)
+$(INITRD_BIN)/wdemo16.elf: user/cli/wdemo16.c $(SDK_OBJS) $(TK_OBJS) user/crt/tsukasa_app.ld
+	@mkdir -p $(INITRD_BIN)
 	$(SDK_CC) $(SDK_CFLAGS) -c -o user/cli/wdemo16.o $<
 	$(LD) -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
 	    -o $@ user/crt/crt0.o user/cli/wdemo16.o $(TK_OBJS) user/crt/syscalls.o user/crt/stdio_lite.o
@@ -222,174 +226,34 @@ libc:
 vanilla: libc
 	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C vanilla all
 
-$(INITRD_FILES)/VSRV.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/vanilla_srv.elf $@
-
-$(INITRD_FILES)/REGISTRD.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/registryd.elf $@
-
-$(INITRD_FILES)/CLIPBD.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/clipboardd.elf $@
-
-$(INITRD_FILES)/NOTIFYD.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/notifyd.elf $@
-
-$(INITRD_FILES)/TESTIPC.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/test_ipc.elf $@
-
-$(INITRD_FILES)/TESTCOMP.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/test_compositor.elf $@
-
-$(INITRD_FILES)/TESTTYPO.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/test_typography.elf $@
-
-$(INITRD_FILES)/TSHELL.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/test_shell.elf $@
-
-$(INITRD_FILES)/TERMINAL.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/terminal.elf $@
-
-$(INITRD_FILES)/NOTEPAD.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/notepad.elf $@
-
-$(INITRD_FILES)/CALC.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/calc.elf $@
-
-$(INITRD_FILES)/FILEMGR.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/filemgr.elf $@
-
-$(INITRD_FILES)/SETTINGS.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/settings.elf $@
-
-$(INITRD_FILES)/TASKMGR.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/taskmgr.elf $@
-
-$(INITRD_FILES)/SHELL.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/bin/shell.elf $@
-
-$(INITRD_FILES)/SUPERVSD.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/supervisor/SUPERVSD.ELF $@
-
-$(INITRD_FILES)/DEVTOOLS.ELF: vanilla
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/devtools/DEVTOOLS.ELF $@
-
-$(INITRD_FILES)/SVCS.CFG: vanilla/supervisor/services.conf
-	@mkdir -p $(INITRD_FILES)
-	cp vanilla/supervisor/services.conf $@
-
-ICON_FILES = $(INITRD_FILES)/TERM.VCO $(INITRD_FILES)/NOTEPAD.VCO $(INITRD_FILES)/CALC.VCO \
-             $(INITRD_FILES)/FILEMGR.VCO $(INITRD_FILES)/TASKMGR.VCO $(INITRD_FILES)/SYSFETCH.VCO \
-             $(INITRD_FILES)/SETTINGS.VCO $(INITRD_FILES)/PSVIEW.VCO $(INITRD_FILES)/NETINFO.VCO \
-             $(INITRD_FILES)/TSUKASA.VCO
-
-$(INITRD_FILES)/%.VCO: vanilla/icons/builtin/%.VCO
-	@mkdir -p $(INITRD_FILES)
-	cp $< $@
-
-$(INITRD_FILES)/WALLPAP.BMP: vanilla/assets/wallpaper.bmp
-	@mkdir -p $(INITRD_FILES)
-	cp $< $@
-
-$(INITRD_FILES)/WALLPAP.PNG: vanilla/assets/wallpaper.png
-	@mkdir -p $(INITRD_FILES)
-	cp $< $@
-
 coreutils: libc
 	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C tsukasa-coreutils all
-
-$(INITRD_FILES)/TSH.ELF: coreutils
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-coreutils/bin/tsh.elf $@
 
 disktools: libc
 	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C tsukasa-disktools all
 
-$(INITRD_FILES)/FDISK.ELF: disktools
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-disktools/bin/fdisk.elf $@
-
-$(INITRD_FILES)/MKFSFAT.ELF: disktools
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-disktools/bin/mkfs.fat32.elf $@
-
-$(INITRD_FILES)/MKFSEXT2.ELF: disktools
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-disktools/bin/mkfs.ext2.elf $@
-
-$(INITRD_FILES)/INSTALL.ELF: disktools
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-disktools/bin/installer.elf $@
- 
 ports: vanilla
 	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C tsukasa-ports all
-
-$(INITRD_FILES)/DOOM.ELF: ports
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-ports/staging/bin/doomgeneric.elf $@
-
-$(INITRD_FILES)/DOOM1.WAD: ports
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-ports/staging/usr/share/doom/doom1.wad $@
-
-$(INITRD_FILES)/TCC.ELF: ports
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-ports/staging/bin/tcc.elf $@
-
-$(INITRD_FILES)/LUA.ELF: ports
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-ports/staging/bin/lua.elf $@
-
-$(INITRD_FILES)/LUAC.ELF: ports
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-ports/staging/bin/luac.elf $@
 
 libc-tests: libc
 	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C tsukasa-libc all check
 
-$(INITRD_FILES)/TCRT0.ELF: libc-tests
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-libc/tests/test_crt0.elf $@
-
-$(INITRD_FILES)/TSYSC.ELF: libc-tests
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-libc/tests/test_syscalls.elf $@
-
-$(INITRD_FILES)/TLIBC.ELF: libc-tests
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-libc/tests/test_libc.elf $@
-
-$(INITRD_FILES)/TMATH.ELF: libc-tests
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-libc/tests/test_math.elf $@
-
-$(INITRD_FILES)/TSTDIO.ELF: libc-tests
-	@mkdir -p $(INITRD_FILES)
-	cp tsukasa-libc/tests/test_stdio.elf $@
-
-$(INITRD_FILES)/TESTDRV.ELF: user/cli/testdrv.c $(SDK_OBJS) user/crt/tsukasa_app.ld
-	@mkdir -p $(INITRD_FILES)
+$(INITRD_BIN)/TESTDRV.ELF: user/cli/testdrv.c $(SDK_OBJS) user/crt/tsukasa_app.ld
+	@mkdir -p $(INITRD_BIN)
 	$(SDK_CC) $(SDK_CFLAGS) -c -o user/cli/testdrv.o $<
 	$(LD) -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
 	    -o $@ user/crt/crt0.o user/cli/testdrv.o user/crt/syscalls.o user/crt/stdio_lite.o
 
-apps: $(INITRD_FILES)/hellosdk.elf $(INITRD_FILES)/echo.elf $(INITRD_FILES)/cat.elf $(INITRD_FILES)/argvchk.elf $(INITRD_FILES)/futex10.elf $(INITRD_FILES)/usock20.elf $(INITRD_FILES)/wsrv15.elf $(INITRD_FILES)/wapp15.elf $(INITRD_FILES)/wdemo16.elf $(INITRD_FILES)/VSRV.ELF $(INITRD_FILES)/REGISTRD.ELF $(INITRD_FILES)/CLIPBD.ELF $(INITRD_FILES)/NOTIFYD.ELF $(INITRD_FILES)/TESTIPC.ELF $(INITRD_FILES)/TESTCOMP.ELF $(INITRD_FILES)/TESTTYPO.ELF $(INITRD_FILES)/TSHELL.ELF $(INITRD_FILES)/TERMINAL.ELF $(INITRD_FILES)/NOTEPAD.ELF $(INITRD_FILES)/CALC.ELF $(INITRD_FILES)/FILEMGR.ELF $(INITRD_FILES)/SETTINGS.ELF $(INITRD_FILES)/TASKMGR.ELF $(INITRD_FILES)/SHELL.ELF $(INITRD_FILES)/SUPERVSD.ELF $(INITRD_FILES)/DEVTOOLS.ELF $(INITRD_FILES)/SVCS.CFG $(INITRD_FILES)/TSH.ELF $(INITRD_FILES)/FDISK.ELF $(INITRD_FILES)/MKFSFAT.ELF $(INITRD_FILES)/MKFSEXT2.ELF $(INITRD_FILES)/INSTALL.ELF $(INITRD_FILES)/DOOM.ELF $(INITRD_FILES)/DOOM1.WAD $(INITRD_FILES)/TCC.ELF $(INITRD_FILES)/LUA.ELF $(INITRD_FILES)/LUAC.ELF $(INITRD_FILES)/TCRT0.ELF $(INITRD_FILES)/TSYSC.ELF $(INITRD_FILES)/TLIBC.ELF $(INITRD_FILES)/TMATH.ELF $(INITRD_FILES)/TSTDIO.ELF $(INITRD_FILES)/TESTDRV.ELF $(ICON_FILES) $(INITRD_FILES)/WALLPAP.BMP $(INITRD_FILES)/WALLPAP.PNG
+USER_TEST_BINS = $(INITRD_BIN)/hello.elf $(INITRD_BIN)/hello_sc.elf $(INITRD_BIN)/fault.elf \
+                 $(INITRD_BIN)/exit7.elf $(INITRD_BIN)/hellosdk.elf $(INITRD_BIN)/echo.elf \
+                 $(INITRD_BIN)/cat.elf $(INITRD_BIN)/argvchk.elf $(INITRD_BIN)/futex10.elf \
+                 $(INITRD_BIN)/usock20.elf $(INITRD_BIN)/wsrv15.elf $(INITRD_BIN)/wapp15.elf \
+                 $(INITRD_BIN)/wdemo16.elf $(INITRD_BIN)/TESTDRV.ELF
+
+COREUTILS_NAMES = ls cat mkdir rm cp mv grep ps free sysfetch kill date poweroff reboot \
+                  head tail wc sort uniq cut uname touch net ping telnet fetch tsh
+
+apps: $(USER_TEST_BINS) vanilla coreutils disktools ports libc-tests
 
 sdk: $(SDK_OBJS) user/crt/tsukasa_app.ld user/crt/tsukasa_sdk.h
 	@mkdir -p $(SDK_DIR)/include $(SDK_DIR)/lib $(SDK_DIR)/crt
@@ -398,17 +262,116 @@ sdk: $(SDK_OBJS) user/crt/tsukasa_app.ld user/crt/tsukasa_sdk.h
 	cp user/crt/syscalls.o $(SDK_DIR)/lib/
 	@echo "[OK] SDK staged in $(SDK_DIR)/ (crt0.o, tsukasa_app.ld, syscalls.o, tsukasa_sdk.h)."
 
-$(INITRD_IMG): $(INITRD_FILES)/hello.elf $(INITRD_FILES)/hello_sc.elf $(INITRD_FILES)/fault.elf $(INITRD_FILES)/exit7.elf $(INITRD_FILES)/hellosdk.elf $(INITRD_FILES)/echo.elf $(INITRD_FILES)/cat.elf $(INITRD_FILES)/argvchk.elf $(INITRD_FILES)/futex10.elf $(INITRD_FILES)/usock20.elf $(INITRD_FILES)/wsrv15.elf $(INITRD_FILES)/wapp15.elf $(INITRD_FILES)/wdemo16.elf $(INITRD_FILES)/VSRV.ELF $(INITRD_FILES)/REGISTRD.ELF $(INITRD_FILES)/CLIPBD.ELF $(INITRD_FILES)/NOTIFYD.ELF $(INITRD_FILES)/TESTIPC.ELF $(INITRD_FILES)/TESTCOMP.ELF $(INITRD_FILES)/TESTTYPO.ELF $(INITRD_FILES)/TSHELL.ELF $(INITRD_FILES)/TERMINAL.ELF $(INITRD_FILES)/NOTEPAD.ELF $(INITRD_FILES)/CALC.ELF $(INITRD_FILES)/FILEMGR.ELF $(INITRD_FILES)/SETTINGS.ELF $(INITRD_FILES)/TASKMGR.ELF $(INITRD_FILES)/SHELL.ELF $(INITRD_FILES)/SUPERVSD.ELF $(INITRD_FILES)/DEVTOOLS.ELF $(INITRD_FILES)/SVCS.CFG $(INITRD_FILES)/TSH.ELF $(INITRD_FILES)/FDISK.ELF $(INITRD_FILES)/MKFSFAT.ELF $(INITRD_FILES)/MKFSEXT2.ELF $(INITRD_FILES)/INSTALL.ELF $(INITRD_FILES)/DOOM.ELF $(INITRD_FILES)/DOOM1.WAD $(INITRD_FILES)/TCC.ELF $(INITRD_FILES)/LUA.ELF $(INITRD_FILES)/LUAC.ELF $(INITRD_FILES)/TCRT0.ELF $(INITRD_FILES)/TSYSC.ELF $(INITRD_FILES)/TLIBC.ELF $(INITRD_FILES)/TMATH.ELF $(INITRD_FILES)/TSTDIO.ELF $(INITRD_FILES)/TESTDRV.ELF $(ICON_FILES) $(INITRD_FILES)/WALLPAP.BMP $(INITRD_FILES)/WALLPAP.PNG
+$(LZ4PACK): tools/lz4pack.c
+	@mkdir -p $(dir $@)
+	$(HOST_CC) -O2 -Wall -Wextra -Werror -o $@ $<
 
-	@mkdir -p $(INITRD_FILES)
-	@mkdir -p $(INITRD_FILES)/ICONS
-	cp vanilla/icons/builtin/*.VCO $(INITRD_FILES)/ICONS/ 2>/dev/null || true
-	dd if=/dev/zero of=$(INITRD_IMG) bs=1024 count=16384
-	mkfs.fat -F 12 -s 16 $(INITRD_IMG)
-	@if [ -n "$$(ls -A $(INITRD_FILES) 2>/dev/null)" ]; then \
-	    mcopy -s -i $(INITRD_IMG) $(INITRD_FILES)/* ::; \
+$(INITRD_IMG): apps limine-artifacts bootblob.bin $(LZ4PACK)
+	@mkdir -p $(INITRD_DIR)/bin $(INITRD_DIR)/sbin $(INITRD_DIR)/usr/bin \
+	          $(INITRD_DIR)/usr/lib $(INITRD_DIR)/usr/include \
+	          $(INITRD_DIR)/usr/share/vanilla/cursors \
+	          $(INITRD_DIR)/usr/share/vanilla/icons \
+	          $(INITRD_DIR)/usr/share/doom \
+	          $(INITRD_DIR)/usr/share/limine \
+	          $(INITRD_DIR)/etc/vanilla/themes \
+	          $(INITRD_DIR)/home $(INITRD_DIR)/root \
+	          $(INITRD_DIR)/var/log $(INITRD_DIR)/var/run $(INITRD_DIR)/var/tmp \
+	          $(INITRD_DIR)/tmp $(INITRD_DIR)/dev $(INITRD_DIR)/proc \
+	          $(INITRD_DIR)/sys $(INITRD_DIR)/boot $(INITRD_DIR)/mnt
+	@for util in $(COREUTILS_NAMES); do \
+	    cp tsukasa-coreutils/bin/$${util}.elf $(INITRD_BIN)/$${util}; \
+	done
+	ln -sf tsh $(INITRD_BIN)/tsh.elf
+	ln -sf tsh $(INITRD_BIN)/TSH.ELF
+	cp vanilla/bin/vanilla_srv.elf $(INITRD_BIN)/vsrv
+	ln -sf vsrv $(INITRD_BIN)/vsrv.elf
+	ln -sf vsrv $(INITRD_BIN)/VSRV.ELF
+	cp vanilla/bin/shell.elf $(INITRD_BIN)/shell
+	ln -sf shell $(INITRD_BIN)/shell.elf
+	ln -sf shell $(INITRD_BIN)/SHELL.ELF
+	cp vanilla/bin/terminal.elf $(INITRD_BIN)/terminal
+	ln -sf terminal $(INITRD_BIN)/terminal.elf
+	ln -sf terminal $(INITRD_BIN)/TERMINAL.ELF
+	cp vanilla/bin/notepad.elf $(INITRD_BIN)/notepad
+	ln -sf notepad $(INITRD_BIN)/notepad.elf
+	ln -sf notepad $(INITRD_BIN)/NOTEPAD.ELF
+	cp vanilla/bin/filemgr.elf $(INITRD_BIN)/filemgr
+	ln -sf filemgr $(INITRD_BIN)/filemgr.elf
+	ln -sf filemgr $(INITRD_BIN)/FILEMGR.ELF
+	cp vanilla/bin/calc.elf $(INITRD_BIN)/calc
+	ln -sf calc $(INITRD_BIN)/calc.elf
+	ln -sf calc $(INITRD_BIN)/CALC.ELF
+	cp vanilla/bin/taskmgr.elf $(INITRD_BIN)/taskmgr
+	ln -sf taskmgr $(INITRD_BIN)/taskmgr.elf
+	ln -sf taskmgr $(INITRD_BIN)/TASKMGR.ELF
+	cp vanilla/bin/settings.elf $(INITRD_BIN)/settings
+	ln -sf settings $(INITRD_BIN)/settings.elf
+	ln -sf settings $(INITRD_BIN)/SETTINGS.ELF
+	cp vanilla/supervisor/SUPERVSD.ELF $(INITRD_BIN)/supervisord
+	ln -sf supervisord $(INITRD_BIN)/supervsd.elf
+	ln -sf supervisord $(INITRD_BIN)/SUPERVSD.ELF
+	cp vanilla/bin/registryd.elf $(INITRD_BIN)/registryd
+	ln -sf registryd $(INITRD_BIN)/registryd.elf
+	ln -sf registryd $(INITRD_BIN)/REGISTRD.ELF
+	cp vanilla/bin/clipboardd.elf $(INITRD_BIN)/clipboardd
+	ln -sf clipboardd $(INITRD_BIN)/clipboardd.elf
+	ln -sf clipboardd $(INITRD_BIN)/CLIPBD.ELF
+	cp vanilla/bin/notifyd.elf $(INITRD_BIN)/notifyd
+	ln -sf notifyd $(INITRD_BIN)/notifyd.elf
+	ln -sf notifyd $(INITRD_BIN)/NOTIFYD.ELF
+	cp vanilla/devtools/DEVTOOLS.ELF $(INITRD_BIN)/devtools
+	ln -sf devtools $(INITRD_BIN)/devtools.elf
+	ln -sf devtools $(INITRD_BIN)/DEVTOOLS.ELF
+	cp tsukasa-disktools/bin/fdisk.elf $(INITRD_BIN)/fdisk
+	ln -sf fdisk $(INITRD_BIN)/fdisk.elf
+	ln -sf fdisk $(INITRD_BIN)/FDISK.ELF
+	cp tsukasa-disktools/bin/mkfs.fat32.elf $(INITRD_BIN)/mkfs.fat32
+	ln -sf mkfs.fat32 $(INITRD_BIN)/MKFSFAT.ELF
+	cp tsukasa-disktools/bin/mkfs.ext2.elf $(INITRD_BIN)/mkfs.ext2
+	ln -sf mkfs.ext2 $(INITRD_BIN)/MKFSEXT2.ELF
+	cp tsukasa-disktools/bin/installer.elf $(INITRD_BIN)/installer
+	ln -sf installer $(INITRD_BIN)/installer.elf
+	ln -sf installer $(INITRD_BIN)/INSTALL.ELF
+	ln -sf installer $(INITRD_BIN)/install
+	cp tsukasa-ports/staging/bin/doomgeneric.elf $(INITRD_BIN)/doom
+	ln -sf doom $(INITRD_BIN)/doom.elf
+	ln -sf doom $(INITRD_BIN)/DOOM.ELF
+	cp tsukasa-ports/staging/usr/share/doom/doom1.wad $(INITRD_DIR)/usr/share/doom/doom1.wad
+	ln -sf ../usr/share/doom/doom1.wad $(INITRD_BIN)/doom1.wad
+	ln -sf ../usr/share/doom/doom1.wad $(INITRD_BIN)/DOOM1.WAD
+	cp tsukasa-ports/staging/bin/tcc.elf $(INITRD_BIN)/tcc
+	ln -sf tcc $(INITRD_BIN)/tcc.elf
+	ln -sf tcc $(INITRD_BIN)/TCC.ELF
+	cp tsukasa-ports/staging/bin/lua.elf $(INITRD_BIN)/lua
+	ln -sf lua $(INITRD_BIN)/lua.elf
+	ln -sf lua $(INITRD_BIN)/LUA.ELF
+	cp tsukasa-ports/staging/bin/luac.elf $(INITRD_BIN)/luac
+	ln -sf luac $(INITRD_BIN)/luac.elf
+	ln -sf luac $(INITRD_BIN)/LUAC.ELF
+	cp -r tsukasa-ports/staging/usr/include/. $(INITRD_DIR)/usr/include/
+	cp -r tsukasa-ports/staging/usr/lib/. $(INITRD_DIR)/usr/lib/
+	cp tsukasa-libc/tests/test_crt0.elf $(INITRD_BIN)/TCRT0.ELF
+	cp tsukasa-libc/tests/test_syscalls.elf $(INITRD_BIN)/TSYSC.ELF
+	cp tsukasa-libc/tests/test_libc.elf $(INITRD_BIN)/TLIBC.ELF
+	cp tsukasa-libc/tests/test_math.elf $(INITRD_BIN)/TMATH.ELF
+	cp tsukasa-libc/tests/test_stdio.elf $(INITRD_BIN)/TSTDIO.ELF
+	cp vanilla/bin/test_ipc.elf $(INITRD_BIN)/TESTIPC.ELF
+	cp vanilla/bin/test_compositor.elf $(INITRD_BIN)/TESTCOMP.ELF
+	cp vanilla/bin/test_typography.elf $(INITRD_BIN)/TESTTYPO.ELF
+	cp vanilla/bin/test_shell.elf $(INITRD_BIN)/TSHELL.ELF
+	cp assets/themes/*.ini $(INITRD_DIR)/etc/vanilla/themes/
+	cp assets/cursors/*.argb $(INITRD_DIR)/usr/share/vanilla/cursors/
+	cp vanilla/icons/builtin/*.VCO $(INITRD_DIR)/usr/share/vanilla/icons/
+	cp vanilla/assets/wallpaper.png vanilla/assets/wallpaper.bmp $(INITRD_DIR)/usr/share/vanilla/
+	cp vanilla/supervisor/services.conf $(INITRD_DIR)/etc/services.conf
+	cp $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/limine-bios.sys bootblob.bin $(INITRD_DIR)/usr/share/limine/
+	tar --numeric-owner --format=ustar -C $(INITRD_DIR) -cf $(INITRD_TAR) .
+	@if command -v lz4 >/dev/null 2>&1; then \
+	    lz4 -f -9 $(INITRD_TAR) $@; \
+	else \
+	    $(LZ4PACK) $(INITRD_TAR) $@; \
 	fi
-	@echo "[OK] $(INITRD_IMG) ready (FAT12, 16 MB)."
+	@echo "[OK] $@ ready (USTAR + LZ4)."
 
 initrd: $(INITRD_IMG)
 
@@ -443,12 +406,8 @@ iso-x86_64: $(KERNEL_BIN) limine-artifacts bootblob.bin $(INITRD_IMG)
 	cp $(KERNEL_BIN) $(BOOT_DIR)/tsukasa_x64.elf
 	cp bootblob.bin $(BOOT_DIR)/
 	cp limine.conf $(ISO_DIR)/
-	@if [ -f $(INITRD_IMG) ]; then \
-	    cp $(INITRD_IMG) $(BOOT_DIR)/; \
-	    echo "[OK] initrd.img included in ISO."; \
-	else \
-	    echo "[WARN] No initrd.img found. Continuing without optional FAT12 compatibility ramdisk."; \
-	fi
+	cp $(INITRD_IMG) $(BOOT_DIR)/initrd.tar.lz4
+	@echo "[OK] initrd.tar.lz4 included in ISO."
 	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_BOOT_DIR)/
 	cp $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_BOOT_DIR)/
 	cp $(LIMINE_DIR)/limine-uefi-cd.bin $(LIMINE_BOOT_DIR)/
@@ -481,7 +440,9 @@ vnc-run: iso-x86_64
 
 clean:
 	find . -name '*.o' -delete
-	rm -f tsukasa_x64.elf $(ISO_IMAGE) $(INITRD_IMG) lib/ksymbols_table.c
-	rm -rf $(ISO_DIR) $(SDK_DIR) $(INITRD_FILES)
+	rm -f tsukasa_x64.elf $(ISO_IMAGE) $(INITRD_IMG) $(INITRD_TAR) lib/ksymbols_table.c
+	rm -rf $(ISO_DIR) $(SDK_DIR) build
 	$(MAKE) -C vanilla clean
 	$(MAKE) -C tsukasa-disktools clean
+	$(MAKE) -C tsukasa-coreutils clean
+	$(MAKE) -C tsukasa-libc clean

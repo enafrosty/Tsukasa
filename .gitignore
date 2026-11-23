@@ -10,8 +10,10 @@
 *.exe
 
 # Boot / ISO staging outputs
+build/
 iso/boot/*.elf
 iso/boot/*.img
+iso/boot/*.lz4
 iso/boot/limine/*.bin
 iso/boot/limine/*.sys
 iso/EFI/BOOT/*.EFI

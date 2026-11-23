@@ -157,13 +157,11 @@ int main(int argc, char **argv)
 
     /* Spawn interactive shell using fallback candidate paths */
     static const char *shell_candidates[] = {
-        "/bin/tsh.elf",
         "/bin/tsh",
-        "tsh.elf",
+        "/bin/tsh.elf",
         "tsh",
+        "tsh.elf",
         "/bin/TSH.ELF",
-        "/fat12/tsh.elf",
-        "/fat12/TSH.ELF",
         NULL
     };
 
