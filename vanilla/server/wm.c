@@ -197,6 +197,27 @@ static inline vanilla_cursor_shape_t resize_edge_to_cursor_shape(vanilla_resize_
     }
 }
 
+static vanilla_cursor_shape_t wm_cursor_shape_for_pos(vanilla_server_t *srv, int32_t x, int32_t y)
+{
+    vanilla_server_window_t *under = wm_window_at(srv, x, y);
+    if (!under)
+        return CURSOR_ARROW;
+
+    if ((under->flags & WINDOW_FLAG_RESIZABLE) && under->is_snapped == SNAP_NONE) {
+        vanilla_resize_edge_t edge = wm_hit_test_resize_edge(under, x, y);
+        if (edge != RESIZE_EDGE_NONE)
+            return resize_edge_to_cursor_shape(edge);
+    }
+
+    if (x >= under->x && x < under->x + (int32_t)under->width &&
+        y >= under->y && y < under->y + (int32_t)under->height) {
+        if (under->cursor_shape < (uint32_t)CURSOR_COUNT)
+            return (vanilla_cursor_shape_t)under->cursor_shape;
+    }
+
+    return CURSOR_ARROW;
+}
+
 vanilla_resize_edge_t wm_hit_test_resize_edge(const vanilla_server_window_t *w, int32_t px, int32_t py)
 {
     if (!w || !w->in_use || !w->is_mapped)
@@ -737,6 +758,8 @@ void vanilla_server_destroy_window_record(vanilla_server_t *srv, vanilla_server_
         srv->hovered_btn_win_id = 0;
         srv->hovered_btn_kind = CHROME_BTN_NONE;
     }
+    if (srv->hovered_window_id == w->window_id)
+        srv->hovered_window_id = 0;
     dnd_window_destroyed(srv, w->window_id);
     w->resize_has_target = 0;
     w->anim_state = ANIM_IDLE;
@@ -813,10 +836,41 @@ vanilla_server_window_t *vanilla_server_find_window(vanilla_server_t *srv, uint3
     return NULL;
 }
 
+static void wm_commit_pending_configure(vanilla_server_t *srv, vanilla_server_window_t *w)
+{
+    w->configure_pending = 0;
+    wm_invalidate_window(srv, w);
+    if (w->pending_surface.pixels) {
+        surface_destroy(&w->surface);
+        w->surface = w->pending_surface;
+        w->shm_id = w->surface.shm_id;
+        memset(&w->pending_surface, 0, sizeof(w->pending_surface));
+    }
+    if (w->has_pending_geometry) {
+        if (!(srv->is_dragging && srv->drag_window_id == w->window_id)) {
+            w->x = w->pending_x;
+            w->y = w->pending_y;
+        }
+        w->width = w->pending_w;
+        w->height = w->pending_h;
+        w->has_pending_geometry = 0;
+    }
+    w->damage.x = 0;
+    w->damage.y = 0;
+    w->damage.w = (int32_t)w->width;
+    w->damage.h = (int32_t)w->height;
+    wm_invalidate_window(srv, w);
+}
+
 static void wm_send_configure(vanilla_server_t *srv, vanilla_server_window_t *w)
 {
     if (!srv || !w || w->client_fd < 0)
         return;
+
+    int32_t cfg_x = w->has_pending_geometry ? w->pending_x : w->x;
+    int32_t cfg_y = w->has_pending_geometry ? w->pending_y : w->y;
+    uint32_t cfg_w = w->has_pending_geometry ? w->pending_w : w->width;
+    uint32_t cfg_h = w->has_pending_geometry ? w->pending_h : w->height;
 
     vanilla_client_conn_t *c = find_client_by_fd(srv, w->client_fd);
     if (c && c->negotiated_version >= 2) {
@@ -832,14 +886,15 @@ static void wm_send_configure(vanilla_server_t *srv, vanilla_server_window_t *w)
         hdr.payload_len = (uint16_t)sizeof(cfg);
         hdr.window_id = w->window_id;
 
-        if (w->surface.pixels && w->pending_w > 0 && w->pending_h > 0 &&
-            (w->pending_w != w->surface.width || w->pending_h != w->surface.height)) {
+        if (w->surface.pixels && cfg_w > 0 && cfg_h > 0 &&
+            (cfg_w != w->surface.width || cfg_h != w->surface.height)) {
             vanilla_surface_t new_surf;
-            if (surface_create_shm(&new_surf, w->pending_w, w->pending_h) < 0) {
+            if (surface_create_shm(&new_surf, cfg_w, cfg_h) < 0) {
                 w->pending_x = w->x;
                 w->pending_y = w->y;
                 w->pending_w = w->width;
                 w->pending_h = w->height;
+                w->has_pending_geometry = 0;
                 return;
             }
             if (!(w->flags & WINDOW_FLAG_TRANSPARENT)) {
@@ -876,10 +931,10 @@ static void wm_send_configure(vanilla_server_t *srv, vanilla_server_window_t *w)
             cfg.buffer_size = (uint32_t)w->surface.size;
         }
 
-        cfg.x = w->pending_x;
-        cfg.y = w->pending_y;
-        cfg.width = w->pending_w;
-        cfg.height = w->pending_h;
+        cfg.x = cfg_x;
+        cfg.y = cfg_y;
+        cfg.width = cfg_w;
+        cfg.height = cfg_h;
         cfg.serial = next_serial;
         cfg.flags = w->flags;
 
@@ -919,10 +974,10 @@ static void wm_send_configure(vanilla_server_t *srv, vanilla_server_window_t *w)
         b_hdr.payload_len = (uint16_t)sizeof(b_cfg);
         b_hdr.window_id = w->window_id;
 
-        b_cfg.x = w->pending_x ? w->pending_x : w->x;
-        b_cfg.y = w->pending_y ? w->pending_y : w->y;
-        b_cfg.width = w->pending_w ? w->pending_w : w->width;
-        b_cfg.height = w->pending_h ? w->pending_h : w->height;
+        b_cfg.x = cfg_x;
+        b_cfg.y = cfg_y;
+        b_cfg.width = cfg_w;
+        b_cfg.height = cfg_h;
         b_cfg.serial = 0;
         b_cfg.flags = w->flags;
 
@@ -1029,6 +1084,7 @@ int handle_msg_create_window(vanilla_server_t *srv, int client_idx, const vanill
 
     w->configure_serial = 0;
     w->configure_pending = 0;
+    w->has_pending_geometry = 0;
     w->pending_x = req->x;
     w->pending_y = req->y;
     w->pending_w = req->width;
@@ -1126,6 +1182,8 @@ int handle_msg_destroy_window(vanilla_server_t *srv, int client_idx, const vanil
             srv->hovered_btn_win_id = 0;
             srv->hovered_btn_kind = CHROME_BTN_NONE;
         }
+        if (srv->hovered_window_id == w->window_id)
+            srv->hovered_window_id = 0;
         w->resize_has_target = 0;
 
         if (g_theme->reduce_motion != 0 || !w->is_mapped) {
@@ -1149,6 +1207,7 @@ int handle_msg_map_window(vanilla_server_t *srv, int client_idx, const vanilla_m
     const vanilla_msg_map_window_t *req = (const vanilla_msg_map_window_t *)payload;
     vanilla_server_window_t *w = vanilla_server_find_window(srv, req->window_id);
     if (w) {
+        int was_mapped = w->is_mapped;
         w->is_mapped = 1;
         w->frame_begin_in_flight = 0;
         vanilla_server_focus_window(srv, w->window_id);
@@ -1163,7 +1222,8 @@ int handle_msg_map_window(vanilla_server_t *srv, int client_idx, const vanilla_m
         }
 
         wm_invalidate_window(srv, w);
-        wm_send_configure(srv, w);
+        if (!(was_mapped && !w->has_pending_geometry))
+            wm_send_configure(srv, w);
     }
     return 0;
 }
@@ -1191,6 +1251,8 @@ int handle_msg_unmap_window(vanilla_server_t *srv, int client_idx, const vanilla
             srv->hovered_btn_win_id = 0;
             srv->hovered_btn_kind = CHROME_BTN_NONE;
         }
+        if (srv->hovered_window_id == w->window_id)
+            srv->hovered_window_id = 0;
         w->resize_has_target = 0;
         w->anim_state = ANIM_IDLE;
         w->anim_destroy_on_done = 0;
@@ -1222,6 +1284,7 @@ int handle_msg_move_resize(vanilla_server_t *srv, int client_idx, const vanilla_
             w->pending_w = req->width;
             w->pending_h = req->height;
             if (srv->clients[client_idx].negotiated_version >= 2) {
+                w->has_pending_geometry = 1;
                 wm_send_configure(srv, w);
             } else {
                 wm_invalidate_window(srv, w);
@@ -1229,6 +1292,7 @@ int handle_msg_move_resize(vanilla_server_t *srv, int client_idx, const vanilla_
                 w->y = req->y;
                 w->width = req->width;
                 w->height = req->height;
+                w->has_pending_geometry = 0;
                 wm_send_configure(srv, w);
                 wm_invalidate_window(srv, w);
             }
@@ -1339,25 +1403,7 @@ int handle_msg_ack_configure(vanilla_server_t *srv, int client_idx, const vanill
         return 0;
     }
 
-    w->configure_pending = 0;
-    wm_invalidate_window(srv, w);
-    if (w->pending_surface.pixels) {
-        surface_destroy(&w->surface);
-        w->surface = w->pending_surface;
-        w->shm_id = w->surface.shm_id;
-        memset(&w->pending_surface, 0, sizeof(w->pending_surface));
-    }
-    if (!(srv->is_dragging && srv->drag_window_id == w->window_id)) {
-        w->x = w->pending_x;
-        w->y = w->pending_y;
-    }
-    w->width = w->pending_w;
-    w->height = w->pending_h;
-    w->damage.x = 0;
-    w->damage.y = 0;
-    w->damage.w = (int32_t)w->width;
-    w->damage.h = (int32_t)w->height;
-    wm_invalidate_window(srv, w);
+    wm_commit_pending_configure(srv, w);
     printf("[vanilla] ack_configure: window %u serial %u applied\n", w->window_id, ack->serial);
 
     /* If a target geometry was queued while configure was in flight, dispatch it now */
@@ -1373,6 +1419,7 @@ int handle_msg_ack_configure(vanilla_server_t *srv, int client_idx, const vanill
             w->pending_y = ty;
             w->pending_w = tw;
             w->pending_h = th;
+            w->has_pending_geometry = 1;
             wm_send_configure(srv, w);
             return 0;
         }
@@ -1387,6 +1434,7 @@ int handle_msg_ack_configure(vanilla_server_t *srv, int client_idx, const vanill
             w->pending_y = new_y;
             w->pending_w = new_w;
             w->pending_h = new_h;
+            w->has_pending_geometry = 1;
             wm_send_configure(srv, w);
         }
     }
@@ -1401,8 +1449,43 @@ int handle_msg_set_cursor(vanilla_server_t *srv, int client_idx, const vanilla_m
     uint32_t wid = hdr->window_id ? hdr->window_id : req->window_id;
     vanilla_server_window_t *w = vanilla_server_find_window(srv, wid);
     if (w && w->client_fd == cfd) {
-        w->cursor_shape = req->shape;
+        w->cursor_shape = (req->shape < (uint32_t)CURSOR_COUNT) ? req->shape : CURSOR_ARROW;
+        if (!srv->is_dragging && !srv->is_resizing && !dnd_is_active() && srv->context_menu_depth == 0) {
+            if (wm_window_at(srv, srv->cursor_x, srv->cursor_y) == w) {
+                cursor_set_active(wm_cursor_shape_for_pos(srv, srv->cursor_x, srv->cursor_y));
+                vanilla_rect_t cur_box;
+                cursor_get_rect(srv->cursor_x, srv->cursor_y, &cur_box);
+                compositor_add_damage(&srv->compositor, &cur_box);
+            }
+        }
     }
+    return 0;
+}
+
+int handle_msg_window_action(vanilla_server_t *srv, int client_idx, const vanilla_msg_hdr_t *hdr, const uint8_t *payload)
+{
+    (void)client_idx;
+    if (!srv || !hdr || !payload)
+        return -1;
+
+    const vanilla_msg_window_action_t *req = (const vanilla_msg_window_action_t *)payload;
+    uint32_t wid = req->window_id ? req->window_id : hdr->window_id;
+    vanilla_server_window_t *w = vanilla_server_find_window(srv, wid);
+    if (!w)
+        return 0;
+
+    if (req->action == WINDOW_ACTION_CLOSE) {
+        vanilla_server_close_request(srv, wid);
+    } else if (req->action == WINDOW_ACTION_MAXIMIZE) {
+        if (!w->is_mapped) {
+            w->is_mapped = 1;
+            w->frame_begin_in_flight = 0;
+        }
+        vanilla_server_focus_window(srv, wid);
+        wm_raise_window(srv, wid);
+        wm_snap_window(srv, wid, w->is_snapped == SNAP_MAXIMIZE ? SNAP_NONE : SNAP_MAXIMIZE);
+    }
+
     return 0;
 }
 
@@ -1802,14 +1885,31 @@ int wm_run_input_selftests(void)
         return -1;
     }
 
-    /* 4. Tab focus cycling without Alt (sequential z-order traversal) */
+    /* 4. Plain KEY_TAB and Shift+Tab passthrough to focused window */
+    int tab_pfd[2] = { -1, -1 };
+    if (pipe(tab_pfd) < 0) {
+        fprintf(stderr, "[input_selftest] FAIL: pipe for tab passthrough\n");
+        return -1;
+    }
     for (int i = 0; i < 3; i++) {
         srv.windows[i].client_fd = -1;
         srv.windows[i].layer = LAYER_NORMAL;
     }
+    srv.clients[0].in_use = 1;
+    srv.clients[0].fd = tab_pfd[1];
+    srv.clients[0].negotiated_version = 2;
+
     srv.focused_window_id = 20;
     vanilla_server_window_t *w20 = vanilla_server_find_window(&srv, 20);
-    if (w20) w20->is_focused = 1;
+    if (!w20) {
+        close(tab_pfd[0]);
+        close(tab_pfd[1]);
+        fprintf(stderr, "[input_selftest] FAIL: missing window 20\n");
+        return -1;
+    }
+    w20->client_fd = tab_pfd[1];
+    w20->is_focused = 1;
+    w20->has_keyboard_focus = 1;
 
     struct input_event tab_ev;
     memset(&tab_ev, 0, sizeof(tab_ev));
@@ -1817,40 +1917,57 @@ int wm_run_input_selftests(void)
     tab_ev.code = KEY_TAB;
     tab_ev.value = 1;
 
-    /* First Tab: moves 20 -> 30 */
     wm_handle_input_event(&srv, &tab_ev);
-    if (srv.focused_window_id != 30) {
-        fprintf(stderr, "[input_selftest] FAIL: Tab cycle 20->30 (got %u)\n", srv.focused_window_id);
-        return -1;
-    }
-    vanilla_server_window_t *w30 = vanilla_server_find_window(&srv, 30);
-    if (!w30 || !w30->has_keyboard_focus) {
-        fprintf(stderr, "[input_selftest] FAIL: window 30 has_keyboard_focus\n");
+    if (srv.focused_window_id != 20 || srv.alttab_visible || !w20->has_keyboard_focus) {
+        close(tab_pfd[0]);
+        close(tab_pfd[1]);
+        fprintf(stderr, "[input_selftest] FAIL: plain Tab changed focus (focus=%u alttab=%d)\n",
+                srv.focused_window_id, srv.alttab_visible);
         return -1;
     }
 
-    /* Second Tab: moves 30 -> 10 */
-    wm_handle_input_event(&srv, &tab_ev);
-    if (srv.focused_window_id != 10) {
-        fprintf(stderr, "[input_selftest] FAIL: Tab cycle 30->10 (got %u)\n", srv.focused_window_id);
+    vanilla_msg_hdr_t tab_hdr;
+    vanilla_msg_input_event_v2_t tab_in;
+    if (exact_read(tab_pfd[0], &tab_hdr, sizeof(tab_hdr)) < 0 ||
+        exact_read(tab_pfd[0], &tab_in, sizeof(tab_in)) < 0 ||
+        tab_hdr.msg_type != MSG_INPUT_EVENT_V2 ||
+        tab_hdr.window_id != 20 ||
+        tab_in.event.type != EV_KEY ||
+        tab_in.event.code != KEY_TAB ||
+        tab_in.event.value != 1) {
+        close(tab_pfd[0]);
+        close(tab_pfd[1]);
+        fprintf(stderr, "[input_selftest] FAIL: plain Tab not forwarded to focused window\n");
         return -1;
     }
 
-    /* Third Tab: wraps 10 -> 20 */
-    wm_handle_input_event(&srv, &tab_ev);
-    if (srv.focused_window_id != 20) {
-        fprintf(stderr, "[input_selftest] FAIL: Tab cycle 10->20 wrap (got %u)\n", srv.focused_window_id);
-        return -1;
-    }
-
-    /* Shift+Tab: reverses 20 -> 10 */
+    /* Shift+Tab without Alt also passes through to focused window */
     srv.mod_state |= MOD_LSHIFT;
     wm_handle_input_event(&srv, &tab_ev);
     srv.mod_state &= ~MOD_LSHIFT;
-    if (srv.focused_window_id != 10) {
-        fprintf(stderr, "[input_selftest] FAIL: Shift+Tab reverse 20->10 (got %u)\n", srv.focused_window_id);
+    if (srv.focused_window_id != 20 || srv.alttab_visible) {
+        close(tab_pfd[0]);
+        close(tab_pfd[1]);
+        fprintf(stderr, "[input_selftest] FAIL: Shift+Tab changed focus (focus=%u)\n", srv.focused_window_id);
         return -1;
     }
+    if (exact_read(tab_pfd[0], &tab_hdr, sizeof(tab_hdr)) < 0 ||
+        exact_read(tab_pfd[0], &tab_in, sizeof(tab_in)) < 0 ||
+        tab_hdr.msg_type != MSG_INPUT_EVENT_V2 ||
+        tab_hdr.window_id != 20 ||
+        tab_in.event.code != KEY_TAB ||
+        !(tab_in.mod_state & MOD_LSHIFT)) {
+        close(tab_pfd[0]);
+        close(tab_pfd[1]);
+        fprintf(stderr, "[input_selftest] FAIL: Shift+Tab mod_state/key passthrough\n");
+        return -1;
+    }
+
+    close(tab_pfd[0]);
+    close(tab_pfd[1]);
+    memset(&srv.clients[0], 0, sizeof(srv.clients[0]));
+    srv.clients[0].fd = -1;
+    w20->client_fd = -1;
 
     /* 5. Alt+Tab forward, reverse, and commit */
     struct input_event alt_down, alt_up;
@@ -1918,7 +2035,340 @@ int wm_run_input_selftests(void)
         return -1;
     }
 
-    printf("[vanilla] input completeness self-tests passed (6/6)\n");
+    /* 7. Pointer hover forwarding, leave 0xFFFF notification, and cursor_shape honor */
+    int hp1[2] = { -1, -1 };
+    int hp2[2] = { -1, -1 };
+    if (pipe(hp1) < 0 || pipe(hp2) < 0) {
+        if (hp1[0] >= 0) { close(hp1[0]); close(hp1[1]); }
+        if (hp2[0] >= 0) { close(hp2[0]); close(hp2[1]); }
+        fprintf(stderr, "[input_selftest] FAIL: pipe for hover selftest\n");
+        return -1;
+    }
+
+    memset(&srv, 0, sizeof(srv));
+    srv.compositor.width = 1024;
+    srv.compositor.height = 768;
+    srv.cursor_x = 50;
+    srv.cursor_y = 50;
+
+    srv.clients[0].in_use = 1;
+    srv.clients[0].fd = hp1[1];
+    srv.clients[0].negotiated_version = 2;
+    srv.clients[1].in_use = 1;
+    srv.clients[1].fd = hp2[1];
+    srv.clients[1].negotiated_version = 2;
+
+    srv.windows[0].in_use = 1;
+    srv.windows[0].is_mapped = 1;
+    srv.windows[0].window_id = 101;
+    srv.windows[0].client_fd = hp1[1];
+    srv.windows[0].x = 100;
+    srv.windows[0].y = 100;
+    srv.windows[0].width = 200;
+    srv.windows[0].height = 200;
+    srv.windows[0].layer = LAYER_NORMAL;
+    srv.windows[0].z_index = 10;
+    srv.windows[0].cursor_shape = CURSOR_IBEAM;
+
+    srv.windows[1].in_use = 1;
+    srv.windows[1].is_mapped = 1;
+    srv.windows[1].window_id = 102;
+    srv.windows[1].client_fd = hp2[1];
+    srv.windows[1].x = 400;
+    srv.windows[1].y = 100;
+    srv.windows[1].width = 200;
+    srv.windows[1].height = 200;
+    srv.windows[1].layer = LAYER_NORMAL;
+    srv.windows[1].z_index = 20;
+    srv.windows[1].cursor_shape = CURSOR_HAND;
+    srv.focused_window_id = 102;
+
+    struct input_event move_ev;
+    memset(&move_ev, 0, sizeof(move_ev));
+    move_ev.type = EV_REL;
+
+    move_ev.code = REL_X;
+    move_ev.value = 100; /* (50,50) -> (150,50), outside windows */
+    wm_handle_input_event(&srv, &move_ev);
+    if (srv.hovered_window_id != 0 || cursor_get_active() != CURSOR_ARROW) {
+        close(hp1[0]); close(hp1[1]); close(hp2[0]); close(hp2[1]);
+        fprintf(stderr, "[input_selftest] FAIL: initial outside hover/cursor\n");
+        return -1;
+    }
+
+    move_ev.code = REL_Y;
+    move_ev.value = 100; /* (150,50) -> (150,150), inside unfocused window 101 */
+    wm_handle_input_event(&srv, &move_ev);
+    if (srv.hovered_window_id != 101 || cursor_get_active() != CURSOR_IBEAM) {
+        close(hp1[0]); close(hp1[1]); close(hp2[0]); close(hp2[1]);
+        fprintf(stderr, "[input_selftest] FAIL: enter window 101 hover=%u cursor=%d\n",
+                srv.hovered_window_id, (int)cursor_get_active());
+        return -1;
+    }
+
+    vanilla_msg_hdr_t hov_hdr;
+    vanilla_msg_input_event_v2_t hov_in;
+    if (exact_read(hp1[0], &hov_hdr, sizeof(hov_hdr)) < 0 ||
+        exact_read(hp1[0], &hov_in, sizeof(hov_in)) < 0 ||
+        hov_hdr.msg_type != MSG_INPUT_EVENT_V2 ||
+        hov_hdr.window_id != 101 ||
+        hov_in.event.type != EV_REL ||
+        hov_in.event.pad1 != 50 ||
+        hov_in.event.pad2 != 50) {
+        close(hp1[0]); close(hp1[1]); close(hp2[0]); close(hp2[1]);
+        fprintf(stderr, "[input_selftest] FAIL: window 101 hover coords\n");
+        return -1;
+    }
+
+    move_ev.code = REL_X;
+    move_ev.value = 300; /* (150,150) -> (450,150), moves into window 102 */
+    wm_handle_input_event(&srv, &move_ev);
+    if (srv.hovered_window_id != 102 || cursor_get_active() != CURSOR_HAND) {
+        close(hp1[0]); close(hp1[1]); close(hp2[0]); close(hp2[1]);
+        fprintf(stderr, "[input_selftest] FAIL: move into window 102 hover=%u cursor=%d\n",
+                srv.hovered_window_id, (int)cursor_get_active());
+        return -1;
+    }
+
+    if (exact_read(hp1[0], &hov_hdr, sizeof(hov_hdr)) < 0 ||
+        exact_read(hp1[0], &hov_in, sizeof(hov_in)) < 0 ||
+        hov_hdr.window_id != 101 ||
+        hov_in.event.pad1 != 0xFFFFu ||
+        hov_in.event.pad2 != 0xFFFFu) {
+        close(hp1[0]); close(hp1[1]); close(hp2[0]); close(hp2[1]);
+        fprintf(stderr, "[input_selftest] FAIL: window 101 leave sentinel 0xFFFF\n");
+        return -1;
+    }
+
+    if (exact_read(hp2[0], &hov_hdr, sizeof(hov_hdr)) < 0 ||
+        exact_read(hp2[0], &hov_in, sizeof(hov_in)) < 0 ||
+        hov_hdr.window_id != 102 ||
+        hov_in.event.pad1 != 50 ||
+        hov_in.event.pad2 != 50) {
+        close(hp1[0]); close(hp1[1]); close(hp2[0]); close(hp2[1]);
+        fprintf(stderr, "[input_selftest] FAIL: window 102 enter coords\n");
+        return -1;
+    }
+
+    close(hp1[0]); close(hp1[1]);
+    close(hp2[0]); close(hp2[1]);
+
+    /* 8. Configure origin=0, create+map single configure, timeout swap, and window action */
+    int cp[2] = { -1, -1 };
+    if (pipe(cp) < 0) {
+        cursor_set_active(CURSOR_ARROW);
+        fprintf(stderr, "[input_selftest] FAIL: pipe for configure selftest\n");
+        return -1;
+    }
+
+    memset(&srv, 0, sizeof(srv));
+    srv.compositor.width = 1024;
+    srv.compositor.height = 768;
+    srv.next_window_id = 1;
+    srv.clients[0].in_use = 1;
+    srv.clients[0].fd = cp[1];
+    srv.clients[0].negotiated_version = 2;
+
+    vanilla_msg_hdr_t chdr;
+    vanilla_msg_create_window_t creq;
+    memset(&chdr, 0, sizeof(chdr));
+    memset(&creq, 0, sizeof(creq));
+    chdr.magic = VANILLA_IPC_MAGIC;
+    chdr.msg_type = MSG_CREATE_WINDOW;
+    chdr.payload_len = (uint16_t)sizeof(creq);
+    creq.x = 0;
+    creq.y = 0;
+    creq.width = 120;
+    creq.height = 80;
+    creq.flags = WINDOW_FLAG_NONE;
+
+    handle_msg_create_window(&srv, 0, &chdr, (const uint8_t *)&creq);
+
+    vanilla_msg_hdr_t ack_h;
+    vanilla_msg_create_window_ack_t cack;
+    vanilla_msg_window_configure_v2_t cfg2;
+    if (exact_read(cp[0], &ack_h, sizeof(ack_h)) < 0 ||
+        exact_read(cp[0], &cack, sizeof(cack)) < 0 ||
+        ack_h.msg_type != MSG_CREATE_WINDOW_ACK ||
+        cack.status != 0) {
+        close(cp[0]); close(cp[1]);
+        cursor_set_active(CURSOR_ARROW);
+        fprintf(stderr, "[input_selftest] FAIL: create window ack\n");
+        return -1;
+    }
+    if (exact_read(cp[0], &ack_h, sizeof(ack_h)) < 0 ||
+        exact_read(cp[0], &cfg2, sizeof(cfg2)) < 0 ||
+        ack_h.msg_type != MSG_WINDOW_CONFIGURE ||
+        cfg2.serial != 1 || cfg2.x != 0 || cfg2.y != 0) {
+        close(cp[0]); close(cp[1]);
+        cursor_set_active(CURSOR_ARROW);
+        fprintf(stderr, "[input_selftest] FAIL: initial configure serial 1\n");
+        return -1;
+    }
+
+    vanilla_server_window_t *cw = vanilla_server_find_window(&srv, ack_h.window_id);
+    if (!cw) {
+        close(cp[0]); close(cp[1]);
+        cursor_set_active(CURSOR_ARROW);
+        fprintf(stderr, "[input_selftest] FAIL: created window lookup\n");
+        return -1;
+    }
+
+    vanilla_msg_map_window_t mreq;
+    mreq.window_id = cw->window_id;
+    chdr.msg_type = MSG_MAP_WINDOW;
+    chdr.payload_len = (uint16_t)sizeof(mreq);
+    chdr.window_id = cw->window_id;
+    handle_msg_map_window(&srv, 0, &chdr, (const uint8_t *)&mreq);
+    if (cw->configure_serial != 1) {
+        surface_destroy(&cw->pending_surface);
+        surface_destroy(&cw->surface);
+        close(cp[0]); close(cp[1]);
+        cursor_set_active(CURSOR_ARROW);
+        fprintf(stderr, "[input_selftest] FAIL: map emitted duplicate configure (serial=%u)\n", cw->configure_serial);
+        return -1;
+    }
+
+    vanilla_msg_window_focus_t fmsg;
+    if (exact_read(cp[0], &ack_h, sizeof(ack_h)) < 0 ||
+        exact_read(cp[0], &fmsg, sizeof(fmsg)) < 0 ||
+        ack_h.msg_type != MSG_WINDOW_FOCUS ||
+        fmsg.focused != 1) {
+        surface_destroy(&cw->pending_surface);
+        surface_destroy(&cw->surface);
+        close(cp[0]); close(cp[1]);
+        cursor_set_active(CURSOR_ARROW);
+        fprintf(stderr, "[input_selftest] FAIL: map focus message\n");
+        return -1;
+    }
+
+    /* has_pending_geometry honors pending_x == 0, pending_y == 0 */
+    cw->x = 50;
+    cw->y = 60;
+    cw->pending_x = 0;
+    cw->pending_y = 0;
+    cw->pending_w = 120;
+    cw->pending_h = 80;
+    cw->has_pending_geometry = 1;
+    wm_send_configure(&srv, cw);
+    if (exact_read(cp[0], &ack_h, sizeof(ack_h)) < 0 ||
+        exact_read(cp[0], &cfg2, sizeof(cfg2)) < 0 ||
+        ack_h.msg_type != MSG_WINDOW_CONFIGURE ||
+        cfg2.serial != 2 || cfg2.x != 0 || cfg2.y != 0) {
+        surface_destroy(&cw->pending_surface);
+        surface_destroy(&cw->surface);
+        close(cp[0]); close(cp[1]);
+        cursor_set_active(CURSOR_ARROW);
+        fprintf(stderr, "[input_selftest] FAIL: has_pending_geometry origin=(0,0)\n");
+        return -1;
+    }
+
+    /* Timeout fallback swaps pending_surface and guards x/y while dragging */
+    cw->pending_x = 12;
+    cw->pending_y = 24;
+    cw->pending_w = 160;
+    cw->pending_h = 100;
+    cw->has_pending_geometry = 1;
+    wm_send_configure(&srv, cw);
+    if (exact_read(cp[0], &ack_h, sizeof(ack_h)) < 0 ||
+        exact_read(cp[0], &cfg2, sizeof(cfg2)) < 0 ||
+        ack_h.msg_type != MSG_WINDOW_CONFIGURE ||
+        !cw->pending_surface.pixels) {
+        surface_destroy(&cw->pending_surface);
+        surface_destroy(&cw->surface);
+        close(cp[0]); close(cp[1]);
+        cursor_set_active(CURSOR_ARROW);
+        fprintf(stderr, "[input_selftest] FAIL: resize pending_surface alloc\n");
+        return -1;
+    }
+    int32_t pending_shm = cw->pending_surface.shm_id;
+    srv.is_dragging = 1;
+    srv.drag_window_id = cw->window_id;
+    cw->x = 77;
+    cw->y = 88;
+    wm_commit_pending_configure(&srv, cw);
+    srv.is_dragging = 0;
+    srv.drag_window_id = 0;
+    if (cw->surface.shm_id != pending_shm || cw->shm_id != pending_shm ||
+        cw->pending_surface.pixels != NULL ||
+        cw->width != 160 || cw->height != 100 ||
+        cw->x != 77 || cw->y != 88 ||
+        cw->has_pending_geometry != 0 || cw->configure_pending != 0) {
+        surface_destroy(&cw->pending_surface);
+        surface_destroy(&cw->surface);
+        close(cp[0]); close(cp[1]);
+        cursor_set_active(CURSOR_ARROW);
+        fprintf(stderr, "[input_selftest] FAIL: timeout commit pending_surface/drag guard\n");
+        return -1;
+    }
+
+    /* MSG_WINDOW_ACTION MAXIMIZE + CLOSE */
+    vanilla_msg_window_action_t act;
+    memset(&act, 0, sizeof(act));
+    act.window_id = cw->window_id;
+    act.action = WINDOW_ACTION_MAXIMIZE;
+    chdr.msg_type = MSG_WINDOW_ACTION;
+    chdr.payload_len = (uint16_t)sizeof(act);
+    chdr.window_id = cw->window_id;
+    handle_msg_window_action(&srv, 0, &chdr, (const uint8_t *)&act);
+    if (cw->is_snapped != SNAP_MAXIMIZE || !cw->has_pending_geometry) {
+        surface_destroy(&cw->pending_surface);
+        surface_destroy(&cw->surface);
+        close(cp[0]); close(cp[1]);
+        cursor_set_active(CURSOR_ARROW);
+        fprintf(stderr, "[input_selftest] FAIL: MSG_WINDOW_ACTION maximize\n");
+        return -1;
+    }
+
+    int got_max_cfg = 0;
+    for (int m = 0; m < 4; m++) {
+        uint8_t scratch[128];
+        if (exact_read(cp[0], &ack_h, sizeof(ack_h)) < 0)
+            break;
+        if (ack_h.payload_len > sizeof(scratch))
+            break;
+        if (ack_h.payload_len > 0 && exact_read(cp[0], scratch, ack_h.payload_len) < 0)
+            break;
+        if (ack_h.msg_type == MSG_WINDOW_CONFIGURE) {
+            got_max_cfg = 1;
+            break;
+        }
+    }
+    if (!got_max_cfg) {
+        surface_destroy(&cw->pending_surface);
+        surface_destroy(&cw->surface);
+        close(cp[0]); close(cp[1]);
+        cursor_set_active(CURSOR_ARROW);
+        fprintf(stderr, "[input_selftest] FAIL: missing maximize configure\n");
+        return -1;
+    }
+    wm_commit_pending_configure(&srv, cw);
+
+    act.action = WINDOW_ACTION_CLOSE;
+    handle_msg_window_action(&srv, 0, &chdr, (const uint8_t *)&act);
+    if (exact_read(cp[0], &ack_h, sizeof(ack_h)) < 0 ||
+        ack_h.msg_type != MSG_WINDOW_CLOSE_REQ ||
+        ack_h.window_id != cw->window_id) {
+        surface_destroy(&cw->pending_surface);
+        surface_destroy(&cw->surface);
+        close(cp[0]); close(cp[1]);
+        cursor_set_active(CURSOR_ARROW);
+        fprintf(stderr, "[input_selftest] FAIL: MSG_WINDOW_ACTION close\n");
+        return -1;
+    }
+    if (ack_h.payload_len > 0) {
+        uint8_t discard[64];
+        if (ack_h.payload_len <= sizeof(discard))
+            exact_read(cp[0], discard, ack_h.payload_len);
+    }
+
+    surface_destroy(&cw->pending_surface);
+    surface_destroy(&cw->surface);
+    close(cp[0]);
+    close(cp[1]);
+    cursor_set_active(CURSOR_ARROW);
+
+    printf("[vanilla] input completeness self-tests passed (8/8)\n");
     return 0;
 }
 
@@ -3576,13 +4026,7 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
         if (w->in_use && w->configure_pending && (now_ms - (int64_t)w->configure_timestamp_ms > 500)) {
             printf("[vanilla] ack_configure: timeout fallback for window %u serial %u\n",
                    w->window_id, w->configure_serial);
-            w->configure_pending = 0;
-            wm_invalidate_window(srv, w);
-            w->x = w->pending_x;
-            w->y = w->pending_y;
-            w->width = w->pending_w;
-            w->height = w->pending_h;
-            wm_invalidate_window(srv, w);
+            wm_commit_pending_configure(srv, w);
 
             if (w->resize_has_target) {
                 int32_t tx = w->target_x;
@@ -3595,6 +4039,7 @@ int vanilla_server_poll(vanilla_server_t *srv, int timeout_ms)
                     w->pending_y = ty;
                     w->pending_w = tw;
                     w->pending_h = th;
+                    w->has_pending_geometry = 1;
                     wm_send_configure(srv, w);
                 }
             }
@@ -4007,6 +4452,7 @@ void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
 
     vanilla_client_conn_t *c = find_client_by_fd(srv, w->client_fd);
     if (c && c->negotiated_version >= 2) {
+        w->has_pending_geometry = 1;
         wm_send_configure(srv, w);
     } else {
         wm_invalidate_window(srv, w);
@@ -4014,6 +4460,7 @@ void wm_snap_window(vanilla_server_t *srv, uint32_t window_id, int snap_type)
         w->y = target_y;
         w->width = target_w;
         w->height = target_h;
+        w->has_pending_geometry = 0;
         wm_send_configure(srv, w);
         wm_invalidate_window(srv, w);
     }
@@ -4107,17 +4554,50 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
         if (srv->cursor_x != old_x || srv->cursor_y != old_y) {
             dnd_handle_mouse_move(srv, srv->cursor_x, srv->cursor_y);
 
-            if ((srv->mouse_buttons & 1) && srv->focused_window_id != 0 &&
-                !srv->is_dragging && !srv->is_resizing && !srv->drag_threshold_pending &&
-                !dnd_is_active()) {
-                vanilla_server_window_t *fw = vanilla_server_find_window(srv, srv->focused_window_id);
-                if (fw) {
-                    int lx = srv->cursor_x - fw->x;
-                    int ly = srv->cursor_y - fw->y;
-                    struct input_event client_ev = *ev;
-                    client_ev.pad1 = (uint16_t)(lx < 0 ? 0 : lx);
-                    client_ev.pad2 = (uint32_t)(ly < 0 ? 0 : ly);
-                    vanilla_server_send_input(srv, srv->focused_window_id, &client_ev);
+            if (!srv->is_dragging && !srv->is_resizing && !srv->drag_threshold_pending &&
+                !dnd_is_active() && srv->context_menu_depth == 0) {
+                if ((srv->mouse_buttons & 1) && srv->focused_window_id != 0) {
+                    if (srv->hovered_window_id != 0 && srv->hovered_window_id != srv->focused_window_id) {
+                        struct input_event leave_ev = *ev;
+                        leave_ev.pad1 = 0xFFFFu;
+                        leave_ev.pad2 = 0xFFFFu;
+                        vanilla_server_send_input(srv, srv->hovered_window_id, &leave_ev);
+                        srv->hovered_window_id = 0;
+                    }
+                    vanilla_server_window_t *fw = vanilla_server_find_window(srv, srv->focused_window_id);
+                    if (fw) {
+                        int lx = srv->cursor_x - fw->x;
+                        int ly = srv->cursor_y - fw->y;
+                        struct input_event client_ev = *ev;
+                        client_ev.pad1 = (uint16_t)(lx < 0 ? 0 : lx);
+                        client_ev.pad2 = (uint32_t)(ly < 0 ? 0 : ly);
+                        vanilla_server_send_input(srv, srv->focused_window_id, &client_ev);
+                    }
+                } else {
+                    vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
+                    uint32_t new_hover_id = 0;
+                    int32_t lx = 0;
+                    int32_t ly = 0;
+                    if (under &&
+                        srv->cursor_x >= under->x && srv->cursor_x < under->x + (int32_t)under->width &&
+                        srv->cursor_y >= under->y && srv->cursor_y < under->y + (int32_t)under->height) {
+                        new_hover_id = under->window_id;
+                        lx = srv->cursor_x - under->x;
+                        ly = srv->cursor_y - under->y;
+                    }
+                    if (srv->hovered_window_id != 0 && srv->hovered_window_id != new_hover_id) {
+                        struct input_event leave_ev = *ev;
+                        leave_ev.pad1 = 0xFFFFu;
+                        leave_ev.pad2 = 0xFFFFu;
+                        vanilla_server_send_input(srv, srv->hovered_window_id, &leave_ev);
+                    }
+                    srv->hovered_window_id = new_hover_id;
+                    if (new_hover_id != 0) {
+                        struct input_event client_ev = *ev;
+                        client_ev.pad1 = (uint16_t)lx;
+                        client_ev.pad2 = (uint32_t)ly;
+                        vanilla_server_send_input(srv, new_hover_id, &client_ev);
+                    }
                 }
             }
 
@@ -4178,16 +4658,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             } else if (srv->is_resizing) {
                 cursor_set_active(resize_edge_to_cursor_shape((vanilla_resize_edge_t)srv->resize_edge));
             } else if (!srv->is_dragging) {
-                vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
-                if (under && (under->flags & WINDOW_FLAG_RESIZABLE) && under->is_snapped == SNAP_NONE) {
-                    vanilla_resize_edge_t edge = wm_hit_test_resize_edge(under, srv->cursor_x, srv->cursor_y);
-                    if (edge != RESIZE_EDGE_NONE)
-                        cursor_set_active(resize_edge_to_cursor_shape(edge));
-                    else
-                        cursor_set_active(CURSOR_ARROW);
-                } else {
-                    cursor_set_active(CURSOR_ARROW);
-                }
+                cursor_set_active(wm_cursor_shape_for_pos(srv, srv->cursor_x, srv->cursor_y));
             } else {
                 cursor_set_active(CURSOR_ARROW);
             }
@@ -4259,6 +4730,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                                 w->pending_y = new_y;
                                 w->pending_w = new_w;
                                 w->pending_h = new_h;
+                                w->has_pending_geometry = 1;
                                 wm_send_configure(srv, w);
                             }
                         } else {
@@ -4281,6 +4753,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                             w->pending_y = new_y;
                             w->pending_w = new_w;
                             w->pending_h = new_h;
+                            w->has_pending_geometry = 0;
                             wm_send_configure(srv, w);
                             wm_invalidate_window(srv, w);
                         }
@@ -4412,6 +4885,8 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                                 srv->hovered_btn_win_id = 0;
                                 srv->hovered_btn_kind = CHROME_BTN_NONE;
                             }
+                            if (srv->hovered_window_id == hit->window_id)
+                                srv->hovered_window_id = 0;
                             if (g_theme->reduce_motion != 0) {
                                 hit->is_mapped = 0;
                                 hit->is_focused = 0;
@@ -4504,6 +4979,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                                     w->pending_y = new_y;
                                     w->pending_w = new_w;
                                     w->pending_h = new_h;
+                                    w->has_pending_geometry = 1;
                                     wm_send_configure(srv, w);
                                 }
                             } else {
@@ -4526,6 +5002,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                                 w->pending_y = new_y;
                                 w->pending_w = new_w;
                                 w->pending_h = new_h;
+                                w->has_pending_geometry = 0;
                                 wm_send_configure(srv, w);
                                 wm_invalidate_window(srv, w);
                             }
@@ -4535,16 +5012,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     srv->resize_window_id = 0;
                     srv->resize_edge = RESIZE_EDGE_NONE;
 
-                    vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
-                    if (under && (under->flags & WINDOW_FLAG_RESIZABLE) && under->is_snapped == SNAP_NONE) {
-                        vanilla_resize_edge_t edge = wm_hit_test_resize_edge(under, srv->cursor_x, srv->cursor_y);
-                        if (edge != RESIZE_EDGE_NONE)
-                            cursor_set_active(resize_edge_to_cursor_shape(edge));
-                        else
-                            cursor_set_active(CURSOR_ARROW);
-                    } else {
-                        cursor_set_active(CURSOR_ARROW);
-                    }
+                    cursor_set_active(wm_cursor_shape_for_pos(srv, srv->cursor_x, srv->cursor_y));
                     vanilla_rect_t cur_box;
                     cursor_get_rect(srv->cursor_x, srv->cursor_y, &cur_box);
                     compositor_add_damage(&srv->compositor, &cur_box);
@@ -4568,16 +5036,7 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
                     srv->is_dragging = 0;
                     srv->drag_window_id = 0;
 
-                    vanilla_server_window_t *under = wm_window_at(srv, srv->cursor_x, srv->cursor_y);
-                    if (under && (under->flags & WINDOW_FLAG_RESIZABLE) && under->is_snapped == SNAP_NONE) {
-                        vanilla_resize_edge_t edge = wm_hit_test_resize_edge(under, srv->cursor_x, srv->cursor_y);
-                        if (edge != RESIZE_EDGE_NONE)
-                            cursor_set_active(resize_edge_to_cursor_shape(edge));
-                        else
-                            cursor_set_active(CURSOR_ARROW);
-                    } else {
-                        cursor_set_active(CURSOR_ARROW);
-                    }
+                    cursor_set_active(wm_cursor_shape_for_pos(srv, srv->cursor_x, srv->cursor_y));
                     vanilla_rect_t cur_box;
                     cursor_get_rect(srv->cursor_x, srv->cursor_y, &cur_box);
                     compositor_add_damage(&srv->compositor, &cur_box);
@@ -4742,87 +5201,30 @@ int wm_handle_input_event(vanilla_server_t *srv, const struct input_event *ev)
             return 0;
         }
 
-        /* Alt+Tab and Tab focus cycling */
-        if (ev->code == KEY_TAB && ev->value == 1) {
-            if (srv->mod_state & MOD_ALT) {
-                if (!srv->alttab_visible) {
-                    wm_alttab_build_list(srv);
-                    if (srv->alttab_window_count > 0) {
-                        srv->alttab_visible = 1;
-                        if (srv->mod_state & MOD_SHIFT)
-                            srv->alttab_selection = srv->alttab_window_count - 1;
-                        else
-                            srv->alttab_selection = (srv->alttab_window_count > 1) ? 1 : 0;
-                        vanilla_rect_t r;
-                        alttab_get_rect(srv, &r);
-                        compositor_add_damage(&srv->compositor, &r);
-                    }
-                } else {
-                    if (srv->alttab_window_count > 0) {
-                        if (srv->mod_state & MOD_SHIFT)
-                            srv->alttab_selection = (srv->alttab_selection - 1 + srv->alttab_window_count) % srv->alttab_window_count;
-                        else
-                            srv->alttab_selection = (srv->alttab_selection + 1) % srv->alttab_window_count;
-                        vanilla_rect_t r;
-                        alttab_get_rect(srv, &r);
-                        compositor_add_damage(&srv->compositor, &r);
-                    }
+        /* Alt+Tab window switcher (plain Tab passes through to the focused window) */
+        if (ev->code == KEY_TAB && ev->value == 1 && (srv->mod_state & MOD_ALT)) {
+            if (!srv->alttab_visible) {
+                wm_alttab_build_list(srv);
+                if (srv->alttab_window_count > 0) {
+                    srv->alttab_visible = 1;
+                    if (srv->mod_state & MOD_SHIFT)
+                        srv->alttab_selection = srv->alttab_window_count - 1;
+                    else
+                        srv->alttab_selection = (srv->alttab_window_count > 1) ? 1 : 0;
+                    vanilla_rect_t r;
+                    alttab_get_rect(srv, &r);
+                    compositor_add_damage(&srv->compositor, &r);
                 }
-                return 0;
-            } else if (!srv->alttab_visible) {
-                uint32_t normal_wins[VANILLA_MAX_WINDOWS];
-                int normal_count = 0;
-                for (int i = 0; i < VANILLA_MAX_WINDOWS; i++) {
-                    vanilla_server_window_t *w = &srv->windows[i];
-                    if (w->in_use && w->is_mapped && w->layer == LAYER_NORMAL &&
-                        !(w->flags & WINDOW_FLAG_POPUP) &&
-                        !(w->flags & WINDOW_FLAG_ALWAYS_TOP)) {
-                        normal_wins[normal_count++] = w->window_id;
-                    }
-                }
-                for (int i = 0; i < normal_count - 1; i++) {
-                    for (int j = i + 1; j < normal_count; j++) {
-                        vanilla_server_window_t *w_i = vanilla_server_find_window(srv, normal_wins[i]);
-                        vanilla_server_window_t *w_j = vanilla_server_find_window(srv, normal_wins[j]);
-                        int32_t z_i = w_i ? w_i->z_index : 0;
-                        int32_t z_j = w_j ? w_j->z_index : 0;
-                        if (z_j > z_i) {
-                            uint32_t tmp = normal_wins[i];
-                            normal_wins[i] = normal_wins[j];
-                            normal_wins[j] = tmp;
-                        }
-                    }
-                }
-                if (normal_count > 0) {
-                    int cur_idx = -1;
-                    for (int i = 0; i < normal_count; i++) {
-                        if (normal_wins[i] == srv->focused_window_id) {
-                            cur_idx = i;
-                            break;
-                        }
-                    }
-                    int next_idx;
-                    if (srv->mod_state & MOD_SHIFT) {
-                        if (cur_idx == -1)
-                            next_idx = normal_count - 1;
-                        else
-                            next_idx = (cur_idx - 1 + normal_count) % normal_count;
-                    } else {
-                        if (cur_idx == -1)
-                            next_idx = 0;
-                        else
-                            next_idx = (cur_idx + 1) % normal_count;
-                    }
-                    uint32_t new_id = normal_wins[next_idx];
-                    vanilla_server_focus_window(srv, new_id);
-                    vanilla_server_window_t *target = vanilla_server_find_window(srv, new_id);
-                    if (target) {
-                        target->has_keyboard_focus = 1;
-                        wm_invalidate_window(srv, target);
-                    }
-                    return 0;
-                }
+            } else if (srv->alttab_window_count > 0) {
+                if (srv->mod_state & MOD_SHIFT)
+                    srv->alttab_selection = (srv->alttab_selection - 1 + srv->alttab_window_count) % srv->alttab_window_count;
+                else
+                    srv->alttab_selection = (srv->alttab_selection + 1) % srv->alttab_window_count;
+                vanilla_rect_t r;
+                alttab_get_rect(srv, &r);
+                compositor_add_damage(&srv->compositor, &r);
             }
+            return 0;
         }
 
         /* ESC closes overlays */

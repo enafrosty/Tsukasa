@@ -61,6 +61,10 @@ void app_fill_rect(vanilla_surface_t *surf, int32_t x, int32_t y, int32_t w, int
     if (!surf || !surf->pixels || w <= 0 || h <= 0)
         return;
 
+    uint32_t sa = (color >> 24) & 0xFFu;
+    if (sa == 0)
+        return;
+
     int32_t surf_w = (int32_t)surf->width;
     int32_t surf_h = (int32_t)surf->height;
 
@@ -77,10 +81,37 @@ void app_fill_rect(vanilla_surface_t *surf, int32_t x, int32_t y, int32_t w, int
 
     uint32_t pitch_px = app_surface_pitch_px(surf);
 
+    if (sa == 0xFFu) {
+        for (int32_t cy = y0; cy < y1; cy++) {
+            uint32_t *row = surf->pixels + (size_t)cy * pitch_px;
+            for (int32_t cx = x0; cx < x1; cx++) {
+                row[cx] = color;
+            }
+        }
+        return;
+    }
+
+    uint32_t sr = (color >> 16) & 0xFFu;
+    uint32_t sg = (color >> 8) & 0xFFu;
+    uint32_t sb = color & 0xFFu;
+    uint32_t inv_sa = 255u - sa;
+
     for (int32_t cy = y0; cy < y1; cy++) {
         uint32_t *row = surf->pixels + (size_t)cy * pitch_px;
         for (int32_t cx = x0; cx < x1; cx++) {
-            row[cx] = color;
+            uint32_t dst = row[cx];
+            uint32_t da = (dst >> 24) & 0xFFu;
+            uint32_t dr = (dst >> 16) & 0xFFu;
+            uint32_t dg = (dst >> 8) & 0xFFu;
+            uint32_t db = dst & 0xFFu;
+
+            uint32_t oa = sa + (da * inv_sa + 127u) / 255u;
+            if (oa > 255u)
+                oa = 255u;
+            uint32_t or_ = (sr * sa + dr * inv_sa + 127u) / 255u;
+            uint32_t og = (sg * sa + dg * inv_sa + 127u) / 255u;
+            uint32_t ob = (sb * sa + db * inv_sa + 127u) / 255u;
+            row[cx] = (oa << 24) | (or_ << 16) | (og << 8) | ob;
         }
     }
 }

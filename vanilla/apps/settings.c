@@ -1296,8 +1296,18 @@ int main(int argc, char **argv)
                 break;
             }
             if (ev.type == VANILLA_EVENT_CONFIGURE && ev.window_id == win->window_id) {
-                vanilla_ack_configure(client, win->window_id, ev.configure.serial);
                 ui_widget_invalidate(st.root);
+                force_present = 1;
+            }
+            if (ev.type == VANILLA_EVENT_THEME_CHANGED) {
+                if (theme_load("/tmp/vanilla_theme.ini") < 0)
+                    theme_reload();
+                vanilla_theme_t local_th = *g_theme;
+                local_th.scale_factor = 1.0f;
+                if (local_th.title_font_size > 16.0f)
+                    local_th.title_font_size = (float)st.font_px;
+                theme_set(&local_th);
+                sync_local_theme_colors(&st);
                 force_present = 1;
             }
             if (ev.type == VANILLA_EVENT_INPUT ||

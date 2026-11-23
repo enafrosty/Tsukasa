@@ -128,8 +128,31 @@ static int run_client(const char *sock_path)
     damage.h = TEST_WIN_H;
     vanilla_present(win, &damage);
 
-    for (int i = 0; i < 5; i++)
-        sched_yield();
+    vanilla_window_action(client, win->window_id, WINDOW_ACTION_CLOSE);
+
+    int saw_theme = 0;
+    int saw_close_req = 0;
+    for (int spin = 0; spin < 5000 && (!saw_theme || !saw_close_req); spin++) {
+        vanilla_event_t ev;
+        int got = vanilla_poll_event(client, &ev);
+        if (got < 0)
+            break;
+        if (got == 0) {
+            sched_yield();
+            continue;
+        }
+        if (ev.type == VANILLA_EVENT_THEME_CHANGED)
+            saw_theme = 1;
+        else if (ev.type == VANILLA_EVENT_CLOSE_REQ && ev.window_id == win->window_id)
+            saw_close_req = 1;
+    }
+
+    if (!saw_theme || !saw_close_req) {
+        printf("[test_client] Error: Missing theme=%d or close_req=%d\n", saw_theme, saw_close_req);
+        vanilla_destroy_window(win);
+        vanilla_disconnect(client);
+        return 4;
+    }
 
     vanilla_destroy_window(win);
     vanilla_disconnect(client);
@@ -143,6 +166,7 @@ static int run_server_loop(vanilla_server_t *srv)
     vanilla_server_window_t *win = NULL;
     int saw_present = 0;
     int verified_shm = 0;
+    int sent_theme = 0;
 
     for (int spin = 0; spin < 500 && client_idx < 0; spin++) {
         client_idx = vanilla_server_accept(srv);
@@ -179,8 +203,13 @@ static int run_server_loop(vanilla_server_t *srv)
                 uint32_t exp_mid = expected_pixel(TEST_WIN_W / 2, TEST_WIN_H / 2, TEST_WIN_W, TEST_WIN_H);
                 uint32_t exp_br = expected_pixel(TEST_WIN_W - 1, TEST_WIN_H - 1, TEST_WIN_W, TEST_WIN_H);
 
-                if (p_top_left == exp_tl && p_mid == exp_mid && p_bottom_right == exp_br)
+                if (p_top_left == exp_tl && p_mid == exp_mid && p_bottom_right == exp_br) {
                     verified_shm = 1;
+                    if (!sent_theme) {
+                        vanilla_server_broadcast_theme_changed(srv);
+                        sent_theme = 1;
+                    }
+                }
             }
         }
 
@@ -560,6 +589,68 @@ static int run_inprocess_loopback(const char *sock_path)
         printf("[FAIL] 8. Invalid input payload\n");
         goto fail;
     }
+
+    /* Step 8b: MSG_THEME_CHANGED broadcast */
+    vanilla_server_broadcast_theme_changed(srv);
+    vanilla_msg_theme_changed_t theme_msg;
+    if (read_msg_draining_configure(cfd, &ack_hdr) < 0 ||
+        ack_hdr.magic != VANILLA_IPC_MAGIC ||
+        ack_hdr.msg_type != MSG_THEME_CHANGED ||
+        ack_hdr.payload_len != sizeof(theme_msg) ||
+        exact_read_fd(cfd, &theme_msg, sizeof(theme_msg)) < 0) {
+        printf("[FAIL] 8b. MSG_THEME_CHANGED verification failed\n");
+        goto fail;
+    }
+    printf("[PASS] 5b. Server broadcast MSG_THEME_CHANGED verified.\n");
+
+    /* Step 8c: MSG_WINDOW_ACTION maximize + close */
+    vanilla_msg_window_action_t act_req;
+    memset(&hdr, 0, sizeof(hdr));
+    memset(&act_req, 0, sizeof(act_req));
+    hdr.magic = VANILLA_IPC_MAGIC;
+    hdr.msg_type = MSG_WINDOW_ACTION;
+    hdr.payload_len = (uint16_t)sizeof(act_req);
+    hdr.window_id = win_id;
+    act_req.window_id = win_id;
+    act_req.action = WINDOW_ACTION_MAXIMIZE;
+
+    if (exact_write_fd(cfd, &hdr, sizeof(hdr)) < 0 ||
+        exact_write_fd(cfd, &act_req, sizeof(act_req)) < 0 ||
+        vanilla_server_dispatch_client(srv, client_idx) < 0) {
+        printf("[FAIL] 8c. MSG_WINDOW_ACTION maximize failed\n");
+        goto fail;
+    }
+    if (srv_win->is_snapped != SNAP_MAXIMIZE) {
+        printf("[FAIL] 8c. Window not snapped to SNAP_MAXIMIZE\n");
+        goto fail;
+    }
+
+    act_req.action = WINDOW_ACTION_CLOSE;
+    if (exact_write_fd(cfd, &hdr, sizeof(hdr)) < 0 ||
+        exact_write_fd(cfd, &act_req, sizeof(act_req)) < 0 ||
+        vanilla_server_dispatch_client(srv, client_idx) < 0) {
+        printf("[FAIL] 8c. MSG_WINDOW_ACTION close failed\n");
+        goto fail;
+    }
+
+    int saw_close_req = 0;
+    for (int i = 0; i < 8; i++) {
+        if (exact_read_fd(cfd, &ack_hdr, sizeof(ack_hdr)) < 0)
+            break;
+        if (ack_hdr.payload_len > 0 && drain_payload_fd(cfd, ack_hdr.payload_len) < 0)
+            break;
+        if (ack_hdr.magic == VANILLA_IPC_MAGIC &&
+            ack_hdr.msg_type == MSG_WINDOW_CLOSE_REQ &&
+            ack_hdr.window_id == win_id) {
+            saw_close_req = 1;
+            break;
+        }
+    }
+    if (!saw_close_req) {
+        printf("[FAIL] 8c. Missing MSG_CLOSE_REQ from WINDOW_ACTION_CLOSE\n");
+        goto fail;
+    }
+    printf("[PASS] 5c. MSG_WINDOW_ACTION maximize and close verified.\n");
 
     /* Step 9: MSG_DESTROY_WINDOW */
     vanilla_msg_destroy_window_t dest_req;

@@ -234,7 +234,7 @@ static inline uint32_t shell_menu_selection_bg(uint32_t base_bg)
 void shell_init(vanilla_shell_t *shell);
 void shell_free_icons(void);
 void shell_update_clock(vanilla_shell_t *shell, struct vanilla_server *srv);
-void shell_spawn_app(const char *path);
+pid_t shell_spawn_app(const char *path);
 
 void launcher_init(vanilla_launcher_t *launcher);
 int  launcher_fuzzy_match(const char *pattern, const char *target);

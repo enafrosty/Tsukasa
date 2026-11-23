@@ -22,6 +22,7 @@
 
 #include "../server/server.h"
 #include "../shell-client/shell_client.h"
+#include "../apps/app_common.h"
 
 static const char *g_shell_case = "";
 
@@ -476,13 +477,112 @@ static void test_modern_shell_chrome_and_poll(void)
     printf("       Passed.\n");
 }
 
+static void test_alpha_hover_theme_and_launcher(void)
+{
+    printf("[TEST] Alpha blending, dock hover, theme change, and launcher list...\n");
+
+    theme_set(theme_defaults_nord_dark());
+
+    /* 1. Alpha blending in app_fill_rect */
+    uint32_t pixels[16];
+    for (int i = 0; i < 16; i++)
+        pixels[i] = 0xFF204060u;
+
+    vanilla_surface_t surf;
+    memset(&surf, 0, sizeof(surf));
+    surf.width = 4;
+    surf.height = 4;
+    surf.pitch = 4 * sizeof(uint32_t);
+    surf.pixels = pixels;
+
+    app_fill_rect(&surf, 0, 0, 1, 1, 0x00AABBCCu);
+    ASSERT(pixels[0] == 0xFF204060u, "sa == 0 preserves destination pixel");
+
+    app_fill_rect(&surf, 1, 0, 1, 1, 0xFF112233u);
+    ASSERT(pixels[1] == 0xFF112233u, "sa == 255 writes opaque source pixel");
+
+    app_fill_rect(&surf, 2, 0, 1, 1, 0x80FFFFFFu);
+    ASSERT(pixels[2] == 0xFF90A0B0u, "sa == 128 source-over blends channels");
+
+    /* 2. Statusbar repeated render resets background cleanly without alpha smear */
+    statusbar_state_t sb;
+    statusbar_init(&sb);
+    vanilla_window_t sb_win;
+    memset(&sb_win, 0, sizeof(sb_win));
+    sb_win.surface.width = 320;
+    sb_win.surface.height = (uint32_t)STATUSBAR_HEIGHT;
+    sb_win.surface.pitch = sb_win.surface.width * sizeof(uint32_t);
+    sb_win.surface.pixels = calloc((size_t)sb_win.surface.width * sb_win.surface.height, sizeof(uint32_t));
+    ASSERT(sb_win.surface.pixels != NULL, "allocated statusbar alpha check buffer");
+    sb_win.surface.pixels[0] = 0xFF112233u;
+    sb.win = &sb_win;
+    statusbar_render(&sb, 320);
+    ASSERT(sb_win.surface.pixels[0] == THEME_COLOR_STATUSBAR_BG, "statusbar_render resets pixel cleanly");
+    free(sb_win.surface.pixels);
+    statusbar_free_icons(&sb);
+
+    /* 3. Dock hover motion update and 0xFFFF leave reset */
+    dock_state_t dock;
+    dock_init(&dock);
+    dock_recompute_geometry(&dock, 1024, 768);
+    vanilla_window_t dwin;
+    memset(&dwin, 0, sizeof(dwin));
+    dwin.window_id = 55;
+    dwin.surface.width = (uint32_t)dock.width;
+    dwin.surface.height = (uint32_t)dock.height;
+    dock.win = &dwin;
+    ASSERT(dock.hovered_idx == -1, "dock hovered_idx initially -1");
+
+    dock.dirty = 0;
+    dock_handle_mouse_motion(&dock, dock.items[0].x_offset + 4, 8);
+    ASSERT(dock.hovered_idx == 0, "dock_handle_mouse_motion sets hovered_idx on hit");
+    ASSERT(dock.dirty == 1, "dock_handle_mouse_motion marks dock dirty on hover change");
+
+    dock.dirty = 0;
+    dock_handle_mouse_motion(&dock, 0xFFFF, 0xFFFF);
+    ASSERT(dock.hovered_idx == -1, "dock_handle_mouse_motion clears hovered_idx on leave sentinel");
+    ASSERT(dock.dirty == 1, "dock_handle_mouse_motion marks dock dirty on leave");
+    dock_free_icons(&dock);
+
+    /* 4. VANILLA_EVENT_THEME_CHANGED handling and mod_state preservation */
+    shell_state_t st;
+    memset(&st, 0, sizeof(st));
+    st.mod_state = MOD_LCTRL;
+    st.launcher.visible = 1;
+    st.statusbar.menu_open = 1;
+    st.dock.menu_open = 1;
+    st.shell.start_menu_open = 1;
+
+    vanilla_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = VANILLA_EVENT_THEME_CHANGED;
+    ev.mod_state = 0;
+    shell_handle_event(&st, &ev);
+    ASSERT(st.statusbar.dirty == 1 && st.dock.dirty == 1 && st.taskbar_dirty == 1,
+           "theme change marks primary shell surfaces dirty");
+    ASSERT(st.launcher.dirty == 1 && st.statusbar.menu_dirty == 1 &&
+           st.dock.menu_dirty == 1 && st.shell.start_menu_dirty == 1,
+           "theme change marks open popups dirty");
+    ASSERT(st.mod_state == MOD_LCTRL, "theme change preserves mod_state");
+
+    /* 5. Launcher app list count and nonexistent binary removal */
+    vanilla_launcher_t launcher;
+    launcher_init(&launcher);
+    ASSERT(launcher.match_count == 6, "launcher contains 6 packaged built-in apps");
+    strcpy(launcher.query, "sysfetch");
+    launcher_update_matches(&launcher);
+    ASSERT(launcher.match_count == 0, "sysfetch removed from built-in launcher");
+
+    printf("       Passed.\n");
+}
+
 int main(void)
 {
     printf("============================================================\n");
     printf("  Project Tsukasa - Desktop Shell & Launcher Unit Tests\n");
     printf("============================================================\n");
     int passed = 0;
-    int total = 7;
+    int total = 8;
 
     g_shell_case = "layout_clock";
     test_shell_layout_and_clock();
@@ -517,6 +617,11 @@ int main(void)
     g_shell_case = "modern_chrome";
     test_modern_shell_chrome_and_poll();
     TSK_TEST_PASS("shell", "modern_chrome");
+    passed++;
+
+    g_shell_case = "alpha_hover_theme_launcher";
+    test_alpha_hover_theme_and_launcher();
+    TSK_TEST_PASS("shell", "alpha_hover_theme_launcher");
     passed++;
 
     TSK_TEST_DONE("shell", passed, total);

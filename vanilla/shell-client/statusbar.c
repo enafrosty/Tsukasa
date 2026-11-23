@@ -25,18 +25,25 @@
 #include <time.h>
 #include <math.h>
 
+typedef enum {
+    SYS_MENU_ACTION_SPAWN = 0,
+    SYS_MENU_ACTION_REBOOT = 1,
+    SYS_MENU_ACTION_POWEROFF = 2,
+} system_menu_action_t;
+
 typedef struct {
-    const char *title;
-    const char *path;
-    const char *badge;
+    const char          *title;
+    system_menu_action_t action;
+    const char          *path;
+    const char          *badge;
 } system_menu_item_t;
 
 static const system_menu_item_t g_system_menu_items[SYSTEM_MENU_NUM_ITEMS] = {
-    { "About Tsukasa",    "/bin/sysfetch",     "TS" },
-    { "Display Settings", "/bin/settings.elf", "CF" },
-    { "Task Manager",     "/bin/taskmgr.elf",  "TM" },
-    { "Reboot System",    "/bin/reboot",       "RB" },
-    { "Power Off",        "/bin/poweroff",     "PW" },
+    { "About Tsukasa",    SYS_MENU_ACTION_SPAWN,    "/bin/settings.elf", "TS" },
+    { "Display Settings", SYS_MENU_ACTION_SPAWN,    "/bin/settings.elf", "CF" },
+    { "Task Manager",     SYS_MENU_ACTION_SPAWN,    "/bin/taskmgr.elf",  "TM" },
+    { "Reboot System",    SYS_MENU_ACTION_REBOOT,   NULL,                "RB" },
+    { "Power Off",        SYS_MENU_ACTION_POWEROFF, NULL,                "PW" },
 };
 
 static unsigned long read_sysfs_key_val(const char *filename, const char *key)
@@ -373,8 +380,14 @@ void statusbar_render(statusbar_state_t *sb, int32_t screen_w)
     int32_t w = (int32_t)surf->width;
     int32_t h = (int32_t)surf->height;
 
-    /* Background translucent glass */
-    app_fill_rect(surf, 0, 0, w, h, THEME_COLOR_STATUSBAR_BG);
+    /* Reset translucent background cleanly so 1 Hz updates do not accumulate alpha */
+    uint32_t pitch_px = surf->pitch / sizeof(uint32_t);
+    for (int32_t y = 0; y < h; y++) {
+        uint32_t *row = surf->pixels + (size_t)y * pitch_px;
+        for (int32_t x = 0; x < w; x++) {
+            row[x] = THEME_COLOR_STATUSBAR_BG;
+        }
+    }
 
     /* 1px bottom border stroke */
     app_fill_rect(surf, 0, h - 1, w, 1, THEME_COLOR_STATUSBAR_BORDER);
@@ -588,8 +601,19 @@ int statusbar_handle_menu_click(statusbar_state_t *sb, int32_t cx, int32_t cy, s
     for (int i = 0; i < SYSTEM_MENU_NUM_ITEMS; i++) {
         int32_t iy = sb_menu_item_y(i);
         if (cy >= iy && cy < iy + SYSTEM_MENU_ITEM_H) {
-            shell_spawn_app(g_system_menu_items[i].path);
+            const system_menu_item_t *item = &g_system_menu_items[i];
             statusbar_close_menu(sb);
+            if (item->action == SYS_MENU_ACTION_SPAWN && item->path) {
+                shell_spawn_app(item->path);
+            } else if (item->action == SYS_MENU_ACTION_REBOOT) {
+#if !defined(_WIN32) && !defined(__linux__) && !defined(TEST_SHELL_RUNNER)
+                reboot(0x01234567);
+#endif
+            } else if (item->action == SYS_MENU_ACTION_POWEROFF) {
+#if !defined(_WIN32) && !defined(__linux__) && !defined(TEST_SHELL_RUNNER)
+                reboot(0x4321fedc);
+#endif
+            }
             return 1;
         }
     }

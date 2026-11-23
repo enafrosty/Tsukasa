@@ -985,8 +985,12 @@ int main(int argc, char **argv)
                 ui_widget_invalidate(state->editor);
                 need_present = 1;
             } else if (ev.type == VANILLA_EVENT_CONFIGURE && ev.window_id == win->window_id) {
-                if (ev.configure.serial != 0)
-                    vanilla_ack_configure(client, win->window_id, ev.configure.serial);
+                ui_widget_invalidate(state->root);
+                need_present = 1;
+            } else if (ev.type == VANILLA_EVENT_THEME_CHANGED) {
+                if (theme_load("/tmp/vanilla_theme.ini") < 0)
+                    theme_reload();
+                state->root->layout_elem->bg_color = g_theme ? g_theme->bg_base : 0xFF2E3440u;
                 ui_widget_invalidate(state->root);
                 need_present = 1;
             } else if (ev.type == VANILLA_EVENT_DND_ENTER) {

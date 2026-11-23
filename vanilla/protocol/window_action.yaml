@@ -1,0 +1,13 @@
+id: 33
+name: MSG_WINDOW_ACTION
+direction: client_to_server
+version: 2
+v1_compat: false
+description: "Client requests a window manager action on a target window."
+fields:
+  - name: window_id
+    type: uint32_t
+    description: "Target window ID"
+  - name: action
+    type: uint32_t
+    description: "Window action code (WINDOW_ACTION_*)"

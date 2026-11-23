@@ -62,10 +62,7 @@ static const vanilla_app_entry_t g_launcher_apps[] = {
     { "Calculator",      "Basic math calculator",        "/bin/calc.elf",     0 },
     { "File Manager",    "Browse directory files",       "/bin/filemgr.elf",  0 },
     { "Task Manager",    "Inspect and manage processes", "/bin/taskmgr.elf",  0 },
-    { "System Fetch",    "Display system information",   "/bin/sysfetch",     0 },
     { "Settings",        "Desktop and system config",    "/bin/settings.elf", 0 },
-    { "Process Viewer",  "Inspect running processes",    "/bin/ps",           0 },
-    { "Network Info",    "Network status and sockets",   "/bin/net",          0 },
 };
 #define LAUNCHER_NUM_BUILTIN_APPS (int)(sizeof(g_launcher_apps) / sizeof(g_launcher_apps[0]))
 
@@ -374,8 +371,11 @@ static void shell_record_pending_spawn(const char *path)
     g_pending_spawn.spawn_time = time(NULL);
 }
 
-void shell_spawn_app(const char *path)
+pid_t shell_spawn_app(const char *path)
 {
+    if (!path || !path[0])
+        return -1;
+
     shell_record_pending_spawn(path);
 
     char current_path[256];
@@ -413,6 +413,7 @@ void shell_spawn_app(const char *path)
     }
     if (pid > 0)
         g_pending_spawn.pid = pid;
+    return pid;
 }
 
 static void launcher_exec_selected(vanilla_launcher_t *launcher)
@@ -425,13 +426,14 @@ static void launcher_exec_selected(vanilla_launcher_t *launcher)
         int app_idx = launcher->matches[sel].app_index;
         const vanilla_app_entry_t *app = &g_launcher_apps[app_idx];
 
-        shell_spawn_app(app->exec_path);
-
-        size_t len = strlen(app->exec_path);
-        if (len < 4 || strcmp(app->exec_path + len - 4, ".elf") != 0) {
-            char elf_path[256];
-            snprintf(elf_path, sizeof(elf_path), "%s.elf", app->exec_path);
-            shell_spawn_app(elf_path);
+        pid_t pid = shell_spawn_app(app->exec_path);
+        if (pid <= 0) {
+            size_t len = strlen(app->exec_path);
+            if (len < 4 || strcmp(app->exec_path + len - 4, ".elf") != 0) {
+                char elf_path[256];
+                snprintf(elf_path, sizeof(elf_path), "%s.elf", app->exec_path);
+                shell_spawn_app(elf_path);
+            }
         }
     }
 }
@@ -1000,7 +1002,29 @@ void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
     if (!st || !ev)
         return;
 
-    st->mod_state = ev->mod_state;
+    if (ev->type == VANILLA_EVENT_INPUT ||
+        ev->type == VANILLA_EVENT_DOUBLE_CLICK ||
+        ev->type == VANILLA_EVENT_TRIPLE_CLICK ||
+        ev->type == VANILLA_EVENT_LONG_PRESS) {
+        st->mod_state = ev->mod_state;
+    }
+
+    if (ev->type == VANILLA_EVENT_THEME_CHANGED) {
+        if (theme_load("/tmp/vanilla_theme.ini") < 0)
+            theme_reload();
+        st->statusbar.dirty = 1;
+        st->dock.dirty = 1;
+        st->taskbar_dirty = 1;
+        if (st->launcher.visible)
+            st->launcher.dirty = 1;
+        if (st->statusbar.menu_open)
+            st->statusbar.menu_dirty = 1;
+        if (st->dock.menu_open)
+            st->dock.menu_dirty = 1;
+        if (st->shell.start_menu_open)
+            st->shell.start_menu_dirty = 1;
+        return;
+    }
 
     if (ev->type == VANILLA_EVENT_CLOSE_REQ) {
         if ((st->statusbar_win && ev->window_id == st->statusbar_win->window_id) ||
@@ -1251,7 +1275,11 @@ void shell_handle_event(shell_state_t *st, const vanilla_event_t *ev)
 
         /* Floating Aurora Dock events */
         if (st->dock.win && ev->window_id == st->dock.win->window_id) {
-            if (iev->type == EV_KEY && (iev->code == BTN_LEFT || iev->code == BTN_RIGHT) && iev->value == 1) {
+            if (iev->type == EV_REL && iev->code != REL_WHEEL) {
+                int32_t cx = (int32_t)iev->pad1;
+                int32_t cy = (int32_t)iev->pad2;
+                dock_handle_mouse_motion(&st->dock, cx, cy);
+            } else if (iev->type == EV_KEY && (iev->code == BTN_LEFT || iev->code == BTN_RIGHT) && iev->value == 1) {
                 int32_t cx = (int32_t)iev->pad1;
                 int32_t cy = (int32_t)iev->pad2;
                 dock_handle_mouse_click(&st->dock, cx, cy, iev->code, st);

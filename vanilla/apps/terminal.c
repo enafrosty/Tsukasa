@@ -204,7 +204,10 @@ int main(int argc, char **argv)
                 int new_rows = (avail_h > 0 ? avail_h : CELL_HEIGHT) / CELL_HEIGHT;
                 vt_resize(&state, new_rows, new_cols);
                 state.dirty = 1;
-                vanilla_ack_configure(client, win->window_id, ev.configure.serial);
+            } else if (ev.type == VANILLA_EVENT_THEME_CHANGED) {
+                if (theme_load("/tmp/vanilla_theme.ini") < 0)
+                    theme_reload();
+                state.dirty = 1;
             } else if (ev.type == VANILLA_EVENT_INPUT) {
                 struct input_event *iev = &ev.input;
                 if (iev->type == EV_KEY) {
