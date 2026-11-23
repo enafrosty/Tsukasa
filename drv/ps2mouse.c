@@ -19,15 +19,13 @@
 #include "irq.h"
 #include "ps2mouse.h"
 #include "input_dev.h"
-#include "../input/event.h"
-#include "../gfx/cursor.h"
 #include "../include/vfs_abi.h"
 #include "../include/kprintf.h"
 #include <stdint.h>
 
-#ifndef INPUT_EVENT_SCROLL
-#define INPUT_EVENT_SCROLL INPUT_EVENT_MOUSE_WHEEL
-#endif
+#define MOUSE_BUTTON_LEFT   1u
+#define MOUSE_BUTTON_RIGHT  2u
+#define MOUSE_BUTTON_MIDDLE 4u
 
 /* Mouse packet state machine. */
 static uint8_t mouse_cycle;
@@ -149,8 +147,6 @@ void ps2mouse_handler(void)
 
             dy = -dy;
 
-            cursor_move(dx, dy);
-
             uint8_t buttons = status & 0x07;
             uint8_t changed = buttons ^ mouse_buttons_prev;
 
@@ -171,71 +167,6 @@ void ps2mouse_handler(void)
             if (dx != 0 || dy != 0 || changed != 0)
                 input_dev_push(EV_SYN, SYN_REPORT, 0);
 
-            /* Feed legacy desktop queue */
-            if (dx != 0 || dy != 0) {
-                struct gui_event ev;
-                ev.event_id = INPUT_EVENT_MOUSE_MOVE;
-                ev.type = EVENT_MOUSE;
-                ev.subtype = MOUSE_MOVE;
-                ev.keycode = buttons;
-                ev.x = cursor_x();
-                ev.y = cursor_y();
-                ev.wheel_delta = 0;
-                ev.width = 0;
-                ev.height = 0;
-                ev.modifiers = 0;
-                ev.window_id = -1;
-                event_enqueue(&ev);
-            }
-
-            if (changed & MOUSE_BUTTON_LEFT) {
-                struct gui_event ev;
-                int pressed = (buttons & MOUSE_BUTTON_LEFT) != 0;
-                ev.event_id = pressed ? INPUT_EVENT_MOUSE_DOWN : INPUT_EVENT_MOUSE_UP;
-                ev.type = EVENT_MOUSE;
-                ev.subtype = pressed ? MOUSE_BTN_DOWN : MOUSE_BTN_UP;
-                ev.keycode = buttons;
-                ev.x = cursor_x();
-                ev.y = cursor_y();
-                ev.wheel_delta = 0;
-                ev.width = 0;
-                ev.height = 0;
-                ev.modifiers = MOUSE_BUTTON_LEFT;
-                ev.window_id = -1;
-                event_enqueue(&ev);
-            }
-            if (changed & MOUSE_BUTTON_RIGHT) {
-                struct gui_event ev;
-                int pressed = (buttons & MOUSE_BUTTON_RIGHT) != 0;
-                ev.event_id = pressed ? INPUT_EVENT_RIGHT_CLICK : INPUT_EVENT_MOUSE_UP;
-                ev.type = EVENT_MOUSE;
-                ev.subtype = pressed ? MOUSE_BTN_DOWN : MOUSE_BTN_UP;
-                ev.keycode = buttons;
-                ev.x = cursor_x();
-                ev.y = cursor_y();
-                ev.wheel_delta = 0;
-                ev.width = 0;
-                ev.height = 0;
-                ev.modifiers = MOUSE_BUTTON_RIGHT;
-                ev.window_id = -1;
-                event_enqueue(&ev);
-            }
-            if (changed & MOUSE_BUTTON_MIDDLE) {
-                struct gui_event ev;
-                int pressed = (buttons & MOUSE_BUTTON_MIDDLE) != 0;
-                ev.event_id = pressed ? INPUT_EVENT_MOUSE_DOWN : INPUT_EVENT_MOUSE_UP;
-                ev.type = EVENT_MOUSE;
-                ev.subtype = pressed ? MOUSE_BTN_DOWN : MOUSE_BTN_UP;
-                ev.keycode = buttons;
-                ev.x = cursor_x();
-                ev.y = cursor_y();
-                ev.wheel_delta = 0;
-                ev.width = 0;
-                ev.height = 0;
-                ev.modifiers = MOUSE_BUTTON_MIDDLE;
-                ev.window_id = -1;
-                event_enqueue(&ev);
-            }
             mouse_buttons_prev = buttons;
         }
         break;
@@ -250,20 +181,6 @@ void ps2mouse_handler(void)
             if (dz != 0) {
                 input_dev_push(EV_REL, REL_WHEEL, (int)dz);
                 input_dev_push(EV_SYN, SYN_REPORT, 0);
-
-                struct gui_event ev;
-                ev.event_id = INPUT_EVENT_SCROLL;
-                ev.type = EVENT_MOUSE;
-                ev.subtype = MOUSE_MOVE;
-                ev.keycode = mouse_buttons_prev;
-                ev.x = cursor_x();
-                ev.y = cursor_y();
-                ev.wheel_delta = dz;
-                ev.width = 0;
-                ev.height = 0;
-                ev.modifiers = 0;
-                ev.window_id = -1;
-                event_enqueue(&ev);
             }
             mouse_cycle = 0;
         }

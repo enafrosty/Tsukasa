@@ -27,7 +27,7 @@ AR = ar
 endif
 
 CFLAGS = -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
-         -fno-pie -fstack-protector-strong -O2 \
+         -fno-pie -fstack-protector-strong -mstack-protector-guard=global -O2 \
          -I../../tsukasa-libc/include -I../include -I../input -I../apps -I. -DSTBI_NO_THREAD_LOCALS
 
 LDFLAGS = -m elf_x86_64 -T ../../tsukasa-libc/tsukasa_app.ld -nostdlib
@@ -47,16 +47,16 @@ OBJS = shell_client.o dock.o statusbar.o
 all: $(BIN)
 
 $(CRT0) $(LIBC_A) $(LIBM_A):
-	$(MAKE) -C ../../tsukasa-libc all
+	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C ../../tsukasa-libc all
 
 $(LIBVANILLA_A):
-	$(MAKE) -C .. $(LIBVANILLA_A)
+	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C .. $(LIBVANILLA_A)
 
 $(APP_COMMON):
-	$(MAKE) -C .. $(APP_COMMON)
+	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C .. $(APP_COMMON)
 
 $(FONT_OBJS):
-	$(MAKE) -C .. server/font.o server/default_font.o
+	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C .. server/font.o server/default_font.o
 
 $(BIN): $(CRT0) $(OBJS) $(APP_COMMON) $(FONT_OBJS) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 	@mkdir -p ../bin

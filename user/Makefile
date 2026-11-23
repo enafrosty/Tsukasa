@@ -1,6 +1,5 @@
 # User-space SDK Makefile
 # Usage:
-#   make -C user hello_gui
 #   make -C user sample_cli
 #   make -C user clean
 
@@ -44,19 +43,13 @@ $(BUILD):
 $(BUILD)/%.o: $(ROOT)/user/lib/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(BUILD)/hello_gui.o: $(ROOT)/user/apps/hello_gui.c | $(BUILD)
-	$(CC) $(CFLAGS) -c -o $@ $<
-
 $(BUILD)/sample_cli.o: $(ROOT)/user/examples/sample_cli.c | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
-
-hello_gui: $(BUILD)/hello_gui.o $(LIB_OBJS)
-	$(LD) $(LDFLAGS) -e hello_gui_main -o $@ $^
 
 sample_cli: $(BUILD)/sample_cli.o $(LIB_OBJS)
 	$(LD) $(LDFLAGS) -e sample_cli_main -o $@ $^
 
 clean:
-	@rm -rf $(BUILD) hello_gui sample_cli
+	@rm -rf $(BUILD) sample_cli
 
 .PHONY: clean

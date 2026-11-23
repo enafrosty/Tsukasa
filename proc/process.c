@@ -32,8 +32,6 @@
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm_x64.h"
-#include "../gfx/gui_srv.h"
-#include "../gfx/wm.h"
 #include "../net/network.h"
 #include "../sys/futex.h"
 #include "../sys/work_queue.h"
@@ -439,7 +437,6 @@ static void free_process_resources_locked(process_t *p)
     if (!p)
         return;
 
-    gui_srv_process_cleanup((int)p->pid);
     vfs_process_cleanup(p);
     shm_process_cleanup(p);
     vm_space_destroy(&p->vm_space);
@@ -3193,15 +3190,9 @@ void process_run_phase7_selftests(void)
     process_spawn_kernel("phase7-selftest", phase7_selftest_entry);
 }
 
-/* frosty (2026-07-22): the boot-time window storms — the gui/input stress windows and the core-app-launch... */
-#define PHASE8_GUI_TESTS 0
-
 /* frosty (2026-07-23): the proc/mem STRESS STORM (192 p8-kill-target spawns + shm churn + forced reap) can... */
 #define PHASE8_STRESS_STORM 0
 
-#define PHASE8_GUI_WINDOWS      3
-#define PHASE8_GUI_STORM_ITERS  320
-#define PHASE8_INPUT_FLOOD_ITERS 1400
 #define PHASE8_PROC_ROUNDS      24
 #define PHASE8_PROC_FANOUT      8
 #define PHASE8_SHM_CHURN_ITERS  192
@@ -3366,149 +3357,6 @@ static int phase8_scheduler_fairness_test(uint32_t *ratio_pct_out,
 
     return (ratio_pct >= 35u) ? 0 : -1;
 }
-
-#if PHASE8_GUI_TESTS
-static int phase8_gui_input_stress_test(uint32_t *event_count_out,
-                                        uint32_t *draw_ops_out,
-                                        uint32_t *ops_per_100ticks_out)
-{
-    int pid = process_current_pid();
-    int handles[PHASE8_GUI_WINDOWS];
-    int ok = 0;
-    uint32_t draw_ops = 0;
-    uint32_t ev_count = 0;
-    uint64_t start_ticks = 0;
-    uint64_t elapsed_ticks = 1;
-
-    for (int i = 0; i < PHASE8_GUI_WINDOWS; i++)
-        handles[i] = 0;
-
-    for (int i = 0; i < PHASE8_GUI_WINDOWS; i++) {
-        handles[i] = gui_srv_window_create(pid,
-                                           "phase8-gui",
-                                           60 + i * 50,
-                                           60 + i * 40,
-                                           240,
-                                           160);
-        if (handles[i] < 0)
-            goto cleanup;
-    }
-
-    start_ticks = process_ticks();
-    for (int i = 0; i < PHASE8_GUI_STORM_ITERS; i++) {
-        int h = handles[i % PHASE8_GUI_WINDOWS];
-        int x = (i * 11) % 140;
-        int y = (i * 7) % 96;
-        uint32_t color = 0xFF002020u | ((uint32_t)(i * 41) & 0x0000FFFFu);
-
-        if (gui_srv_draw_rect(pid, h, x, y, 90, 28, color) != GUI_OK)
-            goto cleanup;
-        if (gui_srv_draw_text(pid, h, 8, 8, "p8", 0xFFFFFFFFu) != GUI_OK)
-            goto cleanup;
-        if (gui_srv_mark_dirty(pid, h, 0, 0, 220, 140) != GUI_OK)
-            goto cleanup;
-        draw_ops += 3;
-
-        if ((i & 31) == 0)
-            gui_srv_window_set_title(pid, h, (i & 63) ? "phase8-gui" : "phase8-gui*");
-        if ((i & 7) == 0)
-            process_yield();
-    }
-
-    for (int i = 0; i < (PHASE8_GUI_STORM_ITERS / 4); i++) {
-        wm_window_t *top = wm_get_top();
-        int tx;
-        int ty;
-        int rx;
-        int ry;
-
-        if (!top)
-            goto cleanup;
-
-        tx = top->x + top->w / 2;
-        ty = top->y + 8;
-        wm_handle_mouse(tx, ty, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_LEFT);
-        wm_handle_mouse(tx + 20, ty + 10, MOUSE_BUTTON_LEFT, 0);
-        wm_handle_mouse(tx + 40, ty + 12, MOUSE_BUTTON_LEFT, 0);
-        wm_handle_mouse(tx + 40, ty + 12, 0, MOUSE_BUTTON_LEFT);
-
-        rx = top->x + top->w - 2;
-        ry = top->y + top->h - 2;
-        wm_handle_mouse(rx, ry, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_LEFT);
-        wm_handle_mouse(rx + 6, ry + 4, MOUSE_BUTTON_LEFT, 0);
-        wm_handle_mouse(rx + 12, ry + 8, MOUSE_BUTTON_LEFT, 0);
-        wm_handle_mouse(rx + 12, ry + 8, 0, MOUSE_BUTTON_LEFT);
-        process_yield();
-    }
-
-    for (int i = 0; i < PHASE8_INPUT_FLOOD_ITERS; i++) {
-        wm_window_t *top = wm_get_top();
-        int usable_w;
-        int usable_h;
-        int mx;
-        int my;
-
-        if (!top)
-            break;
-        usable_w = top->w - (2 * WM_BORDER_PX);
-        usable_h = top->h - (2 * WM_BORDER_PX) - WM_TITLE_BAR_H;
-        if (usable_w < 8)
-            usable_w = 8;
-        if (usable_h < 8)
-            usable_h = 8;
-
-        mx = top->x + WM_BORDER_PX + ((i * 5) % usable_w);
-        my = top->y + WM_BORDER_PX + WM_TITLE_BAR_H + ((i * 11) % usable_h);
-        wm_handle_mouse(mx, my, 0, 0);
-        if ((i % 120) == 0) {
-            wm_handle_mouse(mx, my, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_LEFT);
-            wm_handle_mouse(mx + 1, my + 1, MOUSE_BUTTON_LEFT, 0);
-            wm_handle_mouse(mx + 1, my + 1, 0, MOUSE_BUTTON_LEFT);
-        }
-    }
-
-    for (int i = 0; i < PHASE8_GUI_WINDOWS; i++) {
-        struct tsukasa_gui_event ev;
-        int guard = 0;
-        for (;;) {
-            int rc;
-            if (guard++ > 8192)
-                goto cleanup;
-            rc = gui_srv_get_event(pid, handles[i], &ev);
-            if (rc == GUI_OK) {
-                ev_count++;
-                continue;
-            }
-            if (rc == GUI_ERR_AGAIN)
-                break;
-            goto cleanup;
-        }
-    }
-
-    elapsed_ticks = process_ticks() - start_ticks;
-    if (elapsed_ticks == 0)
-        elapsed_ticks = 1;
-    if (ev_count < 64)
-        goto cleanup;
-
-    ok = 1;
-
-cleanup:
-    for (int i = 0; i < PHASE8_GUI_WINDOWS; i++) {
-        if (handles[i] > 0)
-            (void)gui_srv_window_destroy(pid, handles[i]);
-    }
-
-    if (event_count_out)
-        *event_count_out = ev_count;
-    if (draw_ops_out)
-        *draw_ops_out = draw_ops;
-    if (ops_per_100ticks_out)
-        *ops_per_100ticks_out = (uint32_t)((draw_ops * 100u) / (uint32_t)(elapsed_ticks ? elapsed_ticks : 1u));
-
-    return ok ? 0 : -1;
-}
-#endif
 
 #if PHASE8_STRESS_STORM
 static void phase8_kill_target(void)
@@ -3896,11 +3744,6 @@ static void phase8_selftest_entry(void)
     uint32_t fairness_ratio = 0;
     uint64_t fairness_min = 0;
     uint64_t fairness_max = 0;
-#if PHASE8_GUI_TESTS
-    uint32_t gui_events = 0;
-    uint32_t gui_draw_ops = 0;
-    uint32_t gui_ops_per_100ticks = 0;
-#endif
 #if PHASE8_STRESS_STORM
     uint32_t spawned = 0;
     uint32_t killed = 0;
@@ -3914,11 +3757,6 @@ static void phase8_selftest_entry(void)
     uint32_t net_success = 0;
     int net_online = 0;
     int fault_checks = 0;
-#if PHASE8_GUI_TESTS
-    int apps_launched = 0;
-    int apps_passed = 0;
-    int apps_total = 0;
-#endif
 
     {
         uint64_t wait_start = process_ticks();
@@ -3942,38 +3780,6 @@ static void phase8_selftest_entry(void)
                 (uint32_t)fairness_min,
                 (uint32_t)fairness_max);
     }
-
-#if PHASE8_GUI_TESTS
-    if (phase8_gui_input_stress_test(&gui_events, &gui_draw_ops, &gui_ops_per_100ticks) == 0) {
-        pass++;
-        kprintf("[phase8][stress] gui/input PASS events=%u draw_ops=%u ops_per_100ticks=%u\n",
-                gui_events,
-                gui_draw_ops,
-                gui_ops_per_100ticks);
-    } else {
-        fail++;
-        blocker++;
-        kprintf("[phase8][stress] gui/input FAIL events=%u draw_ops=%u ops_per_100ticks=%u\n",
-                gui_events,
-                gui_draw_ops,
-                gui_ops_per_100ticks);
-    }
-
-    if (gui_ops_per_100ticks >= 50) {
-        pass++;
-        kprintf("[phase8][perf] redraw throughput PASS ops_per_100ticks=%u\n",
-                gui_ops_per_100ticks);
-    } else {
-        fail++;
-        major++;
-        kprintf("[phase8][perf] redraw throughput FAIL ops_per_100ticks=%u\n",
-                gui_ops_per_100ticks);
-    }
-#else
-    kprintf("[phase8][stress] gui/input SKIPPED (PHASE8_GUI_TESTS=0 — "
-            "boot window storm disabled per frosty; issue #21 family)\n");
-    kprintf("[phase8][perf] redraw throughput SKIPPED (PHASE8_GUI_TESTS=0)\n");
-#endif
 
 #if PHASE8_STRESS_STORM
     if (phase8_process_memory_stress_test(&spawned,
@@ -4039,24 +3845,6 @@ static void phase8_selftest_entry(void)
         blocker++;
         kprintf("[phase8][fault] invalid-syscalls FAIL checks=%d\n", fault_checks);
     }
-
-#if PHASE8_GUI_TESTS
-    if (phase8_core_app_launch_test(&apps_launched, &apps_passed, &apps_total) == 0) {
-        pass++;
-        kprintf("[phase8][regression] core-app-launch PASS launched=%d/%d\n",
-                apps_passed,
-                apps_total);
-    } else {
-        fail++;
-        blocker++;
-        kprintf("[phase8][regression] core-app-launch FAIL launched=%d/%d (spawned=%d)\n",
-                apps_passed,
-                apps_total,
-                apps_launched);
-    }
-#else
-    kprintf("[phase8][regression] core-app-launch SKIPPED (PHASE8_GUI_TESTS=0)\n");
-#endif
 
     kprintf("[phase8][triage] blocker=%d major=%d minor=%d\n", blocker, major, minor);
     kprintf("[phase8][test] done pass=%d fail=%d\n", pass, fail);

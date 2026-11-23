@@ -84,8 +84,6 @@ jobs:
   toolchain-gcc:
     name: "Toolchain (GCC x86_64 build check)"
     runs-on: ubuntu-24.04
-    # Marked continue-on-error: true per P0-1 specification to monitor GCC bit rot without blocking CI
-    continue-on-error: true
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -93,8 +91,14 @@ jobs:
       - name: Install toolchain
         run: bash scripts/ci/install-toolchain.sh
 
-      - name: Build x86_64 kernel with GCC
-        run: make TOOLCHAIN=gcc
+      - name: Cache Limine bootloader artifacts
+        uses: actions/cache@v4
+        with:
+          path: .limine
+          key: limine-v8.x-binary
+
+      - name: Build x86_64 ISO with GCC
+        run: make TOOLCHAIN=gcc iso-x86_64
 
   boot-test:
     name: "QEMU Boot Smoke Test"
@@ -126,13 +130,18 @@ jobs:
     name: "Test Suite Runner (make check)"
     needs: kernel-x86_64
     runs-on: ubuntu-24.04
-    continue-on-error: true
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
       - name: Install toolchain
         run: bash scripts/ci/install-toolchain.sh
+
+      - name: Cache Limine bootloader artifacts
+        uses: actions/cache@v4
+        with:
+          path: .limine
+          key: limine-v8.x-binary
 
       - name: Run test suite
         run: make check

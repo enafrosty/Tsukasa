@@ -27,7 +27,7 @@ AR = ar
 endif
 
 CFLAGS = -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
-         -fno-pie -fstack-protector-strong -O2 \
+         -fno-pie -fstack-protector-strong -mstack-protector-guard=global -O2 \
          -I../tsukasa-libc/include -Iinclude -Iinput -DSTBI_NO_THREAD_LOCALS
 
 LDFLAGS = -m elf_x86_64 -T ../tsukasa-libc/tsukasa_app.ld -nostdlib
@@ -37,7 +37,7 @@ LIBC_A = ../tsukasa-libc/lib/libc.a
 LIBM_A = ../tsukasa-libc/lib/libm.a
 
 $(CRT0) $(LIBC_A) $(LIBM_A):
-	$(MAKE) -C ../tsukasa-libc all
+	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C ../tsukasa-libc all
 
 BIN_DIR = bin
 LIB_DIR = lib
@@ -159,8 +159,7 @@ PYTHON ?= python3
 gen-protocol:
 	$(PYTHON) tools/gen_protocol.py \
 		--yaml-dir protocol/ \
-		--out-header include/protocol_generated.h \
-		--out-doc ../docs/agent/phase-2-protocol-motion/wire-format.md
+		--out-header include/protocol_generated.h
 
 all: gen-protocol $(ALL_TARGETS)
 
@@ -218,11 +217,11 @@ $(TEST_LAYOUT_BIN): $(CRT0) $(TEST_LAYOUT_OBJS) $(LIBVANILLALAYOUT_A) $(LIBVANIL
 
 build/test_layout: layout/test_layout.c layout/layout.c layout/draw_consumer.c apps/app_common.c server/font.c server/default_font.c server/blitter.c server/theme.c
 	@mkdir -p build
-	gcc -O2 -Iinclude -I../tsukasa-libc/include -Iinput -Iserver -Iapps -DVANILLA_HOST -o $@ $^ -lm
+	gcc -O2 -idirafter host_emulator/sys_compat -Iinclude -Iinput -Iserver -Iapps -DVANILLA_HOST -o $@ $^ -lm
 
 build/test_ui: libvanilla-ui/test_ui.c $(LIBVANILLA_UI_SRCS) layout/layout.c layout/draw_consumer.c apps/app_common.c server/font.c server/default_font.c server/blitter.c server/theme.c input/keymap.c
 	@mkdir -p build
-	gcc -O2 -Iinclude -I../tsukasa-libc/include -Iinput -Iserver -Iapps -Ilibvanilla-ui -DVANILLA_HOST -o $@ $^ -lm
+	gcc -O2 -idirafter host_emulator/sys_compat -Iinclude -Iinput -Iserver -Iapps -Ilibvanilla-ui -DVANILLA_HOST -o $@ $^ -lm
 
 build/test_service_registry: tests/test_service_registry.c libvanilla/service.c services/registryd.c
 	@mkdir -p build
@@ -281,12 +280,12 @@ $(SHELL_BIN): $(CRT0) shell-client/shell_client.o $(APP_COMMON_OBJ) $(FONT_OBJS)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) shell-client/shell_client.o $(APP_COMMON_OBJ) $(FONT_OBJS) $(LIBVANILLALAYOUT_A) $(LIBVANILLA_A) $(LIBM_A) $(LIBC_A)
 
 $(SUPERVISOR_BIN): supervisor/supervisor.c supervisor/supervisor.h supervisor/Makefile
-	$(MAKE) -C supervisor all
+	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C supervisor all
 	@mkdir -p $(BIN_DIR)
 	cp $@ $(BIN_DIR)/supervsd.elf
 
 $(DEVTOOLS_BIN): $(LIBVANILLA_A) $(APP_COMMON_OBJ) $(FONT_OBJS)
-	$(MAKE) -C devtools all
+	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C devtools all
 	@mkdir -p $(BIN_DIR)
 	cp $@ $(BIN_DIR)/devtools.elf
 

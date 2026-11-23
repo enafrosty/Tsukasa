@@ -21,6 +21,7 @@
 #define TEST_ASSERT(cond) \
     do { \
         if (!(cond)) { \
+            printf("[TEST] terminal_vt.assert FAIL: %s at %s:%d\n", #cond, __FILE__, __LINE__); \
             fprintf(stderr, "Assertion failed: %s at %s:%d\n", #cond, __FILE__, __LINE__); \
             exit(1); \
         } \

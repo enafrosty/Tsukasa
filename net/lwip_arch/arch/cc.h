@@ -19,6 +19,12 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <limits.h>
+
+typedef int ssize_t;
+#ifndef SSIZE_MAX
+#define SSIZE_MAX INT_MAX
+#endif
 
 #include "../../../include/kprintf.h"
 #include "../../../drv/pit.h"
