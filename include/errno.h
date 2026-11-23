@@ -39,5 +39,9 @@
 #define EBADF        9   // Bad file descriptor
 #define EMFILE       24  // Too many open files
 #define ENFILE       23  // File table overflow
+#define ENOTDIR      20  // Not a directory
+#define EISDIR       21  // Is a directory
+#define ENOTEMPTY    39  // Directory not empty
+#define ELOOP        40  // Too many levels of symbolic links
 
 #endif // CORE_ERRNO_H

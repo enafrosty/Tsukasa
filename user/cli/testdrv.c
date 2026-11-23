@@ -115,6 +115,16 @@ static inline long sys_unlink(const char *path)
     return ret;
 }
 
+static inline long sys_rename(const char *oldpath, const char *newpath)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(82L), "D"((long)(uintptr_t)oldpath), "S"((long)(uintptr_t)newpath)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
 static inline long sys_nanosleep(long ms)
 {
     long ret;
@@ -189,7 +199,7 @@ static void test_spawn_argv(void)
 {
     int status = 0;
     long detail = 0;
-    int rc = spawn_and_wait("/fat12/argvchk.elf", "argvchk alpha beta gamma",
+    int rc = spawn_and_wait("/bin/argvchk.elf", "argvchk alpha beta gamma",
                             &status, &detail);
     if (rc == -1) {
         dprintf(1, "[TEST] spawn_argv FAIL: SYS_spawn failed (rc=%ld)\n", detail);
@@ -206,8 +216,8 @@ static void test_spawn_argv(void)
     }
 
     struct test_spawn_request req;
-    req.path = "/fat12/exit7.elf";
-    req.args = "/fat12/exit7.elf";
+    req.path = "/bin/exit7.elf";
+    req.args = "/bin/exit7.elf";
     req.stdin_fd = -1;
     req.stdout_fd = -1;
     req.stderr_fd = -1;
@@ -242,7 +252,7 @@ static void test_pmm_reclaim(void)
     for (int i = 0; i < 25; i++) {
         int status = 0;
         long detail = 0;
-        int rc = spawn_and_wait("/fat12/exit7.elf", NULL, &status, &detail);
+        int rc = spawn_and_wait("/bin/exit7.elf", NULL, &status, &detail);
         if (rc == -1) {
             dprintf(1, "[TEST] pmm_reclaim FAIL: iter %d spawn failed (rc=%ld)\n",
                     i, detail);
@@ -425,9 +435,8 @@ static void test_vfs_tmp_crud(void)
         return;
     }
 
-    /* memfs on /tmp is flat and has no directory inodes, so rmdir returns -EINVAL */
     long rmrc = sys_rmdir(dir);
-    if (rmrc != 0 && rmrc != TSK_EINVAL_RC) {
+    if (rmrc != 0) {
         dprintf(1, "[TEST] vfs_tmp_crud FAIL: rmdir unexpected rc=%ld\n", rmrc);
         return;
     }
@@ -439,7 +448,7 @@ static void test_tsh_pipeline(void)
 {
     static const char script_path[] = "/tmp/pipe_test.sh";
     static const char out_path[] = "/tmp/pipe_out.txt";
-    static const char script[] = "echo pipe_magic_42 | /fat12/cat.elf > /tmp/pipe_out.txt\n";
+    static const char script[] = "echo pipe_magic_42 | /bin/cat.elf > /tmp/pipe_out.txt\n";
     static const char expected[] = "pipe_magic_42";
     const size_t script_len = sizeof(script) - 1;
     const size_t expected_len = sizeof(expected) - 1;
@@ -469,7 +478,7 @@ static void test_tsh_pipeline(void)
 
     int status = 0;
     long detail = 0;
-    int rc = spawn_and_wait("/fat12/TSH.ELF", "tsh /tmp/pipe_test.sh",
+    int rc = spawn_and_wait("/bin/tsh", "tsh /tmp/pipe_test.sh",
                             &status, &detail);
     if (rc == -1) {
         (void)sys_unlink(out_path);
@@ -543,7 +552,7 @@ static void test_ring3_fault_isolation(void)
 {
     int status = 0;
     long detail = 0;
-    int rc = spawn_and_wait("/fat12/fault.elf", NULL, &status, &detail);
+    int rc = spawn_and_wait("/bin/fault.elf", NULL, &status, &detail);
     if (rc == -1) {
         dprintf(1, "[TEST] ring3_fault_isolation FAIL: SYS_spawn failed (rc=%ld)\n", detail);
         return;
@@ -561,7 +570,7 @@ static void test_ring3_fault_isolation(void)
 
     status = 0;
     detail = 0;
-    rc = spawn_and_wait("/fat12/exit7.elf", NULL, &status, &detail);
+    rc = spawn_and_wait("/bin/exit7.elf", NULL, &status, &detail);
     if (rc != 0 || !TSK_WIFEXITED(status) || TSK_WEXITSTATUS(status) != 7) {
         dprintf(1, "[TEST] ring3_fault_isolation FAIL: post-fault spawn rc=%d status=0x%x\n",
                 rc, (unsigned)status);
@@ -672,6 +681,121 @@ static void test_proc_stat(void)
     dprintf(1, "[TEST] proc_stat PASS\n");
 }
 
+struct test_vfs_stat {
+    uint64_t size;
+    uint32_t type;
+    uint32_t mode;
+    uint64_t blocks;
+};
+
+static void test_initrd_rootfs_layout(void)
+{
+    static const char *const required[] = {
+        "/bin/ls",
+        "/bin/reboot",
+        "/bin/ps",
+        "/etc/vanilla/themes/nord-dark.ini",
+        "/usr/share/vanilla/cursors/arrow.argb",
+        "/etc/services.conf",
+    };
+
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        struct test_vfs_stat st;
+        if (sys_stat(required[i], &st) != 0 || st.size == 0) {
+            dprintf(1, "[TEST] initrd_rootfs_layout FAIL: missing or empty %s\n",
+                    required[i]);
+            return;
+        }
+    }
+
+    /* Verify symlink resolution works (/bin/VSRV.ELF -> vsrv) */
+    struct test_vfs_stat st_sym;
+    if (sys_stat("/bin/VSRV.ELF", &st_sym) != 0 || st_sym.size == 0) {
+        dprintf(1, "[TEST] initrd_rootfs_layout FAIL: symlink /bin/VSRV.ELF broken\n");
+        return;
+    }
+
+    dprintf(1, "[TEST] initrd_rootfs_layout PASS\n");
+}
+
+static void test_tmpfs_isolation(void)
+{
+    static const char root_file[] = "/root_iso_probe.txt";
+    static const char tmp_file[] = "/tmp/tmp_iso_probe.txt";
+    static const char run_file[] = "/var/run/run_iso_probe.txt";
+    static const char moved_file[] = "/tmp/tmp_iso_moved.txt";
+    struct test_vfs_stat st;
+
+    (void)sys_unlink(root_file);
+    (void)sys_unlink(tmp_file);
+    (void)sys_unlink(run_file);
+    (void)sys_unlink(moved_file);
+
+    int fd1 = open(root_file, TSK_O_WRONLY | TSK_O_CREAT | TSK_O_TRUNC);
+    int fd2 = open(tmp_file, TSK_O_WRONLY | TSK_O_CREAT | TSK_O_TRUNC);
+    int fd3 = open(run_file, TSK_O_WRONLY | TSK_O_CREAT | TSK_O_TRUNC);
+    if (fd1 < 0 || fd2 < 0 || fd3 < 0) {
+        if (fd1 >= 0) close(fd1);
+        if (fd2 >= 0) close(fd2);
+        if (fd3 >= 0) close(fd3);
+        dprintf(1, "[TEST] tmpfs_isolation FAIL: open failed (%d %d %d)\n", fd1, fd2, fd3);
+        return;
+    }
+
+    (void)write(fd1, "ROOT", 4);
+    (void)write(fd2, "TMP!", 4);
+    (void)write(fd3, "RUN!", 4);
+    close(fd1);
+    close(fd2);
+    close(fd3);
+
+    /* Ensure instances do not alias each other */
+    if (sys_stat("/tmp/root_iso_probe.txt", &st) == 0 ||
+        sys_stat("/tmp_iso_probe.txt", &st) == 0 ||
+        sys_stat("/var/run/tmp_iso_probe.txt", &st) == 0 ||
+        sys_stat("/tmp/run_iso_probe.txt", &st) == 0) {
+        (void)sys_unlink(root_file);
+        (void)sys_unlink(tmp_file);
+        (void)sys_unlink(run_file);
+        dprintf(1, "[TEST] tmpfs_isolation FAIL: cross-mount aliasing detected\n");
+        return;
+    }
+
+    /* Verify rename + truncate within /tmp */
+    if (sys_rename(tmp_file, moved_file) != 0 ||
+        sys_stat(tmp_file, &st) == 0 ||
+        sys_stat(moved_file, &st) != 0 || st.size != 4) {
+        (void)sys_unlink(root_file);
+        (void)sys_unlink(tmp_file);
+        (void)sys_unlink(moved_file);
+        (void)sys_unlink(run_file);
+        dprintf(1, "[TEST] tmpfs_isolation FAIL: rename check failed\n");
+        return;
+    }
+
+    int fd_tr = open(moved_file, TSK_O_WRONLY | TSK_O_TRUNC);
+    if (fd_tr < 0) {
+        (void)sys_unlink(root_file);
+        (void)sys_unlink(moved_file);
+        (void)sys_unlink(run_file);
+        dprintf(1, "[TEST] tmpfs_isolation FAIL: truncate reopen failed\n");
+        return;
+    }
+    close(fd_tr);
+
+    int ok_trunc = (sys_stat(moved_file, &st) == 0 && st.size == 0);
+    (void)sys_unlink(root_file);
+    (void)sys_unlink(moved_file);
+    (void)sys_unlink(run_file);
+
+    if (!ok_trunc) {
+        dprintf(1, "[TEST] tmpfs_isolation FAIL: O_TRUNC did not zero size\n");
+        return;
+    }
+
+    dprintf(1, "[TEST] tmpfs_isolation PASS\n");
+}
+
 static void run_kernel_regression_tests(void)
 {
     test_spawn_argv();
@@ -679,6 +803,8 @@ static void run_kernel_regression_tests(void)
     test_munmap_safety();
     test_urandom_entropy();
     test_vfs_tmp_crud();
+    test_initrd_rootfs_layout();
+    test_tmpfs_isolation();
     test_tsh_pipeline();
     test_ring3_fault_isolation();
     test_yield_no_tick_forge();
@@ -689,10 +815,10 @@ static void run_kernel_regression_tests(void)
 static int is_vanilla_test(const char *bin_path)
 {
     const char * const targets[] = {
-        "/fat12/TESTIPC.ELF",
-        "/fat12/TESTCOMP.ELF",
-        "/fat12/TESTTYPO.ELF",
-        "/fat12/TSHELL.ELF",
+        "/bin/TESTIPC.ELF",
+        "/bin/TESTCOMP.ELF",
+        "/bin/TESTTYPO.ELF",
+        "/bin/TSHELL.ELF",
         0
     };
 
@@ -710,15 +836,15 @@ static int is_vanilla_test(const char *bin_path)
 }
 
 static const char * const g_test_binaries[] = {
-    "/fat12/TCRT0.ELF",
-    "/fat12/TSYSC.ELF",
-    "/fat12/TLIBC.ELF",
-    "/fat12/TMATH.ELF",
-    "/fat12/TSTDIO.ELF",
-    "/fat12/TESTIPC.ELF",
-    "/fat12/TESTCOMP.ELF",
-    "/fat12/TESTTYPO.ELF",
-    "/fat12/TSHELL.ELF",
+    "/bin/TCRT0.ELF",
+    "/bin/TSYSC.ELF",
+    "/bin/TLIBC.ELF",
+    "/bin/TMATH.ELF",
+    "/bin/TSTDIO.ELF",
+    "/bin/TESTIPC.ELF",
+    "/bin/TESTCOMP.ELF",
+    "/bin/TESTTYPO.ELF",
+    "/bin/TSHELL.ELF",
     NULL
 };
 

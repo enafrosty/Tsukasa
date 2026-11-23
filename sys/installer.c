@@ -33,7 +33,7 @@
 static const char *const g_source_modules[] = {
     "/bootblob.bin",
     "/tsukasa_x64.elf",
-    "/initrd.img",
+    "/initrd.tar.lz4",
     "/limine-bios.sys",
 };
 
@@ -218,11 +218,11 @@ int installer_run(block_dev_t *bd, installer_progress_fn cb)
     report(cb, "copying kernel (tsukasa_x64.elf)", 65);
     if (install_file(vol, "/tsukasa_x64.elf", "tsukasa_x64.elf") != 0)
         return -1;
-    report(cb, "copying initrd.img", 80);
-    if (install_file(vol, "/initrd.img", "initrd.img") != 0)
+    report(cb, "copying initrd.tar.lz4", 80);
+    if (install_file(vol, "/initrd.tar.lz4", "initrd.tar.lz4") != 0)
         return -1;
 
-    /* 6 — boot config (mirrors the live limine.conf semantics; the installed system boots exactly like the ISO,... */
+    /* 6 - boot config (mirrors the live limine.conf semantics; the installed system boots exactly like the ISO) */
     report(cb, "writing limine.conf", 90);
     if (install_generated(vol, "/limine.conf",
                           "timeout: 2\n"
@@ -232,7 +232,7 @@ int installer_run(block_dev_t *bd, installer_progress_fn cb)
                           "    protocol: limine\n"
                           "    kernel_path: boot():/tsukasa_x64.elf\n"
                           "    cmdline: arch=x86_64 single_core=1\n"
-                          "    module_path: boot():/initrd.img\n") != 0)
+                          "    module_path: boot():/initrd.tar.lz4\n") != 0)
         return -1;
 
     report(cb, "syncing target disk", 95);

@@ -241,12 +241,12 @@ unsigned long long strtoull(const char *nptr, char **endptr, int base)
 }
 
 static char g_env_home[] = "/";
-static char g_env_path[] = "/bin:/fat12";
+static char g_env_path[] = "/bin:/usr/bin:/sbin";
 static char g_env_term[] = "xterm";
 
 static char *g_default_environ[] = {
     "HOME=/",
-    "PATH=/bin:/fat12",
+    "PATH=/bin:/usr/bin:/sbin",
     "TERM=xterm",
     NULL
 };

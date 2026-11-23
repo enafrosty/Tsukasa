@@ -158,17 +158,13 @@ static int resolve_service_path(const char *path, char *out, size_t out_sz)
         const char *name;
         const char *target;
     } s_fallbacks[] = {
-        { "/bin/registryd.elf", "/bin/REGISTRD.ELF" },
-        { "/fat12/registryd.elf", "/fat12/REGISTRD.ELF" },
-        { "registryd.elf", "/bin/REGISTRD.ELF" },
-        { "/bin/shell.elf", "/bin/SHELL.ELF" },
-        { "/fat12/shell.elf", "/fat12/SHELL.ELF" },
-        { "shell.elf", "/bin/SHELL.ELF" },
-        { "/bin/clipboardd.elf", "/bin/CLIPBD.ELF" },
-        { "/bin/clipbd.elf", "/bin/CLIPBD.ELF" },
-        { "/fat12/clipbd.elf", "/fat12/CLIPBD.ELF" },
-        { "/bin/notifyd.elf", "/bin/NOTIFYD.ELF" },
-        { "/fat12/notifyd.elf", "/fat12/NOTIFYD.ELF" },
+        { "/bin/registryd.elf", "/bin/registryd" },
+        { "registryd.elf", "/bin/registryd" },
+        { "/bin/shell.elf", "/bin/shell" },
+        { "shell.elf", "/bin/shell" },
+        { "/bin/clipboardd.elf", "/bin/clipboardd" },
+        { "/bin/clipbd.elf", "/bin/clipboardd" },
+        { "/bin/notifyd.elf", "/bin/notifyd" },
     };
 
     for (size_t i = 0; i < sizeof(s_fallbacks) / sizeof(s_fallbacks[0]); i++) {
@@ -180,18 +176,6 @@ static int resolve_service_path(const char *path, char *out, size_t out_sz)
                 out[out_sz - 1] = '\0';
                 return 0;
             }
-        }
-    }
-
-    if (strncmp(path, "/bin/", 5) == 0) {
-        char alt[SUPERVISOR_PATH_MAX];
-        snprintf(alt, sizeof(alt), "/fat12/%s", path + 5);
-        fd = open(alt, O_RDONLY);
-        if (fd >= 0) {
-            close(fd);
-            strncpy(out, alt, out_sz - 1);
-            out[out_sz - 1] = '\0';
-            return 0;
         }
     }
 
@@ -209,18 +193,6 @@ static int resolve_service_path(const char *path, char *out, size_t out_sz)
             strncpy(out, upath, out_sz - 1);
             out[out_sz - 1] = '\0';
             return 0;
-        }
-
-        if (strncmp(upath, "/BIN/", 5) == 0) {
-            char ufat[SUPERVISOR_PATH_MAX];
-            snprintf(ufat, sizeof(ufat), "/fat12/%s", upath + 5);
-            fd = open(ufat, O_RDONLY);
-            if (fd >= 0) {
-                close(fd);
-                strncpy(out, ufat, out_sz - 1);
-                out[out_sz - 1] = '\0';
-                return 0;
-            }
         }
     }
 
@@ -276,16 +248,7 @@ static int load_services(const char *specified_path)
     if (load_services_file("/etc/services.conf") >= 0)
         return g_service_count;
 
-    if (load_services_file("/SVCS.CFG") >= 0)
-        return g_service_count;
-
-    if (load_services_file("/fat12/SVCS.CFG") >= 0)
-        return g_service_count;
-
     if (load_services_file("/bin/SVCS.CFG") >= 0)
-        return g_service_count;
-
-    if (load_services_file("/fat12/services.conf") >= 0)
         return g_service_count;
 
     if (load_services_file("services.conf") >= 0)

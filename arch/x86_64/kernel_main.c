@@ -328,17 +328,13 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     vfs_stat_t st;
     if (test_mode) {
         kprintf("[boot:x64] automated test runner mode enabled\n");
-        if (vfs_stat("/fat12/TESTDRV.ELF", &st) == 0 && st.type != VFS_TYPE_DIR)
-            init_pid = elf64_spawn("/fat12/TESTDRV.ELF", "testdrv");
-        else if (vfs_stat("/bin/TESTDRV.ELF", &st) == 0 && st.type != VFS_TYPE_DIR)
+        if (vfs_stat("/bin/TESTDRV.ELF", &st) == 0 && st.type != VFS_TYPE_DIR)
             init_pid = elf64_spawn("/bin/TESTDRV.ELF", "testdrv");
-        else if (vfs_stat("/fat12/testdrv.elf", &st) == 0 && st.type != VFS_TYPE_DIR)
-            init_pid = elf64_spawn("/fat12/testdrv.elf", "testdrv");
         else if (vfs_stat("/bin/testdrv.elf", &st) == 0 && st.type != VFS_TYPE_DIR)
             init_pid = elf64_spawn("/bin/testdrv.elf", "testdrv");
 
         if (init_pid >= 0) {
-            kprintf("[boot:x64] /fat12/TESTDRV.ELF running (pid=%d)\n", init_pid);
+            kprintf("[boot:x64] /bin/TESTDRV.ELF running (pid=%d)\n", init_pid);
         } else {
             kprintf("[boot:x64] WARN: failed to spawn TESTDRV.ELF\n");
         }

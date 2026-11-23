@@ -449,9 +449,8 @@ static void fm_go_up(filemgr_state_t *st)
 static pid_t fm_spawn_notepad_file(const char *filepath)
 {
     static const char *notepad_bins[] = {
+        "/bin/notepad",
         "/bin/notepad.elf",
-        "/fat12/NOTEPAD.ELF",
-        "/NOTEPAD.ELF",
         "/bin/NOTEPAD.ELF",
         NULL
     };
@@ -499,7 +498,7 @@ static void fm_open_entry(filemgr_state_t *st, int idx)
         return;
     }
 
-    if (strncmp(st->cwd, "/bin", 4) == 0 || strncmp(st->cwd, "/fat12", 6) == 0) {
+    if (strncmp(st->cwd, "/bin", 4) == 0 || strncmp(st->cwd, "/usr/bin", 8) == 0) {
         char *argv[] = { full, NULL };
         pid_t pid = spawn(full, argv, NULL);
         if (pid > 0) {

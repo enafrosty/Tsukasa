@@ -69,13 +69,11 @@ static int init_main(int argc, char **argv)
     shell_run_rc_file("/tmp/.tsukasarc", 1, 2);
 
     /* Spawn Vanilla service supervisor */
-    int sup_pid = spawn("/fat12/SUPERVSD.ELF");
+    int sup_pid = spawn("/bin/supervisord");
     if (sup_pid <= 0)
         sup_pid = spawn("/bin/SUPERVSD.ELF");
     if (sup_pid <= 0)
         sup_pid = spawn("/bin/supervsd.elf");
-    if (sup_pid <= 0)
-        sup_pid = spawn("/fat12/supervsd.elf");
 
     if (sup_pid > 0) {
         dprintf(1, "[init] spawned Vanilla service supervisor (pid=%d)\n", sup_pid);
@@ -83,13 +81,11 @@ static int init_main(int argc, char **argv)
         nanosleep(&ts_sup, NULL);
     } else {
         /* Fallback: Spawn Vanilla service registry daemon directly if supervisor is unavailable */
-        int reg_pid = spawn("/fat12/REGISTRD.ELF");
+        int reg_pid = spawn("/bin/registryd");
         if (reg_pid <= 0)
             reg_pid = spawn("/bin/REGISTRD.ELF");
         if (reg_pid <= 0)
             reg_pid = spawn("/bin/registryd.elf");
-        if (reg_pid <= 0)
-            reg_pid = spawn("/fat12/registryd.elf");
 
         if (reg_pid > 0) {
             dprintf(1, "[init] spawned Service Registry (pid=%d)\n", reg_pid);
@@ -99,13 +95,11 @@ static int init_main(int argc, char **argv)
     }
 
     /* Spawn Project Vanilla display server */
-    int vsrv_pid = spawn("/bin/vsrv.elf");
+    int vsrv_pid = spawn("/bin/vsrv");
     if (vsrv_pid <= 0)
-        vsrv_pid = spawn("/fat12/vsrv.elf");
+        vsrv_pid = spawn("/bin/vsrv.elf");
     if (vsrv_pid <= 0)
         vsrv_pid = spawn("/bin/VSRV.ELF");
-    if (vsrv_pid <= 0)
-        vsrv_pid = spawn("/fat12/VSRV.ELF");
 
     if (vsrv_pid > 0)
         dprintf(1, "[init] spawned Vanilla display server (pid=%d)\n", vsrv_pid);
@@ -118,13 +112,11 @@ static int init_main(int argc, char **argv)
 
     int shell_pid = 0;
     if (sup_pid <= 0) {
-        shell_pid = spawn("/bin/shell.elf");
+        shell_pid = spawn("/bin/shell");
         if (shell_pid <= 0)
-            shell_pid = spawn("/fat12/shell.elf");
+            shell_pid = spawn("/bin/shell.elf");
         if (shell_pid <= 0)
             shell_pid = spawn("/bin/SHELL.ELF");
-        if (shell_pid <= 0)
-            shell_pid = spawn("/fat12/SHELL.ELF");
         if (shell_pid > 0)
             dprintf(1, "[init] spawned Vanilla desktop shell (pid=%d)\n", shell_pid);
     }
@@ -133,9 +125,9 @@ static int init_main(int argc, char **argv)
     ts_init.tv_nsec = 50000000;
     nanosleep(&ts_init, NULL);
 
-    int fm_pid = spawn("/bin/filemgr.elf");
+    int fm_pid = spawn("/bin/filemgr");
     if (fm_pid <= 0)
-        fm_pid = spawn("/fat12/filemgr.elf");
+        fm_pid = spawn("/bin/filemgr.elf");
     if (fm_pid > 0)
         dprintf(1, "[init] spawned File Manager (pid=%d)\n", fm_pid);
 
@@ -143,9 +135,9 @@ static int init_main(int argc, char **argv)
     ts_init.tv_nsec = 50000000;
     nanosleep(&ts_init, NULL);
 
-    int tm_pid = spawn("/bin/taskmgr.elf");
+    int tm_pid = spawn("/bin/taskmgr");
     if (tm_pid <= 0)
-        tm_pid = spawn("/fat12/taskmgr.elf");
+        tm_pid = spawn("/bin/taskmgr.elf");
     if (tm_pid > 0)
         dprintf(1, "[init] spawned Task Manager (pid=%d)\n", tm_pid);
 
@@ -153,9 +145,9 @@ static int init_main(int argc, char **argv)
     ts_init.tv_nsec = 50000000;
     nanosleep(&ts_init, NULL);
 
-    int term_pid = spawn("/bin/terminal.elf");
+    int term_pid = spawn("/bin/terminal");
     if (term_pid <= 0)
-        term_pid = spawn("/fat12/terminal.elf");
+        term_pid = spawn("/bin/terminal.elf");
     if (term_pid > 0)
         dprintf(1, "[init] spawned Terminal (pid=%d)\n", term_pid);
 

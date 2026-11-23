@@ -330,6 +330,10 @@ static FILE *try_open_cursor_file(const char *assets_dir, const char *name)
     f = fopen(path, "rb");
     if (f) return f;
 
+    snprintf(path, sizeof(path), "/usr/share/vanilla/cursors/%s.argb", name);
+    f = fopen(path, "rb");
+    if (f) return f;
+
     snprintf(path, sizeof(path), "/usr/share/cursors/%s.argb", name);
     f = fopen(path, "rb");
     if (f) return f;
