@@ -101,6 +101,7 @@ extern void isr_x64_64(void);
 extern void isr_x64_65(void);
 extern void isr_x64_128(void);
 extern void isr_x64_ignore(void);
+extern void (*const isr_x64_irq_table[])(void);
 
 static void (*const exception_stubs[32])(void) = {
     isr_x64_0, isr_x64_1, isr_x64_2, isr_x64_3,
@@ -332,6 +333,12 @@ void idt_init_x64(void)
     set_gate(45, isr_x64_45, 0x8Eu);
     set_gate(46, isr_x64_46, 0x8Eu);
     set_gate(47, isr_x64_47, 0x8Eu);
+    for (uint32_t vec = 48u; vec <= 254u; vec++) {
+        if (vec == IDT_VEC_YIELD || vec == 65u || vec == 128u)
+            continue;
+        if (isr_x64_irq_table[vec - 48u])
+            set_gate((uint8_t)vec, isr_x64_irq_table[vec - 48u], 0x8Eu);
+    }
     set_gate(IDT_VEC_YIELD, isr_x64_64, 0x8Eu);
     set_gate(65, isr_x64_65, 0x8Eu);
     set_gate(128, isr_x64_128, 0xEEu);

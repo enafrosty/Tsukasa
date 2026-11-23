@@ -27,16 +27,143 @@
 #include "../include/kprintf.h"
 #include "../include/lapic.h"
 #include "../include/smp.h"
+#include "../include/spinlock.h"
 #include "../proc/process.h"
 #include "ioapic.h"
 #endif
+
+#define IRQ_DYN_VEC_BASE 0x50u
+#define IRQ_DYN_VEC_END  0xEFu
+#define IRQ_SYSCALL_VEC  0x80u
 
 typedef struct irq_hook {
     irq_callback_t callback;
     void *ctx;
 } irq_hook_t;
 
+typedef struct irq_vec_hook {
+    irq_vector_callback_t callback;
+    void *ctx;
+} irq_vec_hook_t;
+
 static irq_hook_t g_irq_hooks[16];
+static irq_vec_hook_t g_vec_hooks[256];
+static uint64_t g_vec_bitmap[4];
+#ifdef __x86_64__
+static spinlock_t g_vec_lock = SPINLOCK_INIT;
+#endif
+
+static int irq_vec_is_reserved(uint32_t vec)
+{
+    return (vec < IRQ_DYN_VEC_BASE || vec > IRQ_DYN_VEC_END || vec == IRQ_SYSCALL_VEC);
+}
+
+static int irq_vec_bit_test(uint32_t vec)
+{
+    return (g_vec_bitmap[vec >> 6] & (1ULL << (vec & 63u))) != 0ULL;
+}
+
+static void irq_vec_bit_set(uint32_t vec)
+{
+    g_vec_bitmap[vec >> 6] |= (1ULL << (vec & 63u));
+}
+
+static void irq_vec_bit_clear(uint32_t vec)
+{
+    g_vec_bitmap[vec >> 6] &= ~(1ULL << (vec & 63u));
+}
+
+static int irq_vec_is_valid_handler_slot(uint8_t vec)
+{
+    return (vec >= 48u && vec != 64u && vec != 65u && vec != 128u && vec != 255u);
+}
+
+int irq_alloc_vectors(int count)
+{
+    if (count <= 0 || count > 32 || (count & (count - 1)) != 0)
+        return -1;
+
+#ifdef __x86_64__
+    unsigned long flags = spin_lock_irqsave(&g_vec_lock);
+#endif
+    uint32_t align = (uint32_t)count;
+    uint32_t base = (IRQ_DYN_VEC_BASE + align - 1u) & ~(align - 1u);
+    int found = -1;
+
+    for (; base + align - 1u <= IRQ_DYN_VEC_END; base += align) {
+        int ok = 1;
+        for (uint32_t i = 0; i < align; i++) {
+            uint32_t v = base + i;
+            if (irq_vec_is_reserved(v) || irq_vec_bit_test(v)) {
+                ok = 0;
+                break;
+            }
+        }
+        if (ok) {
+            for (uint32_t i = 0; i < align; i++)
+                irq_vec_bit_set(base + i);
+            found = (int)base;
+            break;
+        }
+    }
+
+#ifdef __x86_64__
+    spin_unlock_irqrestore(&g_vec_lock, flags);
+#endif
+    return found;
+}
+
+int irq_alloc_vector(void)
+{
+    return irq_alloc_vectors(1);
+}
+
+void irq_free_vector(uint8_t vec)
+{
+    if (irq_vec_is_reserved(vec))
+        return;
+
+#ifdef __x86_64__
+    unsigned long flags = spin_lock_irqsave(&g_vec_lock);
+#endif
+    irq_vec_bit_clear(vec);
+    g_vec_hooks[vec].callback = NULL;
+    g_vec_hooks[vec].ctx = NULL;
+#ifdef __x86_64__
+    spin_unlock_irqrestore(&g_vec_lock, flags);
+#endif
+}
+
+int irq_register_vector_handler(uint8_t vec, irq_vector_callback_t cb, void *ctx)
+{
+    if (!cb || !irq_vec_is_valid_handler_slot(vec))
+        return -1;
+
+#ifdef __x86_64__
+    unsigned long flags = spin_lock_irqsave(&g_vec_lock);
+#endif
+    g_vec_hooks[vec].callback = cb;
+    g_vec_hooks[vec].ctx = ctx;
+#ifdef __x86_64__
+    spin_unlock_irqrestore(&g_vec_lock, flags);
+#endif
+    return 0;
+}
+
+void irq_unregister_vector_handler(uint8_t vec)
+{
+    if (!irq_vec_is_valid_handler_slot(vec))
+        return;
+
+#ifdef __x86_64__
+    unsigned long flags = spin_lock_irqsave(&g_vec_lock);
+#endif
+    g_vec_hooks[vec].callback = NULL;
+    g_vec_hooks[vec].ctx = NULL;
+#ifdef __x86_64__
+    spin_unlock_irqrestore(&g_vec_lock, flags);
+#endif
+}
 
 int irq_register_handler(uint8_t irq, irq_callback_t callback, void *ctx)
 {
@@ -194,8 +321,23 @@ uint64_t irq_handler_x64(unsigned int vector, uint64_t context_rsp)
         return context_rsp;
     }
 
-    if (vector >= 32 && vector < 48)
+    if (vector >= 32 && vector < 48) {
         irq_ack(vector - 32);
+        return context_rsp;
+    }
+
+    if (vector >= 48 && vector < 255) {
+        irq_vector_callback_t cb;
+        void *ctx;
+        unsigned long flags = spin_lock_irqsave(&g_vec_lock);
+        cb = g_vec_hooks[vector].callback;
+        ctx = g_vec_hooks[vector].ctx;
+        spin_unlock_irqrestore(&g_vec_lock, flags);
+        if (cb)
+            cb((uint8_t)vector, ctx);
+        lapic_eoi();
+        return context_rsp;
+    }
 
     return context_rsp;
 }

@@ -33,6 +33,8 @@
 
 #include "drv/serial.h"
 #include "drv/fb.h"
+#include "drv/acpi.h"
+#include "drv/ioapic.h"
 #include "drv/pic.h"
 #include "drv/pit.h"
 #include "drv/rtc.h"
@@ -280,6 +282,8 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     kprintf("[boot:x64] GDT/IDT ready\n");
     kprintf("[boot:x64] SMP online CPUs=%u\n", online_cpus);
 
+    acpi_init(boot_info);
+
     if (fb_init(boot_info) == 0 && fb_info.addr && fb_info.bpp == 32) {
         uintptr_t fb_mapped = 0;
         size_t fb_size = (size_t)fb_info.pitch * (size_t)fb_info.height;
@@ -307,6 +311,7 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     rtc_init();
 
     pic_init();
+    ioapic_init();
     pit_init(100);
     pci_init();
     network_init();

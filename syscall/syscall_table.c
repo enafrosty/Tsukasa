@@ -29,8 +29,11 @@
 #include "../sys/futex.h"
 #include "../sys/panic.h"
 #include "../drv/acpi.h"
+#include "../drv/ioapic.h"
+#include "../drv/irq.h"
 #include "../drv/pit.h"
 #include "../drv/fb.h"
+#include "../dev/pci.h"
 #include "../include/kutils.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
@@ -921,6 +924,12 @@ void syscall_gate_x64(interrupt_frame_t *f)
 
 #include "../loader/elf64.h"
 
+static void selftest_dummy_irq_cb(uint8_t vec, void *ctx)
+{
+    (void)vec;
+    (void)ctx;
+}
+
 static int is_wc_leaf_pte(uint64_t fl, size_t page_size)
 {
     if ((fl & VMM_X64_PTE_PRESENT) == 0)
@@ -1282,6 +1291,83 @@ static void c01_test_entry(void)
         else
             kprintf("[selftest] fb user wc FAIL flags=0x%08x%08x\n",
                     (uint32_t)(ufl >> 32), (uint32_t)ufl);
+    }
+
+    {
+        int ok = (acpi_available() == 1 && acpi_get_ioapic_count() >= 1);
+        kprintf("[selftest] acpi %s ioapics=%d mcfg=%d\n",
+                ok ? "PASS" : "FAIL", acpi_get_ioapic_count(), acpi_get_mcfg_count());
+    }
+
+    {
+        int ok = (ioapic_active() == 1);
+        kprintf("[selftest] ioapic %s active=%d\n", ok ? "PASS" : "FAIL", ioapic_active());
+    }
+
+    {
+        int v1 = irq_alloc_vector();
+        int v4 = irq_alloc_vectors(4);
+        int bad_cnt = irq_alloc_vectors(3);
+        int bad_sys = irq_register_vector_handler(0x80u, selftest_dummy_irq_cb, NULL);
+        int reg_ok = (v1 >= 0x50)
+            ? irq_register_vector_handler((uint8_t)v1, selftest_dummy_irq_cb, NULL)
+            : -1;
+        int ok = (v1 >= 0x50 && v1 <= 0xEF && v1 != 0x80 &&
+                  v4 >= 0x50 && v4 + 3 <= 0xEF && (v4 & 3) == 0 &&
+                  !(v4 <= 0x80 && v4 + 3 >= 0x80) &&
+                  bad_cnt == -1 && bad_sys == -1 && reg_ok == 0);
+        if (v1 >= 0) {
+            irq_unregister_vector_handler((uint8_t)v1);
+            irq_free_vector((uint8_t)v1);
+        }
+        if (v4 >= 0) {
+            for (int i = 0; i < 4; i++)
+                irq_free_vector((uint8_t)(v4 + i));
+        }
+        int v_reuse = irq_alloc_vector();
+        if (v_reuse != v1)
+            ok = 0;
+        if (v_reuse >= 0)
+            irq_free_vector((uint8_t)v_reuse);
+        kprintf("[selftest] irq alloc %s v1=0x%x v4=0x%x reuse=0x%x\n",
+                ok ? "PASS" : "FAIL", v1, v4, v_reuse);
+    }
+
+    {
+        int ndevs = pci_device_count();
+        int bars_found = 0;
+        int caps_found = 0;
+        int bad_bar = -1;
+        for (int i = 0; i < ndevs; i++) {
+            const pci_device_info_t *d = pci_device_at(i);
+            if (!d)
+                continue;
+            if (i == 0) {
+                uint64_t b = 0, s = 0;
+                int mm = 0;
+                bad_bar = pci_get_bar(d, -1, &b, &s, &mm);
+                if (bad_bar == 0)
+                    break;
+                bad_bar = pci_get_bar(d, 6, &b, &s, &mm);
+                if (bad_bar == 0)
+                    break;
+            }
+            for (int bar = 0; bar < 6; bar++) {
+                uint64_t base = 0, size = 0;
+                int is_mmio = 0;
+                if (pci_get_bar(d, bar, &base, &size, &is_mmio) == 0 && size > 0)
+                    bars_found++;
+            }
+            if (pci_find_capability(d, PCI_CAP_ID_MSI) ||
+                pci_find_capability(d, PCI_CAP_ID_MSIX) ||
+                pci_find_capability(d, 0x01u) ||
+                pci_find_capability(d, 0x10u)) {
+                caps_found++;
+            }
+        }
+        int ok = (ndevs > 0 && bars_found > 0 && bad_bar == -1);
+        kprintf("[selftest] pci cap/bar %s devs=%d bars=%d caps=%d ecam=%d\n",
+                ok ? "PASS" : "FAIL", ndevs, bars_found, caps_found, pci_ecam_active());
     }
 
     kprintf("[selftest] ALL DONE\n");

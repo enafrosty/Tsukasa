@@ -109,16 +109,16 @@ typedef struct acpi_fadt {
     uint8_t  fadt_minor_version;
     uint64_t x_firmware_ctrl;
     uint64_t x_dsdt;
-    uint8_t  x_pm1a_evt_blk[12];
-    uint8_t  x_pm1b_evt_blk[12];
-    uint8_t  x_pm1a_cnt_blk[12];
-    uint8_t  x_pm1b_cnt_blk[12];
-    uint8_t  x_pm2_cnt_blk[12];
-    uint8_t  x_pm_tmr_blk[12];
-    uint8_t  x_gpe0_blk[12];
-    uint8_t  x_gpe1_blk[12];
-    uint8_t  sleep_control_reg[12];
-    uint8_t  sleep_status_reg[12];
+    acpi_gas_t x_pm1a_evt_blk;
+    acpi_gas_t x_pm1b_evt_blk;
+    acpi_gas_t x_pm1a_cnt_blk;
+    acpi_gas_t x_pm1b_cnt_blk;
+    acpi_gas_t x_pm2_cnt_blk;
+    acpi_gas_t x_pm_tmr_blk;
+    acpi_gas_t x_gpe0_blk;
+    acpi_gas_t x_gpe1_blk;
+    acpi_gas_t sleep_control_reg;
+    acpi_gas_t sleep_status_reg;
     uint64_t hypervisor_vendor_identity;
 } __attribute__((packed)) acpi_fadt_t;
 
@@ -161,16 +161,32 @@ struct madt_iso {
     uint16_t flags;
 } __attribute__((packed));
 
+/* PCI Express Memory Mapped Configuration Space (MCFG) table. */
+struct acpi_mcfg_entry {
+    uint64_t base_addr;
+    uint16_t seg_group;
+    uint8_t  start_bus;
+    uint8_t  end_bus;
+    uint32_t reserved;
+} __attribute__((packed));
+
+struct acpi_mcfg {
+    struct acpi_sdt header;
+    uint64_t reserved;
+    struct acpi_mcfg_entry entries[];
+} __attribute__((packed));
+
 /* PM1 control register bits (spec §4.8.3.2.1). */
 #define ACPI_PM1_SCI_EN (1u << 0)
 #define ACPI_PM1_SLP_EN (1u << 13)
 
 #define ACPI_MAX_IOAPIC 8
 #define ACPI_MAX_ISO    16
+#define ACPI_MAX_MCFG   16
 
 struct tsukasa_boot_info;
 
-/* Parse RSDP -> XSDT/RSDT -> FADT/MADT, ACPI-enable the machine, capture the _S5_ sleep type. */
+/* Parse RSDP -> XSDT/RSDT -> FADT/MADT/MCFG, ACPI-enable the machine, capture the _S5_ sleep type. */
 int acpi_init(const struct tsukasa_boot_info *boot_info);
 
 /* 1 when acpi_init() completed and tables are usable. */
@@ -182,6 +198,10 @@ uint64_t acpi_get_lapic_base(void);
 int acpi_get_ioapic_count(void);
 int acpi_get_ioapic_info(int idx, uint8_t *id_out, uint32_t *addr_out,
                          uint32_t *gsi_base_out);
+
+int acpi_get_mcfg_count(void);
+int acpi_get_mcfg_info(int idx, uint64_t *base, uint16_t *seg,
+                       uint8_t *start_bus, uint8_t *end_bus);
 
 /* ISA IRQ -> GSI (identity when no override exists) and its MPS INTI flags. */
 uint32_t acpi_irq_to_gsi(uint32_t irq);
