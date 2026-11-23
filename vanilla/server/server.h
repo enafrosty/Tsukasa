@@ -63,7 +63,7 @@ typedef struct {
 #define O_NONBLOCK 0x4000
 #endif
 int sched_yield(void);
-#elif defined(__linux__)
+#elif defined(__linux__) && defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 1)
 #include <sched.h>
 #endif
 

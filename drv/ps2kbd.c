@@ -18,19 +18,10 @@
 #include "pic.h"
 #include "irq.h"
 #include "input_dev.h"
-#include "../input/event.h"
 #include "../include/vfs_abi.h"
 #ifdef __x86_64__
 #include "../tty/tty.h"
 #endif
-
-/* Scan code to ASCII (make codes, set 1). High bit = release. */
-static const unsigned char scan_to_key[] = {
-    0, 0x1B, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
-    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', 0,
-    'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '\\',
-    'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' ',
-};
 
 /* Standard Linux evdev keycode table for PS/2 set 1 */
 static const uint16_t ps2_set1_to_linux[89] = {
@@ -135,12 +126,9 @@ static uint8_t g_ext_prefix;
 void ps2kbd_handler(void)
 {
     unsigned char sc = inb(PS2_DATA);
-    unsigned char key = 0;
     int press;
     unsigned int code;
-    uint32_t keycode;
     uint16_t linux_key;
-    struct gui_event e;
 
     if (sc == 0xE0) {
         g_ext_prefix = 1;
@@ -170,31 +158,10 @@ void ps2kbd_handler(void)
         input_dev_push(EV_SYN, SYN_REPORT, 0);
     }
 
-    if (g_ext_prefix && code == 0x37) {
-        keycode = INPUT_KEY_PRINTSCREEN;
-    } else {
-        if (code < sizeof(scan_to_key) / sizeof(scan_to_key[0]))
-            key = scan_to_key[code];
-        keycode = key ? (uint32_t)key : (uint32_t)(g_ext_prefix ? (0xE000u | code) : code);
-    }
-
-    e.event_id = press ? INPUT_EVENT_KEY : INPUT_EVENT_KEYUP;
-    e.type = EVENT_KEY;
-    e.subtype = press ? KEY_PRESS : KEY_RELEASE;
-    e.keycode = keycode;
-    e.x = 0;
-    e.y = 0;
-    e.wheel_delta = 0;
-    e.width = 0;
-    e.height = 0;
-    e.modifiers = 0;
-    e.window_id = -1;
-
 #ifdef __x86_64__
     if (!g_ext_prefix)
         tty_handle_scancode((uint8_t)code, press);
 #endif
-    event_enqueue(&e);
     g_ext_prefix = 0;
     irq_ack(1);
 }

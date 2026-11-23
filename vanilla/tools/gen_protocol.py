@@ -139,7 +139,7 @@ def main():
     p = argparse.ArgumentParser(description="Vanilla Protocol Code Generator")
     p.add_argument("--yaml-dir", default="protocol")
     p.add_argument("--out-header", default="include/protocol_generated.h")
-    p.add_argument("--out-doc", default="../docs/agent/phase-2-protocol-motion/wire-format.md")
+    p.add_argument("--out-doc", default=None)
     p.add_argument("--version", type=int, default=2)
     p.add_argument("--print-structs", action="store_true")
     args = p.parse_args()
@@ -155,8 +155,9 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out_header)), exist_ok=True)
     with open(args.out_header, "w", encoding="utf-8") as f: f.write(emit_header(msgs))
-    os.makedirs(os.path.dirname(os.path.abspath(args.out_doc)), exist_ok=True)
-    with open(args.out_doc, "w", encoding="utf-8") as f: f.write(emit_doc(msgs))
+    if args.out_doc:
+        os.makedirs(os.path.dirname(os.path.abspath(args.out_doc)), exist_ok=True)
+        with open(args.out_doc, "w", encoding="utf-8") as f: f.write(emit_doc(msgs))
 
 if __name__ == "__main__":
     main()

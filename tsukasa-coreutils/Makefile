@@ -25,7 +25,7 @@ LD = ld
 endif
 
 CFLAGS = -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
-         -fno-pie -fstack-protector-strong -O2 \
+         -fno-pie -fstack-protector-strong -mstack-protector-guard=global -O2 \
          -I../tsukasa-libc/include
 
 LDFLAGS = -m elf_x86_64 -T ../tsukasa-libc/tsukasa_app.ld -nostdlib
@@ -34,7 +34,7 @@ CRT0   = ../tsukasa-libc/crt/crt0.o
 LIBC_A = ../tsukasa-libc/lib/libc.a
 
 $(CRT0) $(LIBC_A):
-	$(MAKE) -C ../tsukasa-libc all
+	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C ../tsukasa-libc all
 
 TSH_OBJS = src/tsh/main.o \
            src/tsh/line_editor.o \

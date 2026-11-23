@@ -25,7 +25,7 @@
 #define TEST_ASSERT(cond, msg) \
     do { \
         if (!(cond)) { \
-            printf("[FAIL] %s:%d: %s\n", __FILE__, __LINE__, (msg)); \
+            printf("[TEST] ui.assert FAIL: %s:%d: %s\n", __FILE__, __LINE__, (msg)); \
             return -1; \
         } \
     } while (0)

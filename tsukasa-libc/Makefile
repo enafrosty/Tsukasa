@@ -28,7 +28,7 @@ ASM ?= nasm
 AR ?= ar
 
 CFLAGS_BASE = -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
-              -fno-pie -fstack-protector-strong -O2 -Iinclude
+              -fno-pie -fstack-protector-strong -mstack-protector-guard=global -O2 -Iinclude
 
 CFLAGS      = $(CFLAGS_BASE) -mno-mmx -mno-sse -mno-sse2
 MATH_CFLAGS = $(CFLAGS_BASE)

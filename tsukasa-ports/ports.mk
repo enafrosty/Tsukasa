@@ -42,4 +42,4 @@ LIBC_A = $(TOP)/tsukasa-libc/lib/libc.a
 LIBM_A = $(TOP)/tsukasa-libc/lib/libm.a
 
 $(CRT0) $(LIBC_A) $(LIBM_A):
-	$(MAKE) -C $(TOP)/tsukasa-libc all
+	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C $(TOP)/tsukasa-libc all

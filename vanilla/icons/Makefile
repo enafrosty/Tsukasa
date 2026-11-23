@@ -27,7 +27,7 @@ AR = ar
 endif
 
 CFLAGS = -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
-         -fno-pie -fstack-protector-strong -O2 \
+         -fno-pie -fstack-protector-strong -mstack-protector-guard=global -O2 \
          -I../../tsukasa-libc/include -I../include -I.
 
 OBJS = icon.o

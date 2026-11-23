@@ -21,10 +21,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #pragma clang diagnostic ignored "-Wsign-compare"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_STATIC
@@ -40,7 +47,11 @@
 
 #include "../include/stb_image.h"
 
+#if defined(__clang__)
 #pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 int image_load_memory(vanilla_image_t *img, const void *data, size_t len)
 {

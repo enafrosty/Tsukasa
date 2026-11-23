@@ -39,7 +39,6 @@
 #include "drv/ps2mouse.h"
 
 #include "dev/pci.h"
-#include "input/event.h"
 #include "fs/vfs.h"
 #include "ipc/unix_socket.h"
 #include "net/network.h"
@@ -307,7 +306,6 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
 
     rtc_init();
 
-    event_init();
     pic_init();
     pit_init(100);
     pci_init();

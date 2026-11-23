@@ -606,11 +606,11 @@ int statusbar_handle_menu_click(statusbar_state_t *sb, int32_t cx, int32_t cy, s
             if (item->action == SYS_MENU_ACTION_SPAWN && item->path) {
                 shell_spawn_app(item->path);
             } else if (item->action == SYS_MENU_ACTION_REBOOT) {
-#if !defined(_WIN32) && !defined(__linux__) && !defined(TEST_SHELL_RUNNER)
+#if !defined(_WIN32) && !(defined(__linux__) && defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 1)) && !defined(TEST_SHELL_RUNNER)
                 reboot(0x01234567);
 #endif
             } else if (item->action == SYS_MENU_ACTION_POWEROFF) {
-#if !defined(_WIN32) && !defined(__linux__) && !defined(TEST_SHELL_RUNNER)
+#if !defined(_WIN32) && !(defined(__linux__) && defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 1)) && !defined(TEST_SHELL_RUNNER)
                 reboot(0x4321fedc);
 #endif
             }

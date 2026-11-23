@@ -223,8 +223,6 @@ int main(int argc, char *argv[])
     printf("[Host Emulator] Prototyping controls:\n");
     printf("  - Mouse: Left click to focus/drag windows, use titlebar [X] [] [_]\n");
     printf("  - Snapping: Drag window to top to maximize, drag to left/right for 50%% split\n");
-    printf("  - Taskbar: Click Start for launcher, click window pills to minimize/restore\n");
-    printf("  - Hotkey: Press Alt + Space to open Quick Launcher and search apps\n");
     fflush(stdout);
 
     /* Initial full-frame render */
