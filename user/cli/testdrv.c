@@ -125,6 +125,111 @@ static inline long sys_rename(const char *oldpath, const char *newpath)
     return ret;
 }
 
+static inline long sys_lstat(const char *path, void *st)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(6L), "D"((long)(uintptr_t)path), "S"((long)(uintptr_t)st), "d"(0L)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long sys_truncate(const char *path, long length)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(76L), "D"((long)(uintptr_t)path), "S"(length)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long sys_ftruncate(int fd, long length)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(77L), "D"((long)fd), "S"(length)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long sys_symlink(const char *target, const char *linkpath)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(88L), "D"((long)(uintptr_t)target), "S"((long)(uintptr_t)linkpath)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long sys_readlink(const char *path, char *buf, long bufsiz)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(89L), "D"((long)(uintptr_t)path), "S"((long)(uintptr_t)buf), "d"(bufsiz)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long sys_chmod(const char *path, long mode)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(90L), "D"((long)(uintptr_t)path), "S"(mode)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long sys_chown(const char *path, long uid, long gid)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(92L), "D"((long)(uintptr_t)path), "S"(uid), "d"(gid)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long sys_mount(const char *source, const char *target,
+                             const char *fstype, unsigned long flags)
+{
+    register long r10 __asm__("r10") = (long)flags;
+    register long r8  __asm__("r8")  = 0;
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(165L), "D"((long)(uintptr_t)source),
+                        "S"((long)(uintptr_t)target),
+                        "d"((long)(uintptr_t)fstype), "r"(r10), "r"(r8)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long sys_umount2(const char *target, int flags)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(166L), "D"((long)(uintptr_t)target), "S"((long)flags)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long sys_getdents64(int fd, void *dirp, long count)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(217L), "D"((long)fd), "S"((long)(uintptr_t)dirp), "d"(count)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
 static inline long sys_nanosleep(long ms)
 {
     long ret;
@@ -809,6 +914,385 @@ static void test_tmpfs_isolation(void)
     dprintf(1, "[TEST] tmpfs_isolation PASS\n");
 }
 
+static uint8_t g_fs_io_buf[32768];
+
+static int str_eq_local(const char *a, const char *b)
+{
+    while (*a && *b && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static int verify_big_file(const char *path, size_t expected_min_bytes)
+{
+    int fd = open(path, TSK_O_RDONLY);
+    if (fd < 0)
+        return -1;
+    size_t total = 0;
+    for (;;) {
+        long r = read(fd, g_fs_io_buf, sizeof(g_fs_io_buf));
+        if (r < 0) {
+            close(fd);
+            return -2;
+        }
+        if (r == 0)
+            break;
+        for (long j = 0; j < r; j++) {
+            size_t off = total + (size_t)j;
+            uint8_t exp = (uint8_t)(((off >> 12) * 37u + (off & 0xFFu) * 13u + 0x5Au) & 0xFFu);
+            if (g_fs_io_buf[j] != exp) {
+                close(fd);
+                return -3;
+            }
+        }
+        total += (size_t)r;
+    }
+    close(fd);
+    if (total < expected_min_bytes)
+        return -4;
+    return 0;
+}
+
+static int read_exact_small(const char *path, char *out, size_t cap, long *out_len)
+{
+    int fd = open(path, TSK_O_RDONLY);
+    if (fd < 0)
+        return -1;
+    long n = read(fd, out, cap - 1);
+    close(fd);
+    if (n < 0)
+        return -2;
+    out[n] = '\0';
+    if (out_len)
+        *out_len = n;
+    return 0;
+}
+
+static int check_dirent_present(const char *dir_path, const char *target_name)
+{
+    int fd = open(dir_path, TSK_O_RDONLY);
+    if (fd < 0)
+        return 0;
+    uint8_t dbuf[2048];
+    int found = 0;
+    for (;;) {
+        long n = sys_getdents64(fd, dbuf, sizeof(dbuf));
+        if (n <= 0)
+            break;
+        long pos = 0;
+        while (pos < n) {
+            struct linux_dirent64 *de = (struct linux_dirent64 *)(dbuf + pos);
+            if (de->d_reclen == 0)
+                break;
+            if (str_eq_local(de->d_name, target_name)) {
+                found = 1;
+                break;
+            }
+            pos += de->d_reclen;
+        }
+        if (found)
+            break;
+    }
+    close(fd);
+    return found;
+}
+
+static void test_mount_negative(void)
+{
+    struct test_vfs_stat st;
+    long r1 = sys_mount("/dev/no_such_blk", "/mnt", "ext4", 0);
+    long r2 = sys_mount("/dev/no_such_blk", "/bin/ls", "ext4", 0);
+    long r3 = sys_umount2("/no_such_mnt", 0);
+    if (r1 != -19 || r2 != -20 || r3 != -22) {
+        dprintf(1, "[TEST] mount_negative FAIL: r1=%ld r2=%ld r3=%ld\n", r1, r2, r3);
+        return;
+    }
+    if (sys_stat("/dev/hda", &st) == 0) {
+        long r4 = sys_mount("/dev/hda", "/mnt", "ext4", 0);
+        if (r4 != -22) {
+            dprintf(1, "[TEST] mount_negative FAIL: blank hda rc=%ld\n", r4);
+            return;
+        }
+    }
+    dprintf(1, "[TEST] mount_negative PASS\n");
+}
+
+static void test_ext4_fat32_images(void)
+{
+    struct test_vfs_stat st;
+    const char *ext4_dev = NULL;
+    const char *fat_dev = NULL;
+
+    if (sys_stat("/dev/vda", &st) == 0)
+        ext4_dev = "/dev/vda";
+    else if (sys_stat("/dev/sda", &st) == 0)
+        ext4_dev = "/dev/sda";
+
+    if (sys_stat("/dev/vdb", &st) == 0)
+        fat_dev = "/dev/vdb";
+    else if (sys_stat("/dev/sdb", &st) == 0)
+        fat_dev = "/dev/sdb";
+
+    if (!ext4_dev && !fat_dev)
+        return;
+
+    if (ext4_dev && !fat_dev) {
+        (void)sys_mkdir("/mnt/neg", 0755);
+        long mrc = sys_mount(ext4_dev, "/mnt/neg", "ext4", 0);
+        if (mrc == -22) {
+            dprintf(1, "[TEST] ext4_corrupt_sb_reject PASS rc=%ld\n", mrc);
+        } else {
+            if (mrc == 0)
+                (void)sys_umount2("/mnt/neg", 0);
+            dprintf(1, "[TEST] ext4_corrupt_sb_reject FAIL rc=%ld\n", mrc);
+        }
+        return;
+    }
+
+    if (!ext4_dev || !fat_dev) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: expected both ext4 and fat32 drives\n");
+        return;
+    }
+
+    (void)sys_umount2("/disk", 0);
+    (void)sys_mkdir("/mnt/e4", 0755);
+    (void)sys_mkdir("/mnt/fat", 0755);
+
+    long m_e4 = sys_mount(ext4_dev, "/mnt/e4", "ext4", 0);
+    if (m_e4 != 0) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: mount %s ext4 rc=%ld\n", ext4_dev, m_e4);
+        return;
+    }
+    long m_fat = sys_mount(fat_dev, "/mnt/fat", "fat32", 0);
+    if (m_fat != 0) {
+        (void)sys_umount2("/mnt/e4", 0);
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: mount %s fat32 rc=%ld\n", fat_dev, m_fat);
+        return;
+    }
+
+    /* 1. Verify ext4 pre-populated contents (>10 MiB file, nested file, symlink, getdents64). */
+    int v_big = verify_big_file("/mnt/e4/big.bin", 10u * 1024u * 1024u + 1u);
+    if (v_big != 0) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 big.bin verify=%d\n", v_big);
+        goto umount_fail;
+    }
+
+    char sbuf[128];
+    long slen = 0;
+    if (read_exact_small("/mnt/e4/a/b/c/hello.txt", sbuf, sizeof(sbuf), &slen) != 0 ||
+        !str_eq_local(sbuf, "hello from nested ext4\n")) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 nested hello.txt mismatch\n");
+        goto umount_fail;
+    }
+
+    if (sys_lstat("/mnt/e4/link_hello", &st) != 0 || st.type != 7) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 lstat symlink type=%u\n", st.type);
+        goto umount_fail;
+    }
+
+    long rl = sys_readlink("/mnt/e4/link_hello", sbuf, sizeof(sbuf) - 1);
+    if (rl <= 0) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 readlink rc=%ld\n", rl);
+        goto umount_fail;
+    }
+    sbuf[rl] = '\0';
+    if (!str_eq_local(sbuf, "a/b/c/hello.txt")) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 readlink target=%s\n", sbuf);
+        goto umount_fail;
+    }
+
+    if (read_exact_small("/mnt/e4/link_hello", sbuf, sizeof(sbuf), &slen) != 0 ||
+        !str_eq_local(sbuf, "hello from nested ext4\n")) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 follow symlink content mismatch\n");
+        goto umount_fail;
+    }
+
+    if (!check_dirent_present("/mnt/e4", "big.bin") ||
+        !check_dirent_present("/mnt/e4", "link_hello")) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 getdents64 missing entries\n");
+        goto umount_fail;
+    }
+
+    /* 2. ext4 R/W mutations: mkdir, create, append, truncate shrink, symlink, chmod/chown, rename, unlink, rmdir */
+    if (sys_mkdir("/mnt/e4/wdir", 0755) != 0 ||
+        sys_mkdir("/mnt/e4/wdir/sub", 0755) != 0 ||
+        sys_mkdir("/mnt/e4/wdir/tempdir", 0755) != 0) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 mkdir\n");
+        goto umount_fail;
+    }
+
+    int fd = open("/mnt/e4/wdir/sub/new.txt", TSK_O_WRONLY | TSK_O_CREAT | TSK_O_TRUNC);
+    if (fd < 0 || write(fd, "ABCD", 4) != 4) {
+        if (fd >= 0) close(fd);
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 create/write\n");
+        goto umount_fail;
+    }
+    close(fd);
+
+    fd = open("/mnt/e4/wdir/sub/new.txt", TSK_O_WRONLY | TSK_O_APPEND);
+    if (fd < 0 || write(fd, "EFGH", 4) != 4) {
+        if (fd >= 0) close(fd);
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 append\n");
+        goto umount_fail;
+    }
+    close(fd);
+
+    if (sys_truncate("/mnt/e4/wdir/sub/new.txt", 5) != 0 ||
+        sys_stat("/mnt/e4/wdir/sub/new.txt", &st) != 0 || st.size != 5 ||
+        read_exact_small("/mnt/e4/wdir/sub/new.txt", sbuf, sizeof(sbuf), &slen) != 0 ||
+        !str_eq_local(sbuf, "ABCDE")) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 truncate shrink\n");
+        goto umount_fail;
+    }
+
+    if (sys_chmod("/mnt/e4/wdir/sub/new.txt", 0640) != 0 ||
+        sys_chown("/mnt/e4/wdir/sub/new.txt", 1000, 1000) != 0 ||
+        sys_stat("/mnt/e4/wdir/sub/new.txt", &st) != 0 ||
+        (st.st_mode & 0777u) != 0640u || st.st_uid != 1000u || st.st_gid != 1000u) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 chmod/chown\n");
+        goto umount_fail;
+    }
+
+    if (sys_symlink("/mnt/e4/a/b/c/hello.txt", "/mnt/e4/wdir/abs_link") != 0 ||
+        sys_rename("/mnt/e4/wdir/sub/new.txt", "/mnt/e4/wdir/renamed.txt") != 0 ||
+        sys_stat("/mnt/e4/wdir/sub/new.txt", &st) == 0 ||
+        sys_stat("/mnt/e4/wdir/renamed.txt", &st) != 0 || st.size != 5) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 symlink/rename\n");
+        goto umount_fail;
+    }
+
+    fd = open("/mnt/e4/wdir/tmpdel.txt", TSK_O_WRONLY | TSK_O_CREAT | TSK_O_TRUNC);
+    if (fd < 0 || write(fd, "bye", 3) != 3) {
+        if (fd >= 0) close(fd);
+        goto umount_fail;
+    }
+    close(fd);
+    if (sys_unlink("/mnt/e4/wdir/tmpdel.txt") != 0 ||
+        sys_rmdir("/mnt/e4/wdir/tempdir") != 0 ||
+        sys_rmdir("/mnt/e4/wdir") == 0) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 unlink/rmdir\n");
+        goto umount_fail;
+    }
+
+    fd = open("/mnt/e4/wdir/ftrunc.bin", TSK_O_RDWR | TSK_O_CREAT | TSK_O_TRUNC);
+    if (fd < 0)
+        goto umount_fail;
+    for (int i = 0; i < 8192; i++)
+        g_fs_io_buf[i] = (uint8_t)(i & 0xFFu);
+    if (write(fd, g_fs_io_buf, 8192) != 8192 || sys_ftruncate(fd, 1234) != 0) {
+        close(fd);
+        goto umount_fail;
+    }
+    close(fd);
+    if (sys_stat("/mnt/e4/wdir/ftrunc.bin", &st) != 0 || st.size != 1234) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 ftruncate\n");
+        goto umount_fail;
+    }
+
+    /* 3. Verify FAT32 pre-populated contents (>10 MiB file, nested dir, mixed-case LFN). */
+    v_big = verify_big_file("/mnt/fat/BIGFILE.BIN", 10u * 1024u * 1024u + 1u);
+    if (v_big != 0) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: fat32 BIGFILE.BIN verify=%d\n", v_big);
+        goto umount_fail;
+    }
+
+    if (read_exact_small("/mnt/fat/dir1/dir2/nested.txt", sbuf, sizeof(sbuf), &slen) != 0 ||
+        !str_eq_local(sbuf, "hello from nested fat32\n")) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: fat32 nested.txt mismatch\n");
+        goto umount_fail;
+    }
+
+    if (read_exact_small("/mnt/fat/Long Mixed Case File.txt", sbuf, sizeof(sbuf), &slen) != 0 ||
+        !str_eq_local(sbuf, "mixed case LFN payload\n")) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: fat32 LFN read mismatch\n");
+        goto umount_fail;
+    }
+
+    if (!check_dirent_present("/mnt/fat", "BIGFILE.BIN") ||
+        !check_dirent_present("/mnt/fat", "Long Mixed Case File.txt")) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: fat32 getdents64 missing entries\n");
+        goto umount_fail;
+    }
+
+    /* 4. FAT32 R/W mutations: nested mkdir, nested LFN create+append, cluster-chain shrink, LFN rename, unlink, rmdir */
+    if (sys_mkdir("/mnt/fat/newdir", 0755) != 0 ||
+        sys_mkdir("/mnt/fat/newdir/nested_sub", 0755) != 0 ||
+        sys_mkdir("/mnt/fat/newdir/del_dir", 0755) != 0) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: fat32 mkdir\n");
+        goto umount_fail;
+    }
+
+    fd = open("/mnt/fat/newdir/nested_sub/Nested Mixed Case.txt",
+              TSK_O_WRONLY | TSK_O_CREAT | TSK_O_TRUNC);
+    if (fd < 0 || write(fd, "FAT1-", 5) != 5) {
+        if (fd >= 0) close(fd);
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: fat32 nested LFN create\n");
+        goto umount_fail;
+    }
+    close(fd);
+
+    fd = open("/mnt/fat/newdir/nested_sub/Nested Mixed Case.txt", TSK_O_WRONLY | TSK_O_APPEND);
+    if (fd < 0 || write(fd, "FAT2", 4) != 4) {
+        if (fd >= 0) close(fd);
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: fat32 nested LFN append\n");
+        goto umount_fail;
+    }
+    close(fd);
+
+    if (read_exact_small("/mnt/fat/newdir/nested_sub/Nested Mixed Case.txt",
+                         sbuf, sizeof(sbuf), &slen) != 0 ||
+        !str_eq_local(sbuf, "FAT1-FAT2")) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: fat32 nested LFN readback\n");
+        goto umount_fail;
+    }
+
+    fd = open("/mnt/fat/shrink.bin", TSK_O_WRONLY | TSK_O_CREAT | TSK_O_TRUNC);
+    if (fd < 0)
+        goto umount_fail;
+    for (int i = 0; i < 16384; i++)
+        g_fs_io_buf[i] = (uint8_t)((i * 7 + 3) & 0xFFu);
+    if (write(fd, g_fs_io_buf, 16384) != 16384) {
+        close(fd);
+        goto umount_fail;
+    }
+    close(fd);
+
+    if (sys_truncate("/mnt/fat/shrink.bin", 100) != 0 ||
+        sys_stat("/mnt/fat/shrink.bin", &st) != 0 || st.size != 100) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: fat32 truncate shrink\n");
+        goto umount_fail;
+    }
+
+    if (sys_rename("/mnt/fat/Long Mixed Case File.txt",
+                   "/mnt/fat/newdir/Renamed Mixed Case File.txt") != 0 ||
+        sys_stat("/mnt/fat/Long Mixed Case File.txt", &st) == 0 ||
+        sys_stat("/mnt/fat/newdir/Renamed Mixed Case File.txt", &st) != 0) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: fat32 LFN rename\n");
+        goto umount_fail;
+    }
+
+    if (sys_unlink("/mnt/fat/newdir/nested_sub/Nested Mixed Case.txt") != 0 ||
+        sys_rmdir("/mnt/fat/newdir/nested_sub") != 0 ||
+        sys_rmdir("/mnt/fat/newdir/del_dir") != 0) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: fat32 unlink/rmdir\n");
+        goto umount_fail;
+    }
+
+    if (sys_umount2("/mnt/e4", 0) != 0 || sys_umount2("/mnt/fat", 0) != 0) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: umount2 failed\n");
+        return;
+    }
+
+    dprintf(1, "[TEST] ext4_fat32_images PASS\n");
+    return;
+
+umount_fail:
+    (void)sys_umount2("/mnt/e4", 0);
+    (void)sys_umount2("/mnt/fat", 0);
+}
+
 static void run_kernel_regression_tests(void)
 {
     test_spawn_argv();
@@ -818,6 +1302,8 @@ static void run_kernel_regression_tests(void)
     test_vfs_tmp_crud();
     test_initrd_rootfs_layout();
     test_tmpfs_isolation();
+    test_mount_negative();
+    test_ext4_fat32_images();
     test_tsh_pipeline();
     test_ring3_fault_isolation();
     test_yield_no_tick_forge();

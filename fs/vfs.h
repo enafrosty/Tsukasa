@@ -74,7 +74,8 @@ typedef enum vfs_backend {
     VFS_BACKEND_DEVFS,
     VFS_BACKEND_PIPE,
     VFS_BACKEND_UNIXSOCK,
-    VFS_BACKEND_EPOLL
+    VFS_BACKEND_EPOLL,
+    VFS_BACKEND_EXT4
 } vfs_backend_t;
 
 typedef struct epoll_item {

@@ -44,7 +44,25 @@ COMMON_OBJS = vga.o \
     drv/serial.o drv/ata.o drv/blockdev.o drv/diskmgr.o drv/rtc.o \
     drv/input_dev.o \
     fs/vfs.o fs/devfs.o fs/initrd.o fs/fat32.o fs/mkfs_fat32.o fs/tmpfs.o fs/procfs.o fs/sysfs.o fs/bootfs.o \
-    fs/tar.o fs/tar_testdata.o \
+    fs/tar.o fs/tar_testdata.o fs/ext4fs.o \
+    fs/third_party/lwext4/src/ext4.o \
+    fs/third_party/lwext4/src/ext4_balloc.o \
+    fs/third_party/lwext4/src/ext4_bcache.o \
+    fs/third_party/lwext4/src/ext4_bitmap.o \
+    fs/third_party/lwext4/src/ext4_block_group.o \
+    fs/third_party/lwext4/src/ext4_blockdev.o \
+    fs/third_party/lwext4/src/ext4_crc32.o \
+    fs/third_party/lwext4/src/ext4_debug.o \
+    fs/third_party/lwext4/src/ext4_dir.o \
+    fs/third_party/lwext4/src/ext4_dir_idx.o \
+    fs/third_party/lwext4/src/ext4_extent.o \
+    fs/third_party/lwext4/src/ext4_fs.o \
+    fs/third_party/lwext4/src/ext4_hash.o \
+    fs/third_party/lwext4/src/ext4_ialloc.o \
+    fs/third_party/lwext4/src/ext4_inode.o \
+    fs/third_party/lwext4/src/ext4_journal.o \
+    fs/third_party/lwext4/src/ext4_super.o \
+    fs/third_party/lwext4/src/ext4_trans.o \
     loader/elf.o loader/exec.o loader/elf64.o \
     lib/kprintf.o lib/kutils.o lib/lz4.o lib/compiler_rt.o lib/ksymbols.o lib/backtrace.o lib/stack_chk.o \
     gfx/blit.o gfx/font.o gfx/font_8x8.o
@@ -121,6 +139,11 @@ ISO_TARGET = iso-x86_64
 all: $(KERNEL_BIN)
 
 iso: $(ISO_TARGET)
+
+LWEXT4_INCLUDES = -Ifs/third_party/lwext4/compat -Ifs/third_party/lwext4/include
+
+fs/third_party/lwext4/src/%.o: CFLAGS := $(LWEXT4_INCLUDES) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter -Wno-unused-but-set-variable
+fs/ext4fs.o: CFLAGS := $(LWEXT4_INCLUDES) $(CFLAGS)
 
 %.o: %.c
 	@mkdir -p $(dir $@)
