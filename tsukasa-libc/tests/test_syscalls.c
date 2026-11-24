@@ -174,7 +174,7 @@ static int real_main(int argc, char **argv, char **envp)
         return run_worker_mprotect_segv();
 
     int passed = 0;
-    int total = 21;
+    int total = 23;
 
     /* Test 1: Stack frame alignment (rsp % 16 == 8 on function entry). */
     if ((s_entry_rsp & 0xF) != 8) {
@@ -1156,6 +1156,105 @@ static int real_main(int argc, char **argv, char **envp)
             return 76;
         }
         TSK_TEST_PASS("syscalls", "sysfs_memory_breakdown");
+        passed++;
+    }
+
+    /* Test 22: Demand-paged file mmap (close(fd), MAP_PRIVATE COW, MAP_SHARED + msync). */
+    {
+        const char *mpath = "/tmp/libc_mmap.bin";
+        int fd = open(mpath, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        int ok = 1;
+        uint8_t seed[8192];
+        for (size_t i = 0; i < sizeof(seed); i++)
+            seed[i] = (uint8_t)((i * 29u + 7u) & 0xFFu);
+        if (fd < 0 || write(fd, seed, sizeof(seed)) != (ssize_t)sizeof(seed)) {
+            if (fd >= 0) close(fd);
+            ok = 0;
+        } else {
+            close(fd);
+        }
+
+        if (ok) {
+            fd = open(mpath, O_RDONLY);
+            volatile uint8_t *pm = (volatile uint8_t *)mmap(
+                NULL, sizeof(seed), PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+            if (fd >= 0)
+                close(fd);
+            if ((void *)pm == MAP_FAILED) {
+                ok = 0;
+            } else {
+                for (size_t i = 0; i < sizeof(seed); i++) {
+                    if (pm[i] != seed[i]) {
+                        ok = 0;
+                        break;
+                    }
+                }
+                pm[0] = 0x11u;
+                pm[4096] = 0x22u;
+                if (munmap((void *)(uintptr_t)pm, sizeof(seed)) != 0)
+                    ok = 0;
+            }
+        }
+
+        if (ok) {
+            fd = open(mpath, O_RDWR);
+            volatile uint8_t *sm = (volatile uint8_t *)mmap(
+                NULL, sizeof(seed), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (fd >= 0)
+                close(fd);
+            if ((void *)sm == MAP_FAILED) {
+                ok = 0;
+            } else {
+                if (sm[0] != seed[0] || sm[4096] != seed[4096])
+                    ok = 0;
+                sm[5] = 0x99u;
+                sm[4100] = 0x77u;
+                if (msync((void *)(uintptr_t)sm, sizeof(seed), MS_SYNC) != 0)
+                    ok = 0;
+                if (munmap((void *)(uintptr_t)sm, sizeof(seed)) != 0)
+                    ok = 0;
+            }
+        }
+
+        if (ok) {
+            uint8_t rb[8192];
+            fd = open(mpath, O_RDONLY);
+            if (fd < 0 || read(fd, rb, sizeof(rb)) != (ssize_t)sizeof(rb) ||
+                rb[5] != 0x99u || rb[4100] != 0x77u) {
+                ok = 0;
+            }
+            if (fd >= 0)
+                close(fd);
+        }
+        unlink(mpath);
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "file_mmap_cow_shared_msync", "file mmap/msync check failed");
+            return 77;
+        }
+        TSK_TEST_PASS("syscalls", "file_mmap_cow_shared_msync");
+        passed++;
+    }
+
+    /* Test 23: Negative mmap/msync errno validation. */
+    {
+        int ok = 1;
+        errno = 0;
+        if (msync((void *)0x80000123ULL, 4096, MS_SYNC) != -1 || errno != EINVAL)
+            ok = 0;
+        errno = 0;
+        if (msync((void *)0x80000000ULL, 4096, MS_ASYNC | MS_SYNC) != -1 || errno != EINVAL)
+            ok = 0;
+        errno = 0;
+        if (msync((void *)0x50000000ULL, 4096, MS_SYNC) != -1 || errno != ENOMEM)
+            ok = 0;
+        errno = 0;
+        if (mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 999, 0) != MAP_FAILED || errno != EBADF)
+            ok = 0;
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "mmap_msync_negative", "negative errno mismatch");
+            return 78;
+        }
+        TSK_TEST_PASS("syscalls", "mmap_msync_negative");
         passed++;
     }
 

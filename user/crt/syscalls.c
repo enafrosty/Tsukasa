@@ -148,9 +148,12 @@ long recvfrom(int fd, void *buf, size_t len, int flags,
 
 void *mmap(void *addr, unsigned long length, int prot, int flags, int fd, long offset)
 {
-    return (void *)(uintptr_t)tsk_syscall6(9, (long)(uintptr_t)addr,
-                                           (long)length, (long)prot,
-                                           (long)flags, (long)fd, offset);
+    long r = tsk_syscall6(9, (long)(uintptr_t)addr,
+                          (long)length, (long)prot,
+                          (long)flags, (long)fd, offset);
+    if (r < 0 && r >= -4095)
+        return (void *)-1;
+    return (void *)(uintptr_t)r;
 }
 
 int munmap(void *addr, unsigned long length)

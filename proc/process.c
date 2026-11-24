@@ -1373,7 +1373,38 @@ int process_waitpid(int caller_pid, int target_pid, int options, int *status_out
                     if (status_out)
                         *status_out = child->wait_status;
                     parent_unlink_child_locked(caller, child);
-                    reset_process_slot_locked(child);
+                    sleepq_remove_locked(child);
+                    child->state = PROCESS_DEAD;
+                    spin_unlock(&g_sched_lock);
+                    irq_restore(flags);
+
+                    /* Release VFS files, SHM, and VM space outside g_sched_lock so dirty MAP_SHARED writeback can sleep. */
+                    vfs_process_cleanup(child);
+                    shm_process_cleanup(child);
+                    vm_space_destroy(&child->vm_space);
+
+                    flags = irq_save_disable();
+                    spin_lock(&g_sched_lock);
+                    if (child->kernel_stack) {
+                        if (child->kernel_stack_from_pmm) {
+                            if (child->kernel_stack_phys)
+                                pmm_free_pages(child->kernel_stack_phys, PROCESS_STACK_PAGES);
+                        } else {
+                            kfree(child->kernel_stack);
+                        }
+                        child->kernel_stack = NULL;
+                        child->kernel_stack_phys = 0;
+                        child->kernel_stack_from_pmm = 0;
+                    }
+                    child->used = 0;
+                    child->shm_attachment_count = 0;
+                    child->rq_next = NULL;
+                    child->next_queue = NULL;
+                    child->prev_queue = NULL;
+                    child->parent = NULL;
+                    child->child_count = 0;
+                    child->children_head = NULL;
+                    child->parent_next_child = NULL;
                     spin_unlock(&g_sched_lock);
                     irq_restore(flags);
                     return pid;

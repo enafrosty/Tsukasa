@@ -28,6 +28,143 @@ static int str_eq(const char *a, const char *b)
     return *a == *b;
 }
 
+static inline long mf_syscall3(long nr, long a1, long a2, long a3)
+{
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(nr), "D"(a1), "S"(a2), "d"(a3)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long mf_syscall4(long nr, long a1, long a2, long a3, long a4)
+{
+    register long r10 __asm__("r10") = a4;
+    long ret;
+    __asm__ volatile ("syscall"
+                      : "=a"(ret)
+                      : "a"(nr), "D"(a1), "S"(a2), "d"(a3), "r"(r10)
+                      : "rcx", "r11", "memory");
+    return ret;
+}
+
+static int ext4_persist_write(const char *dev)
+{
+    (void)mf_syscall3(83L, (long)(uintptr_t)"/mnt", 0755L, 0L);
+    (void)mf_syscall3(83L, (long)(uintptr_t)"/mnt/e4p", 0755L, 0L);
+    long mrc = mf_syscall4(165L, (long)(uintptr_t)dev, (long)(uintptr_t)"/mnt/e4p",
+                           (long)(uintptr_t)"ext4", 0L);
+    if (mrc != 0) {
+        dprintf(1, "[mmapflt] ext4_write FAIL: mount %s rc=%ld\n", dev, mrc);
+        return 51;
+    }
+
+    int fd = open("/mnt/e4p/persist.bin", TSK_O_RDWR | TSK_O_CREAT | TSK_O_TRUNC);
+    if (fd < 0) {
+        (void)mf_syscall3(166L, (long)(uintptr_t)"/mnt/e4p", 0L, 0L);
+        dprintf(1, "[mmapflt] ext4_write FAIL: open\n");
+        return 52;
+    }
+
+    uint8_t zbuf[4096];
+    for (int i = 0; i < 4096; i++)
+        zbuf[i] = (uint8_t)(i & 0xFF);
+    if (write(fd, zbuf, 4096) != 4096 || write(fd, zbuf, 4096) != 4096) {
+        close(fd);
+        (void)mf_syscall3(166L, (long)(uintptr_t)"/mnt/e4p", 0L, 0L);
+        dprintf(1, "[mmapflt] ext4_write FAIL: seed write\n");
+        return 53;
+    }
+    close(fd);
+
+    fd = open("/mnt/e4p/persist.bin", TSK_O_RDWR);
+    if (fd < 0) {
+        (void)mf_syscall3(166L, (long)(uintptr_t)"/mnt/e4p", 0L, 0L);
+        return 54;
+    }
+    volatile uint8_t *p = (volatile uint8_t *)mmap(
+        NULL, 8192, VFS_PROT_READ | VFS_PROT_WRITE, VFS_MAP_SHARED, fd, 0);
+    close(fd);
+    if (!p || (long)(uintptr_t)p < 0) {
+        (void)mf_syscall3(166L, (long)(uintptr_t)"/mnt/e4p", 0L, 0L);
+        dprintf(1, "[mmapflt] ext4_write FAIL: mmap\n");
+        return 55;
+    }
+
+    const uint64_t magic0 = 0xDEADBEEFCAFEBABEULL;
+    const uint64_t magic1 = 0x123456789ABCDEF0ULL;
+    for (int i = 0; i < 8; i++) {
+        p[i] = (uint8_t)((magic0 >> (i * 8)) & 0xFFu);
+        p[4100 + i] = (uint8_t)((magic1 >> (i * 8)) & 0xFFu);
+    }
+
+    if (msync((void *)(uintptr_t)p, 8192, VFS_MS_SYNC) != 0) {
+        (void)munmap((void *)(uintptr_t)p, 8192);
+        (void)mf_syscall3(166L, (long)(uintptr_t)"/mnt/e4p", 0L, 0L);
+        dprintf(1, "[mmapflt] ext4_write FAIL: msync\n");
+        return 56;
+    }
+    (void)munmap((void *)(uintptr_t)p, 8192);
+
+    long urc = mf_syscall3(166L, (long)(uintptr_t)"/mnt/e4p", 0L, 0L);
+    if (urc != 0) {
+        dprintf(1, "[mmapflt] ext4_write FAIL: umount rc=%ld\n", urc);
+        return 57;
+    }
+    dprintf(1, "[mmapflt] ext4_write PASS\n");
+    return 0;
+}
+
+static int ext4_persist_verify(const char *dev)
+{
+    (void)mf_syscall3(83L, (long)(uintptr_t)"/mnt", 0755L, 0L);
+    (void)mf_syscall3(83L, (long)(uintptr_t)"/mnt/e4p", 0755L, 0L);
+    long mrc = mf_syscall4(165L, (long)(uintptr_t)dev, (long)(uintptr_t)"/mnt/e4p",
+                           (long)(uintptr_t)"ext4", 0L);
+    if (mrc != 0) {
+        dprintf(1, "[mmapflt] ext4_verify FAIL: mount %s rc=%ld\n", dev, mrc);
+        return 61;
+    }
+
+    int fd = open("/mnt/e4p/persist.bin", TSK_O_RDONLY);
+    if (fd < 0) {
+        (void)mf_syscall3(166L, (long)(uintptr_t)"/mnt/e4p", 0L, 0L);
+        dprintf(1, "[mmapflt] ext4_verify FAIL: open\n");
+        return 62;
+    }
+    volatile uint8_t *p = (volatile uint8_t *)mmap(
+        NULL, 8192, VFS_PROT_READ, VFS_MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (!p || (long)(uintptr_t)p < 0) {
+        (void)mf_syscall3(166L, (long)(uintptr_t)"/mnt/e4p", 0L, 0L);
+        dprintf(1, "[mmapflt] ext4_verify FAIL: mmap\n");
+        return 63;
+    }
+
+    const uint64_t magic0 = 0xDEADBEEFCAFEBABEULL;
+    const uint64_t magic1 = 0x123456789ABCDEF0ULL;
+    int ok = 1;
+    for (int i = 0; i < 8; i++) {
+        if (p[i] != (uint8_t)((magic0 >> (i * 8)) & 0xFFu) ||
+            p[4100 + i] != (uint8_t)((magic1 >> (i * 8)) & 0xFFu)) {
+            ok = 0;
+            break;
+        }
+    }
+    if (p[200] != (uint8_t)(200 & 0xFF) || p[5000] != (uint8_t)(5000 & 0xFF))
+        ok = 0;
+
+    (void)munmap((void *)(uintptr_t)p, 8192);
+    (void)mf_syscall3(166L, (long)(uintptr_t)"/mnt/e4p", 0L, 0L);
+    if (!ok) {
+        dprintf(1, "[mmapflt] ext4_verify FAIL: persisted bytes mismatch\n");
+        return 64;
+    }
+    dprintf(1, "[mmapflt] ext4_verify PASS\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2)
@@ -89,6 +226,12 @@ int main(int argc, char **argv)
         (void)munmap((void *)(uintptr_t)p, 4096);
         return rc;
     }
+
+    if (str_eq(argv[1], "ext4_write") && argc >= 3)
+        return ext4_persist_write(argv[2]);
+
+    if (str_eq(argv[1], "ext4_verify") && argc >= 3)
+        return ext4_persist_verify(argv[2]);
 
     return 15;
 }

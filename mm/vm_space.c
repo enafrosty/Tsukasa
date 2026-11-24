@@ -674,6 +674,7 @@ vm_area_t *vma_insert(vm_space_t *space,
     vma->end = end;
     vma->prot = prot;
     vma->flags = flags;
+    vma->vm_space = space;
 
     rb_insert_node(space, vma);
     return vma;
@@ -740,6 +741,11 @@ static void account_vma_page_delta(vm_space_t *space, const vm_area_t *vma, int 
             }
         }
     }
+}
+
+void vm_space_account_vma_page(vm_space_t *space, const vm_area_t *vma, int delta)
+{
+    account_vma_page_delta(space, vma, delta);
 }
 
 static void unmap_vma_span_pages(vm_space_t *space,
@@ -874,6 +880,7 @@ int vma_unmap_range(vm_space_t *space, uintptr_t start, size_t len)
             right->end = vma->end;
             right->prot = vma->prot;
             right->flags = vma->flags;
+            right->vm_space = space;
             right->file = vma->file;
             right->file_size = vma->file_size;
             right->file_offset = (vma->flags & VMA_FLAG_FILE)
@@ -998,7 +1005,13 @@ int vma_protect_range(vm_space_t *space, uintptr_t start, size_t len, uint32_t p
                 vma->prot = prot;
             }
 
-            uint64_t map_flags = map_flags_from_vma(prot, vma->flags);
+            uint32_t hw_prot = prot;
+            if ((vma->flags & VMA_FLAG_PRIVATE) ||
+                ((vma->flags & (VMA_FLAG_FILE | VMA_FLAG_SHARED)) ==
+                 (VMA_FLAG_FILE | VMA_FLAG_SHARED))) {
+                hw_prot &= ~VMA_PROT_WRITE;
+            }
+            uint64_t map_flags = map_flags_from_vma(hw_prot, vma->flags);
             size_t pages = (size_t)((p_end - p_start) / PAGE_SIZE);
             if (pages > 0) {
                 (void)vmm_protect_present_pages(space->pml4_phys, p_start, pages, map_flags);
@@ -1054,7 +1067,17 @@ int vm_space_handle_page_fault(vm_space_t *space, uintptr_t fault_addr, uint64_t
     vm_area_t *vma = vma_find(space, va);
     if (!vma) {
         vm_space_mmap_read_unlock(space);
-        return -1;
+        vm_space_mmap_write_lock(space);
+        int exp_rc = vma_expand_stack(space, va);
+        vm_space_mmap_write_unlock(space);
+        if (exp_rc != 0)
+            return -1;
+        vm_space_mmap_read_lock(space);
+        vma = vma_find(space, va);
+        if (!vma) {
+            vm_space_mmap_read_unlock(space);
+            return -1;
+        }
     }
 
     if ((error_code & 0x2ULL) && !(vma->prot & VMA_PROT_WRITE)) {
@@ -1076,15 +1099,76 @@ int vm_space_handle_page_fault(vm_space_t *space, uintptr_t fault_addr, uint64_t
         return rc;
     }
 
-    /* Present protection violation without a fault handler is SIGSEGV. */
-    if (error_code & 0x1ULL) {
+    if (vma->flags & (VMA_FLAG_SHM | VMA_FLAG_DEVICE | VMA_FLAG_FILE)) {
         vm_space_mmap_read_unlock(space);
         return -1;
     }
 
-    if (vma->flags & (VMA_FLAG_SHM | VMA_FLAG_DEVICE | VMA_FLAG_FILE)) {
+    /* Anonymous MAP_PRIVATE demand paging: shared zero page on read, private frame on write/COW. */
+    if ((error_code & 0x1ULL) != 0ULL) {
+        if (!(error_code & 0x2ULL)) {
+            vm_space_mmap_read_unlock(space);
+            return -1;
+        }
+        uint64_t q_phys = 0, q_flags = 0;
+        if (vmm_query_page(space->pml4_phys, va, &q_phys, &q_flags) != 0 ||
+            !(q_flags & VMM_X64_PTE_PRESENT)) {
+            vm_space_mmap_read_unlock(space);
+            return -1;
+        }
+        uint64_t rw_flags = map_flags_from_vma(vma->prot, vma->flags);
+        uintptr_t zero_phys = pmm_zero_page_phys();
+        if (q_phys != (uint64_t)zero_phys && pmm_page_refcount((uintptr_t)q_phys) == 1u) {
+            int urc = vmm_upgrade_user_page_write(space->pml4_phys, va, q_phys, rw_flags);
+            if (urc == 0)
+                vmm_tlb_shootdown(space, va, 1);
+            vm_space_mmap_read_unlock(space);
+            return (urc >= 0) ? 0 : -1;
+        }
+        uintptr_t new_phys = pmm_alloc_pages(1);
+        if (!new_phys) {
+            vm_space_mmap_read_unlock(space);
+            return -1;
+        }
+        uint8_t *dst_kva = (uint8_t *)vmm_phys_to_virt((uint64_t)new_phys);
+        const uint8_t *src_kva = (const uint8_t *)vmm_phys_to_virt(q_phys);
+        k_memcpy(dst_kva, src_kva, PAGE_SIZE);
+        page_t *npg = pmm_phys_to_page(new_phys);
+        if (npg)
+            npg->flags |= PAGE_FLAG_ANON;
+
+        int crc = vmm_cow_replace_user_page(space->pml4_phys, va, q_phys, (uint64_t)new_phys, rw_flags);
+        if (crc == 0) {
+            vmm_tlb_shootdown(space, va, 1);
+            (void)pmm_page_put((uintptr_t)q_phys);
+            vm_space_mmap_read_unlock(space);
+            return 0;
+        }
+        (void)pmm_page_put(new_phys);
         vm_space_mmap_read_unlock(space);
-        return -1;
+        return (crc == 1) ? 0 : -1;
+    }
+
+    if (!(error_code & 0x2ULL) && (vma->flags & VMA_FLAG_PRIVATE) &&
+        !(vma->flags & VMA_FLAG_GROWSDOWN)) {
+        uintptr_t zero_phys = pmm_zero_page_phys();
+        if (zero_phys) {
+            uint64_t ro_flags = map_flags_from_vma(vma->prot & ~VMA_PROT_WRITE, vma->flags);
+            (void)pmm_page_get(zero_phys);
+            int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va, (uint64_t)zero_phys, ro_flags);
+            if (mrc == 0) {
+                account_vma_page_delta(space, vma, 1);
+                vm_space_mmap_read_unlock(space);
+                return 0;
+            }
+            (void)pmm_page_put(zero_phys);
+            if (mrc == 1) {
+                vm_space_mmap_read_unlock(space);
+                return 0;
+            }
+            vm_space_mmap_read_unlock(space);
+            return -1;
+        }
     }
 
     uintptr_t phys = pmm_alloc_pages(1);
@@ -1100,22 +1184,19 @@ int vm_space_handle_page_fault(vm_space_t *space, uintptr_t fault_addr, uint64_t
         pg->flags |= PAGE_FLAG_ANON;
 
     uint64_t map_flags = map_flags_from_vma(vma->prot, vma->flags);
-    if (vmm_map_pages(space->pml4_phys, va, (uint64_t)phys, 1, map_flags) != 0) {
-        pmm_free_pages(phys, 1);
-        /* Another thread may have faulted the same VA concurrently. */
-        uint64_t q_phys = 0, q_flags = 0;
-        if (vmm_query_page(space->pml4_phys, va, &q_phys, &q_flags) == 0 &&
-            (q_flags & VMM_X64_PTE_PRESENT)) {
-            vm_space_mmap_read_unlock(space);
-            return 0;
-        }
+    int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va, (uint64_t)phys, map_flags);
+    if (mrc == 0) {
+        account_vma_page_delta(space, vma, 1);
         vm_space_mmap_read_unlock(space);
-        return -1;
+        return 0;
     }
-
-    account_vma_page_delta(space, vma, 1);
+    (void)pmm_page_put(phys);
+    if (mrc == 1) {
+        vm_space_mmap_read_unlock(space);
+        return 0;
+    }
     vm_space_mmap_read_unlock(space);
-    return 0;
+    return -1;
 }
 
 int vm_space_brk(vm_space_t *space, uintptr_t new_brk, uintptr_t *cur_out)

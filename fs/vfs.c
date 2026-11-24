@@ -4734,24 +4734,329 @@ int vfs_kd_mode(void)
     return fb_kd_mode();
 }
 
+#ifdef __x86_64__
+static uint64_t vfs_vma_map_flags(uint32_t prot, uint32_t flags, int allow_write)
+{
+    uint64_t mf = PAGING_MAP_USER | PAGING_MAP_READ;
+    if (allow_write && (prot & VMA_PROT_WRITE))
+        mf |= PAGING_MAP_WRITE;
+    if (prot & VMA_PROT_EXEC)
+        mf |= PAGING_MAP_EXEC;
+    if (flags & VMA_FLAG_DEVICE)
+        mf |= PAGING_MAP_DEVICE;
+    return mf;
+}
+
+static void vfs_mmap_vma_open(vm_area_t *vma)
+{
+    if (vma && vma->file)
+        (void)vfs_file_ref((vfs_file_t *)vma->file);
+}
+
+static void vfs_mmap_vma_close(vm_area_t *vma)
+{
+    if (vma && vma->file) {
+        vfs_file_t *f = (vfs_file_t *)vma->file;
+        vma->file = NULL;
+        vfs_file_unref(f);
+    }
+}
+
+static void vfs_mmap_vma_unmap(vm_area_t *vma, uintptr_t u_start, uintptr_t u_end)
+{
+    if (!vma || !vma->file || !vma->vm_space || !vma->vm_space->pml4_phys)
+        return;
+    if ((vma->flags & (VMA_FLAG_FILE | VMA_FLAG_SHARED)) != (VMA_FLAG_FILE | VMA_FLAG_SHARED))
+        return;
+
+    vfs_file_t *f = (vfs_file_t *)vma->file;
+    uint64_t obj_id = vfs_file_pc_obj_id(f);
+    if (!obj_id)
+        return;
+
+    uintptr_t zero_phys = pmm_zero_page_phys();
+    uint64_t min_pidx = UINT64_MAX;
+    uint64_t max_pidx = 0;
+    int any_dirty = 0;
+
+    for (uintptr_t va = u_start; va < u_end; va += PAGE_SIZE) {
+        uint64_t q_phys = 0;
+        uint64_t q_flags = 0;
+        if (vmm_query_page(vma->vm_space->pml4_phys, va, &q_phys, &q_flags) != 0 ||
+            !(q_flags & VMM_X64_PTE_PRESENT)) {
+            continue;
+        }
+        if (q_phys == (uint64_t)zero_phys)
+            continue;
+
+        uint64_t file_off = vma->file_offset + (uint64_t)(va - vma->start);
+        uint64_t pidx = file_off >> 12;
+        pagecache_page_t *pg = pagecache_lookup_page(obj_id, pidx);
+        if (pg) {
+            if (pg->phys_addr == (uintptr_t)q_phys) {
+                if (q_flags & VMM_X64_PTE_WRITABLE) {
+                    pagecache_mark_dirty(pg);
+                    any_dirty = 1;
+                }
+                if (pg->dirty)
+                    any_dirty = 1;
+                if (pidx < min_pidx)
+                    min_pidx = pidx;
+                if (pidx + 1ULL > max_pidx)
+                    max_pidx = pidx + 1ULL;
+                /* Drop the pin held for this MAP_SHARED PTE. */
+                pagecache_put_page(pg);
+            }
+            /* Drop the lookup pin from pagecache_lookup_page. */
+            pagecache_put_page(pg);
+        }
+    }
+
+    if (any_dirty && min_pidx < max_pidx)
+        (void)vfs_file_sync_range(f, min_pidx, max_pidx, 1);
+}
+
+static int vfs_mmap_vma_fault(vm_area_t *vma, uintptr_t va, uint64_t error_code)
+{
+    if (!vma || !vma->file || !vma->vm_space || !vma->vm_space->pml4_phys)
+        return -1;
+
+    vm_space_t *space = vma->vm_space;
+    vfs_file_t *f = (vfs_file_t *)vma->file;
+    int is_write = (error_code & 0x2ULL) ? 1 : 0;
+    int is_present = (error_code & 0x1ULL) ? 1 : 0;
+    int is_shared = (vma->flags & VMA_FLAG_SHARED) ? 1 : 0;
+    uint64_t file_off = vma->file_offset + (uint64_t)(va - vma->start);
+    uint64_t page_idx = file_off >> 12;
+    uint64_t cur_fsize = vfs_file_size_bytes(f);
+
+    if (file_off >= cur_fsize) {
+        if (!is_write) {
+            if (is_present)
+                return -1;
+            uintptr_t zero_phys = pmm_zero_page_phys();
+            if (!zero_phys)
+                return -1;
+            uint64_t ro_flags = vfs_vma_map_flags(vma->prot, vma->flags, 0);
+            (void)pmm_page_get(zero_phys);
+            int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va, (uint64_t)zero_phys, ro_flags);
+            if (mrc == 0) {
+                vm_space_account_vma_page(space, vma, 1);
+                return 0;
+            }
+            (void)pmm_page_put(zero_phys);
+            return (mrc == 1) ? 0 : -1;
+        }
+
+        uint64_t rw_flags = vfs_vma_map_flags(vma->prot, vma->flags, 1);
+        if (is_present) {
+            uint64_t q_phys = 0, q_flags = 0;
+            if (vmm_query_page(space->pml4_phys, va, &q_phys, &q_flags) != 0 ||
+                !(q_flags & VMM_X64_PTE_PRESENT)) {
+                return -1;
+            }
+            if (q_flags & VMM_X64_PTE_WRITABLE)
+                return 0;
+            uintptr_t zero_phys = pmm_zero_page_phys();
+            if (q_phys != (uint64_t)zero_phys && pmm_page_refcount((uintptr_t)q_phys) == 1u) {
+                int urc = vmm_upgrade_user_page_write(space->pml4_phys, va, q_phys, rw_flags);
+                if (urc == 0)
+                    vmm_tlb_shootdown(space, va, 1);
+                return (urc >= 0) ? 0 : -1;
+            }
+            uintptr_t new_phys = pmm_alloc_pages(1);
+            if (!new_phys)
+                return -1;
+            k_memset((void *)vmm_phys_to_virt((uint64_t)new_phys), 0, PAGE_SIZE);
+            page_t *npg = pmm_phys_to_page(new_phys);
+            if (npg)
+                npg->flags |= PAGE_FLAG_ANON;
+            int crc = vmm_cow_replace_user_page(space->pml4_phys, va, q_phys, (uint64_t)new_phys, rw_flags);
+            if (crc == 0) {
+                vmm_tlb_shootdown(space, va, 1);
+                (void)pmm_page_put((uintptr_t)q_phys);
+                return 0;
+            }
+            (void)pmm_page_put(new_phys);
+            return (crc == 1) ? 0 : -1;
+        }
+
+        uintptr_t phys = pmm_alloc_pages(1);
+        if (!phys)
+            return -1;
+        k_memset((void *)vmm_phys_to_virt((uint64_t)phys), 0, PAGE_SIZE);
+        page_t *pg = pmm_phys_to_page(phys);
+        if (pg)
+            pg->flags |= PAGE_FLAG_ANON;
+        int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va, (uint64_t)phys, rw_flags);
+        if (mrc == 0) {
+            vm_space_account_vma_page(space, vma, 1);
+            return 0;
+        }
+        (void)pmm_page_put(phys);
+        return (mrc == 1) ? 0 : -1;
+    }
+
+    pagecache_page_t *pc_pg = vfs_file_get_page(f, page_idx);
+    if (!pc_pg)
+        return -1;
+
+    if (!is_shared) {
+        if (!is_write) {
+            if (is_present) {
+                pagecache_put_page(pc_pg);
+                return -1;
+            }
+            uint64_t ro_flags = vfs_vma_map_flags(vma->prot, vma->flags, 0);
+            (void)pmm_page_get(pc_pg->phys_addr);
+            int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va,
+                                                  (uint64_t)pc_pg->phys_addr, ro_flags);
+            if (mrc == 0)
+                vm_space_account_vma_page(space, vma, 1);
+            else
+                (void)pmm_page_put(pc_pg->phys_addr);
+            pagecache_put_page(pc_pg);
+            return (mrc >= 0) ? 0 : -1;
+        }
+
+        uintptr_t new_phys = pmm_alloc_pages(1);
+        if (!new_phys) {
+            pagecache_put_page(pc_pg);
+            return -1;
+        }
+        uint8_t *dst_kva = (uint8_t *)vmm_phys_to_virt((uint64_t)new_phys);
+        size_t valid = PAGECACHE_PAGE_SIZE;
+        if (cur_fsize - file_off < (uint64_t)PAGECACHE_PAGE_SIZE)
+            valid = (size_t)(cur_fsize - file_off);
+        k_memcpy(dst_kva, pc_pg->data, valid);
+        if (valid < PAGECACHE_PAGE_SIZE)
+            k_memset(dst_kva + valid, 0, PAGECACHE_PAGE_SIZE - valid);
+        pagecache_put_page(pc_pg);
+
+        page_t *npg = pmm_phys_to_page(new_phys);
+        if (npg)
+            npg->flags |= PAGE_FLAG_ANON;
+
+        uint64_t rw_flags = vfs_vma_map_flags(vma->prot, vma->flags, 1);
+        if (!is_present) {
+            int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va, (uint64_t)new_phys, rw_flags);
+            if (mrc == 0) {
+                vm_space_account_vma_page(space, vma, 1);
+                return 0;
+            }
+            if (mrc < 0) {
+                (void)pmm_page_put(new_phys);
+                return -1;
+            }
+            /* Concurrent read-fault mapped RO before this write: fall through to COW replace. */
+        }
+
+        uint64_t q_phys = 0, q_flags = 0;
+        if (vmm_query_page(space->pml4_phys, va, &q_phys, &q_flags) != 0 ||
+            !(q_flags & VMM_X64_PTE_PRESENT)) {
+            (void)pmm_page_put(new_phys);
+            return -1;
+        }
+        if (q_flags & VMM_X64_PTE_WRITABLE) {
+            (void)pmm_page_put(new_phys);
+            return 0;
+        }
+        int crc = vmm_cow_replace_user_page(space->pml4_phys, va, q_phys, (uint64_t)new_phys, rw_flags);
+        if (crc == 0) {
+            vmm_tlb_shootdown(space, va, 1);
+            (void)pmm_page_put((uintptr_t)q_phys);
+            return 0;
+        }
+        (void)pmm_page_put(new_phys);
+        return (crc == 1) ? 0 : -1;
+    }
+
+    /* MAP_SHARED file-backed fault. */
+    {
+        page_t *pp = pmm_phys_to_page(pc_pg->phys_addr);
+        if (pp)
+            pp->flags |= PAGE_FLAG_PAGECACHE;
+    }
+
+    if (!is_write) {
+        if (is_present) {
+            pagecache_put_page(pc_pg);
+            return -1;
+        }
+        uint64_t ro_flags = vfs_vma_map_flags(vma->prot, vma->flags, 0);
+        (void)pmm_page_get(pc_pg->phys_addr);
+        int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va,
+                                              (uint64_t)pc_pg->phys_addr, ro_flags);
+        if (mrc == 0) {
+            vm_space_account_vma_page(space, vma, 1);
+            /* Retain pc_pg pin until vfs_mmap_vma_unmap unmaps this PTE. */
+            return 0;
+        }
+        (void)pmm_page_put(pc_pg->phys_addr);
+        pagecache_put_page(pc_pg);
+        return (mrc == 1) ? 0 : -1;
+    }
+
+    pagecache_mark_dirty(pc_pg);
+    uint64_t rw_flags = vfs_vma_map_flags(vma->prot, vma->flags, 1);
+    if (!is_present) {
+        (void)pmm_page_get(pc_pg->phys_addr);
+        int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va,
+                                              (uint64_t)pc_pg->phys_addr, rw_flags);
+        if (mrc == 0) {
+            vm_space_account_vma_page(space, vma, 1);
+            return 0;
+        }
+        (void)pmm_page_put(pc_pg->phys_addr);
+        if (mrc < 0) {
+            pagecache_put_page(pc_pg);
+            return -1;
+        }
+    }
+
+    int urc = vmm_upgrade_user_page_write(space->pml4_phys, va, (uint64_t)pc_pg->phys_addr, rw_flags);
+    if (urc == 0)
+        vmm_tlb_shootdown(space, va, 1);
+    pagecache_put_page(pc_pg);
+    return (urc >= 0) ? 0 : -1;
+}
+#endif
+
 void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t offset)
 {
     process_t *proc = vfs_current_process();
     if (!proc || !proc->vm_space.owns_pml4 || length == 0)
-        return (void *)-1;
+        return (void *)(intptr_t)-EINVAL;
 
     if ((prot & ~(VFS_PROT_READ | VFS_PROT_WRITE | VFS_PROT_EXEC)) != 0)
         return (void *)(intptr_t)-EINVAL;
 
-    /* Handle anonymous mmap (backing for user heap and anonymous regions). */
-    if ((flags & VFS_MAP_ANONYMOUS) || fd == -1) {
-        uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
-        if (length > SIZE_MAX - page_mask)
-            return (void *)(intptr_t)-ENOMEM;
-        size_t span = (length + page_mask) & ~page_mask;
-        size_t page_count = span / PAGE_SIZE;
-        uintptr_t target_va = 0;
+    const int allowed_flags = VFS_MAP_SHARED | VFS_MAP_PRIVATE | VFS_MAP_FIXED | VFS_MAP_ANONYMOUS;
+    if ((flags & ~allowed_flags) != 0)
+        return (void *)(intptr_t)-EINVAL;
 
+    int is_shared = (flags & VFS_MAP_SHARED) ? 1 : 0;
+    int is_priv = (flags & VFS_MAP_PRIVATE) ? 1 : 0;
+    if (is_shared == is_priv)
+        return (void *)(intptr_t)-EINVAL;
+
+    uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
+    if (length > SIZE_MAX - page_mask)
+        return (void *)(intptr_t)-ENOMEM;
+    size_t span = (length + page_mask) & ~page_mask;
+    size_t page_count = span / PAGE_SIZE;
+
+    uint32_t vma_prot = 0;
+    if (prot & VFS_PROT_READ)  vma_prot |= VMA_PROT_READ;
+    if (prot & VFS_PROT_WRITE) vma_prot |= VMA_PROT_WRITE;
+    if (prot & VFS_PROT_EXEC)  vma_prot |= VMA_PROT_EXEC;
+
+    /* Anonymous mmap: demand-paged zero-fill on read, private frame on write. */
+    if ((flags & VFS_MAP_ANONYMOUS) || fd == -1) {
+        if ((flags & VFS_MAP_ANONYMOUS) == 0)
+            return (void *)(intptr_t)-EBADF;
+
+        uintptr_t target_va = 0;
         vm_space_mmap_write_lock(&proc->vm_space);
 
         if (flags & VFS_MAP_FIXED) {
@@ -4780,14 +5085,7 @@ void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t of
             }
         }
 
-        uint32_t vma_prot = 0;
-        if (prot & VFS_PROT_READ)  vma_prot |= VMA_PROT_READ;
-        if (prot & VFS_PROT_WRITE) vma_prot |= VMA_PROT_WRITE;
-        if (prot & VFS_PROT_EXEC)  vma_prot |= VMA_PROT_EXEC;
-
-        uint32_t vma_flags = VMA_FLAG_ANON |
-                             ((flags & VFS_MAP_SHARED) ? VMA_FLAG_SHARED : VMA_FLAG_PRIVATE);
-
+        uint32_t vma_flags = VMA_FLAG_ANON | (is_shared ? VMA_FLAG_SHARED : VMA_FLAG_PRIVATE);
         vm_area_t *vma = vma_insert(&proc->vm_space, target_va, target_va + span,
                                     vma_prot, vma_flags);
         vm_space_mmap_write_unlock(&proc->vm_space);
@@ -4797,15 +5095,111 @@ void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t of
         return (void *)target_va;
     }
 
+    if ((offset & (size_t)page_mask) != 0)
+        return (void *)(intptr_t)-EINVAL;
+    if ((uint64_t)offset > UINT64_MAX - (uint64_t)span)
+        return (void *)(intptr_t)-EINVAL;
+
     vfs_file_t *f = fd_lookup_ref(proc, fd);
     if (!f)
         return (void *)(intptr_t)-EBADF;
 
-    void *res = (void *)-1;
-    if (f->backend == VFS_BACKEND_DEVFS && f->u.device.ops && f->u.device.ops->mmap)
-        res = f->u.device.ops->mmap(f->u.device.priv, addr, length, prot, flags, offset);
+    if (f->backend == VFS_BACKEND_DEVFS) {
+        void *res = (void *)(intptr_t)-ENODEV;
+        if (f->u.device.ops && f->u.device.ops->mmap) {
+            res = f->u.device.ops->mmap(f->u.device.priv, addr, length, prot, flags, offset);
+            if ((intptr_t)res >= 0 && res != (void *)-1) {
+                uintptr_t dev_va = (uintptr_t)res & ~page_mask;
+                size_t dev_off_in_pg = (size_t)((uintptr_t)res & page_mask);
+                size_t dev_span = (length + dev_off_in_pg + (size_t)page_mask) & ~(size_t)page_mask;
+                vm_space_mmap_write_lock(&proc->vm_space);
+                if (!vma_find(&proc->vm_space, dev_va)) {
+                    vm_area_t *dvma = vma_insert(&proc->vm_space, dev_va, dev_va + dev_span,
+                                                 vma_prot, VMA_FLAG_DEVICE | VMA_FLAG_SHARED);
+                    if (dvma) {
+                        dvma->file = vfs_file_ref(f);
+                        dvma->file_offset = (uint64_t)offset;
+                        dvma->open_cb = vfs_mmap_vma_open;
+                        dvma->close_cb = vfs_mmap_vma_close;
+                    }
+                }
+                vm_space_mmap_write_unlock(&proc->vm_space);
+            }
+        }
+        file_release(f);
+        return res;
+    }
+
+    if (!vfs_file_is_mmap_regular(f)) {
+        file_release(f);
+        return (void *)(intptr_t)-ENODEV;
+    }
+    if (!(f->mode & VFS_MODE_READ)) {
+        file_release(f);
+        return (void *)(intptr_t)-EACCES;
+    }
+    if (is_shared && (prot & VFS_PROT_WRITE) && !vfs_file_is_writable(f)) {
+        file_release(f);
+        return (void *)(intptr_t)-EACCES;
+    }
+    if (vfs_file_pc_obj_id(f) == 0ULL) {
+        file_release(f);
+        return (void *)(intptr_t)-EIO;
+    }
+
+    uint64_t fsize = vfs_file_size_bytes(f);
+    uintptr_t target_va = 0;
+
+    vm_space_mmap_write_lock(&proc->vm_space);
+    if (flags & VFS_MAP_FIXED) {
+        uintptr_t req_va = (uintptr_t)addr;
+        if (!req_va || !paging_is_page_aligned_uintptr(req_va)) {
+            vm_space_mmap_write_unlock(&proc->vm_space);
+            file_release(f);
+            return (void *)(intptr_t)-EINVAL;
+        }
+        if (!paging_range_is_user(req_va, span)) {
+            vm_space_mmap_write_unlock(&proc->vm_space);
+            file_release(f);
+            return (void *)(intptr_t)-ENOMEM;
+        }
+        (void)vma_unmap_range(&proc->vm_space, req_va, span);
+        target_va = req_va;
+    } else {
+        if (addr != NULL && paging_is_page_aligned_uintptr((uintptr_t)addr) &&
+            paging_range_is_user((uintptr_t)addr, span)) {
+            uintptr_t hint = (uintptr_t)addr;
+            target_va = vma_find_unmapped_area(&proc->vm_space, hint, hint + span, span);
+        }
+        if (!target_va)
+            target_va = vm_space_reserve_anon_range(&proc->vm_space, page_count);
+        if (!target_va) {
+            vm_space_mmap_write_unlock(&proc->vm_space);
+            file_release(f);
+            return (void *)(intptr_t)-ENOMEM;
+        }
+    }
+
+    uint32_t vma_flags = VMA_FLAG_FILE | (is_shared ? VMA_FLAG_SHARED : VMA_FLAG_PRIVATE);
+    vm_area_t *vma = vma_insert(&proc->vm_space, target_va, target_va + span,
+                                vma_prot, vma_flags);
+    if (!vma) {
+        vm_space_mmap_write_unlock(&proc->vm_space);
+        file_release(f);
+        return (void *)(intptr_t)-ENOMEM;
+    }
+
+    vma->file = vfs_file_ref(f);
+    vma->file_offset = (uint64_t)offset;
+    vma->file_size = fsize;
+    vma->open_cb = vfs_mmap_vma_open;
+    vma->close_cb = vfs_mmap_vma_close;
+    vma->unmap_cb = vfs_mmap_vma_unmap;
+    vma->fault_cb = vfs_mmap_vma_fault;
+    vm_space_mmap_write_unlock(&proc->vm_space);
+
     file_release(f);
-    return res;
+    return (void *)target_va;
 }
 
 int vfs_munmap(void *addr, size_t length)
@@ -4833,17 +5227,21 @@ int vfs_munmap(void *addr, size_t length)
     if (!paging_range_is_user(base, span))
         return -EINVAL;
 
-    size_t fb_sz = fb_byte_size();
-    if (fb_sz > 0) {
-        uintptr_t fb_end = (uintptr_t)VFS_FB_USER_BASE +
-                           ((fb_sz + page_mask) & ~page_mask);
-        if (base >= (uintptr_t)VFS_FB_USER_BASE && end <= fb_end)
-            return fb_munmap((void *)base, span);
-    }
-
     vm_space_mmap_write_lock(&proc->vm_space);
+    int has_vma = (vma_find(&proc->vm_space, base) != NULL);
     int rc = vma_unmap_range(&proc->vm_space, base, span);
     vm_space_mmap_write_unlock(&proc->vm_space);
+
+    if (!has_vma) {
+        size_t fb_sz = fb_byte_size();
+        if (fb_sz > 0) {
+            uintptr_t fb_end = (uintptr_t)VFS_FB_USER_BASE +
+                               ((fb_sz + page_mask) & ~page_mask);
+            if (base >= (uintptr_t)VFS_FB_USER_BASE && end <= fb_end)
+                return fb_munmap((void *)base, span);
+        }
+    }
+
     return rc;
 }
 
@@ -4873,17 +5271,73 @@ int vfs_msync(void *addr, size_t length, int flags)
     if (end <= p || !paging_range_is_user(p, (size_t)(end - p)))
         return -ENOMEM;
 
-    for (uintptr_t va = p; va < end; va += PAGE_SIZE) {
-        uint64_t q_phys = 0, q_flags = 0;
-        if (vmm_query_page(proc->vm_space.pml4_phys, va, &q_phys, &q_flags) != 0 ||
-            !(q_flags & VMM_X64_PTE_PRESENT)) {
+    vm_space_mmap_read_lock(&proc->vm_space);
+
+    /* Ensure the entire requested range is covered by VMAs with no holes. */
+    uintptr_t pos = p;
+    while (pos < end) {
+        vm_area_t *check = vma_find(&proc->vm_space, pos);
+        if (!check || check->start > pos) {
+            vm_space_mmap_read_unlock(&proc->vm_space);
             return -ENOMEM;
         }
+        pos = check->end;
     }
 
-    if (flags & VFS_MS_SYNC)
-        vfs_sync_all();
-    return 0;
+    int first_err = 0;
+    uintptr_t zero_phys = pmm_zero_page_phys();
+    pos = p;
+    while (pos < end) {
+        vm_area_t *vma = vma_find(&proc->vm_space, pos);
+        if (!vma) {
+            vm_space_mmap_read_unlock(&proc->vm_space);
+            return -ENOMEM;
+        }
+        uintptr_t u_start = (vma->start > pos) ? vma->start : pos;
+        uintptr_t u_end = (vma->end < end) ? vma->end : end;
+
+        if ((vma->flags & (VMA_FLAG_FILE | VMA_FLAG_SHARED)) == (VMA_FLAG_FILE | VMA_FLAG_SHARED) &&
+            vma->file) {
+            vfs_file_t *f = (vfs_file_t *)vma->file;
+            uint64_t obj_id = vfs_file_pc_obj_id(f);
+            uint64_t ro_flags = vfs_vma_map_flags(vma->prot, vma->flags, 0);
+
+            for (uintptr_t va = u_start; va < u_end; va += PAGE_SIZE) {
+                uint64_t q_phys = 0, q_flags = 0;
+                if (vmm_query_page(proc->vm_space.pml4_phys, va, &q_phys, &q_flags) != 0 ||
+                    !(q_flags & VMM_X64_PTE_PRESENT)) {
+                    continue;
+                }
+                if (q_phys == (uint64_t)zero_phys)
+                    continue;
+                if (q_flags & VMM_X64_PTE_WRITABLE) {
+                    uint64_t pidx = (vma->file_offset + (uint64_t)(va - vma->start)) >> 12;
+                    pagecache_page_t *pg = pagecache_lookup_page(obj_id, pidx);
+                    if (pg) {
+                        if (pg->phys_addr == (uintptr_t)q_phys)
+                            pagecache_mark_dirty(pg);
+                        pagecache_put_page(pg);
+                    }
+                    /* Clear WRITABLE so subsequent writes after msync fault and re-dirty. */
+                    if (vmm_protect_present_pages(proc->vm_space.pml4_phys, va, 1, ro_flags) == 0)
+                        vmm_tlb_shootdown(&proc->vm_space, va, 1);
+                }
+            }
+
+            if ((flags & VFS_MS_ASYNC) == 0) {
+                uint64_t start_pidx = (vma->file_offset + (uint64_t)(u_start - vma->start)) >> 12;
+                uint64_t end_pidx = ((vma->file_offset + (uint64_t)(u_end - vma->start) - 1ULL) >> 12) + 1ULL;
+                int src = vfs_file_sync_range(f, start_pidx, end_pidx, (flags & VFS_MS_SYNC) ? 1 : 0);
+                if (first_err == 0 && src != 0)
+                    first_err = src;
+            }
+        }
+
+        pos = u_end;
+    }
+
+    vm_space_mmap_read_unlock(&proc->vm_space);
+    return first_err;
 }
 
 static int vfs_file_poll_mask(vfs_file_t *f)

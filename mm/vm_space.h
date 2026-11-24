@@ -50,11 +50,14 @@ typedef struct vm_rwsem {
     wait_queue_head_t waitq;
 } vm_rwsem_t;
 
+struct vm_space;
+
 typedef struct vm_area {
     uintptr_t start;
     uintptr_t end;
     uint32_t prot;
     uint32_t flags;
+    struct vm_space *vm_space;
     void *file;
     uint64_t file_offset;
     uint64_t file_size;
@@ -122,6 +125,7 @@ int vma_protect_range(vm_space_t *space, uintptr_t start, size_t len, uint32_t p
 int vma_expand_stack(vm_space_t *space, uintptr_t addr);
 int vm_space_handle_page_fault(vm_space_t *space, uintptr_t fault_addr, uint64_t error_code);
 int vm_space_brk(vm_space_t *space, uintptr_t new_brk, uintptr_t *cur_out);
+void vm_space_account_vma_page(vm_space_t *space, const vm_area_t *vma, int delta);
 
 int vm_space_contains_user_range(const vm_space_t *space, uintptr_t base, size_t size);
 uintptr_t vm_space_reserve_shm_range(vm_space_t *space, size_t page_count);

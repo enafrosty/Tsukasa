@@ -85,6 +85,19 @@ int vmm_unmap_page_collect(uint64_t pml4_phys,
                            uintptr_t virt_addr,
                            uint64_t *phys_out,
                            uint64_t *flags_out);
+int vmm_map_user_page_if_absent(uint64_t pml4_phys,
+                                uintptr_t virt_addr,
+                                uint64_t phys_addr,
+                                uint64_t map_flags);
+int vmm_cow_replace_user_page(uint64_t pml4_phys,
+                              uintptr_t virt_addr,
+                              uint64_t expected_old_phys,
+                              uint64_t new_phys,
+                              uint64_t map_flags);
+int vmm_upgrade_user_page_write(uint64_t pml4_phys,
+                                uintptr_t virt_addr,
+                                uint64_t expected_phys,
+                                uint64_t map_flags);
 void vmm_tlb_shootdown(struct vm_space *space, uintptr_t va, size_t page_count);
 void tlb_shootdown_ipi_handler(void);
 uint64_t vmm_tlb_shootdown_ipi_count(void);
