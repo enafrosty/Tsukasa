@@ -84,12 +84,12 @@ static int run_child_atexit_full(void)
 static pid_t spawn_self_child(const char *flag)
 {
     char *child_argv[3];
-    child_argv[0] = (char *)"/fat12/TSTDIO.ELF";
+    child_argv[0] = (char *)"/bin/TSTDIO.ELF";
     child_argv[1] = (char *)flag;
     child_argv[2] = NULL;
     pid_t pid = -1;
     for (int retry = 0; retry < 50 && pid < 0; retry++) {
-        pid = spawn("/fat12/TSTDIO.ELF", child_argv, NULL);
+        pid = spawn("/bin/TSTDIO.ELF", child_argv, NULL);
         if (pid < 0)
             sched_yield();
     }

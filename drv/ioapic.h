@@ -17,12 +17,21 @@
 #ifndef TSUKASA_IOAPIC_H
 #define TSUKASA_IOAPIC_H
 
-/* All-or-nothing cutover: on success the PIC is fully masked and IOAPIC-delivered interrupts are... */
+#include <stdint.h>
+
+/* All-or-nothing cutover: on success the PIC is fully masked and IOAPIC-delivered interrupts are active. */
 
 /* Route timer/keyboard/mouse through the IOAPIC and mask the PIC. */
 int ioapic_init(void);
 
 /* 1 once ioapic_init() completed the cutover (EOIs must go to the LAPIC). */
 int ioapic_active(void);
+
+/* Route a Global System Interrupt to the given vector and destination LAPIC ID. */
+int ioapic_route_gsi(uint32_t gsi, uint8_t vector, uint8_t dest_lapic_id,
+                     int active_low, int level_triggered);
+
+/* Mask a Global System Interrupt redirection entry. */
+int ioapic_mask_gsi(uint32_t gsi);
 
 #endif /* TSUKASA_IOAPIC_H */

@@ -23,6 +23,8 @@
 #ifdef _WIN32
 #include <io.h>
 #define fsync(fd) _commit(fd)
+#else
+#include <sys/ioctl.h>
 #endif
 
 #ifndef O_BINARY
@@ -42,17 +44,24 @@ int device_open(const char *path, int flags, device_handle_t *dev)
     if (dev->fd < 0)
         return -1;
 
-    off_t sz = lseek(dev->fd, 0, SEEK_END);
-    if (sz < 0) {
-        close(dev->fd);
-        dev->fd = -1;
-        return -1;
+    uint64_t bytes = 0;
+#ifndef _WIN32
+    if (ioctl(dev->fd, BLKGETSIZE64, &bytes) != 0 || bytes == 0)
+#endif
+    {
+        off_t sz = lseek(dev->fd, 0, SEEK_END);
+        if (sz < 0) {
+            close(dev->fd);
+            dev->fd = -1;
+            return -1;
+        }
+        bytes = (uint64_t)sz;
     }
 
     lseek(dev->fd, 0, SEEK_SET);
 
     dev->sector_size = SECTOR_SIZE;
-    dev->sector_count = (uint64_t)sz / dev->sector_size;
+    dev->sector_count = bytes / dev->sector_size;
 
     return 0;
 }
@@ -127,6 +136,22 @@ int device_sync(device_handle_t *dev)
         return -1;
 
     return fsync(dev->fd);
+}
+
+int device_reread_partitions(device_handle_t *dev)
+{
+    if (!dev || dev->fd < 0)
+        return -1;
+#ifdef _WIN32
+    return 0;
+#else
+    if (ioctl(dev->fd, BLKRRPART, NULL) != 0) {
+        if (errno == ENOTTY)
+            return 0;
+        return -1;
+    }
+    return 0;
+#endif
 }
 
 uint64_t device_get_size(device_handle_t *dev)

@@ -157,6 +157,9 @@ static void process_init_io_state(process_t *p, const process_t *parent)
         p->fds[i].file_desc = -1;
     }
     p->next_fd = 0;
+    p->umask = parent ? (parent->umask & 0777U) : 0022U;
+    p->fd_lock = SPINLOCK_INIT;
+    p->io_pad = 0;
     if (parent && parent->cwd[0]) {
         name_copy(p->cwd, parent->cwd, PROCESS_CWD_MAX);
     } else {
@@ -227,6 +230,8 @@ static void runq_push_locked(process_t *p)
     pri = p->priority;
     if (pri >= PROCESS_PRIORITY_LEVELS)
         pri = PROCESS_PRIORITY_LEVELS - 1;
+    if (p->rq_next || p->prev_queue || g_runq_head[pri] == p || g_runq_tail[pri] == p)
+        return;
     p->rq_next = NULL;
     p->next_queue = NULL;
     p->prev_queue = g_runq_tail[pri];
@@ -619,8 +624,23 @@ void process_block_current(void)
     unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
     process_t *self = g_current[sched_this_cpu()];
     if (self && !self->is_idle) {
+        runq_remove_locked(self);
         self->state = PROCESS_BLOCKED;
         self->main_thread.state = THREAD_BLOCKED;
+    }
+    spin_unlock_irqrestore(&g_sched_lock, irqf);
+}
+
+void process_finish_wait_current(void)
+{
+    unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
+    process_t *self = g_current[sched_this_cpu()];
+    if (self && !self->is_idle) {
+        runq_remove_locked(self);
+        if (self->state == PROCESS_BLOCKED || self->state == PROCESS_READY) {
+            self->state = PROCESS_RUNNING;
+            self->main_thread.state = THREAD_RUNNING;
+        }
     }
     spin_unlock_irqrestore(&g_sched_lock, irqf);
 }
@@ -630,6 +650,7 @@ void process_set_poll_blocked(uint64_t deadline_ms)
     unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
     process_t *self = g_current[sched_this_cpu()];
     if (self && !self->is_idle) {
+        runq_remove_locked(self);
         self->poll_deadline_ms = deadline_ms;
         self->state = PROCESS_BLOCKED;
         self->main_thread.state = THREAD_BLOCKED;
@@ -643,7 +664,8 @@ void process_clear_poll_deadline(void)
     process_t *self = g_current[sched_this_cpu()];
     if (self) {
         self->poll_deadline_ms = 0;
-        if (self->state == PROCESS_BLOCKED) {
+        runq_remove_locked(self);
+        if (self->state == PROCESS_BLOCKED || self->state == PROCESS_READY) {
             self->state = PROCESS_RUNNING;
             self->main_thread.state = THREAD_RUNNING;
         }
@@ -709,6 +731,7 @@ int process_sleep_ms(uint64_t ms)
             irq_restore(flags);
             return 0;
         }
+        runq_remove_locked(self);
         self->sleep_deadline_ms = deadline;
         self->state = PROCESS_SLEEPING;
         self->main_thread.state = THREAD_SLEEPING;
@@ -1070,6 +1093,28 @@ process_t *process_spawn_kernel(const char *name, process_entry_t entry)
     spin_lock(&g_sched_lock);
     parent = g_current[sched_this_cpu()];
     child = create_kernel_process_locked(name, entry, parent);
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    return child;
+}
+
+process_t *process_spawn_kernel_paused(const char *name, process_entry_t entry)
+{
+    process_t *parent;
+    process_t *child;
+    uint64_t flags;
+    if (!entry)
+        return NULL;
+
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    parent = g_current[sched_this_cpu()];
+    child = create_kernel_process_locked(name, entry, parent);
+    if (child) {
+        runq_remove_locked(child);
+        child->state = PROCESS_BLOCKED;
+        child->main_thread.state = THREAD_BLOCKED;
+    }
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
     return child;
@@ -2350,7 +2395,7 @@ static void phase1_fault_isolation_entry(void)
 
     /* elf64_spawn uses a single-slot handoff; retry while another spawn (e.g. */
     for (int i = 0; i < 200 && pid < 0; i++) {
-        pid = elf64_spawn("/fat12/fault.elf", "fault-victim");
+        pid = elf64_spawn("/bin/fault.elf", "fault-victim");
         if (pid < 0)
             process_yield();
     }
@@ -2380,7 +2425,7 @@ static void phase1_elf_spawn_syscall_entry(void)
 
     for (int i = 0; i < 200 && pid < 0; i++) {
         pid = (long)syscall_handler(SYS_SYSTEM, SYSTEM_CMD_SPAWN,
-                                    (uintptr_t)"/fat12/hello.elf", 0, 0, 0);
+                                    (uintptr_t)"/bin/hello.elf", 0, 0, 0);
         if (pid < 0)
             process_yield();
     }
@@ -2405,8 +2450,8 @@ static void phase1_spawn_wait_entry(void)
     int status = -1;
     int r;
 
-    req.path = "/fat12/exit7.elf";
-    req.args = "/fat12/exit7.elf";
+    req.path = "/bin/exit7.elf";
+    req.args = "/bin/exit7.elf";
     req.stdin_fd = -1;
     req.stdout_fd = -1;
     req.stderr_fd = -1;
@@ -4103,7 +4148,7 @@ static int guide10_spawn_cli(const char *args, const char *name)
 {
     int pid = -1;
     for (int i = 0; i < 200 && pid < 0; i++) {
-        pid = elf64_spawn_cmdline("/fat12/futex10.elf", args, name);
+        pid = elf64_spawn_cmdline("/bin/futex10.elf", args, name);
         if (pid < 0)
             process_yield();
     }
@@ -4341,7 +4386,7 @@ void process_run_guide10_selftests(void)
 
 /* AF_UNIX sockets: rendezvous (bind/listen/connect/accept), byte-exact */
 /* data both ways, error paths, fd-teardown cleanup, and the ring-3 */
-/* flat-table glue via /fat12/usock20.elf (futex10/m5 precedent). Runs */
+/* flat-table glue via /bin/usock20.elf (futex10/m5 precedent). Runs */
 /* as a spawned process (guide10 pattern) because M2/M3 need the */
 /* scheduler. Idempotent: socket paths are RAM-registry entries that */
 /* die with their fds; every path bound here is released here. */
@@ -4440,7 +4485,7 @@ static int guide20_spawn_cli(const char *args, const char *name)
 {
     int pid = -1;
     for (int i = 0; i < 200 && pid < 0; i++) {
-        pid = elf64_spawn_cmdline("/fat12/usock20.elf", args, name);
+        pid = elf64_spawn_cmdline("/bin/usock20.elf", args, name);
         if (pid < 0)
             process_yield();
     }
@@ -4609,7 +4654,7 @@ static void guide20_selftest_entry(void)
         }
     }
 
-    /* M4 — ring-3 flat-table glue via /fat12/usock20.elf. */
+    /* M4 - ring-3 flat-table glue via /bin/usock20.elf. */
     {
         int ok = 0;
         int code = -1;
@@ -4657,10 +4702,10 @@ void process_run_guide20_selftests(void)
     process_spawn_kernel("guide20-selftest", guide20_selftest_entry);
 }
 
-/* Userland display server: a ring-3 compositor (/fat12/wsrv15.elf) that */
+/* Userland display server: a ring-3 compositor (/bin/wsrv15.elf) that */
 /* owns /dev/fb0 + KD_GRAPHICS, listens on an AF_UNIX socket, and */
 /* composites client pixels delivered via ipc/shm.c surfaces. A ring-3 */
-/* client (/fat12/wapp15.elf) draws a window through the protocol. */
+/* client (/bin/wapp15.elf) draws a window through the protocol. */
 /* Verdicts come back purely through exit codes (usock20 precedent), so */
 /* the checks are signal-aware (a #UD/#GP kill has exit byte 0). Runs */
 /* after [guide20] (blocks on g_guide20_done_w) so the two socket suites */
@@ -4688,7 +4733,7 @@ static int guide15_run_pair(const char *srv_args, const char *srv_name,
     int sp, cp, st;
 
     *sc = *ss = *cc = *cs = -1;
-    sp = guide15_spawn("/fat12/wsrv15.elf", srv_args, srv_name);
+    sp = guide15_spawn("/bin/wsrv15.elf", srv_args, srv_name);
     if (sp < 0)
         return -1;
     cp = guide15_spawn(cli_path, cli_args, cli_name);
@@ -4734,7 +4779,7 @@ static void guide15_selftest_entry(void)
     {
         int sc, ss, cc, cs;
         int r = guide15_run_pair("wsrv15 m1", "wsrv15-m1",
-                                 "/fat12/wapp15.elf",
+                                 "/bin/wapp15.elf",
                                  "wapp15 handshake", "wapp15-hs", 0,
                                  &sc, &ss, &cc, &cs);
         if (r == 0 && sc == 0 && ss == 0 && cc == 0 && cs == 0) {
@@ -4752,7 +4797,7 @@ static void guide15_selftest_entry(void)
     {
         int sc, ss, cc, cs;
         int r = guide15_run_pair("wsrv15 m2", "wsrv15-m2",
-                                 "/fat12/wapp15.elf",
+                                 "/bin/wapp15.elf",
                                  "wapp15 draw", "wapp15-draw", 0,
                                  &sc, &ss, &cc, &cs);
         if (r == 0 && sc == 20 && ss == 0) {
@@ -4772,7 +4817,7 @@ static void guide15_selftest_entry(void)
     {
         int sc, ss, cc, cs;
         int r = guide15_run_pair("wsrv15 m3", "wsrv15-m3",
-                                 "/fat12/wapp15.elf",
+                                 "/bin/wapp15.elf",
                                  "wapp15 die", "wapp15-die", 0,
                                  &sc, &ss, &cc, &cs);
         if (r == 0 && sc == 0 && ss == 0 && cc == 0 && cs == 0) {
@@ -4966,7 +5011,7 @@ static void guide16_selftest_entry(void)
     {
         int sc, ss, cc, cs;
         int r = guide15_run_pair("wsrv15 m2", "wsrv15-g16",
-                                 "/fat12/wdemo16.elf",
+                                 "/bin/wdemo16.elf",
                                  "wdemo16 selftest", "wdemo16-st", 42,
                                  &sc, &ss, &cc, &cs);
         if (r == 0 && sc == 20 && ss == 0) {

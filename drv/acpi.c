@@ -44,6 +44,9 @@ static struct {
 } g_iso_table[ACPI_MAX_ISO];
 static int g_iso_count;
 
+static struct acpi_mcfg_entry g_mcfg_entries[ACPI_MAX_MCFG];
+static int g_mcfg_count;
+
 /* _S5_ sleep type values, pre-shifted into PM1 SLP_TYP position (bits 10-12). */
 static uint16_t g_slp_typa;
 static uint16_t g_slp_typb;
@@ -177,28 +180,75 @@ static void acpi_parse_s5(void)
         return;
     if (dsdt->length < sizeof(struct acpi_sdt) + 5)
         return;
+    if (!acpi_checksum(dsdt, dsdt->length))
+        return;
 
     const uint8_t *ptr = (const uint8_t *)dsdt + sizeof(struct acpi_sdt);
     const uint8_t *end = (const uint8_t *)dsdt + dsdt->length;
 
-    while (ptr + 4 + 5 < end) {
+    while (ptr + 4 <= end) {
         if (bytes_equal(ptr, "_S5_", 4)) {
-            ptr += 4;
-            if (*ptr == 0x12) {
-                ptr += 3;
-                if (*ptr == 0x0A)
-                    ptr++;
-                g_slp_typa = (uint16_t)(*ptr << 10);
-                ptr++;
-                if (*ptr == 0x0A)
-                    ptr++;
-                g_slp_typb = (uint16_t)(*ptr << 10);
+            const uint8_t *p = ptr + 4;
+            if (p < end && *p == 0x12) {
+                p++;
+                if (p >= end)
+                    break;
+                uint8_t extra_len = (uint8_t)((*p >> 6) & 0x3u);
+                if ((size_t)(end - p) <= (size_t)(1u + extra_len))
+                    break;
+                p += 1u + extra_len; /* skip PkgLength */
+                p++;                 /* skip NumElements */
+                if (p >= end)
+                    break;
+                if (*p == 0x0A) {
+                    p++;
+                    if (p >= end)
+                        break;
+                }
+                uint16_t typa = (uint16_t)(*p << 10);
+                p++;
+                if (p >= end)
+                    break;
+                if (*p == 0x0A) {
+                    p++;
+                    if (p >= end)
+                        break;
+                }
+                uint16_t typb = (uint16_t)(*p << 10);
+                g_slp_typa = typa;
+                g_slp_typb = typb;
                 g_s5_from_dsdt = 1;
                 return;
             }
         }
         ptr++;
     }
+}
+
+static uint16_t acpi_pm1_cnt_port(int is_b)
+{
+    if (!g_fadt)
+        return 0;
+
+    size_t ext_end = is_b
+        ? (offsetof(acpi_fadt_t, x_pm1b_cnt_blk) + sizeof(acpi_gas_t))
+        : (offsetof(acpi_fadt_t, x_pm1a_cnt_blk) + sizeof(acpi_gas_t));
+    if (g_fadt->header.length >= ext_end) {
+        const acpi_gas_t *gas = is_b ? &g_fadt->x_pm1b_cnt_blk : &g_fadt->x_pm1a_cnt_blk;
+        if (gas->address_space_id == 1 && gas->address != 0 && gas->address <= 0xFFFFu)
+            return (uint16_t)gas->address;
+    }
+
+    size_t leg_end = is_b
+        ? (offsetof(acpi_fadt_t, pm1b_cnt_blk) + sizeof(uint32_t))
+        : (offsetof(acpi_fadt_t, pm1a_cnt_blk) + sizeof(uint32_t));
+    if (g_fadt->header.length >= leg_end) {
+        uint32_t port = is_b ? g_fadt->pm1b_cnt_blk : g_fadt->pm1a_cnt_blk;
+        if (port != 0 && port <= 0xFFFFu)
+            return (uint16_t)port;
+    }
+
+    return 0;
 }
 
 int acpi_available(void)
@@ -230,6 +280,27 @@ int acpi_get_ioapic_info(int idx, uint8_t *id_out, uint32_t *addr_out,
     return 0;
 }
 
+int acpi_get_mcfg_count(void)
+{
+    return g_mcfg_count;
+}
+
+int acpi_get_mcfg_info(int idx, uint64_t *base, uint16_t *seg,
+                       uint8_t *start_bus, uint8_t *end_bus)
+{
+    if (idx < 0 || idx >= g_mcfg_count)
+        return -1;
+    if (base)
+        *base = g_mcfg_entries[idx].base_addr;
+    if (seg)
+        *seg = g_mcfg_entries[idx].seg_group;
+    if (start_bus)
+        *start_bus = g_mcfg_entries[idx].start_bus;
+    if (end_bus)
+        *end_bus = g_mcfg_entries[idx].end_bus;
+    return 0;
+}
+
 uint32_t acpi_irq_to_gsi(uint32_t irq)
 {
     for (int i = 0; i < g_iso_count; i++) {
@@ -254,17 +325,16 @@ void acpi_power_off(void)
             g_slp_typa, g_slp_typb,
             g_s5_from_dsdt ? "from DSDT" : "fallback guess");
 
-    if (g_slp_typa == 0) {
-        
+    if (!g_s5_from_dsdt && g_slp_typa == 0) {
         g_slp_typa = (uint16_t)(5u << 10);
     }
 
-    if (g_fadt && g_fadt->pm1a_cnt_blk) {
-        io_outw((uint16_t)g_fadt->pm1a_cnt_blk,
-                (uint16_t)(g_slp_typa | ACPI_PM1_SLP_EN));
-        if (g_fadt->pm1b_cnt_blk)
-            io_outw((uint16_t)g_fadt->pm1b_cnt_blk,
-                    (uint16_t)(g_slp_typb | ACPI_PM1_SLP_EN));
+    uint16_t pm1a_port = acpi_pm1_cnt_port(0);
+    uint16_t pm1b_port = acpi_pm1_cnt_port(1);
+    if (pm1a_port) {
+        io_outw(pm1a_port, (uint16_t)(g_slp_typa | ACPI_PM1_SLP_EN));
+        if (pm1b_port)
+            io_outw(pm1b_port, (uint16_t)(g_slp_typb | ACPI_PM1_SLP_EN));
     }
 
     io_outw(0xB004, 0x2000);
@@ -280,6 +350,18 @@ void acpi_power_off(void)
 
 int acpi_init(const struct tsukasa_boot_info *boot_info)
 {
+    g_acpi_ok = 0;
+    g_rsdp = NULL;
+    g_fadt = NULL;
+    g_madt = NULL;
+    g_lapic_base = 0;
+    g_ioapic_count = 0;
+    g_iso_count = 0;
+    g_mcfg_count = 0;
+    g_slp_typa = 0;
+    g_slp_typb = 0;
+    g_s5_from_dsdt = 0;
+
     if (!boot_info || !boot_info->rsdp_addr) {
         kprintf("[acpi] no RSDP from bootloader, ACPI disabled\n");
         return -1;
@@ -292,12 +374,27 @@ int acpi_init(const struct tsukasa_boot_info *boot_info)
         return -1;
     }
 
-    size_t rsdp_len = (rsdp->revision >= 2) ? rsdp->length : 20u;
-    if (rsdp_len < 20u)
-        rsdp_len = 20u;
-    if (!acpi_checksum(rsdp, rsdp_len)) {
+    if (!acpi_checksum(rsdp, 20u)) {
         kprintf("[acpi] ERROR: RSDP checksum bad, ACPI disabled\n");
         return -1;
+    }
+
+    if (rsdp->revision >= 2) {
+        if (rsdp->length < sizeof(struct acpi_rsdp) || rsdp->length > 4096u) {
+            kprintf("[acpi] ERROR: bad RSDP length %u, ACPI disabled\n", rsdp->length);
+            return -1;
+        }
+        if (rsdp->length > sizeof(struct acpi_rsdp)) {
+            rsdp = (const struct acpi_rsdp *)acpi_map(boot_info->rsdp_addr, rsdp->length);
+            if (!rsdp) {
+                kprintf("[acpi] ERROR: RSDP remap failed, ACPI disabled\n");
+                return -1;
+            }
+        }
+        if (!acpi_checksum(rsdp, rsdp->length)) {
+            kprintf("[acpi] ERROR: RSDP extended checksum bad, ACPI disabled\n");
+            return -1;
+        }
     }
     g_rsdp = rsdp;
 
@@ -310,19 +407,17 @@ int acpi_init(const struct tsukasa_boot_info *boot_info)
         g_rsdp = NULL;
         return -1;
     }
+    uint16_t pm1a_port = acpi_pm1_cnt_port(0);
+    uint16_t pm1b_port = acpi_pm1_cnt_port(1);
     kprintf("[acpi] FADT smi_cmd=0x%x acpi_enable=0x%x pm1a_cnt=0x%x pm1b_cnt=0x%x\n",
-            g_fadt->smi_cmd, g_fadt->acpi_enable,
-            g_fadt->pm1a_cnt_blk, g_fadt->pm1b_cnt_blk);
+            g_fadt->smi_cmd, g_fadt->acpi_enable, pm1a_port, pm1b_port);
 
-    if (g_fadt->pm1a_cnt_blk &&
-        (io_inw((uint16_t)g_fadt->pm1a_cnt_blk) & ACPI_PM1_SCI_EN)) {
+    if (pm1a_port && (io_inw(pm1a_port) & ACPI_PM1_SCI_EN)) {
         kprintf("[acpi] already in ACPI mode\n");
     } else if (g_fadt->smi_cmd && g_fadt->acpi_enable) {
         io_outb((uint16_t)g_fadt->smi_cmd, g_fadt->acpi_enable);
         int timeout = 1000000;
-        while (g_fadt->pm1a_cnt_blk &&
-               !(io_inw((uint16_t)g_fadt->pm1a_cnt_blk) & ACPI_PM1_SCI_EN) &&
-               timeout-- > 0)
+        while (pm1a_port && !(io_inw(pm1a_port) & ACPI_PM1_SCI_EN) && timeout-- > 0)
             __asm__ volatile ("pause");
         if (timeout <= 0)
             kprintf("[acpi] WARN: SCI_EN never set after enable write\n");
@@ -391,6 +486,23 @@ int acpi_init(const struct tsukasa_boot_info *boot_info)
                 lapic_count, g_ioapic_count, g_iso_count);
     } else {
         kprintf("[acpi] WARN: MADT not found (LAPIC keeps 0xFEE00000 default)\n");
+    }
+
+    const struct acpi_mcfg *mcfg = (const struct acpi_mcfg *)acpi_get_sdt("MCFG");
+    if (mcfg && mcfg->header.length >= sizeof(struct acpi_mcfg)) {
+        size_t data_len = mcfg->header.length - sizeof(struct acpi_mcfg);
+        size_t entries = data_len / sizeof(struct acpi_mcfg_entry);
+        for (size_t i = 0; i < entries && g_mcfg_count < ACPI_MAX_MCFG; i++) {
+            const struct acpi_mcfg_entry *e = &mcfg->entries[i];
+            if (!e->base_addr || e->end_bus < e->start_bus)
+                continue;
+            g_mcfg_entries[g_mcfg_count] = *e;
+            kprintf("[acpi] MCFG seg=%u base=0x%08x%08x buses=%u..%u\n",
+                    e->seg_group,
+                    (uint32_t)(e->base_addr >> 32), (uint32_t)e->base_addr,
+                    e->start_bus, e->end_bus);
+            g_mcfg_count++;
+        }
     }
 
     acpi_parse_s5();

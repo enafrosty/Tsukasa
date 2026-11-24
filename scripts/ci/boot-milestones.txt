@@ -1,6 +1,6 @@
 [boot:x64] Tsukasa x86_64 kernel starting
 [boot:x64] GDT/IDT ready
-[vfs] FAT12 ramdisk: ok
+[vfs] initrd.tar.lz4: ok
 [boot:x64] handoff to /bin/init (PID 1)...
 [init] PID 1 active (Tsukasa OS System Init)
 [vanilla] Listening for client connections.

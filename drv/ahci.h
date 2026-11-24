@@ -1,5 +1,5 @@
 /*
- * Project Tsukasa — disk installer core (guide 13)
+ * Project Tsukasa — AHCI (SATA) PCIe/DMA storage driver
  *
  * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
@@ -14,20 +14,10 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  */
 
-#ifndef TSUKASA_INSTALLER_H
-#define TSUKASA_INSTALLER_H
+#ifndef TSUKASA_AHCI_H
+#define TSUKASA_AHCI_H
 
-#include "../drv/blockdev.h"
+/* Probe all PCI AHCI controllers, initialize active SATA ports, and register block devices. */
+int ahci_init(void);
 
-/* 64 MiB floor: bootblob region + one FAT32 partition >= 32 MiB. */
-#define INSTALLER_MIN_SECTORS 131072u
-
-typedef void (*installer_progress_fn)(const char *stage, int percent);
-
-/* Validate `bd` as an install target and the live medium as an install source... */
-int installer_preflight(block_dev_t *bd, char *err, int errlen);
-
-/* DESTRUCTIVE. */
-int installer_run(block_dev_t *bd, installer_progress_fn cb);
-
-#endif /* TSUKASA_INSTALLER_H */
+#endif /* TSUKASA_AHCI_H */

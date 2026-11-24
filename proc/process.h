@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../include/spinlock.h"
 #include "../mm/vm_space.h"
 
 #define PROCESS_MAX_COUNT      256
@@ -31,7 +32,7 @@
 #define PROCESS_MAX_SIGNALS    64
 #define PROCESS_MAX_CHILDREN   32
 #define PROCESS_CWD_MAX        256
-#define PROCESS_MAX_OPEN_FILES 32
+#define PROCESS_MAX_OPEN_FILES 256
 #define PROCESS_PRIORITY_LEVELS 256
 #define PROCESS_DEFAULT_PRIORITY 128
 #define PROCESS_DEFAULT_TIMESLICE 4
@@ -181,6 +182,9 @@ struct process {
     void *open_files[PROCESS_MAX_OPEN_FILES];
     fd_entry_t fds[PROCESS_MAX_OPEN_FILES];
     int next_fd;
+    uint32_t umask;
+    spinlock_t fd_lock;
+    uint32_t io_pad;
 
     int used;
     char name[PROCESS_NAME_MAX];
@@ -223,6 +227,7 @@ int process_get_pgid(int pid);
 uint64_t process_stack_top_aligned(const process_t *p);
 
 process_t *process_spawn_kernel(const char *name, process_entry_t entry);
+process_t *process_spawn_kernel_paused(const char *name, process_entry_t entry);
 
 process_t *process_spawn_kernel_pinned(const char *name, process_entry_t entry,
                                        uint32_t cpu_id);
@@ -287,6 +292,7 @@ void process_run_guide16_selftests(void);
 
 /* process_block_current marks the CALLER blocked (both state fields) without descheduling — the caller... */
 void process_block_current(void);
+void process_finish_wait_current(void);
 void process_set_poll_blocked(uint64_t deadline_ms);
 void process_clear_poll_deadline(void);
 void process_block_on_poll(uint64_t deadline_ms);

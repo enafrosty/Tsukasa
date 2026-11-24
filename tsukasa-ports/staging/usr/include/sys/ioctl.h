@@ -26,6 +26,11 @@
 #define KD_TEXT     0x00
 #define KD_GRAPHICS 0x01
 
+/* Block device ioctls (Linux-compatible) */
+#define BLKRRPART    0x125F
+#define BLKSSZGET    0x1268
+#define BLKGETSIZE64 0x80081272UL
+
 #define FB_TYPE_PACKED_PIXELS 0
 #define FB_VISUAL_TRUECOLOR   2
 

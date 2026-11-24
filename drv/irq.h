@@ -20,9 +20,16 @@
 #include <stdint.h>
 
 typedef void (*irq_callback_t)(uint8_t irq, void *ctx);
+typedef void (*irq_vector_callback_t)(uint8_t vec, void *ctx);
 
 int irq_register_handler(uint8_t irq, irq_callback_t callback, void *ctx);
 void irq_unregister_handler(uint8_t irq);
+
+int irq_alloc_vector(void);
+int irq_alloc_vectors(int count);
+void irq_free_vector(uint8_t vec);
+int irq_register_vector_handler(uint8_t vec, irq_vector_callback_t cb, void *ctx);
+void irq_unregister_vector_handler(uint8_t vec);
 
 /* On x86_64 with the IOAPIC live, device interrupts are acknowledged at the LAPIC (the 8259 never saw them);... */
 void irq_ack(unsigned int irq);

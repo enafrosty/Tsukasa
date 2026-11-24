@@ -33,6 +33,8 @@
 
 #include "drv/serial.h"
 #include "drv/fb.h"
+#include "drv/acpi.h"
+#include "drv/ioapic.h"
 #include "drv/pic.h"
 #include "drv/pit.h"
 #include "drv/rtc.h"
@@ -79,97 +81,83 @@ static void network_bootstrap_entry(void)
 
 extern void syscall_table_run_selftests(void);
 
-static int is_selftest_requested(const struct tsukasa_boot_info *boot_info)
+static int fw_cfg_read_file(const char *name1, const char *name2, char *out, size_t cap)
 {
-    if (boot_info && boot_info->cmdline) {
-        if (k_strstr(boot_info->cmdline, "tsukasa.selftest=1"))
-            return 1;
-    }
+    if (!out || cap == 0)
+        return -1;
+    out[0] = '\0';
 
     io_outw(0x510, 0x0000);
     char sig[4];
     for (int i = 0; i < 4; i++)
         sig[i] = (char)io_inb(0x511);
 
-    if (sig[0] == 'Q' && sig[1] == 'E' && sig[2] == 'M' && sig[3] == 'U') {
-        io_outw(0x510, 0x0019);
-        uint32_t count = 0;
-        count |= ((uint32_t)io_inb(0x511)) << 24;
-        count |= ((uint32_t)io_inb(0x511)) << 16;
-        count |= ((uint32_t)io_inb(0x511)) << 8;
-        count |= (uint32_t)io_inb(0x511);
+    if (sig[0] != 'Q' || sig[1] != 'E' || sig[2] != 'M' || sig[3] != 'U')
+        return -1;
 
-        for (uint32_t i = 0; i < count; i++) {
-            (void)io_inb(0x511); (void)io_inb(0x511);
-            (void)io_inb(0x511); (void)io_inb(0x511);
+    io_outw(0x510, 0x0019);
+    uint32_t count = 0;
+    count |= ((uint32_t)io_inb(0x511)) << 24;
+    count |= ((uint32_t)io_inb(0x511)) << 16;
+    count |= ((uint32_t)io_inb(0x511)) << 8;
+    count |= (uint32_t)io_inb(0x511);
 
-            uint16_t select = 0;
-            select |= ((uint16_t)io_inb(0x511)) << 8;
-            select |= (uint16_t)io_inb(0x511);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t fsize = 0;
+        fsize |= ((uint32_t)io_inb(0x511)) << 24;
+        fsize |= ((uint32_t)io_inb(0x511)) << 16;
+        fsize |= ((uint32_t)io_inb(0x511)) << 8;
+        fsize |= (uint32_t)io_inb(0x511);
 
-            (void)io_inb(0x511); (void)io_inb(0x511);
+        uint16_t select = 0;
+        select |= ((uint16_t)io_inb(0x511)) << 8;
+        select |= (uint16_t)io_inb(0x511);
 
-            char name[56];
-            for (int j = 0; j < 56; j++)
-                name[j] = (char)io_inb(0x511);
+        (void)io_inb(0x511);
+        (void)io_inb(0x511);
 
-            if (k_strcmp(name, "opt/org.tsukasa.selftest") == 0 ||
-                k_strcmp(name, "opt/tsukasa.selftest") == 0) {
-                io_outw(0x510, select);
-                char val = (char)io_inb(0x511);
-                if (val == '1')
-                    return 1;
-            }
+        char name[56];
+        for (int j = 0; j < 56; j++)
+            name[j] = (char)io_inb(0x511);
+        name[55] = '\0';
+
+        if ((name1 && k_strcmp(name, name1) == 0) ||
+            (name2 && k_strcmp(name, name2) == 0)) {
+            io_outw(0x510, select);
+            size_t to_read = (fsize < cap - 1) ? (size_t)fsize : (cap - 1);
+            for (size_t k = 0; k < to_read; k++)
+                out[k] = (char)io_inb(0x511);
+            out[to_read] = '\0';
+            return (int)to_read;
         }
     }
 
+    return -1;
+}
+
+static int is_selftest_requested(const struct tsukasa_boot_info *boot_info)
+{
+    if (boot_info && boot_info->cmdline &&
+        k_strstr(boot_info->cmdline, "tsukasa.selftest=1"))
+        return 1;
+
+    char val[8];
+    if (fw_cfg_read_file("opt/org.tsukasa.selftest", "opt/tsukasa.selftest",
+                         val, sizeof(val)) > 0 && val[0] == '1')
+        return 1;
     return 0;
 }
 
 static int is_test_requested(const struct tsukasa_boot_info *boot_info)
 {
-    if (boot_info && boot_info->cmdline) {
-        if (k_strstr(boot_info->cmdline, "tsukasa.test=1"))
-            return 1;
-    }
+    if (boot_info && boot_info->cmdline &&
+        k_strstr(boot_info->cmdline, "tsukasa.test=1"))
+        return 1;
 
-    io_outw(0x510, 0x0000);
-    char sig[4];
-    for (int i = 0; i < 4; i++)
-        sig[i] = (char)io_inb(0x511);
-
-    if (sig[0] == 'Q' && sig[1] == 'E' && sig[2] == 'M' && sig[3] == 'U') {
-        io_outw(0x510, 0x0019);
-        uint32_t count = 0;
-        count |= ((uint32_t)io_inb(0x511)) << 24;
-        count |= ((uint32_t)io_inb(0x511)) << 16;
-        count |= ((uint32_t)io_inb(0x511)) << 8;
-        count |= (uint32_t)io_inb(0x511);
-
-        for (uint32_t i = 0; i < count; i++) {
-            (void)io_inb(0x511); (void)io_inb(0x511);
-            (void)io_inb(0x511); (void)io_inb(0x511);
-
-            uint16_t select = 0;
-            select |= ((uint16_t)io_inb(0x511)) << 8;
-            select |= (uint16_t)io_inb(0x511);
-
-            (void)io_inb(0x511); (void)io_inb(0x511);
-
-            char name[56];
-            for (int j = 0; j < 56; j++)
-                name[j] = (char)io_inb(0x511);
-
-            if (k_strcmp(name, "opt/org.tsukasa.test") == 0 ||
-                k_strcmp(name, "opt/tsukasa.test") == 0) {
-                io_outw(0x510, select);
-                char val = (char)io_inb(0x511);
-                if (val == '1')
-                    return 1;
-            }
-        }
-    }
-
+    char val[8];
+    if (fw_cfg_read_file("opt/org.tsukasa.test", "opt/tsukasa.test",
+                         val, sizeof(val)) > 0 && val[0] == '1')
+        return 1;
     return 0;
 }
 
@@ -182,46 +170,46 @@ static int is_gdb_wait_requested(const struct tsukasa_boot_info *boot_info)
             return 1;
     }
 
-    io_outw(0x510, 0x0000);
-    char sig[4];
-    for (int i = 0; i < 4; i++)
-        sig[i] = (char)io_inb(0x511);
-
-    if (sig[0] == 'Q' && sig[1] == 'E' && sig[2] == 'M' && sig[3] == 'U') {
-        io_outw(0x510, 0x0019);
-        uint32_t count = 0;
-        count |= ((uint32_t)io_inb(0x511)) << 24;
-        count |= ((uint32_t)io_inb(0x511)) << 16;
-        count |= ((uint32_t)io_inb(0x511)) << 8;
-        count |= (uint32_t)io_inb(0x511);
-
-        for (uint32_t i = 0; i < count; i++) {
-            (void)io_inb(0x511); (void)io_inb(0x511);
-            (void)io_inb(0x511); (void)io_inb(0x511);
-
-            uint16_t select = 0;
-            select |= ((uint16_t)io_inb(0x511)) << 8;
-            select |= (uint16_t)io_inb(0x511);
-
-            (void)io_inb(0x511); (void)io_inb(0x511);
-
-            char name[56];
-            for (int j = 0; j < 56; j++)
-                name[j] = (char)io_inb(0x511);
-
-            if (k_strcmp(name, "opt/org.tsukasa.gdb") == 0 ||
-                k_strcmp(name, "opt/tsukasa.gdb") == 0) {
-                io_outw(0x510, select);
-                char val = (char)io_inb(0x511);
-                if (val == '1' || val == 'w')
-                    return 1;
-            }
-        }
-    }
-
+    char val[8];
+    if (fw_cfg_read_file("opt/org.tsukasa.gdb", "opt/tsukasa.gdb",
+                         val, sizeof(val)) > 0 &&
+        (val[0] == '1' || val[0] == 'w'))
+        return 1;
     return 0;
 }
 #endif
+
+static char g_effective_cmdline[512];
+
+static void build_effective_boot_info(const struct tsukasa_boot_info *src,
+                                      struct tsukasa_boot_info *dst)
+{
+    char fw_cmd[256];
+    size_t pos = 0;
+
+    if (!src)
+        return;
+    *dst = *src;
+
+    g_effective_cmdline[0] = '\0';
+    if (src->cmdline && src->cmdline[0]) {
+        while (src->cmdline[pos] && pos + 1 < sizeof(g_effective_cmdline)) {
+            g_effective_cmdline[pos] = src->cmdline[pos];
+            pos++;
+        }
+    }
+
+    if (fw_cfg_read_file("opt/org.tsukasa.cmdline", "opt/tsukasa.cmdline",
+                         fw_cmd, sizeof(fw_cmd)) > 0 && fw_cmd[0]) {
+        if (pos > 0 && pos + 1 < sizeof(g_effective_cmdline))
+            g_effective_cmdline[pos++] = ' ';
+        for (size_t i = 0; fw_cmd[i] && pos + 1 < sizeof(g_effective_cmdline); i++)
+            g_effective_cmdline[pos++] = fw_cmd[i];
+    }
+    g_effective_cmdline[pos] = '\0';
+    if (pos > 0)
+        dst->cmdline = g_effective_cmdline;
+}
 
 void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
 {
@@ -239,6 +227,11 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
         :
         : "rax", "memory");
     kprintf("[boot:x64] Tsukasa x86_64 kernel starting\n");
+    struct tsukasa_boot_info effective_bi;
+    if (boot_info) {
+        build_effective_boot_info(boot_info, &effective_bi);
+        boot_info = &effective_bi;
+    }
     if (boot_info && boot_info->cmdline)
         k_log_init(boot_info->cmdline);
 
@@ -280,6 +273,8 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     kprintf("[boot:x64] GDT/IDT ready\n");
     kprintf("[boot:x64] SMP online CPUs=%u\n", online_cpus);
 
+    acpi_init(boot_info);
+
     if (fb_init(boot_info) == 0 && fb_info.addr && fb_info.bpp == 32) {
         uintptr_t fb_mapped = 0;
         size_t fb_size = (size_t)fb_info.pitch * (size_t)fb_info.height;
@@ -307,12 +302,18 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     rtc_init();
 
     pic_init();
+    ioapic_init();
     pit_init(100);
     pci_init();
     network_init();
     kprintf("[boot:x64] network stack init deferred until scheduler start\n");
 
     vfs_init(boot_info);
+    if (!vfs_is_root_mounted()) {
+        kprintf("[boot:x64] root filesystem unavailable; halting\n");
+        vga_puts_row(0, "Tsukasa x64: root mount failed");
+        halt_forever();
+    }
     unix_socket_run_selftests();
     ps2mouse_init();
 
@@ -328,17 +329,13 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     vfs_stat_t st;
     if (test_mode) {
         kprintf("[boot:x64] automated test runner mode enabled\n");
-        if (vfs_stat("/fat12/TESTDRV.ELF", &st) == 0 && st.type != VFS_TYPE_DIR)
-            init_pid = elf64_spawn("/fat12/TESTDRV.ELF", "testdrv");
-        else if (vfs_stat("/bin/TESTDRV.ELF", &st) == 0 && st.type != VFS_TYPE_DIR)
+        if (vfs_stat("/bin/TESTDRV.ELF", &st) == 0 && st.type != VFS_TYPE_DIR)
             init_pid = elf64_spawn("/bin/TESTDRV.ELF", "testdrv");
-        else if (vfs_stat("/fat12/testdrv.elf", &st) == 0 && st.type != VFS_TYPE_DIR)
-            init_pid = elf64_spawn("/fat12/testdrv.elf", "testdrv");
         else if (vfs_stat("/bin/testdrv.elf", &st) == 0 && st.type != VFS_TYPE_DIR)
             init_pid = elf64_spawn("/bin/testdrv.elf", "testdrv");
 
         if (init_pid >= 0) {
-            kprintf("[boot:x64] /fat12/TESTDRV.ELF running (pid=%d)\n", init_pid);
+            kprintf("[boot:x64] /bin/TESTDRV.ELF running (pid=%d)\n", init_pid);
         } else {
             kprintf("[boot:x64] WARN: failed to spawn TESTDRV.ELF\n");
         }

@@ -1210,7 +1210,11 @@ int handle_msg_map_window(vanilla_server_t *srv, int client_idx, const vanilla_m
         int was_mapped = w->is_mapped;
         w->is_mapped = 1;
         w->frame_begin_in_flight = 0;
-        vanilla_server_focus_window(srv, w->window_id);
+        if (!((w->flags & WINDOW_FLAG_ALWAYS_TOP) &&
+              (w->flags & WINDOW_FLAG_BORDERLESS) &&
+              !(w->flags & WINDOW_FLAG_POPUP))) {
+            vanilla_server_focus_window(srv, w->window_id);
+        }
         wm_raise_window(srv, w->window_id);
 
         if (g_theme->reduce_motion == 0) {
@@ -2950,13 +2954,6 @@ static void wm_spawn_app(const char *path)
 
     char *argv[] = { current_path, NULL };
     pid_t pid = spawn(current_path, argv, NULL);
-
-    if (pid <= 0 && strncmp(current_path, "/bin/", 5) == 0) {
-        char fat_path[320];
-        snprintf(fat_path, sizeof(fat_path), "/fat12/%s", current_path + 5);
-        char *fargv[] = { fat_path, NULL };
-        pid = spawn(fat_path, fargv, NULL);
-    }
     (void)pid;
 }
 

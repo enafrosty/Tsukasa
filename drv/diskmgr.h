@@ -20,7 +20,8 @@
 #include <stdint.h>
 #include "blockdev.h"
 
-/* Scan one whole disk: GPT first (LBA 1 signature + header CRC), MBR fallback, then the raw-FAT32 fallback... */
+/* Scan one whole disk: GPT first (primary then backup with header + entry CRCs), MBR fallback, then raw FAT32. */
+int diskmgr_scan_device(block_dev_t *bd);
 int diskmgr_rescan(block_dev_t *bd);
 
 /* Rescan every registered whole disk (called from vfs_init after the disk drivers have registered). */

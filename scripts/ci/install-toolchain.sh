@@ -39,6 +39,7 @@ PKGS=(
     "lld-${LLVM_VERSION}"
     "llvm-${LLVM_VERSION}"
     nasm
+    lz4
     xorriso
     mtools
     dosfstools

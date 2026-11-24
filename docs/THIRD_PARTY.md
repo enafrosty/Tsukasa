@@ -12,6 +12,7 @@ record the new commit here in the same change.
 | Lua | lua.org | 5.4.7 | MIT | `tsukasa-ports/ports/lua/src/` |
 | TinyCC | github.com/TinyCC/tinycc | `0fb54300b56512754221d80adda85ddb9815bceb` (branch `mob`) | LGPL-2.1 | `tsukasa-ports/ports/tcc/src/tinycc/` |
 | microui | github.com/rxi/microui | `897763f04497064d8520267c7e5bf0d4b14dbe1f` | MIT | `vanilla/devtools/vendor/microui/` |
+| lwext4 | https://github.com/gkostka/lwext4 | `b2d8fe025940cf4091fc40334aedd64d56034cdc` | BSD-3-Clause | `fs/third_party/lwext4/` |
 
 Notes: TinyCC's upstream `.github/` was removed when vendoring. Its own
 `.gitignore` is retained so its build output stays untracked.

@@ -313,6 +313,7 @@ char *strerror(int errnum)
     case ENOLCK:       return "No locks available";
     case ENOSYS:       return "Function not implemented";
     case ENOTEMPTY:    return "Directory not empty";
+    case ELOOP:        return "Too many levels of symbolic links";
     case EAFNOSUPPORT: return "Address family not supported by protocol";
     case EADDRINUSE:   return "Address already in use";
     case ETIMEDOUT:    return "Connection timed out";

@@ -385,13 +385,6 @@ pid_t shell_spawn_app(const char *path)
     char *argv[] = { current_path, NULL };
     pid_t pid = spawn(current_path, argv, NULL);
 
-    if (pid <= 0 && strncmp(current_path, "/bin/", 5) == 0) {
-        char fat_path[320];
-        snprintf(fat_path, sizeof(fat_path), "/fat12/%s", current_path + 5);
-        char *fargv[] = { fat_path, NULL };
-        pid = spawn(fat_path, fargv, NULL);
-    }
-
     if (pid <= 0) {
         char upath[256];
         size_t len = strlen(current_path);
@@ -403,13 +396,6 @@ pid_t shell_spawn_app(const char *path)
         upath[i] = '\0';
         char *uargv[] = { upath, NULL };
         pid = spawn(upath, uargv, NULL);
-
-        if (pid <= 0 && strncmp(upath, "/BIN/", 5) == 0) {
-            char fat_upath[320];
-            snprintf(fat_upath, sizeof(fat_upath), "/fat12/%s", upath + 5);
-            char *fuargv[] = { fat_upath, NULL };
-            pid = spawn(fat_upath, fuargv, NULL);
-        }
     }
     if (pid > 0)
         g_pending_spawn.pid = pid;

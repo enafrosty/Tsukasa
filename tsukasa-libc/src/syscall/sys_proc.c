@@ -89,7 +89,7 @@ int execvp(const char *file, char *const argv[])
     snprintf(pathbuf, sizeof(pathbuf), "/bin/%s", file);
     execve(pathbuf, argv, environ);
 
-    snprintf(pathbuf, sizeof(pathbuf), "/fat12/%s", file);
+    snprintf(pathbuf, sizeof(pathbuf), "/usr/bin/%s", file);
     return execve(pathbuf, argv, environ);
 }
 

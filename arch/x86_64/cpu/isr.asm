@@ -81,36 +81,7 @@ isr_x64_%1:
 global isr_x64_%1
 isr_x64_%1:
     push %1
-    PUSH_GPRS
-    test qword [rsp + 136], 3
-    jz %%from_kernel
-    swapgs
-%%from_kernel:
-    mov rdi, [rsp + 120]
-    mov rsi, rsp
-    cld
-    mov r15, rsp
-    and rsp, -16
-    sub rsp, 8
-    call irq_handler_x64
-    mov rsp, r15
-    test rax, rax
-    jz %%keep_rsp
-    mov rsp, rax
-%%keep_rsp:
-    ; Ensure no latent NT/TF flag state can poison iretq task/trace semantics.
-    pushfq
-    pop rax
-    and rax, ~((1 << 14) | (1 << 8))
-    push rax
-    popfq
-    test qword [rsp + 136], 3
-    jz %%skip_swap
-    swapgs
-%%skip_swap:
-    POP_GPRS
-    add rsp, 8
-    iretq
+    jmp isr_irq_common
 %endmacro
 
 ISR_NOERR 0
@@ -164,6 +135,46 @@ IRQ_STUB 46
 IRQ_STUB 47
 IRQ_STUB 64
 IRQ_STUB 65
+
+%assign vec 48
+%rep (254 - 48 + 1)
+    %if (vec != 64) && (vec != 65) && (vec != 128)
+        IRQ_STUB vec
+    %endif
+    %assign vec vec + 1
+%endrep
+
+isr_irq_common:
+    PUSH_GPRS
+    test qword [rsp + 136], 3
+    jz .from_kernel
+    swapgs
+.from_kernel:
+    mov rdi, [rsp + 120]
+    mov rsi, rsp
+    cld
+    mov r15, rsp
+    and rsp, -16
+    sub rsp, 8
+    call irq_handler_x64
+    mov rsp, r15
+    test rax, rax
+    jz .keep_rsp
+    mov rsp, rax
+.keep_rsp:
+    ; Ensure no latent NT/TF flag state can poison iretq task/trace semantics.
+    pushfq
+    pop rax
+    and rax, ~((1 << 14) | (1 << 8))
+    push rax
+    popfq
+    test qword [rsp + 136], 3
+    jz .skip_swap
+    swapgs
+.skip_swap:
+    POP_GPRS
+    add rsp, 8
+    iretq
 
 isr_exception_common:
     PUSH_GPRS
@@ -223,5 +234,18 @@ process_entry_resume:
     call process_entry_trampoline
     leave
     iretq
+
+section .rodata
+global isr_x64_irq_table
+isr_x64_irq_table:
+%assign vec 48
+%rep (254 - 48 + 1)
+    %if (vec == 64) || (vec == 65) || (vec == 128)
+        dq 0
+    %else
+        dq isr_x64_%+vec
+    %endif
+    %assign vec vec + 1
+%endrep
 
 section .note.GNU-stack noalloc noexec nowrite progbits

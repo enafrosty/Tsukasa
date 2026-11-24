@@ -33,7 +33,6 @@ void app_cmd_ping_entry(void);
 void app_cmd_telnet_entry(void);
 void app_cmd_abi_test_entry(void);
 void app_cmd_poweroff_entry(void);
-void app_cmd_install_entry(void);
 void app_shell_init_entry(void);
 void app_init_entry(void);
 
@@ -48,7 +47,6 @@ void user_apps_register_all(void)
     exec_register_builtin("/bin/man", app_cmd_man_entry);
     exec_register_builtin("/bin/grep", app_cmd_grep_entry);
     exec_register_builtin("/bin/cat", app_cmd_cat_entry);
-    exec_register_builtin("/bin/install", app_cmd_install_entry);
     exec_register_builtin("/bin/net", app_cmd_net_entry);
     exec_register_builtin("/bin/ping", app_cmd_ping_entry);
     exec_register_builtin("/bin/telnet", app_cmd_telnet_entry);

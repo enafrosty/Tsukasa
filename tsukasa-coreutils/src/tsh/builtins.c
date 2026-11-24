@@ -146,7 +146,8 @@ int builtin_lookup(const char *name)
             strcmp(name, "exit") == 0 ||
             strcmp(name, "export") == 0 ||
             strcmp(name, "help") == 0 ||
-            strcmp(name, "history") == 0);
+            strcmp(name, "history") == 0 ||
+            strcmp(name, "sync") == 0);
 }
 
 static int builtin_cd(int argc, char **argv, int err_fd)
@@ -304,6 +305,10 @@ int builtin_execute(tsh_cmd_t *cmd, int in_fd, int out_fd, int err_fd, int *exit
         return builtin_help(out_fd);
     if (strcmp(name, "history") == 0)
         return builtin_history(out_fd);
+    if (strcmp(name, "sync") == 0) {
+        sync();
+        return 0;
+    }
 
     return -1;
 }

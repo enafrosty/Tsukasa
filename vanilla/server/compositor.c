@@ -395,17 +395,13 @@ int compositor_load_default_wallpaper(vanilla_compositor_t *comp)
     }
 
     static const char *const wallpaper_paths[] = {
-        "/fat12/WALLPAP.PNG",
-        "/fat12/wallpap.png",
-        "/WALLPAP.PNG",
+        "/usr/share/vanilla/wallpaper.png",
         "/assets/wallpaper.png",
         "assets/wallpaper.png",
         "vanilla/assets/wallpaper.png",
         "../assets/wallpaper.png",
         "../../assets/wallpaper.png",
-        "/fat12/WALLPAP.BMP",
-        "/fat12/wallpap.bmp",
-        "/WALLPAP.BMP",
+        "/usr/share/vanilla/wallpaper.bmp",
         "/assets/wallpaper.bmp",
         "assets/wallpaper.bmp",
         "vanilla/assets/wallpaper.bmp",

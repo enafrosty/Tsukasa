@@ -25,8 +25,10 @@
 #define O_APPEND   0x0004
 #define O_CREAT    0x0008
 #define O_TRUNC    0x0010
-#define O_NONBLOCK 0x0020
-#define O_EXCL     0x0040
+#define O_NONBLOCK  0x0020
+#define O_EXCL      0x0040
+#define O_NOFOLLOW  0x0080
+#define O_DIRECTORY 0x0100
 
 #define F_GETFL 1
 #define F_SETFL 2

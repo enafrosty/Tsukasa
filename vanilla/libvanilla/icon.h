@@ -42,8 +42,7 @@ typedef struct {
  *   then <name>.bmp as a fallback. Returns NULL if neither is found.
  *   The returned icon_t* is owned by the caller; call icon_free() when done.
  *
- * Icon search path: "/icons/", "/fat12/ICONS/", then the assets directory.
- * FAT12 8.3 note: file names are probed in lowercase then uppercase variants.
+ * Icon search path: "/usr/share/vanilla/icons/", "/icons/", then the assets directory.
  */
 icon_t *icon_load(const char *name);
 

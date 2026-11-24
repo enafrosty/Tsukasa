@@ -95,12 +95,21 @@ int main(int argc, char *argv[])
         total_blocks_64 = 0xFFFFFFFFULL;
 
     uint32_t total_blocks = (uint32_t)total_blocks_64;
-    uint32_t num_groups = (total_blocks + BLOCKS_PER_GROUP - 1u) / BLOCKS_PER_GROUP;
-    uint32_t total_inodes = num_groups * INODES_PER_GROUP;
-
-    /* Group descriptor table size */
+    uint32_t num_groups = ((total_blocks - 1u) + BLOCKS_PER_GROUP - 1u) / BLOCKS_PER_GROUP;
     uint32_t gdt_bytes = num_groups * sizeof(ext2_group_desc_t);
     uint32_t gdt_blocks = (gdt_bytes + BLOCK_SIZE - 1u) / BLOCK_SIZE;
+
+    uint32_t min_last_grp = 1u + gdt_blocks + 2u + INODE_TABLE_BLOCKS + 1u;
+    if (num_groups > 1u) {
+        uint32_t last_grp_blocks = (total_blocks - 1u) - (num_groups - 1u) * BLOCKS_PER_GROUP;
+        if (last_grp_blocks < min_last_grp) {
+            num_groups--;
+            total_blocks = 1u + num_groups * BLOCKS_PER_GROUP;
+            gdt_bytes = num_groups * sizeof(ext2_group_desc_t);
+            gdt_blocks = (gdt_bytes + BLOCK_SIZE - 1u) / BLOCK_SIZE;
+        }
+    }
+    uint32_t total_inodes = num_groups * INODES_PER_GROUP;
 
     if (verbose) {
         char sz_buf[32];
@@ -119,21 +128,16 @@ int main(int argc, char *argv[])
     uint32_t total_free_blocks = 0;
     uint32_t total_free_inodes = 0;
 
-    /* Calculate layout for each group */
+    /* Calculate layout for each group (s_first_data_block = 1). */
     for (uint32_t g = 0; g < num_groups; g++) {
-        uint32_t grp_start = (g == 0) ? 1u : (g * BLOCKS_PER_GROUP);
+        uint32_t grp_start = 1u + g * BLOCKS_PER_GROUP;
         uint32_t grp_blocks = BLOCKS_PER_GROUP;
-        if (g == 0)
-            grp_blocks = BLOCKS_PER_GROUP - 1u; /* Block 0 is boot block */
         if (grp_start + grp_blocks > total_blocks)
             grp_blocks = total_blocks - grp_start;
 
         uint32_t cur = grp_start;
-        /* Group 0 has superblock and GDT copy */
-        if (g == 0) {
-            cur += 1u;          /* Block 1: Superblock */
-            cur += gdt_blocks;  /* Blocks 2..: GDT */
-        }
+        cur += 1u;          /* Superblock (primary in group 0, backup in others) */
+        cur += gdt_blocks;  /* Group Descriptor Table */
 
         gdt[g].bg_block_bitmap = cur++;
         gdt[g].bg_inode_bitmap = cur++;
@@ -150,7 +154,7 @@ int main(int argc, char *argv[])
             gdt[g].bg_free_blocks_count = 0;
 
         if (g == 0) {
-            gdt[g].bg_free_inodes_count = (uint16_t)(INODES_PER_GROUP - 11u);
+            gdt[g].bg_free_inodes_count = (uint16_t)(INODES_PER_GROUP - 10u);
             gdt[g].bg_used_dirs_count = 1;
         } else {
             gdt[g].bg_free_inodes_count = (uint16_t)INODES_PER_GROUP;
@@ -171,7 +175,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* 2. Build and write Superblock at Block 1 (offset 1024) */
+    /* 2. Build Superblock */
     ext2_super_block_t sb;
     memset(&sb, 0, sizeof(sb));
 
@@ -201,25 +205,27 @@ int main(int argc, char *argv[])
     sb.s_def_resuid = 0;
     sb.s_def_resgid = 0;
 
-    if (write_block(&dev, 1, &sb) != 0) {
-        fprintf(stderr, "mkfs.ext2: failed to write superblock\n");
-        free(gdt);
-        device_close(&dev);
-        return 1;
-    }
-
-    /* 3. Write Group Descriptor Table starting at Block 2 */
-    for (uint32_t b = 0; b < gdt_blocks; b++) {
-        memset(zero_block, 0, sizeof(zero_block));
-        size_t off = (size_t)b * BLOCK_SIZE;
-        size_t rem = gdt_bytes - off;
-        size_t chunk = rem < BLOCK_SIZE ? rem : BLOCK_SIZE;
-        memcpy(zero_block, (const uint8_t *)gdt + off, chunk);
-        if (write_block(&dev, 2 + b, zero_block) != 0) {
-            fprintf(stderr, "mkfs.ext2: failed to write group descriptors\n");
+    /* 3. Write Superblock and Group Descriptor Table in every group */
+    for (uint32_t g = 0; g < num_groups; g++) {
+        uint32_t grp_start = 1u + g * BLOCKS_PER_GROUP;
+        if (write_block(&dev, grp_start, &sb) != 0) {
+            fprintf(stderr, "mkfs.ext2: failed to write superblock for group %u\n", g);
             free(gdt);
             device_close(&dev);
             return 1;
+        }
+        for (uint32_t b = 0; b < gdt_blocks; b++) {
+            memset(zero_block, 0, sizeof(zero_block));
+            size_t off = (size_t)b * BLOCK_SIZE;
+            size_t rem = gdt_bytes - off;
+            size_t chunk = rem < BLOCK_SIZE ? rem : BLOCK_SIZE;
+            memcpy(zero_block, (const uint8_t *)gdt + off, chunk);
+            if (write_block(&dev, grp_start + 1u + b, zero_block) != 0) {
+                fprintf(stderr, "mkfs.ext2: failed to write group descriptors for group %u\n", g);
+                free(gdt);
+                device_close(&dev);
+                return 1;
+            }
         }
     }
 
@@ -229,10 +235,8 @@ int main(int argc, char *argv[])
         uint8_t block_bitmap[BLOCK_SIZE];
         memset(block_bitmap, 0, sizeof(block_bitmap));
 
-        uint32_t grp_start = (g == 0) ? 1u : (g * BLOCKS_PER_GROUP);
+        uint32_t grp_start = 1u + g * BLOCKS_PER_GROUP;
         uint32_t grp_blocks = BLOCKS_PER_GROUP;
-        if (g == 0)
-            grp_blocks = BLOCKS_PER_GROUP - 1u;
         if (grp_start + grp_blocks > total_blocks)
             grp_blocks = total_blocks - grp_start;
 
@@ -256,8 +260,8 @@ int main(int argc, char *argv[])
         memset(inode_bitmap, 0, sizeof(inode_bitmap));
 
         if (g == 0) {
-            /* Mark Inodes 1..11 as used */
-            for (uint32_t bit = 0; bit < 11; bit++)
+            /* Mark Inodes 1..10 as used */
+            for (uint32_t bit = 0; bit < 10; bit++)
                 inode_bitmap[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
         }
 
@@ -323,7 +327,7 @@ int main(int argc, char *argv[])
     dot->inode = EXT2_ROOT_INO;
     dot->rec_len = 12;
     dot->name_len = 1;
-    dot->file_type = EXT2_FT_DIR;
+    dot->file_type = EXT2_FT_UNKNOWN;
     dot->name[0] = '.';
 
     /* Entry 2: '..' */
@@ -331,7 +335,7 @@ int main(int argc, char *argv[])
     dotdot->inode = EXT2_ROOT_INO;
     dotdot->rec_len = (uint16_t)(BLOCK_SIZE - 12u);
     dotdot->name_len = 2;
-    dotdot->file_type = EXT2_FT_DIR;
+    dotdot->file_type = EXT2_FT_UNKNOWN;
     dotdot->name[0] = '.';
     dotdot->name[1] = '.';
 

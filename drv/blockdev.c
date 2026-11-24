@@ -16,16 +16,24 @@
 
 #include "blockdev.h"
 #include "ata.h"
+#include "diskmgr.h"
 
+#include "../include/errno.h"
 #include "../include/kprintf.h"
 #include "../include/kutils.h"
 #include "../include/spinlock.h"
+#include "../include/vfs_abi.h"
 #include "../mm/heap.h"
+#include "../mm/vmm_x64.h"
 #include "../fs/devfs.h"
 #include "../fs/vfs.h"
 
 #include <stddef.h>
 #include <stdint.h>
+
+#ifndef ENOTTY
+#define ENOTTY 25
+#endif
 
 static int blockdev_devfs_open(void *priv, int flags)
 {
@@ -56,7 +64,7 @@ static size_t blockdev_devfs_read(void *priv, size_t pos, void *buf, size_t coun
     uint64_t start_lba = pos / ss;
     size_t offset_in_sec = pos % ss;
     size_t bytes_read = 0;
-    uint8_t bounce[512];
+    uint8_t *bounce = NULL;
 
     while (bytes_read < count) {
         if (offset_in_sec == 0 && (count - bytes_read) >= ss) {
@@ -66,6 +74,11 @@ static size_t blockdev_devfs_read(void *priv, size_t pos, void *buf, size_t coun
             bytes_read += (size_t)sectors * ss;
             start_lba += sectors;
         } else {
+            if (!bounce) {
+                bounce = (uint8_t *)kmalloc(ss);
+                if (!bounce)
+                    break;
+            }
             if (bd->read(bd, start_lba, 1, bounce) != 0)
                 break;
             size_t chunk = ss - offset_in_sec;
@@ -78,6 +91,8 @@ static size_t blockdev_devfs_read(void *priv, size_t pos, void *buf, size_t coun
             start_lba++;
         }
     }
+    if (bounce)
+        kfree(bounce);
     return bytes_read;
 }
 
@@ -97,7 +112,7 @@ static size_t blockdev_devfs_write(void *priv, size_t pos, const void *buf, size
     uint64_t start_lba = pos / ss;
     size_t offset_in_sec = pos % ss;
     size_t bytes_written = 0;
-    uint8_t bounce[512];
+    uint8_t *bounce = NULL;
 
     while (bytes_written < count) {
         if (offset_in_sec == 0 && (count - bytes_written) >= ss) {
@@ -107,7 +122,12 @@ static size_t blockdev_devfs_write(void *priv, size_t pos, const void *buf, size
             bytes_written += (size_t)sectors * ss;
             start_lba += sectors;
         } else {
-            if (bd->read && bd->read(bd, start_lba, 1, bounce) != 0)
+            if (!bounce) {
+                bounce = (uint8_t *)kmalloc(ss);
+                if (!bounce)
+                    break;
+            }
+            if (!bd->read || bd->read(bd, start_lba, 1, bounce) != 0)
                 k_memset(bounce, 0, ss);
             size_t chunk = ss - offset_in_sec;
             if (chunk > count - bytes_written)
@@ -121,9 +141,43 @@ static size_t blockdev_devfs_write(void *priv, size_t pos, const void *buf, size
             start_lba++;
         }
     }
+    if (bounce)
+        kfree(bounce);
     if (bd->sync)
         bd->sync(bd);
     return bytes_written;
+}
+
+static int blockdev_devfs_ioctl(void *priv, unsigned long request, void *arg)
+{
+    block_dev_t *bd = (block_dev_t *)priv;
+    if (!bd)
+        return -ENODEV;
+
+    switch (request) {
+    case BLKGETSIZE64: {
+        if (!arg || !vmm_validate_user_ptr(arg, sizeof(uint64_t), 1))
+            return -EFAULT;
+        uint32_t ss = bd->sector_size ? bd->sector_size : 512u;
+        *(uint64_t *)arg = bd->sector_count * (uint64_t)ss;
+        return 0;
+    }
+    case BLKSSZGET: {
+        if (!arg || !vmm_validate_user_ptr(arg, sizeof(int), 1))
+            return -EFAULT;
+        uint32_t ss = bd->sector_size ? bd->sector_size : 512u;
+        *(int *)arg = (int)ss;
+        return 0;
+    }
+    case BLKRRPART: {
+        if (bd->is_partition)
+            return -EINVAL;
+        blockdev_unregister_partitions(bd);
+        return (diskmgr_scan_device(bd) < 0) ? -EIO : 0;
+    }
+    default:
+        return -ENOTTY;
+    }
 }
 
 static size_t blockdev_devfs_size(void *priv)
@@ -140,7 +194,7 @@ static const devfs_ops_t g_blockdev_devfs_ops = {
     .close = blockdev_devfs_close,
     .read = blockdev_devfs_read,
     .write = blockdev_devfs_write,
-    .ioctl = NULL,
+    .ioctl = blockdev_devfs_ioctl,
     .mmap = NULL,
     .munmap = NULL,
     .poll = NULL,
@@ -152,9 +206,11 @@ static int g_dev_count;
 static spinlock_t g_blockdev_lock = SPINLOCK_INIT;
 
 static block_dev_t g_part_pool[BLOCKDEV_MAX_PARTS];
-static int g_part_count;
+static uint8_t g_part_used[BLOCKDEV_MAX_PARTS];
 static int g_next_sd_index;   /* sda, sdb, ... (SATA) */
 static int g_next_hd_index;   /* hda, hdb, ... (IDE)  */
+static int g_next_vd_index;   /* vda, vdb, ... (VirtIO) */
+static int g_next_nvme_index; /* nvme0n1, nvme1n1, ... */
 
 static int bd_streq(const char *a, const char *b)
 {
@@ -166,22 +222,64 @@ static int bd_streq(const char *a, const char *b)
     return a[i] == b[i];
 }
 
+static int bd_fmt_uint(char *dst, size_t cap, uint32_t val)
+{
+    char tmp[16];
+    int n = 0;
+    size_t i;
+
+    if (cap == 0)
+        return 0;
+    if (val == 0) {
+        if (cap > 1) {
+            dst[0] = '0';
+            dst[1] = '\0';
+            return 1;
+        }
+        dst[0] = '\0';
+        return 0;
+    }
+    while (val > 0 && n < (int)sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (val % 10u));
+        val /= 10u;
+    }
+    for (i = 0; i < (size_t)n && i + 1 < cap; i++)
+        dst[i] = tmp[n - 1 - (int)i];
+    dst[i] = '\0';
+    return (int)i;
+}
+
 static void blockdev_assign_name(block_dev_t *bd)
 {
     int idx;
-    char c1, c2;
+
+    if (bd->type == BLOCKDEV_TYPE_NVME) {
+        int n;
+        idx = g_next_nvme_index++;
+        bd->name[0] = 'n';
+        bd->name[1] = 'v';
+        bd->name[2] = 'm';
+        bd->name[3] = 'e';
+        n = 4 + bd_fmt_uint(bd->name + 4, BLOCKDEV_NAME_MAX - 6, (uint32_t)idx);
+        if (n + 2 < BLOCKDEV_NAME_MAX) {
+            bd->name[n++] = 'n';
+            bd->name[n++] = '1';
+        }
+        bd->name[n] = '\0';
+        return;
+    }
 
     if (bd->type == BLOCKDEV_TYPE_IDE) {
-        c1 = 'h';
-        c2 = 'd';
+        bd->name[0] = 'h';
         idx = g_next_hd_index++;
+    } else if (bd->type == BLOCKDEV_TYPE_VIRTIO) {
+        bd->name[0] = 'v';
+        idx = g_next_vd_index++;
     } else {
-        c1 = 's';
-        c2 = 'd';
+        bd->name[0] = 's';
         idx = g_next_sd_index++;
     }
-    bd->name[0] = c1;
-    bd->name[1] = c2;
+    bd->name[1] = 'd';
     bd->name[2] = (char)('a' + (idx % 26));
     bd->name[3] = '\0';
 }
@@ -301,28 +399,42 @@ block_dev_t *blockdev_register_partition(block_dev_t *parent, int part_num,
                                          uint64_t sector_count,
                                          int is_fat32, int is_esp)
 {
-    block_dev_t *bd;
+    block_dev_t *bd = NULL;
+    unsigned long flags;
+    int slot = -1;
     int n, i;
 
-    if (!parent || parent->is_partition || part_num < 1 || part_num > 9 ||
+    if (!parent || parent->is_partition || part_num < 1 || part_num > 128 ||
         sector_count == 0)
         return NULL;
     if (lba_offset + sector_count < lba_offset ||
         lba_offset + sector_count > parent->sector_count)
         return NULL;
-    if (g_part_count >= BLOCKDEV_MAX_PARTS)
+
+    flags = spin_lock_irqsave(&g_blockdev_lock);
+    for (i = 0; i < BLOCKDEV_MAX_PARTS; i++) {
+        if (!g_part_used[i]) {
+            g_part_used[i] = 1;
+            slot = i;
+            bd = &g_part_pool[i];
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&g_blockdev_lock, flags);
+
+    if (!bd)
         return NULL;
 
-    bd = &g_part_pool[g_part_count];
     k_memset(bd, 0, sizeof(*bd));
 
     n = 0;
-    while (parent->name[n] && n < BLOCKDEV_NAME_MAX - 2) {
+    while (parent->name[n] && n < BLOCKDEV_NAME_MAX - 4) {
         bd->name[n] = parent->name[n];
         n++;
     }
-    bd->name[n] = (char)('0' + part_num);
-    bd->name[n + 1] = '\0';
+    if (parent->type == BLOCKDEV_TYPE_NVME && n < BLOCKDEV_NAME_MAX - 2)
+        bd->name[n++] = 'p';
+    bd_fmt_uint(bd->name + n, (size_t)(BLOCKDEV_NAME_MAX - n), (uint32_t)part_num);
 
     bd->type = parent->type;
     bd->sector_size = parent->sector_size;
@@ -346,10 +458,131 @@ block_dev_t *blockdev_register_partition(block_dev_t *parent, int part_num,
         bd->label[i] = '\0';
     }
 
-    if (blockdev_register(bd) != 0)
+    if (blockdev_register(bd) != 0) {
+        flags = spin_lock_irqsave(&g_blockdev_lock);
+        g_part_used[slot] = 0;
+        spin_unlock_irqrestore(&g_blockdev_lock, flags);
         return NULL;
-    g_part_count++;
+    }
     return bd;
+}
+
+void blockdev_unregister_partitions(block_dev_t *parent)
+{
+    char names[BLOCKDEV_MAX_PARTS][BLOCKDEV_NAME_MAX];
+    int unreg_count = 0;
+    unsigned long flags;
+    int i, w;
+
+    if (!parent || parent->is_partition)
+        return;
+
+    flags = spin_lock_irqsave(&g_blockdev_lock);
+    w = 0;
+    for (i = 0; i < g_dev_count; i++) {
+        block_dev_t *bd = g_devs[i];
+        if (bd && bd->is_partition && bd->parent == parent) {
+            if (unreg_count < BLOCKDEV_MAX_PARTS) {
+                k_memcpy(names[unreg_count], bd->name, BLOCKDEV_NAME_MAX);
+                unreg_count++;
+            }
+            if (bd >= g_part_pool && bd < g_part_pool + BLOCKDEV_MAX_PARTS)
+                g_part_used[bd - g_part_pool] = 0;
+        } else {
+            g_devs[w++] = bd;
+        }
+    }
+    for (i = w; i < g_dev_count; i++)
+        g_devs[i] = NULL;
+    g_dev_count = w;
+    spin_unlock_irqrestore(&g_blockdev_lock, flags);
+
+    for (i = 0; i < unreg_count; i++)
+        devfs_unregister_device(names[i]);
+}
+
+static int bd_hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int bd_parse_byte(const char *s, uint8_t *out)
+{
+    int hi = bd_hex_nibble(s[0]);
+    int lo = bd_hex_nibble(s[1]);
+    if (hi < 0 || lo < 0)
+        return -1;
+    *out = (uint8_t)((hi << 4) | lo);
+    return 0;
+}
+
+static int bd_parse_gpt_uuid(const char *s, uint8_t guid[16])
+{
+    /* Expected format: 8-4-4-4-12 (36 chars). */
+    if (!s)
+        return -1;
+    for (int i = 0; i < 36; i++) {
+        if (!s[i])
+            return -1;
+    }
+    if (s[36] != '\0')
+        return -1;
+    if (s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-')
+        return -1;
+
+    /* Mixed-endian GPT layout: LE u32, LE u16, LE u16, BE 8 bytes. */
+    if (bd_parse_byte(s + 6, &guid[0]) != 0 ||
+        bd_parse_byte(s + 4, &guid[1]) != 0 ||
+        bd_parse_byte(s + 2, &guid[2]) != 0 ||
+        bd_parse_byte(s + 0, &guid[3]) != 0)
+        return -1;
+    if (bd_parse_byte(s + 11, &guid[4]) != 0 ||
+        bd_parse_byte(s + 9,  &guid[5]) != 0)
+        return -1;
+    if (bd_parse_byte(s + 16, &guid[6]) != 0 ||
+        bd_parse_byte(s + 14, &guid[7]) != 0)
+        return -1;
+    if (bd_parse_byte(s + 19, &guid[8]) != 0 ||
+        bd_parse_byte(s + 21, &guid[9]) != 0)
+        return -1;
+    for (int i = 0; i < 6; i++) {
+        if (bd_parse_byte(s + 24 + i * 2, &guid[10 + i]) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+block_dev_t *blockdev_find_by_partuuid(const char *uuid_str)
+{
+    uint8_t target[16];
+    unsigned long flags;
+    block_dev_t *match = NULL;
+
+    if (bd_parse_gpt_uuid(uuid_str, target) != 0)
+        return NULL;
+
+    flags = spin_lock_irqsave(&g_blockdev_lock);
+    for (int i = 0; i < g_dev_count; i++) {
+        block_dev_t *bd = g_devs[i];
+        if (!bd || !bd->is_partition || !bd->has_part_guid)
+            continue;
+        int eq = 1;
+        for (int j = 0; j < 16; j++) {
+            if (bd->part_guid[j] != target[j]) {
+                eq = 0;
+                break;
+            }
+        }
+        if (eq) {
+            match = bd;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&g_blockdev_lock, flags);
+    return match;
 }
 
 /* Boot-time, inline, pre-sti (polled disk I/O needs no interrupts — */
@@ -547,4 +780,67 @@ void blockdev_run_selftests(void)
     }
 
     kprintf("[guide11][test] done pass=%d fail=%d\n", pass, fail);
+}
+
+void blockdev_run_irq_selftests(void)
+{
+    for (int i = 0; i < g_dev_count; i++) {
+        block_dev_t *bd = g_devs[i];
+        if (!bd || bd->is_partition)
+            continue;
+        if (bd->type == BLOCKDEV_TYPE_RAM)
+            continue;
+
+        uint32_t ss = bd->sector_size ? bd->sector_size : 512u;
+        int parts = 0;
+        for (int j = 0; j < g_dev_count; j++) {
+            block_dev_t *p = g_devs[j];
+            if (p && p->is_partition && p->parent == bd)
+                parts++;
+        }
+
+        /* Verify devfs node exists and ioctl rejects unvalidated kernel pointers. */
+        char devpath[32];
+        devpath[0] = '/'; devpath[1] = 'd'; devpath[2] = 'e'; devpath[3] = 'v'; devpath[4] = '/';
+        k_strcpy(devpath + 5, bd->name);
+        vfs_stat_t st;
+        int stat_ok = (vfs_stat(devpath, &st) == 0 && st.type == VFS_TYPE_BLOCK);
+        uint64_t dummy_sz = 0;
+        int bad_ioctl = blockdev_devfs_ioctl(bd, BLKGETSIZE64, &dummy_sz);
+
+        int rw_ok = 1;
+        if (bd->sector_count >= 128u && bd->read && bd->write) {
+            uint64_t lba = bd->sector_count - 32u;
+            uint8_t *save = (uint8_t *)kmalloc(ss);
+            uint8_t *pat = (uint8_t *)kmalloc(ss);
+            uint8_t *rb = (uint8_t *)kmalloc(ss);
+            if (!save || !pat || !rb) {
+                rw_ok = 0;
+            } else {
+                for (uint32_t k = 0; k < ss; k++)
+                    pat[k] = (uint8_t)(0xA5u ^ (uint8_t)(k * 17u) ^ (uint8_t)(k >> 3));
+                if (bd->read(bd, lba, 1, save) != 0)
+                    rw_ok = 0;
+                if (rw_ok && bd->write(bd, lba, 1, pat) != 0)
+                    rw_ok = 0;
+                if (rw_ok && bd->sync && bd->sync(bd) != 0)
+                    rw_ok = 0;
+                if (rw_ok && bd->read(bd, lba, 1, rb) != 0)
+                    rw_ok = 0;
+                if (rw_ok && bd_memcmp(pat, rb, ss) != 0)
+                    rw_ok = 0;
+                (void)bd->write(bd, lba, 1, save);
+                if (bd->sync)
+                    (void)bd->sync(bd);
+            }
+            if (save) kfree(save);
+            if (pat) kfree(pat);
+            if (rb) kfree(rb);
+        }
+
+        int ok = (stat_ok && bad_ioctl == -EFAULT && rw_ok);
+        kprintf("[selftest] storage %s %s sectors=%u parts=%d\n",
+                bd->name, ok ? "PASS" : "FAIL",
+                (uint32_t)bd->sector_count, parts);
+    }
 }

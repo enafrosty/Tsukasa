@@ -26,7 +26,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DEVFS_MAX_DEVICES 32
+#define DEVFS_MAX_DEVICES 128
 
 typedef struct devfs_node_entry {
     char name[VFS_NAME_MAX];
@@ -37,6 +37,7 @@ typedef struct devfs_node_entry {
 } devfs_node_entry_t;
 
 static devfs_node_entry_t g_dev_nodes[DEVFS_MAX_DEVICES];
+static spinlock_t g_devfs_lock = SPINLOCK_INIT;
 
 static int dev_streq(const char *a, const char *b)
 {
@@ -501,14 +502,17 @@ static const devfs_ops_t g_input_events_ops = {
 
 int devfs_register_device(const char *name, uint32_t type, const devfs_ops_t *ops, void *priv)
 {
+    unsigned long flags;
     if (!name || !ops)
         return -1;
 
+    flags = spin_lock_irqsave(&g_devfs_lock);
     for (size_t i = 0; i < DEVFS_MAX_DEVICES; i++) {
         if (g_dev_nodes[i].used && dev_streq(g_dev_nodes[i].name, name)) {
             g_dev_nodes[i].type = type;
             g_dev_nodes[i].ops = ops;
             g_dev_nodes[i].priv = priv;
+            spin_unlock_irqrestore(&g_devfs_lock, flags);
             return 0;
         }
     }
@@ -520,9 +524,32 @@ int devfs_register_device(const char *name, uint32_t type, const devfs_ops_t *op
             g_dev_nodes[i].ops = ops;
             g_dev_nodes[i].priv = priv;
             g_dev_nodes[i].used = 1;
+            spin_unlock_irqrestore(&g_devfs_lock, flags);
             return 0;
         }
     }
+    spin_unlock_irqrestore(&g_devfs_lock, flags);
+    return -1;
+}
+
+int devfs_unregister_device(const char *name)
+{
+    unsigned long flags;
+    if (!name)
+        return -1;
+
+    flags = spin_lock_irqsave(&g_devfs_lock);
+    for (size_t i = 0; i < DEVFS_MAX_DEVICES; i++) {
+        if (g_dev_nodes[i].used && dev_streq(g_dev_nodes[i].name, name)) {
+            g_dev_nodes[i].used = 0;
+            g_dev_nodes[i].name[0] = '\0';
+            g_dev_nodes[i].ops = NULL;
+            g_dev_nodes[i].priv = NULL;
+            spin_unlock_irqrestore(&g_devfs_lock, flags);
+            return 0;
+        }
+    }
+    spin_unlock_irqrestore(&g_devfs_lock, flags);
     return -1;
 }
 
@@ -559,11 +586,13 @@ void devfs_init(void)
 int devfs_lookup(const char *subpath, const devfs_ops_t **ops_out, void **priv_out, uint32_t *type_out)
 {
     const char *name = subpath;
+    unsigned long flags;
     if (!name)
         return -1;
     while (*name == '/')
         name++;
 
+    flags = spin_lock_irqsave(&g_devfs_lock);
     for (size_t i = 0; i < DEVFS_MAX_DEVICES; i++) {
         if (g_dev_nodes[i].used && dev_streq(g_dev_nodes[i].name, name)) {
             if (ops_out)
@@ -572,9 +601,11 @@ int devfs_lookup(const char *subpath, const devfs_ops_t **ops_out, void **priv_o
                 *priv_out = g_dev_nodes[i].priv;
             if (type_out)
                 *type_out = g_dev_nodes[i].type;
+            spin_unlock_irqrestore(&g_devfs_lock, flags);
             return 0;
         }
     }
+    spin_unlock_irqrestore(&g_devfs_lock, flags);
     return -1;
 }
 
@@ -582,6 +613,9 @@ int devfs_stat(const char *subpath, vfs_stat_t *out)
 {
     if (!subpath || !out)
         return -1;
+
+    for (size_t i = 0; i < sizeof(*out); i++)
+        ((uint8_t *)out)[i] = 0;
 
     const char *p = subpath;
     while (*p == '/')
@@ -592,6 +626,10 @@ int devfs_stat(const char *subpath, vfs_stat_t *out)
         out->blocks = 0;
         out->type = VFS_TYPE_DIR;
         out->mode = VFS_MODE_READ;
+        out->st_ino = dev_streq(p, "") ? 1ULL : 2ULL;
+        out->st_mode = VFS_S_IFDIR | 0555U;
+        out->st_nlink = 2U;
+        out->st_blksize = 4096U;
         return 0;
     }
 
@@ -609,6 +647,14 @@ int devfs_stat(const char *subpath, vfs_stat_t *out)
     out->blocks = (sz + 511) / 512;
     out->type = type;
     out->mode = VFS_MODE_READ | VFS_MODE_WRITE;
+    out->st_size = sz;
+    out->st_blocks = out->blocks;
+    out->st_blksize = 4096U;
+    out->st_nlink = 1U;
+    if (type == VFS_TYPE_BLOCK)
+        out->st_mode = VFS_S_IFBLK | 0660U;
+    else
+        out->st_mode = VFS_S_IFCHR | 0666U;
     return 0;
 }
 
@@ -621,12 +667,14 @@ int devfs_list(const char *subpath, char names[][VFS_NAME_MAX], int max)
         subpath++;
 
     if (*subpath == '\0') {
+        unsigned long flags = spin_lock_irqsave(&g_devfs_lock);
         for (size_t i = 0; i < DEVFS_MAX_DEVICES && count < max; i++) {
             if (g_dev_nodes[i].used && !dev_streq(g_dev_nodes[i].name, "input/events")) {
                 dev_strncpy(names[count], g_dev_nodes[i].name, VFS_NAME_MAX);
                 count++;
             }
         }
+        spin_unlock_irqrestore(&g_devfs_lock, flags);
         if (count < max) {
             dev_strncpy(names[count], "input", VFS_NAME_MAX);
             count++;

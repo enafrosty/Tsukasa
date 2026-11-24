@@ -18,18 +18,23 @@
 
 #include "bootfs.h"
 #include "devfs.h"
-#include "fat12.h"
+#include "ext4fs.h"
 #include "fat32.h"
 #include "initrd.h"
-#include "memfs.h"
 #include "procfs.h"
 #include "sysfs.h"
 #include "tar.h"
 #include "tar_testdata.h"
+#include "tmpfs.h"
 
+#include "../lib/lz4.h"
+
+#include "../drv/ahci.h"
 #include "../drv/ata.h"
 #include "../drv/blockdev.h"
 #include "../drv/diskmgr.h"
+#include "../drv/nvme.h"
+#include "../drv/virtio_blk.h"
 #include "mkfs_fat32.h"
 #include "../drv/fb.h"
 #include "../drv/input_dev.h"
@@ -41,6 +46,7 @@
 #include "../include/spinlock.h"
 #include "../ipc/unix_socket.h"
 #include "../mm/heap.h"
+#include "../mm/pagecache.h"
 #include "../proc/process.h"
 #include "../tty/tty.h"
 #include "../sys/wait_queue.h"
@@ -57,11 +63,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define VFS_MAX_MOUNTS        16
-#define VFS_MAX_OPEN_GLOBAL   128
-#define VFS_MAX_PIPES         32
-#define VFS_PIPE_CAPACITY     4096
-#define VFS_MEMFS_MAX_DIRS    32
+#define VFS_MAX_MOUNTS         32
+#define VFS_PIPE_CAPACITY      4096
+#define VFS_SYMLOOP_MAX        16
+#define VFS_DCACHE_BUCKETS     512U
+#define VFS_DCACHE_MAX_ENTRIES 1024U
+#define VFS_FLOCK_BUCKETS      128U
 
 
 typedef enum vfs_device_kind {
@@ -74,36 +81,44 @@ typedef enum vfs_device_kind {
 
 typedef struct vfs_mount {
     int used;
+    uint64_t mount_id;
+    int open_count;
+    int active_ops;
     char path[VFS_PATH_MAX];
     int path_len;
     vfs_backend_t backend;
     int read_only;
     const char *name;
-    void *ctx;
+    void *fs_private;
 } vfs_mount_t;
 
 typedef struct vfs_pipe {
-    int used;
     uint8_t data[VFS_PIPE_CAPACITY];
     size_t read_pos;
     size_t write_pos;
     size_t size;
     int readers;
     int writers;
+    spinlock_t lock;
     wait_queue_head_t waitq;
 } vfs_pipe_t;
 
 typedef struct vfs_file {
-    int used;
     int refcount;
+    spinlock_t lock;
     int flags;
     int mode;
     int dirty;
+    int is_dir;
     vfs_backend_t backend;
     void *fs_ctx;
+    uint64_t mount_id;
+    uint64_t inode_dev;
+    uint64_t inode_ino;
     size_t pos;
 
     char path[VFS_PATH_MAX];
+    char abs_path[VFS_PATH_MAX];
 
     union {
         struct {
@@ -113,8 +128,17 @@ typedef struct vfs_file {
             int owns_buf;
         } regular;
         struct {
-            int inode;
-        } memfs;
+            tmpfs_inode_t *inode;
+        } tmpfs;
+        struct {
+            void *handle;
+        } ext4;
+        struct {
+            fat32_volume_t *vol;
+            uint32_t hint_clus_idx;
+            uint32_t hint_clus;
+            uint64_t hint_gen;
+        } fat32;
         struct {
             vfs_pipe_t *pipe;
             int can_read;
@@ -128,8 +152,8 @@ typedef struct vfs_file {
         } device;
         struct {
             /* The bound path lives in f->path (reused for unregister-on-close). */
-            vfs_pipe_t *rx;
-            vfs_pipe_t *tx;
+            unix_ring_t *rx;
+            unix_ring_t *tx;
             unix_listener_t *listener;
             int is_listener;
         } sock;
@@ -140,11 +164,49 @@ typedef struct vfs_file {
     } u;
 } vfs_file_t;
 
+typedef struct vfs_dentry {
+    uint64_t id;
+    uint64_t parent_id;
+    uint64_t mount_id;
+    uint64_t ino;
+    uint32_t type;
+    char name[VFS_NAME_MAX];
+    char *target;
+    struct vfs_dentry *hash_next;
+    struct vfs_dentry *lru_prev;
+    struct vfs_dentry *lru_next;
+} vfs_dentry_t;
+
+typedef struct vfs_flock_holder {
+    vfs_file_t *owner_file;
+    int type;
+    struct vfs_flock_holder *next;
+} vfs_flock_holder_t;
+
+typedef struct vfs_flock_inode {
+    uint64_t dev_id;
+    uint64_t ino_id;
+    vfs_flock_holder_t *holders;
+    wait_queue_head_t waitq;
+    int waiters;
+    struct vfs_flock_inode *next;
+} vfs_flock_inode_t;
+
 static vfs_mount_t g_mounts[VFS_MAX_MOUNTS];
-static vfs_file_t g_open_files[VFS_MAX_OPEN_GLOBAL];
-static vfs_pipe_t g_pipes[VFS_MAX_PIPES];
+static uint64_t g_next_mount_id = 1;
+static spinlock_t g_mounts_lock = SPINLOCK_INIT;
 static spinlock_t g_vfs_alloc_lock = SPINLOCK_INIT;
-static spinlock_t g_pipe_lock = SPINLOCK_INIT;
+static spinlock_t g_fd_lock = SPINLOCK_INIT;
+static spinlock_t g_dcache_lock = SPINLOCK_INIT;
+static spinlock_t g_flock_lock = SPINLOCK_INIT;
+
+static vfs_dentry_t *g_dcache_buckets[VFS_DCACHE_BUCKETS];
+static vfs_dentry_t *g_dcache_lru_head;
+static vfs_dentry_t *g_dcache_lru_tail;
+static size_t g_dcache_count;
+static uint64_t g_dcache_next_id = 2;
+
+static vfs_flock_inode_t *g_flock_buckets[VFS_FLOCK_BUCKETS];
 
 static inline unsigned long vfs_irq_save_disable(void)
 {
@@ -169,19 +231,11 @@ static inline void vfs_irq_restore(unsigned long flags)
 
 static void *g_kernel_open_files[PROCESS_MAX_OPEN_FILES];
 static char g_kernel_cwd[VFS_PATH_MAX] = "/";
+static uint32_t g_kernel_umask = 0022U;
 
-static int g_fat12_ok;
 static int g_fat32_ok;
 static int g_initrd_ok;
 static fat32_volume_t *g_fat32_primary_vol;
-
-typedef struct vfs_memfs_dir {
-    int used;
-    const vfs_mount_t *mount;
-    char path[VFS_PATH_MAX];
-} vfs_memfs_dir_t;
-
-static vfs_memfs_dir_t g_memfs_dirs[VFS_MEMFS_MAX_DIRS];
 
 /* String/path helpers */
 
@@ -369,40 +423,75 @@ static process_t *vfs_current_process(void)
 #endif
 }
 
+static uint64_t vfs_hash_str(const char *s)
+{
+    uint64_t h = 14695981039346656037ULL;
+    while (s && *s) {
+        h ^= (uint8_t)(*s++);
+        h *= 1099511628211ULL;
+    }
+    return h ? h : 1ULL;
+}
+
+static uint32_t vfs_current_umask(process_t *proc)
+{
+    return proc ? (proc->umask & 0777U) : (g_kernel_umask & 0777U);
+}
+
 /* Mount table */
 
 static void mount_table_reset(void)
 {
+    unsigned long flags = spin_lock_irqsave(&g_mounts_lock);
     for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
         g_mounts[i].used = 0;
+        g_mounts[i].mount_id = 0;
+        g_mounts[i].open_count = 0;
+        g_mounts[i].active_ops = 0;
         g_mounts[i].path[0] = '\0';
         g_mounts[i].path_len = 0;
         g_mounts[i].backend = VFS_BACKEND_NONE;
         g_mounts[i].read_only = 1;
         g_mounts[i].name = "none";
+        g_mounts[i].fs_private = NULL;
     }
+    g_next_mount_id = 1;
+    spin_unlock_irqrestore(&g_mounts_lock, flags);
 }
 
 static int mount_register_ctx(const char *path, vfs_backend_t backend,
-                              int read_only, const char *name, void *ctx)
+                              int read_only, const char *name, void *fs_private)
 {
     char norm[VFS_PATH_MAX];
+    unsigned long flags;
     if (normalize_path_for_process(NULL, path, norm, VFS_PATH_MAX) != 0)
-        return -1;
+        return -EINVAL;
 
+    flags = spin_lock_irqsave(&g_mounts_lock);
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (g_mounts[i].used && kstreq(g_mounts[i].path, norm)) {
+            spin_unlock_irqrestore(&g_mounts_lock, flags);
+            return -EBUSY;
+        }
+    }
     for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
         if (!g_mounts[i].used) {
             g_mounts[i].used = 1;
+            g_mounts[i].mount_id = g_next_mount_id++;
+            g_mounts[i].open_count = 0;
+            g_mounts[i].active_ops = 0;
             kstrncpy(g_mounts[i].path, norm, VFS_PATH_MAX);
             g_mounts[i].path_len = kstrlen(g_mounts[i].path);
             g_mounts[i].backend = backend;
             g_mounts[i].read_only = read_only ? 1 : 0;
             g_mounts[i].name = name ? name : "unknown";
-            g_mounts[i].ctx = ctx;
+            g_mounts[i].fs_private = fs_private;
+            spin_unlock_irqrestore(&g_mounts_lock, flags);
             return 0;
         }
     }
-    return -1;
+    spin_unlock_irqrestore(&g_mounts_lock, flags);
+    return -ENOSPC;
 }
 
 static int mount_register(const char *path, vfs_backend_t backend, int read_only, const char *name)
@@ -410,12 +499,13 @@ static int mount_register(const char *path, vfs_backend_t backend, int read_only
     return mount_register_ctx(path, backend, read_only, name, NULL);
 }
 
-static const vfs_mount_t *mount_lookup(const char *path)
+static vfs_mount_t *mount_lookup_ref(const char *path)
 {
-    const vfs_mount_t *best = NULL;
+    unsigned long flags = spin_lock_irqsave(&g_mounts_lock);
+    vfs_mount_t *best = NULL;
     int best_len = -1;
     for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
-        const vfs_mount_t *m = &g_mounts[i];
+        vfs_mount_t *m = &g_mounts[i];
         int j = 0;
         if (!m->used)
             continue;
@@ -437,7 +527,44 @@ static const vfs_mount_t *mount_lookup(const char *path)
             best_len = m->path_len;
         }
     }
+    if (best)
+        best->active_ops++;
+    spin_unlock_irqrestore(&g_mounts_lock, flags);
     return best;
+}
+
+static void mount_unref(vfs_mount_t *m)
+{
+    if (!m)
+        return;
+    unsigned long flags = spin_lock_irqsave(&g_mounts_lock);
+    if (m->active_ops > 0)
+        m->active_ops--;
+    spin_unlock_irqrestore(&g_mounts_lock, flags);
+}
+
+static const vfs_mount_t *mount_lookup(const char *path)
+{
+    vfs_mount_t *m = mount_lookup_ref(path);
+    if (m)
+        mount_unref(m);
+    return m;
+}
+
+static void mount_note_open_delta(uint64_t mount_id, int delta)
+{
+    if (mount_id == 0)
+        return;
+    unsigned long flags = spin_lock_irqsave(&g_mounts_lock);
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (g_mounts[i].used && g_mounts[i].mount_id == mount_id) {
+            g_mounts[i].open_count += delta;
+            if (g_mounts[i].open_count < 0)
+                g_mounts[i].open_count = 0;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&g_mounts_lock, flags);
 }
 
 static int mount_subpath(const vfs_mount_t *m, const char *abs_path, char *out, int cap)
@@ -462,8 +589,10 @@ static int mount_subpath(const vfs_mount_t *m, const char *abs_path, char *out, 
 int vfs_get_mounts(vfs_mount_info_t *out, int max)
 {
     int count = 0;
+    unsigned long flags;
     if (!out || max <= 0)
         return -1;
+    flags = spin_lock_irqsave(&g_mounts_lock);
     for (int i = 0; i < VFS_MAX_MOUNTS && count < max; i++) {
         if (!g_mounts[i].used)
             continue;
@@ -472,77 +601,433 @@ int vfs_get_mounts(vfs_mount_info_t *out, int max)
         out[count].read_only = g_mounts[i].read_only;
         count++;
     }
+    spin_unlock_irqrestore(&g_mounts_lock, flags);
     return count;
+}
+
+/* Hierarchical dentry cache: (parent_id, name) -> (id, mount_id, ino, type, target) */
+
+static size_t dcache_hash(uint64_t parent_id, const char *name)
+{
+    uint64_t h = parent_id * 0x9E3779B97F4A7C15ULL;
+    h ^= vfs_hash_str(name);
+    h ^= h >> 30;
+    return (size_t)(h & (VFS_DCACHE_BUCKETS - 1U));
+}
+
+static void dcache_lru_unlink(vfs_dentry_t *d)
+{
+    if (d->lru_prev)
+        d->lru_prev->lru_next = d->lru_next;
+    else if (g_dcache_lru_head == d)
+        g_dcache_lru_head = d->lru_next;
+
+    if (d->lru_next)
+        d->lru_next->lru_prev = d->lru_prev;
+    else if (g_dcache_lru_tail == d)
+        g_dcache_lru_tail = d->lru_prev;
+
+    d->lru_prev = NULL;
+    d->lru_next = NULL;
+}
+
+static void dcache_lru_push_head(vfs_dentry_t *d)
+{
+    d->lru_prev = NULL;
+    d->lru_next = g_dcache_lru_head;
+    if (g_dcache_lru_head)
+        g_dcache_lru_head->lru_prev = d;
+    else
+        g_dcache_lru_tail = d;
+    g_dcache_lru_head = d;
+}
+
+static void dcache_hash_unlink(vfs_dentry_t *d)
+{
+    size_t b = dcache_hash(d->parent_id, d->name);
+    vfs_dentry_t *prev = NULL;
+    vfs_dentry_t *curr = g_dcache_buckets[b];
+    while (curr) {
+        if (curr == d) {
+            if (prev)
+                prev->hash_next = curr->hash_next;
+            else
+                g_dcache_buckets[b] = curr->hash_next;
+            curr->hash_next = NULL;
+            return;
+        }
+        prev = curr;
+        curr = curr->hash_next;
+    }
+}
+
+static void dcache_free_entry_locked(vfs_dentry_t *d)
+{
+    dcache_hash_unlink(d);
+    dcache_lru_unlink(d);
+    if (g_dcache_count > 0)
+        g_dcache_count--;
+    if (d->target)
+        kfree(d->target);
+    kfree(d);
+}
+
+static void dcache_init(void)
+{
+    unsigned long flags = spin_lock_irqsave(&g_dcache_lock);
+    for (size_t i = 0; i < VFS_DCACHE_BUCKETS; i++) {
+        vfs_dentry_t *curr = g_dcache_buckets[i];
+        while (curr) {
+            vfs_dentry_t *next = curr->hash_next;
+            if (curr->target)
+                kfree(curr->target);
+            kfree(curr);
+            curr = next;
+        }
+        g_dcache_buckets[i] = NULL;
+    }
+    g_dcache_lru_head = NULL;
+    g_dcache_lru_tail = NULL;
+    g_dcache_count = 0;
+    g_dcache_next_id = 2;
+    spin_unlock_irqrestore(&g_dcache_lock, flags);
+}
+
+static vfs_dentry_t *dcache_find_locked(uint64_t parent_id, const char *name)
+{
+    size_t b = dcache_hash(parent_id, name);
+    vfs_dentry_t *curr = g_dcache_buckets[b];
+    while (curr) {
+        if (curr->parent_id == parent_id && kstreq(curr->name, name))
+            return curr;
+        curr = curr->hash_next;
+    }
+    return NULL;
+}
+
+static int dcache_lookup(uint64_t parent_id, const char *name, uint64_t mount_id,
+                         uint64_t *id_out, uint64_t *ino_out, uint32_t *type_out,
+                         char *target_out, size_t target_cap)
+{
+    unsigned long flags = spin_lock_irqsave(&g_dcache_lock);
+    vfs_dentry_t *d = dcache_find_locked(parent_id, name);
+    if (!d || d->mount_id != mount_id) {
+        spin_unlock_irqrestore(&g_dcache_lock, flags);
+        return -1;
+    }
+    dcache_lru_unlink(d);
+    dcache_lru_push_head(d);
+    if (id_out)
+        *id_out = d->id;
+    if (ino_out)
+        *ino_out = d->ino;
+    if (type_out)
+        *type_out = d->type;
+    if (target_out && target_cap > 0) {
+        if (d->target)
+            kstrncpy(target_out, d->target, (int)target_cap);
+        else
+            target_out[0] = '\0';
+    }
+    spin_unlock_irqrestore(&g_dcache_lock, flags);
+    return 0;
+}
+
+static uint64_t dcache_insert(uint64_t parent_id, const char *name, uint64_t mount_id,
+                              uint64_t ino, uint32_t type, const char *target)
+{
+    if (!name || !name[0] || kstrlen(name) >= VFS_NAME_MAX)
+        return 0;
+
+    char *target_copy = NULL;
+    if (type == VFS_TYPE_SYMLINK && target) {
+        int tlen = kstrlen(target);
+        target_copy = (char *)kmalloc((size_t)tlen + 1U);
+        if (!target_copy)
+            return 0;
+        kstrncpy(target_copy, target, tlen + 1);
+    }
+
+    vfs_dentry_t *nd = (vfs_dentry_t *)kmalloc(sizeof(vfs_dentry_t));
+    if (!nd) {
+        if (target_copy)
+            kfree(target_copy);
+        return 0;
+    }
+
+    unsigned long flags = spin_lock_irqsave(&g_dcache_lock);
+    vfs_dentry_t *existing = dcache_find_locked(parent_id, name);
+    if (existing) {
+        existing->mount_id = mount_id;
+        existing->ino = ino;
+        existing->type = type;
+        if (existing->target)
+            kfree(existing->target);
+        existing->target = target_copy;
+        dcache_lru_unlink(existing);
+        dcache_lru_push_head(existing);
+        uint64_t eid = existing->id;
+        spin_unlock_irqrestore(&g_dcache_lock, flags);
+        kfree(nd);
+        return eid;
+    }
+
+    while (g_dcache_count >= VFS_DCACHE_MAX_ENTRIES && g_dcache_lru_tail)
+        dcache_free_entry_locked(g_dcache_lru_tail);
+
+    nd->id = g_dcache_next_id++;
+    if (nd->id <= 1ULL)
+        nd->id = g_dcache_next_id++;
+    nd->parent_id = parent_id;
+    nd->mount_id = mount_id;
+    nd->ino = ino;
+    nd->type = type;
+    kstrncpy(nd->name, name, VFS_NAME_MAX);
+    nd->target = target_copy;
+    size_t b = dcache_hash(parent_id, nd->name);
+    nd->hash_next = g_dcache_buckets[b];
+    g_dcache_buckets[b] = nd;
+    dcache_lru_push_head(nd);
+    g_dcache_count++;
+    uint64_t new_id = nd->id;
+    spin_unlock_irqrestore(&g_dcache_lock, flags);
+    return new_id;
+}
+
+static void dcache_invalidate_children_locked(uint64_t parent_id)
+{
+    uint64_t queue[64];
+    int qhead = 0;
+    int qtail = 0;
+    queue[qtail++] = parent_id;
+
+    while (qhead < qtail) {
+        uint64_t pid = queue[qhead++];
+        for (size_t b = 0; b < VFS_DCACHE_BUCKETS; b++) {
+            vfs_dentry_t *curr = g_dcache_buckets[b];
+            while (curr) {
+                vfs_dentry_t *next = curr->hash_next;
+                if (curr->parent_id == pid) {
+                    if (curr->type == VFS_TYPE_DIR && qtail < 64)
+                        queue[qtail++] = curr->id;
+                    dcache_free_entry_locked(curr);
+                    /* Restart bucket scan after modifying bucket list. */
+                    curr = g_dcache_buckets[b];
+                    continue;
+                }
+                curr = next;
+            }
+        }
+    }
+}
+
+static void dcache_invalidate_path(const char *abs_path)
+{
+    if (!abs_path || abs_path[0] != '/')
+        return;
+
+    unsigned long flags = spin_lock_irqsave(&g_dcache_lock);
+    if (abs_path[1] == '\0') {
+        dcache_invalidate_children_locked(1ULL);
+        spin_unlock_irqrestore(&g_dcache_lock, flags);
+        return;
+    }
+
+    uint64_t cur_id = 1ULL;
+    const char *p = abs_path + 1;
+    while (*p) {
+        char comp[VFS_NAME_MAX];
+        int ci = 0;
+        while (*p && *p != '/') {
+            if (ci < VFS_NAME_MAX - 1)
+                comp[ci++] = *p;
+            p++;
+        }
+        comp[ci] = '\0';
+        while (*p == '/')
+            p++;
+
+        vfs_dentry_t *d = dcache_find_locked(cur_id, comp);
+        if (!d)
+            break;
+
+        if (*p == '\0') {
+            uint64_t target_id = d->id;
+            uint32_t target_type = d->type;
+            dcache_free_entry_locked(d);
+            if (target_type == VFS_TYPE_DIR)
+                dcache_invalidate_children_locked(target_id);
+            break;
+        }
+        cur_id = d->id;
+    }
+    spin_unlock_irqrestore(&g_dcache_lock, flags);
+}
+
+static void dcache_invalidate_mount(uint64_t mount_id)
+{
+    if (mount_id == 0)
+        return;
+    unsigned long flags = spin_lock_irqsave(&g_dcache_lock);
+    for (size_t b = 0; b < VFS_DCACHE_BUCKETS; b++) {
+        vfs_dentry_t *curr = g_dcache_buckets[b];
+        while (curr) {
+            if (curr->mount_id == mount_id) {
+                dcache_free_entry_locked(curr);
+                curr = g_dcache_buckets[b];
+                continue;
+            }
+            curr = curr->hash_next;
+        }
+    }
+    spin_unlock_irqrestore(&g_dcache_lock, flags);
+}
+
+/* Per-inode flock table */
+
+static size_t flock_hash(uint64_t dev_id, uint64_t ino_id)
+{
+    uint64_t h = (dev_id * 0x9E3779B97F4A7C15ULL) ^ (ino_id * 0xBF58476D1CE4E5B9ULL);
+    h ^= h >> 30;
+    return (size_t)(h & (VFS_FLOCK_BUCKETS - 1U));
+}
+
+static void flock_init(void)
+{
+    unsigned long flags = spin_lock_irqsave(&g_flock_lock);
+    for (size_t i = 0; i < VFS_FLOCK_BUCKETS; i++)
+        g_flock_buckets[i] = NULL;
+    spin_unlock_irqrestore(&g_flock_lock, flags);
+}
+
+static vfs_flock_inode_t *flock_find_inode_locked(uint64_t dev_id, uint64_t ino_id,
+                                                  vfs_flock_inode_t **prev_out)
+{
+    size_t b = flock_hash(dev_id, ino_id);
+    vfs_flock_inode_t *prev = NULL;
+    vfs_flock_inode_t *curr = g_flock_buckets[b];
+    while (curr) {
+        if (curr->dev_id == dev_id && curr->ino_id == ino_id) {
+            if (prev_out)
+                *prev_out = prev;
+            return curr;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+    if (prev_out)
+        *prev_out = NULL;
+    return NULL;
+}
+
+static void flock_maybe_free_inode_locked(vfs_flock_inode_t *fi)
+{
+    if (!fi || fi->holders != NULL || fi->waiters > 0)
+        return;
+    size_t b = flock_hash(fi->dev_id, fi->ino_id);
+    vfs_flock_inode_t *prev = NULL;
+    vfs_flock_inode_t *curr = g_flock_buckets[b];
+    while (curr) {
+        if (curr == fi) {
+            if (prev)
+                prev->next = curr->next;
+            else
+                g_flock_buckets[b] = curr->next;
+            kfree(fi);
+            return;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+}
+
+static void vfs_flock_release_file(vfs_file_t *f)
+{
+    if (!f || (f->inode_dev == 0 && f->inode_ino == 0))
+        return;
+
+    unsigned long flags = spin_lock_irqsave(&g_flock_lock);
+    vfs_flock_inode_t *fi = flock_find_inode_locked(f->inode_dev, f->inode_ino, NULL);
+    if (!fi) {
+        spin_unlock_irqrestore(&g_flock_lock, flags);
+        return;
+    }
+
+    vfs_flock_holder_t *prev = NULL;
+    vfs_flock_holder_t *curr = fi->holders;
+    int removed = 0;
+    while (curr) {
+        if (curr->owner_file == f) {
+            if (prev)
+                prev->next = curr->next;
+            else
+                fi->holders = curr->next;
+            kfree(curr);
+            removed = 1;
+            break;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+
+    if (removed)
+        wait_queue_wake_all(&fi->waitq);
+    flock_maybe_free_inode_locked(fi);
+    spin_unlock_irqrestore(&g_flock_lock, flags);
 }
 
 /* Open-file / pipe internals */
 
 static void file_pool_reset(void)
 {
-    for (int i = 0; i < VFS_MAX_OPEN_GLOBAL; i++) {
-        g_open_files[i].used = 0;
-        g_open_files[i].refcount = 0;
-    }
-    for (int i = 0; i < VFS_MAX_PIPES; i++) {
-        g_pipes[i].used = 0;
-        g_pipes[i].read_pos = 0;
-        g_pipes[i].write_pos = 0;
-        g_pipes[i].size = 0;
-        g_pipes[i].readers = 0;
-        g_pipes[i].writers = 0;
-    }
+    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
     for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++)
         g_kernel_open_files[i] = NULL;
     kstrncpy(g_kernel_cwd, "/", VFS_PATH_MAX);
+    g_kernel_umask = 0022U;
+    spin_unlock_irqrestore(&g_fd_lock, flags);
 }
 
 static vfs_file_t *file_alloc(void)
 {
+    vfs_file_t *f = (vfs_file_t *)kmalloc(sizeof(vfs_file_t));
+    if (!f)
+        return NULL;
+    for (size_t j = 0; j < sizeof(*f); j++)
+        ((uint8_t *)f)[j] = 0;
+    f->refcount = 1;
+    f->lock = SPINLOCK_INIT;
+    return f;
+}
+
+static void file_ref(vfs_file_t *f)
+{
+    if (!f)
+        return;
     unsigned long flags = spin_lock_irqsave(&g_vfs_alloc_lock);
-    for (int i = 0; i < VFS_MAX_OPEN_GLOBAL; i++) {
-        vfs_file_t *f = &g_open_files[i];
-        if (!f->used) {
-            for (size_t j = 0; j < sizeof(*f); j++)
-                ((uint8_t *)f)[j] = 0;
-            f->used = 1;
-            f->refcount = 1;
-            spin_unlock_irqrestore(&g_vfs_alloc_lock, flags);
-            return f;
-        }
-    }
+    f->refcount++;
     spin_unlock_irqrestore(&g_vfs_alloc_lock, flags);
-    return NULL;
 }
 
 static vfs_pipe_t *pipe_alloc(void)
 {
-    unsigned long flags = spin_lock_irqsave(&g_vfs_alloc_lock);
-    for (int i = 0; i < VFS_MAX_PIPES; i++) {
-        vfs_pipe_t *p = &g_pipes[i];
-        if (!p->used) {
-            p->used = 1;
-            p->read_pos = 0;
-            p->write_pos = 0;
-            p->size = 0;
-            p->readers = 0;
-            p->writers = 0;
-            wait_queue_init(&p->waitq);
-            spin_unlock_irqrestore(&g_vfs_alloc_lock, flags);
-            return p;
-        }
-    }
-    spin_unlock_irqrestore(&g_vfs_alloc_lock, flags);
-    return NULL;
+    vfs_pipe_t *p = (vfs_pipe_t *)kmalloc(sizeof(vfs_pipe_t));
+    if (!p)
+        return NULL;
+    p->read_pos = 0;
+    p->write_pos = 0;
+    p->size = 0;
+    p->readers = 0;
+    p->writers = 0;
+    p->lock = SPINLOCK_INIT;
+    wait_queue_init(&p->waitq);
+    return p;
 }
 
 static void pipe_free_slot(vfs_pipe_t *p)
 {
-    unsigned long flags;
-    if (!p)
-        return;
-    flags = spin_lock_irqsave(&g_vfs_alloc_lock);
-    p->used = 0;
-    spin_unlock_irqrestore(&g_vfs_alloc_lock, flags);
+    if (p)
+        kfree(p);
 }
 
 static size_t pipe_ring_read(vfs_pipe_t *p, void *buf, size_t count)
@@ -573,30 +1058,13 @@ static size_t pipe_ring_write(vfs_pipe_t *p, const void *buf, size_t count)
     return wr;
 }
 
-/* Drop one end's claim on a socket pipe; free the slot when both sides are gone (the exact rule file_release uses). */
-static void sock_drop_pipe_claim(vfs_pipe_t *p, int drop_reader, int drop_writer)
-{
-    unsigned long pflags;
-    int empty_claims;
-    if (!p)
-        return;
-    pflags = spin_lock_irqsave(&g_pipe_lock);
-    if (drop_reader && p->readers > 0)
-        p->readers--;
-    if (drop_writer && p->writers > 0)
-        p->writers--;
-    empty_claims = (p->readers == 0 && p->writers == 0);
-    spin_unlock_irqrestore(&g_pipe_lock, pflags);
-    wait_queue_wake_all(&p->waitq);
-    if (empty_claims)
-        pipe_free_slot(p);
-}
-
 static int ensure_regular_capacity(vfs_file_t *f, size_t need)
 {
     size_t new_cap;
     uint8_t *new_buf;
-    if (!f || f->backend == VFS_BACKEND_MEMFS || f->backend == VFS_BACKEND_PIPE)
+    if (!f || f->backend == VFS_BACKEND_TMPFS || f->backend == VFS_BACKEND_PIPE ||
+        f->backend == VFS_BACKEND_EXT4 || f->backend == VFS_BACKEND_FAT32 ||
+        f->backend == VFS_BACKEND_FAT32VOL)
         return -1;
     if (need <= f->u.regular.capacity)
         return 0;
@@ -622,22 +1090,9 @@ static int flush_regular_file(vfs_file_t *f)
         return 0;
     if (!(f->mode & VFS_MODE_WRITE))
         return 0;
-    switch (f->backend) {
-    case VFS_BACKEND_FAT12:
-        if (fat12_write_file(f->path, f->u.regular.buf, f->u.regular.size) != 0)
-            return -1;
-        break;
-    case VFS_BACKEND_FAT32:
-        if (fat32_write_file(f->path, f->u.regular.buf, f->u.regular.size) < 0)
-            return -1;
-        break;
-    case VFS_BACKEND_FAT32VOL:
-        if (fat32_vol_write_file((fat32_volume_t *)f->fs_ctx, f->path,
-                                 f->u.regular.buf, f->u.regular.size) < 0)
-            return -1;
-        break;
-    default:
-        break;
+    if (f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) {
+        if (f->u.fat32.vol)
+            (void)fat32_vol_sync(f->u.fat32.vol);
     }
     f->dirty = 0;
     return 0;
@@ -650,10 +1105,6 @@ static void file_release(vfs_file_t *f)
         return;
 
     aflags = spin_lock_irqsave(&g_vfs_alloc_lock);
-    if (!f->used) {
-        spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
-        return;
-    }
     if (f->refcount > 1) {
         f->refcount--;
         spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
@@ -662,17 +1113,19 @@ static void file_release(vfs_file_t *f)
     f->refcount = 0;
     spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
 
+    vfs_flock_release_file(f);
+    int was_dirty = f->dirty;
     (void)flush_regular_file(f);
 
     if (f->backend == VFS_BACKEND_PIPE && f->u.pipe.pipe) {
         vfs_pipe_t *p = f->u.pipe.pipe;
-        unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
+        unsigned long pflags = spin_lock_irqsave(&p->lock);
         if (f->u.pipe.can_read && p->readers > 0)
             p->readers--;
         if (f->u.pipe.can_write && p->writers > 0)
             p->writers--;
         int empty_claims = (p->readers == 0 && p->writers == 0);
-        spin_unlock_irqrestore(&g_pipe_lock, pflags);
+        spin_unlock_irqrestore(&p->lock, pflags);
         wait_queue_wake_all(&p->waitq);
         if (empty_claims)
             pipe_free_slot(p);
@@ -680,19 +1133,28 @@ static void file_release(vfs_file_t *f)
 
     if (f->backend == VFS_BACKEND_UNIXSOCK) {
         if (f->u.sock.is_listener) {
-            /* Drain not-yet-accepted connections: each pending record carries the SERVER-side claims (reader on c2s,... */
             unix_pending_conn_t pc;
             while (f->u.sock.listener &&
                    unix_dequeue_pending(f->u.sock.listener, &pc) == 0) {
-                sock_drop_pipe_claim((vfs_pipe_t *)pc.pipe1, 1, 0);
-                sock_drop_pipe_claim((vfs_pipe_t *)pc.pipe2, 0, 1);
+                unix_ring_drop_claim(pc.pipe1, 1, 0);
+                unix_ring_drop_claim(pc.pipe2, 0, 1);
             }
             if (f->path[0])
                 unix_unregister_listener(f->path);
         } else {
-            sock_drop_pipe_claim(f->u.sock.rx, 1, 0);
-            sock_drop_pipe_claim(f->u.sock.tx, 0, 1);
+            unix_ring_drop_claim(f->u.sock.rx, 1, 0);
+            unix_ring_drop_claim(f->u.sock.tx, 0, 1);
         }
+    }
+
+    if (f->backend == VFS_BACKEND_TMPFS && f->u.tmpfs.inode) {
+        tmpfs_inode_unref(f->u.tmpfs.inode);
+        f->u.tmpfs.inode = NULL;
+    }
+
+    if (f->backend == VFS_BACKEND_EXT4) {
+        ext4fs_close((ext4fs_t *)f->fs_ctx, f->u.ext4.handle, was_dirty);
+        f->u.ext4.handle = NULL;
     }
 
     if (f->backend == VFS_BACKEND_DEVFS) {
@@ -700,8 +1162,13 @@ static void file_release(vfs_file_t *f)
             f->u.device.ops->close(f->u.device.priv);
     }
 
-    if (f->u.regular.owns_buf && f->u.regular.buf)
-        kfree(f->u.regular.buf);
+    if (f->backend != VFS_BACKEND_FAT32 && f->backend != VFS_BACKEND_FAT32VOL &&
+        f->backend != VFS_BACKEND_EXT4 && f->backend != VFS_BACKEND_TMPFS &&
+        f->backend != VFS_BACKEND_PIPE && f->backend != VFS_BACKEND_UNIXSOCK &&
+        f->backend != VFS_BACKEND_DEVFS && f->backend != VFS_BACKEND_EPOLL) {
+        if (f->u.regular.owns_buf && f->u.regular.buf)
+            kfree(f->u.regular.buf);
+    }
 
     if (f->backend == VFS_BACKEND_EPOLL) {
         epoll_item_t *curr = f->u.epoll.items;
@@ -714,27 +1181,26 @@ static void file_release(vfs_file_t *f)
         f->u.epoll.count = 0;
     }
 
-    aflags = spin_lock_irqsave(&g_vfs_alloc_lock);
-    f->used = 0;
-    spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
+    if (f->mount_id != 0)
+        mount_note_open_delta(f->mount_id, -1);
+
+    kfree(f);
 }
 
-static int process_fd_alloc(process_t *proc)
+static vfs_file_t *fd_lookup_ref(process_t *proc, int fd)
 {
     void **tbl = fd_table_for_process(proc);
-    for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
-        if (!tbl[i])
-            return i;
-    }
-    return -1;
-}
-
-static vfs_file_t *fd_lookup(process_t *proc, int fd)
-{
-    void **tbl = fd_table_for_process(proc);
+    vfs_file_t *f = NULL;
     if (!fd_valid(fd))
         return NULL;
-    return (vfs_file_t *)tbl[fd];
+    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
+    f = (vfs_file_t *)tbl[fd];
+    if (f == (vfs_file_t *)(uintptr_t)1)
+        f = NULL;
+    if (f)
+        file_ref(f);
+    spin_unlock_irqrestore(&g_fd_lock, flags);
+    return f;
 }
 
 static void fd_close_on_table(void **tbl, int fd)
@@ -742,13 +1208,19 @@ static void fd_close_on_table(void **tbl, int fd)
     vfs_file_t *f;
     if (!tbl || !fd_valid(fd))
         return;
+
+    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
     f = (vfs_file_t *)tbl[fd];
-    if (!f)
+    if (!f || f == (vfs_file_t *)(uintptr_t)1) {
+        tbl[fd] = NULL;
+        spin_unlock_irqrestore(&g_fd_lock, flags);
         return;
+    }
 
     for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
         vfs_file_t *ef = (vfs_file_t *)tbl[i];
-        if (ef && ef->backend == VFS_BACKEND_EPOLL) {
+        if (ef && ef != (vfs_file_t *)(uintptr_t)1 && ef->backend == VFS_BACKEND_EPOLL) {
+            unsigned long eflags = spin_lock_irqsave(&ef->lock);
             epoll_item_t *prev = NULL;
             epoll_item_t *curr = ef->u.epoll.items;
             while (curr) {
@@ -764,282 +1236,387 @@ static void fd_close_on_table(void **tbl, int fd)
                 prev = curr;
                 curr = curr->next;
             }
+            spin_unlock_irqrestore(&ef->lock, eflags);
         }
     }
 
     tbl[fd] = NULL;
+    spin_unlock_irqrestore(&g_fd_lock, flags);
     file_release(f);
-}
-
-static vfs_file_t *fd_lookup_on_table(void **tbl, int fd)
-{
-    if (!tbl || !fd_valid(fd))
-        return NULL;
-    return (vfs_file_t *)tbl[fd];
 }
 
 /* DevFS operations are handled via fs/devfs.c */
 
-/* MemFS virtual directory tracking */
-
-static void memfs_dirs_reset(void)
+static void vfs_stat_finalize(vfs_stat_t *st, uint64_t dev_id, uint64_t ino_id)
 {
-    for (int i = 0; i < VFS_MEMFS_MAX_DIRS; i++) {
-        g_memfs_dirs[i].used = 0;
-        g_memfs_dirs[i].mount = NULL;
-        g_memfs_dirs[i].path[0] = '\0';
+    if (!st)
+        return;
+    if (st->st_dev == 0)
+        st->st_dev = dev_id;
+    if (st->st_ino == 0)
+        st->st_ino = ino_id;
+    if (st->st_size == 0 && st->size != 0)
+        st->st_size = st->size;
+    if (st->st_blocks == 0 && st->blocks != 0)
+        st->st_blocks = st->blocks;
+    if (st->st_blksize == 0)
+        st->st_blksize = 4096U;
+    if (st->st_nlink == 0)
+        st->st_nlink = (st->type == VFS_TYPE_DIR) ? 2U : 1U;
+    if (st->st_mode == 0) {
+        uint32_t ifmt = VFS_S_IFREG;
+        uint32_t perm = 0;
+        if (st->type == VFS_TYPE_DIR)
+            ifmt = VFS_S_IFDIR;
+        else if (st->type == VFS_TYPE_CHAR)
+            ifmt = VFS_S_IFCHR;
+        else if (st->type == VFS_TYPE_BLOCK)
+            ifmt = VFS_S_IFBLK;
+        else if (st->type == VFS_TYPE_PIPE)
+            ifmt = VFS_S_IFIFO;
+        else if (st->type == VFS_TYPE_SOCKET)
+            ifmt = VFS_S_IFSOCK;
+        else if (st->type == VFS_TYPE_SYMLINK)
+            ifmt = VFS_S_IFLNK;
+
+        if (st->mode & VFS_MODE_READ)
+            perm |= (st->type == VFS_TYPE_DIR) ? 0555U : 0444U;
+        if (st->mode & VFS_MODE_WRITE)
+            perm |= 0222U;
+        st->st_mode = ifmt | perm;
     }
 }
 
-static const char *memfs_sub_to_rel(const char *subpath)
-{
-    const char *p = subpath;
-    if (!p)
-        return "";
-    while (*p == '/')
-        p++;
-    return p;
-}
-
-static int memfs_dir_find(const vfs_mount_t *m, const char *rel)
-{
-    if (!rel || !rel[0])
-        return -1;
-    for (int i = 0; i < VFS_MEMFS_MAX_DIRS; i++) {
-        if (g_memfs_dirs[i].used && g_memfs_dirs[i].mount == m &&
-            kstreq(g_memfs_dirs[i].path, rel)) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-static int memfs_split_parent(const char *rel, char *parent_out, int cap,
-                              const char **leaf_out)
-{
-    int last_slash = -1;
-    int len;
-    if (!rel || !parent_out || cap <= 0 || !leaf_out)
-        return -1;
-    len = kstrlen(rel);
-    if (len == 0)
-        return -1;
-    for (int i = 0; i < len; i++) {
-        if (rel[i] == '/')
-            last_slash = i;
-    }
-    if (last_slash < 0) {
-        parent_out[0] = '\0';
-        *leaf_out = rel;
-        return 0;
-    }
-    if (last_slash >= cap)
-        return -1;
-    for (int i = 0; i < last_slash; i++)
-        parent_out[i] = rel[i];
-    parent_out[last_slash] = '\0';
-    *leaf_out = rel + last_slash + 1;
-    return 0;
-}
-
-static int memfs_has_prefix(const char *entry_rel, const char *dir_rel)
-{
-    int dlen = kstrlen(dir_rel);
-    if (!entry_rel || !dir_rel || dlen == 0)
-        return 0;
-    for (int i = 0; i < dlen; i++) {
-        if (entry_rel[i] != dir_rel[i])
-            return 0;
-    }
-    return (entry_rel[dlen] == '/' && entry_rel[dlen + 1] != '\0');
-}
-
-static int memfs_direct_child(const char *dir_rel, const char *entry_rel,
-                              char *child_out, int cap)
-{
-    const char *rest = entry_rel;
-    if (!entry_rel || !entry_rel[0] || !child_out || cap <= 0)
-        return -1;
-    if (dir_rel && dir_rel[0]) {
-        int dlen = kstrlen(dir_rel);
-        for (int i = 0; i < dlen; i++) {
-            if (entry_rel[i] != dir_rel[i])
-                return -1;
-        }
-        if (entry_rel[dlen] != '/')
-            return -1;
-        rest = entry_rel + dlen + 1;
-    }
-    if (!rest[0])
-        return -1;
-    for (int i = 0; rest[i]; i++) {
-        if (rest[i] == '/')
-            return -1;
-    }
-    return kstrncpy(child_out, rest, cap);
-}
-
-static int memfs_dir_has_children(const vfs_mount_t *m, const char *rel)
-{
-    char mnames[MEMFS_MAX_FILES][MEMFS_MAX_NAME];
-    int n;
-
-    for (int i = 0; i < VFS_MEMFS_MAX_DIRS; i++) {
-        if (g_memfs_dirs[i].used && g_memfs_dirs[i].mount == m &&
-            memfs_has_prefix(g_memfs_dirs[i].path, rel)) {
-            return 1;
-        }
-    }
-
-    n = memfs_list(mnames, MEMFS_MAX_FILES);
-    for (int i = 0; i < n; i++) {
-        if (memfs_has_prefix(mnames[i], rel))
-            return 1;
-    }
-    return 0;
-}
-
-static int memfs_list_dir_entries(const vfs_mount_t *m, const char *rel,
-                                  char names[][VFS_NAME_MAX], int max)
-{
-    char mnames[MEMFS_MAX_FILES][MEMFS_MAX_NAME];
-    char child[VFS_NAME_MAX];
-    int count = 0;
-    int n;
-
-    for (int i = 0; i < VFS_MEMFS_MAX_DIRS && count < max; i++) {
-        if (!g_memfs_dirs[i].used || g_memfs_dirs[i].mount != m)
-            continue;
-        if (memfs_direct_child(rel, g_memfs_dirs[i].path, child, VFS_NAME_MAX) == 0) {
-            int dup = 0;
-            for (int k = 0; k < count; k++) {
-                if (kstreq(names[k], child)) {
-                    dup = 1;
-                    break;
-                }
-            }
-            if (!dup) {
-                kstrncpy(names[count], child, VFS_NAME_MAX);
-                count++;
-            }
-        }
-    }
-
-    n = memfs_list(mnames, MEMFS_MAX_FILES);
-    for (int i = 0; i < n && count < max; i++) {
-        if (memfs_direct_child(rel, mnames[i], child, VFS_NAME_MAX) == 0) {
-            int dup = 0;
-            for (int k = 0; k < count; k++) {
-                if (kstreq(names[k], child)) {
-                    dup = 1;
-                    break;
-                }
-            }
-            if (!dup) {
-                kstrncpy(names[count], child, VFS_NAME_MAX);
-                count++;
-            }
-        }
-    }
-    return count;
-}
-
-/* Backend stat/list/read helpers */
-
-static int backend_stat(const vfs_mount_t *m, const char *subpath, vfs_stat_t *out)
+static int backend_stat_mode(const vfs_mount_t *m, const char *subpath, int follow_last, vfs_stat_t *out)
 {
     if (!m || !subpath || !out)
-        return -1;
-    out->size = 0;
-    out->blocks = 0;
-    out->type = VFS_TYPE_UNKNOWN;
+        return -EINVAL;
+    for (size_t i = 0; i < sizeof(*out); i++)
+        ((uint8_t *)out)[i] = 0;
+
     out->mode = VFS_MODE_READ | (m->read_only ? 0 : VFS_MODE_WRITE);
 
     if (kstreq(subpath, "/")) {
-        out->type = VFS_TYPE_DIR;
+        if (m->backend == VFS_BACKEND_TMPFS && m->fs_private) {
+            if (tmpfs_stat((tmpfs_fs_t *)m->fs_private, "/", follow_last, out) != 0)
+                return -ENOENT;
+            out->mode = VFS_MODE_READ | (m->read_only ? 0 : VFS_MODE_WRITE);
+            vfs_stat_finalize(out, m->mount_id, 1ULL);
+        } else if (m->backend == VFS_BACKEND_EXT4 && m->fs_private) {
+            if (ext4fs_stat((ext4fs_t *)m->fs_private, "/", follow_last, out) != 0)
+                return -ENOENT;
+            out->mode = VFS_MODE_READ | (m->read_only ? 0 : VFS_MODE_WRITE);
+            vfs_stat_finalize(out, m->mount_id, out->st_ino ? out->st_ino : 2ULL);
+        } else {
+            out->type = VFS_TYPE_DIR;
+            vfs_stat_finalize(out, m->mount_id, 1ULL);
+        }
         return 0;
     }
 
     switch (m->backend) {
-    case VFS_BACKEND_MEMFS:
-    {
-        size_t sz = 0;
-        const char *name = memfs_sub_to_rel(subpath);
-        if (memfs_dir_find(m, name) >= 0) {
-            out->type = VFS_TYPE_DIR;
-            out->size = 0;
-            out->blocks = 0;
-            return 0;
-        }
-        if (memfs_stat(name, &sz) != 0)
-            return -1;
-        out->type = VFS_TYPE_FILE;
-        out->size = sz;
-        out->blocks = (sz + 511) / 512;
+    case VFS_BACKEND_EXT4: {
+        int rc = ext4fs_stat((ext4fs_t *)m->fs_private, subpath, follow_last, out);
+        if (rc != 0)
+            return rc;
+        out->mode = VFS_MODE_READ | (m->read_only ? 0 : VFS_MODE_WRITE);
+        vfs_stat_finalize(out, m->mount_id, out->st_ino ? out->st_ino : vfs_hash_str(subpath));
         return 0;
     }
-    case VFS_BACKEND_FAT12:
-    {
-        fat12_dirent_t de;
-        if (!g_fat12_ok)
-            return -1;
-        if (fat12_stat(subpath, &de) != 0)
-            return -1;
-        out->type = de.is_dir ? VFS_TYPE_DIR : VFS_TYPE_FILE;
-        out->size = de.size;
-        out->blocks = (de.size + 511) / 512;
+    case VFS_BACKEND_TMPFS: {
+        int rc = tmpfs_stat((tmpfs_fs_t *)m->fs_private, subpath, follow_last, out);
+        if (rc != 0)
+            return rc;
+        out->mode = VFS_MODE_READ | (m->read_only ? 0 : VFS_MODE_WRITE);
+        vfs_stat_finalize(out, m->mount_id, vfs_hash_str(subpath));
         return 0;
     }
-    case VFS_BACKEND_FAT32:
-    {
+    case VFS_BACKEND_FAT32: {
         fat32_dirent_t de;
         if (!g_fat32_ok)
-            return -1;
+            return -ENOENT;
         if (fat32_stat(subpath, &de) != 0)
-            return -1;
+            return -ENOENT;
         out->type = de.is_dir ? VFS_TYPE_DIR : VFS_TYPE_FILE;
         out->size = de.size;
         out->blocks = (de.size + 511) / 512;
+        vfs_stat_finalize(out, m->mount_id, de.first_cluster ? (uint64_t)de.first_cluster : vfs_hash_str(subpath));
         return 0;
     }
-    case VFS_BACKEND_FAT32VOL:
-    {
+    case VFS_BACKEND_FAT32VOL: {
         fat32_dirent_t de;
-        if (fat32_vol_stat((fat32_volume_t *)m->ctx, subpath, &de) != 0)
-            return -1;
+        if (fat32_vol_stat((fat32_volume_t *)m->fs_private, subpath, &de) != 0)
+            return -ENOENT;
         out->type = de.is_dir ? VFS_TYPE_DIR : VFS_TYPE_FILE;
         out->size = de.size;
         out->blocks = (de.size + 511) / 512;
+        vfs_stat_finalize(out, m->mount_id, de.first_cluster ? (uint64_t)de.first_cluster : vfs_hash_str(subpath));
         return 0;
     }
-    case VFS_BACKEND_INITRD:
-    {
+    case VFS_BACKEND_INITRD: {
         const void *data = NULL;
         size_t sz = 0;
         if (initrd_lookup(subpath, &data, &sz) != 0)
-            return -1;
+            return -ENOENT;
         out->type = VFS_TYPE_FILE;
         out->size = sz;
         out->blocks = (sz + 511) / 512;
+        vfs_stat_finalize(out, m->mount_id, vfs_hash_str(subpath));
         return 0;
     }
     case VFS_BACKEND_PROCFS:
-        return procfs_stat(subpath, out);
+        if (procfs_stat(subpath, out) != 0)
+            return -ENOENT;
+        vfs_stat_finalize(out, m->mount_id, vfs_hash_str(subpath));
+        return 0;
     case VFS_BACKEND_SYSFS:
-        return sysfs_stat(subpath, out);
+        if (sysfs_stat(subpath, out) != 0)
+            return -ENOENT;
+        vfs_stat_finalize(out, m->mount_id, vfs_hash_str(subpath));
+        return 0;
     case VFS_BACKEND_BOOTFS:
-        return bootfs_stat(subpath, out);
+        if (bootfs_stat(subpath, out) != 0)
+            return -ENOENT;
+        vfs_stat_finalize(out, m->mount_id, vfs_hash_str(subpath));
+        return 0;
     case VFS_BACKEND_DEVFS:
-        return devfs_stat(subpath, out);
+        if (devfs_stat(subpath, out) != 0)
+            return -ENOENT;
+        vfs_stat_finalize(out, m->mount_id, vfs_hash_str(subpath));
+        return 0;
     case VFS_BACKEND_TAR:
-        return tar_stat((tar_fs_t *)m->ctx, subpath, out);
+        if (tar_stat((tar_fs_t *)m->fs_private, subpath, out) != 0)
+            return -ENOENT;
+        vfs_stat_finalize(out, m->mount_id, vfs_hash_str(subpath));
+        return 0;
     default:
-        return -1;
+        return -ENOENT;
     }
+}
+
+static int backend_stat(const vfs_mount_t *m, const char *subpath, vfs_stat_t *out)
+{
+    return backend_stat_mode(m, subpath, 1, out);
+}
+
+/* Component-by-component path resolution backed by hierarchical dcache and cross-mount symlinks. */
+
+static int vfs_resolve_path_ex(process_t *proc, const char *path, int follow_last,
+                               char *abs_out, vfs_mount_t **mount_out,
+                               char *sub_out, int *exists_out, uint32_t *type_out)
+{
+    char cur_raw[VFS_PATH_MAX];
+    char cur_abs[VFS_PATH_MAX];
+    char sub[VFS_PATH_MAX];
+
+    if (!path || !path[0] || !abs_out || !mount_out || !sub_out)
+        return -EINVAL;
+
+    if (path_is_abs(path)) {
+        if (kstrncpy(cur_raw, path, VFS_PATH_MAX) != 0)
+            return -ENAMETOOLONG;
+    } else {
+        char *cwd = cwd_for_process(proc);
+        if (path_copy_join(cur_raw, VFS_PATH_MAX, cwd && cwd[0] ? cwd : "/", path) != 0)
+            return -ENAMETOOLONG;
+    }
+
+    for (int hop = 0; hop <= VFS_SYMLOOP_MAX; hop++) {
+        uint64_t stack_ids[32];
+        int stack_len[32];
+        int depth = 0;
+
+        cur_abs[0] = '/';
+        cur_abs[1] = '\0';
+        stack_ids[0] = 1ULL;
+        stack_len[0] = 1;
+
+        size_t i = 0;
+        while (cur_raw[i] == '/')
+            i++;
+
+        int restarted = 0;
+        int leaf_exists = 1;
+        uint32_t leaf_type = VFS_TYPE_DIR;
+
+        while (cur_raw[i]) {
+            char comp[VFS_NAME_MAX];
+            int ci = 0;
+            while (cur_raw[i] && cur_raw[i] != '/') {
+                if (ci >= VFS_NAME_MAX - 1)
+                    return -ENAMETOOLONG;
+                comp[ci++] = cur_raw[i++];
+            }
+            comp[ci] = '\0';
+            while (cur_raw[i] == '/')
+                i++;
+            int has_more = (cur_raw[i] != '\0');
+
+            if (kstreq(comp, "."))
+                continue;
+            if (kstreq(comp, "..")) {
+                if (depth > 0) {
+                    depth--;
+                    cur_abs[stack_len[depth]] = '\0';
+                }
+                continue;
+            }
+
+            char next_abs[VFS_PATH_MAX];
+            int cur_len = stack_len[depth];
+            if (cur_len > 1) {
+                if (cur_len + 1 + ci >= VFS_PATH_MAX)
+                    return -ENAMETOOLONG;
+                kstrncpy(next_abs, cur_abs, VFS_PATH_MAX);
+                next_abs[cur_len] = '/';
+                kstrncpy(next_abs + cur_len + 1, comp, VFS_PATH_MAX - cur_len - 1);
+            } else {
+                if (1 + ci >= VFS_PATH_MAX)
+                    return -ENAMETOOLONG;
+                next_abs[0] = '/';
+                kstrncpy(next_abs + 1, comp, VFS_PATH_MAX - 1);
+            }
+
+            vfs_mount_t *m = mount_lookup_ref(next_abs);
+            if (!m)
+                return -ENOENT;
+            if (mount_subpath(m, next_abs, sub, VFS_PATH_MAX) != 0) {
+                mount_unref(m);
+                return -EINVAL;
+            }
+
+            uint64_t child_id = 0;
+            uint64_t child_ino = 0;
+            uint32_t child_type = VFS_TYPE_UNKNOWN;
+            char sym_target[VFS_PATH_MAX];
+            sym_target[0] = '\0';
+
+            int cache_hit = 0;
+            if (m->backend != VFS_BACKEND_PROCFS && m->backend != VFS_BACKEND_SYSFS) {
+                if (dcache_lookup(stack_ids[depth], comp, m->mount_id,
+                                  &child_id, &child_ino, &child_type,
+                                  sym_target, sizeof(sym_target)) == 0) {
+                    cache_hit = 1;
+                }
+            }
+
+            if (!cache_hit) {
+                vfs_stat_t st;
+                int brc = backend_stat_mode(m, sub, 0, &st);
+                if (brc != 0) {
+                    /* Allow unix socket path lookup if it's the final component. */
+                    if (!has_more && unix_find_listener(next_abs) != NULL) {
+                        child_type = VFS_TYPE_SOCKET;
+                        child_ino = vfs_hash_str(next_abs);
+                    } else if (!has_more) {
+                        mount_unref(m);
+                        leaf_exists = 0;
+                        leaf_type = VFS_TYPE_UNKNOWN;
+                        kstrncpy(cur_abs, next_abs, VFS_PATH_MAX);
+                        break;
+                    } else {
+                        mount_unref(m);
+                        return -ENOENT;
+                    }
+                } else {
+                    child_type = st.type;
+                    child_ino = st.st_ino;
+                    if (child_type == VFS_TYPE_SYMLINK) {
+                        int rl = -1;
+                        if (m->backend == VFS_BACKEND_TMPFS) {
+                            rl = tmpfs_readlink((tmpfs_fs_t *)m->fs_private, sub,
+                                                sym_target, sizeof(sym_target));
+                        } else if (m->backend == VFS_BACKEND_EXT4) {
+                            rl = ext4fs_readlink((ext4fs_t *)m->fs_private, sub,
+                                                 sym_target, sizeof(sym_target));
+                        }
+                        if (rl >= 0 && (size_t)rl < sizeof(sym_target))
+                            sym_target[rl] = '\0';
+                        else
+                            sym_target[0] = '\0';
+                    }
+                    if (m->backend != VFS_BACKEND_PROCFS && m->backend != VFS_BACKEND_SYSFS &&
+                        child_type != VFS_TYPE_SOCKET) {
+                        child_id = dcache_insert(stack_ids[depth], comp, m->mount_id,
+                                                 child_ino, child_type,
+                                                 (child_type == VFS_TYPE_SYMLINK) ? sym_target : NULL);
+                    }
+                }
+            }
+
+            if (child_type == VFS_TYPE_SYMLINK && (has_more || follow_last)) {
+                mount_unref(m);
+                if (hop >= VFS_SYMLOOP_MAX)
+                    return -ELOOP;
+                if (!sym_target[0])
+                    return -ENOENT;
+
+                char rebuilt[VFS_PATH_MAX];
+                if (sym_target[0] == '/') {
+                    kstrncpy(rebuilt, sym_target, VFS_PATH_MAX);
+                } else {
+                    if (path_copy_join(rebuilt, VFS_PATH_MAX, cur_abs, sym_target) != 0)
+                        return -ENAMETOOLONG;
+                }
+                if (has_more) {
+                    int rlen = kstrlen(rebuilt);
+                    if (rlen + 1 >= VFS_PATH_MAX)
+                        return -ENAMETOOLONG;
+                    if (rlen == 0 || rebuilt[rlen - 1] != '/') {
+                        rebuilt[rlen++] = '/';
+                        rebuilt[rlen] = '\0';
+                    }
+                    if (kstrncpy(rebuilt + rlen, cur_raw + i, VFS_PATH_MAX - rlen) != 0)
+                        return -ENAMETOOLONG;
+                }
+                kstrncpy(cur_raw, rebuilt, VFS_PATH_MAX);
+                restarted = 1;
+                break;
+            }
+
+            if (has_more && child_type != VFS_TYPE_DIR) {
+                mount_unref(m);
+                return -ENOTDIR;
+            }
+
+            mount_unref(m);
+
+            if (depth + 1 >= 32)
+                return -ENAMETOOLONG;
+            depth++;
+            kstrncpy(cur_abs, next_abs, VFS_PATH_MAX);
+            stack_len[depth] = kstrlen(cur_abs);
+            stack_ids[depth] = child_id ? child_id : vfs_hash_str(cur_abs);
+            leaf_exists = 1;
+            leaf_type = child_type;
+        }
+
+        if (restarted)
+            continue;
+
+        vfs_mount_t *m = mount_lookup_ref(cur_abs);
+        if (!m)
+            return -ENOENT;
+        if (mount_subpath(m, cur_abs, sub, VFS_PATH_MAX) != 0) {
+            mount_unref(m);
+            return -EINVAL;
+        }
+        kstrncpy(abs_out, cur_abs, VFS_PATH_MAX);
+        *mount_out = m;
+        kstrncpy(sub_out, sub, VFS_PATH_MAX);
+        if (exists_out)
+            *exists_out = leaf_exists;
+        if (type_out)
+            *type_out = leaf_type;
+        return 0;
+    }
+
+    return -ELOOP;
 }
 
 static int append_root_mount_names(char names[][VFS_NAME_MAX], int count, int max)
 {
+    unsigned long flags = spin_lock_irqsave(&g_mounts_lock);
     for (int i = 0; i < VFS_MAX_MOUNTS && count < max; i++) {
         const vfs_mount_t *m = &g_mounts[i];
         const char *base;
@@ -1070,66 +1647,316 @@ static int append_root_mount_names(char names[][VFS_NAME_MAX], int count, int ma
         names[count][(j < VFS_NAME_MAX - 1) ? j : (VFS_NAME_MAX - 1)] = '\0';
         count++;
     }
+    spin_unlock_irqrestore(&g_mounts_lock, flags);
     return count;
 }
 
 /* Public init */
 
+static int ends_with(const char *str, const char *suffix)
+{
+    int slen = kstrlen(str);
+    int flen = kstrlen(suffix);
+    if (slen < flen)
+        return 0;
+    return kstreq(str + slen - flen, suffix);
+}
+
+static int find_lz4_initrd(const void *boot_info, const void **data_out,
+                           size_t *size_out)
+{
+    int owns = 0;
+    if (bootfs_read_file("/initrd.tar.lz4", data_out, size_out, &owns) == 0 &&
+        *data_out && *size_out > 0) {
+        return 0;
+    }
+
+    if (tsukasa_boot_info_is_valid(boot_info)) {
+        const struct tsukasa_boot_info *bi =
+            (const struct tsukasa_boot_info *)boot_info;
+        for (uint32_t i = 0; i < bi->module_count && bi->modules; i++) {
+            const uint8_t *ptr = (const uint8_t *)(uintptr_t)bi->modules[i].address;
+            size_t sz = (size_t)bi->modules[i].size;
+            if (!ptr || sz < 4)
+                continue;
+            if (bi->modules[i].path && ends_with(bi->modules[i].path, "initrd.tar.lz4")) {
+                *data_out = ptr;
+                *size_out = sz;
+                return 0;
+            }
+            if (ptr[0] == 0x04U && ptr[1] == 0x22U &&
+                ptr[2] == 0x4DU && ptr[3] == 0x18U) {
+                *data_out = ptr;
+                *size_out = sz;
+                return 0;
+            }
+        }
+    } else {
+        const struct multiboot_info *mb = (const struct multiboot_info *)boot_info;
+        if (mb && (mb->flags & 8) && mb->mods_count > 0) {
+            const struct multiboot_mod_list *mod =
+                (const struct multiboot_mod_list *)(uintptr_t)mb->mods_addr;
+            for (uint32_t i = 0; i < mb->mods_count; i++) {
+                const uint8_t *ptr = (const uint8_t *)(uintptr_t)mod[i].mod_start;
+                size_t sz = mod[i].mod_end - mod[i].mod_start;
+                if (!ptr || sz < 4)
+                    continue;
+                if (ptr[0] == 0x04U && ptr[1] == 0x22U &&
+                    ptr[2] == 0x4DU && ptr[3] == 0x18U) {
+                    *data_out = ptr;
+                    *size_out = sz;
+                    return 0;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+static void unpack_lz4_initrd(const void *boot_info, tmpfs_fs_t *root_fs)
+{
+    const void *lz4_data = NULL;
+    size_t lz4_size = 0;
+    uint64_t content_size = 0;
+    int has_size = 0;
+    size_t max_blk = 0;
+    int rc;
+
+    if (!root_fs) {
+        kprintf("[vfs] ERROR: initrd.tar.lz4 no root tmpfs instance\n");
+        return;
+    }
+    if (find_lz4_initrd(boot_info, &lz4_data, &lz4_size) != 0) {
+        kprintf("[vfs] ERROR: initrd.tar.lz4 module not found\n");
+        return;
+    }
+
+    rc = lz4_frame_info(lz4_data, lz4_size, &content_size, &has_size, &max_blk);
+    if (rc != LZ4_OK) {
+        kprintf("[vfs] ERROR: initrd.tar.lz4 invalid frame: %s\n",
+                lz4_strerror(rc));
+        return;
+    }
+
+    size_t tar_cap = 0;
+    if (has_size && content_size > 0) {
+        tar_cap = (size_t)content_size;
+    } else if (!has_size) {
+        tar_cap = lz4_size * 4U;
+        if (tar_cap < 16U * 1024U * 1024U)
+            tar_cap = 16U * 1024U * 1024U;
+    } else {
+        kprintf("[vfs] ERROR: initrd.tar.lz4 empty content size\n");
+        return;
+    }
+
+    size_t pages = (tar_cap + PAGE_SIZE - 1U) / PAGE_SIZE;
+    uintptr_t phys = pmm_alloc_pages(pages);
+    if (!phys) {
+        kprintf("[vfs] ERROR: initrd.tar.lz4 out of memory (%u KiB)\n",
+                (uint32_t)(tar_cap / 1024U));
+        return;
+    }
+
+    void *tar_buf = (void *)vmm_phys_to_virt((uint64_t)phys);
+    size_t tar_size = 0;
+    rc = lz4_decompress(lz4_data, lz4_size, tar_buf, tar_cap, &tar_size);
+    if (rc != LZ4_OK) {
+        kprintf("[vfs] ERROR: initrd.tar.lz4 decompression failed: %s\n",
+                lz4_strerror(rc));
+        pmm_free_pages(phys, pages);
+        return;
+    }
+
+    int entries = tar_unpack_to_tmpfs(tar_buf, (uint64_t)tar_size, root_fs);
+    pmm_free_pages(phys, pages);
+
+    if (entries < 0) {
+        kprintf("[vfs] ERROR: initrd.tar.lz4 tar unpack failed (rc=%d)\n",
+                entries);
+        return;
+    }
+
+    kprintf("[vfs] initrd.tar.lz4: ok (%d entries unpacked)\n", entries);
+}
+
+static int is_ws(char c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static int starts_with_ci(const char *s, const char *prefix)
+{
+    if (!s || !prefix)
+        return 0;
+    for (int i = 0; prefix[i]; i++) {
+        char a = s[i];
+        char b = prefix[i];
+        if (a >= 'A' && a <= 'Z')
+            a = (char)(a + 32);
+        if (b >= 'A' && b <= 'Z')
+            b = (char)(b + 32);
+        if (a != b)
+            return 0;
+    }
+    return 1;
+}
+
+static int extract_cmdline_root(const char *cmdline, char *out, size_t cap)
+{
+    int found = 0;
+    if (!out || cap == 0)
+        return 0;
+    out[0] = '\0';
+    if (!cmdline)
+        return 0;
+
+    const char *p = cmdline;
+    while (*p) {
+        while (*p && is_ws(*p))
+            p++;
+        if (!*p)
+            break;
+        const char *tok = p;
+        while (*p && !is_ws(*p))
+            p++;
+        size_t tlen = (size_t)(p - tok);
+        if (tlen >= 5 && tok[0] == 'r' && tok[1] == 'o' &&
+            tok[2] == 'o' && tok[3] == 't' && tok[4] == '=') {
+            size_t vlen = tlen - 5;
+            if (vlen >= cap)
+                vlen = cap - 1;
+            for (size_t i = 0; i < vlen; i++)
+                out[i] = tok[5 + i];
+            out[vlen] = '\0';
+            found = 1;
+        }
+    }
+    return found;
+}
+
+static block_dev_t *resolve_root_blockdev(const char *spec)
+{
+    if (!spec || !spec[0])
+        return NULL;
+    if (starts_with_ci(spec, "partuuid="))
+        return blockdev_find_by_partuuid(spec + 9);
+    if (spec[0] == '/' && spec[1] == 'd' && spec[2] == 'e' &&
+        spec[3] == 'v' && spec[4] == '/')
+        return blockdev_find(spec + 5);
+    return blockdev_find(spec);
+}
+
+static block_dev_t *find_esp_on_disk(block_dev_t *root_bd)
+{
+    if (!root_bd)
+        return NULL;
+    block_dev_t *parent = root_bd->is_partition ? root_bd->parent : root_bd;
+    if (!parent)
+        return NULL;
+
+    for (int i = 0; i < blockdev_count(); i++) {
+        block_dev_t *bd = blockdev_at(i);
+        if (bd && bd != root_bd && bd->is_partition &&
+            bd->parent == parent && bd->is_fat32 && bd->is_esp)
+            return bd;
+    }
+    for (int i = 0; i < blockdev_count(); i++) {
+        block_dev_t *bd = blockdev_at(i);
+        if (bd && bd != root_bd && bd->is_partition &&
+            bd->parent == parent && bd->is_fat32)
+            return bd;
+    }
+    return NULL;
+}
+
 void vfs_init(const void *boot_info)
 {
-    const struct multiboot_info *mb = (const struct multiboot_info *)boot_info;
+    const struct tsukasa_boot_info *bi = (const struct tsukasa_boot_info *)boot_info;
+    const char *cmdline = (bi && bi->magic == TSUKASA_BOOT_INFO_MAGIC) ? bi->cmdline : NULL;
     const void *initrd_data = NULL;
     size_t initrd_size = 0;
+    tmpfs_fs_t *root_fs;
+    tmpfs_fs_t *tmp_fs;
+    tmpfs_fs_t *run_fs;
+    char root_spec[128];
+    int has_root_arg;
+    block_dev_t *esp_bd = NULL;
 
     mount_table_reset();
     file_pool_reset();
-    memfs_dirs_reset();
-    memfs_init();
+    dcache_init();
+    flock_init();
+    pagecache_init();
     procfs_init();
     sysfs_init();
     devfs_init();
     bootfs_init(boot_info);
     g_fat32_primary_vol = NULL;
 
-    g_fat12_ok = 0;
-    if (tsukasa_boot_info_is_valid(boot_info)) {
-        const struct tsukasa_boot_info *bi =
-            (const struct tsukasa_boot_info *)boot_info;
-        if (bi->module_count > 0 && bi->modules) {
-            for (uint32_t i = 0; i < bi->module_count; i++) {
-                void *disk = (void *)(uintptr_t)bi->modules[i].address;
-                size_t sz = (size_t)bi->modules[i].size;
-                if (fat12_init(disk, sz) == 0) {
-                    g_fat12_ok = 1;
-                    break;
-                }
-            }
+    g_fat32_ok = 0;
+    /* Storage bring-up: probe PCI DMA drivers first, keep legacy ATA PIO as fallback. */
+    ahci_init();
+    virtio_blk_init();
+    nvme_init();
+    if (blockdev_count() == 0) {
+        if (!ata_init())
+            kprintf("[ata] no drive detected\n");
+    }
+    diskmgr_scan_all();
+
+    has_root_arg = extract_cmdline_root(cmdline, root_spec, sizeof(root_spec));
+    if (has_root_arg) {
+        block_dev_t *root_bd = resolve_root_blockdev(root_spec);
+        if (!root_bd) {
+            kprintf("[vfs] ERROR: failed to mount root=%s (device not found)\n",
+                    root_spec);
+            return;
         }
-    } else if (mb && (mb->flags & 8) && mb->mods_count > 0) {
-        const struct multiboot_mod_list *mod =
-            (const struct multiboot_mod_list *)(uintptr_t)mb->mods_addr;
-        for (uint32_t i = 0; i < mb->mods_count; i++) {
-            void *disk = (void *)(uintptr_t)mod[i].mod_start;
-            size_t sz = mod[i].mod_end - mod[i].mod_start;
-            if (fat12_init(disk, sz) == 0) {
-                g_fat12_ok = 1;
-                break;
+        int mrc = -EINVAL;
+        ext4fs_t *efs = ext4fs_mount(root_bd, 0, &mrc);
+        if (!efs) {
+            kprintf("[vfs] ERROR: failed to mount root=%s on %s as ext4 (err=%d)\n",
+                    root_spec, root_bd->name, mrc);
+            return;
+        }
+        if (mount_register_ctx("/", VFS_BACKEND_EXT4, 0, "ext4", efs) != 0) {
+            (void)ext4fs_umount(efs);
+            kprintf("[vfs] ERROR: failed to mount root=%s at / (register failed)\n",
+                    root_spec);
+            return;
+        }
+        kprintf("[vfs] root=%s mounted ext4 rw (%s)\n", root_spec, root_bd->name);
+
+        (void)ext4fs_mkdir(efs, "/tmp", 01777U);
+        (void)ext4fs_mkdir(efs, "/var", 0755U);
+        (void)ext4fs_mkdir(efs, "/var/run", 0755U);
+        (void)ext4fs_mkdir(efs, "/dev", 0755U);
+        (void)ext4fs_mkdir(efs, "/proc", 0555U);
+        (void)ext4fs_mkdir(efs, "/sys", 0555U);
+        (void)ext4fs_mkdir(efs, "/boot", 0755U);
+        (void)ext4fs_mkdir(efs, "/mnt", 0755U);
+
+        esp_bd = find_esp_on_disk(root_bd);
+        if (esp_bd) {
+            fat32_volume_t *esp_vol = fat32_vol_mount(esp_bd);
+            if (esp_vol && mount_register_ctx("/boot", VFS_BACKEND_FAT32VOL, 0, "fat32", esp_vol) == 0) {
+                kprintf("[vfs] ESP /boot mounted rw (%s)\n", esp_bd->name);
+            } else {
+                if (esp_vol)
+                    (void)fat32_vol_umount(esp_vol);
+                kprintf("[vfs] WARN: failed to mount ESP %s at /boot\n", esp_bd->name);
+                esp_bd = NULL;
             }
         }
     }
-    kprintf("[vfs] FAT12 ramdisk: %s\n", g_fat12_ok ? "ok" : "not found");
 
-    g_fat32_ok = 0;
-    /* Storage bring-up (guides 11+12): the drivers register whole disks (ATA PIO first, then AHCI ports), the... */
-    if (!ata_init())
-        kprintf("[ata] no drive detected\n");
-    diskmgr_scan_all();
     for (int di = 0; di < blockdev_count(); di++) {
         block_dev_t *bd = blockdev_at(di);
         fat32_volume_t *vol;
         char mnt[VFS_PATH_MAX];
 
-        if (!bd || !bd->is_partition || !bd->is_fat32)
+        if (!bd || !bd->is_partition || !bd->is_fat32 || bd == esp_bd)
             continue;
         vol = fat32_vol_mount(bd);
         if (!vol) {
@@ -1138,9 +1965,9 @@ void vfs_init(const void *boot_info)
             continue;
         }
         mnt[0] = '/';
-        mnt[1] = 'd';
-        mnt[2] = 'e';
-        mnt[3] = 'v';
+        mnt[1] = 'm';
+        mnt[2] = 'n';
+        mnt[3] = 't';
         mnt[4] = '/';
         kstrncpy(mnt + 5, bd->name, VFS_PATH_MAX - 5);
         if (mount_register_ctx(mnt, VFS_BACKEND_FAT32VOL, 0, "fat32", vol) == 0)
@@ -1150,33 +1977,43 @@ void vfs_init(const void *boot_info)
     if (blockdev_first_raw_fat32()) {
         if (fat32_init() == 0) {
             g_fat32_ok = 1;
-            g_fat32_primary_vol = fat32_vol_mount(blockdev_first_raw_fat32());
+            g_fat32_primary_vol = fat32_primary_vol();
         }
         kprintf("[vfs] FAT32 /disk: %s\n", g_fat32_ok ? "ok" : "not found");
     }
 
-    initrd_init_from_multiboot(boot_info);
-    g_initrd_ok = (initrd_lookup("/", &initrd_data, &initrd_size) == 0) ? 1 : 0;
+    if (!has_root_arg) {
+        initrd_init_from_multiboot(boot_info);
+        g_initrd_ok = (initrd_lookup("/", &initrd_data, &initrd_size) == 0) ? 1 : 0;
 
-    if (bootfs_module_count() > 0) {
-        mount_register("/", VFS_BACKEND_BOOTFS, 1, "bootfs");
-    } else if (g_initrd_ok) {
-        mount_register("/", VFS_BACKEND_INITRD, 1, "initrd");
-    } else {
-        mount_register("/", VFS_BACKEND_MEMFS, 0, "memfs");
+        root_fs = tmpfs_create();
+        if (root_fs) {
+            mount_register_ctx("/", VFS_BACKEND_TMPFS, 0, "tmpfs", root_fs);
+            unpack_lz4_initrd(boot_info, root_fs);
+            tmpfs_mkdir_p(root_fs, "/tmp", 01777U);
+            tmpfs_mkdir_p(root_fs, "/var/run", 0755U);
+            tmpfs_mkdir_p(root_fs, "/dev", 0755U);
+            tmpfs_mkdir_p(root_fs, "/proc", 0555U);
+            tmpfs_mkdir_p(root_fs, "/sys", 0555U);
+            tmpfs_mkdir_p(root_fs, "/boot", 0755U);
+            tmpfs_mkdir_p(root_fs, "/mnt", 0755U);
+        }
     }
 
-    if (g_fat12_ok) {
-        mount_register("/fat12", VFS_BACKEND_FAT12, 0, "fat12");
-        mount_register("/bin", VFS_BACKEND_FAT12, 0, "fat12");
-    }
-    mount_register("/tmp", VFS_BACKEND_MEMFS, 0, "memfs");
+    tmp_fs = tmpfs_create();
+    if (tmp_fs)
+        mount_register_ctx("/tmp", VFS_BACKEND_TMPFS, 0, "tmpfs", tmp_fs);
+
+    run_fs = tmpfs_create();
+    if (run_fs)
+        mount_register_ctx("/var/run", VFS_BACKEND_TMPFS, 0, "tmpfs", run_fs);
+
     if (g_fat32_ok)
         mount_register("/disk", VFS_BACKEND_FAT32, 0, "fat32");
     mount_register("/proc", VFS_BACKEND_PROCFS, 1, "procfs");
     mount_register("/sys", VFS_BACKEND_SYSFS, 1, "sysfs");
     mount_register("/dev", VFS_BACKEND_DEVFS, 0, "devfs");
-    if (bootfs_module_count() > 0)
+    if (!esp_bd && bootfs_module_count() > 0)
         mount_register("/boot", VFS_BACKEND_BOOTFS, 1, "bootfs");
 
     if (tar_test_archive_len > 0) {
@@ -1189,205 +2026,412 @@ void vfs_init(const void *boot_info)
     }
 }
 
+int vfs_is_root_mounted(void)
+{
+    unsigned long flags = spin_lock_irqsave(&g_mounts_lock);
+    int mounted = 0;
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (g_mounts[i].used && kstreq(g_mounts[i].path, "/")) {
+            mounted = 1;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&g_mounts_lock, flags);
+    return mounted;
+}
+
+void vfs_sync_all(void)
+{
+    vfs_backend_t backends[VFS_MAX_MOUNTS];
+    void *privs[VFS_MAX_MOUNTS];
+    int count = 0;
+
+    unsigned long flags = spin_lock_irqsave(&g_mounts_lock);
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (!g_mounts[i].used || g_mounts[i].read_only)
+            continue;
+        backends[count] = g_mounts[i].backend;
+        privs[count] = g_mounts[i].fs_private;
+        count++;
+    }
+    spin_unlock_irqrestore(&g_mounts_lock, flags);
+
+    for (int i = 0; i < count; i++) {
+        if (backends[i] == VFS_BACKEND_EXT4 && privs[i]) {
+            (void)ext4fs_sync((ext4fs_t *)privs[i]);
+        } else if (backends[i] == VFS_BACKEND_FAT32VOL && privs[i]) {
+            (void)fat32_vol_sync((fat32_volume_t *)privs[i]);
+        } else if (backends[i] == VFS_BACKEND_FAT32) {
+            fat32_volume_t *pv = privs[i] ? (fat32_volume_t *)privs[i] : fat32_primary_vol();
+            if (pv)
+                (void)fat32_vol_sync(pv);
+        }
+    }
+    (void)pagecache_sync_all();
+}
+
+void vfs_shutdown(void)
+{
+    vfs_sync_all();
+
+    for (;;) {
+        char path[VFS_PATH_MAX];
+        int found = 0;
+        unsigned long flags = spin_lock_irqsave(&g_mounts_lock);
+        for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+            if (g_mounts[i].used && !kstreq(g_mounts[i].path, "/")) {
+                kstrncpy(path, g_mounts[i].path, VFS_PATH_MAX);
+                found = 1;
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&g_mounts_lock, flags);
+        if (!found)
+            break;
+        if (vfs_umount2(path, MNT_DETACH) != 0)
+            break;
+    }
+
+    unsigned long flags = spin_lock_irqsave(&g_mounts_lock);
+    vfs_backend_t root_backend = VFS_BACKEND_NONE;
+    void *root_priv = NULL;
+    uint64_t root_mid = 0;
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (g_mounts[i].used && kstreq(g_mounts[i].path, "/")) {
+            root_mid = g_mounts[i].mount_id;
+            root_backend = g_mounts[i].backend;
+            root_priv = g_mounts[i].fs_private;
+            g_mounts[i].used = 0;
+            g_mounts[i].mount_id = 0;
+            g_mounts[i].open_count = 0;
+            g_mounts[i].active_ops = 0;
+            g_mounts[i].path[0] = '\0';
+            g_mounts[i].path_len = 0;
+            g_mounts[i].backend = VFS_BACKEND_NONE;
+            g_mounts[i].fs_private = NULL;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&g_mounts_lock, flags);
+
+    if (root_mid)
+        dcache_invalidate_mount(root_mid);
+    if (root_backend == VFS_BACKEND_EXT4 && root_priv)
+        (void)ext4fs_umount((ext4fs_t *)root_priv);
+    else if (root_backend == VFS_BACKEND_FAT32VOL && root_priv)
+        (void)fat32_vol_umount((fat32_volume_t *)root_priv);
+    else if (root_backend == VFS_BACKEND_TMPFS && root_priv)
+        tmpfs_destroy((tmpfs_fs_t *)root_priv);
+    (void)pagecache_sync_all();
+}
+
+int vfs_sync_fd(int fd)
+{
+    process_t *proc = vfs_current_process();
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    if (!f)
+        return -EBADF;
+
+    int rc = 0;
+    if (f->backend == VFS_BACKEND_EXT4 && f->fs_ctx) {
+        rc = ext4fs_sync((ext4fs_t *)f->fs_ctx);
+    } else if ((f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) &&
+               f->u.fat32.vol) {
+        rc = fat32_vol_sync(f->u.fat32.vol);
+    } else if (f->backend == VFS_BACKEND_DEVFS && f->u.device.priv &&
+               f->u.device.ops && f->u.device.ops->ioctl) {
+        /* Block devices sync on every write; nothing extra needed unless sync exists. */
+        rc = 0;
+    }
+    file_release(f);
+    return rc;
+}
+
 /* Open/create/close */
 
-static int open_memfs_file(const vfs_mount_t *m, vfs_file_t *f,
-                           const char *subpath, int flags)
+static int open_tmpfs_file(const vfs_mount_t *m, vfs_file_t *f,
+                           const char *subpath, int flags, uint32_t create_mode)
 {
-    const char *name = memfs_sub_to_rel(subpath);
-    int inode;
-    if (!name[0])
-        return -1;
-    if (memfs_dir_find(m, name) >= 0)
-        return -1;
+    tmpfs_fs_t *fs = (tmpfs_fs_t *)m->fs_private;
+    tmpfs_inode_t *ino;
 
-    inode = memfs_open(name);
-    if (inode < 0 && (flags & VFS_O_CREAT)) {
-        char parent[VFS_PATH_MAX];
-        const char *leaf = NULL;
-        if (kstrlen(name) >= MEMFS_MAX_NAME)
-            return -1;
-        if (memfs_split_parent(name, parent, VFS_PATH_MAX, &leaf) != 0)
-            return -1;
-        if (!leaf || !leaf[0])
-            return -1;
-        if (parent[0] && memfs_dir_find(m, parent) < 0)
-            return -1;
-        inode = memfs_create(name);
+    if (!fs || !subpath)
+        return -EINVAL;
+
+    ino = tmpfs_lookup(fs, subpath, 1);
+    if (ino) {
+        if ((flags & VFS_O_CREAT) && (flags & VFS_O_EXCL)) {
+            tmpfs_inode_unref(ino);
+            return -EEXIST;
+        }
+        int itype = tmpfs_inode_type(ino);
+        if (itype == TMPFS_TYPE_DIR) {
+            if ((flags & VFS_O_WRONLY) || (flags & VFS_O_CREAT) || (flags & VFS_O_TRUNC)) {
+                tmpfs_inode_unref(ino);
+                return -EISDIR;
+            }
+            f->is_dir = 1;
+            f->mode = VFS_MODE_READ;
+        } else if (itype != TMPFS_TYPE_FILE) {
+            tmpfs_inode_unref(ino);
+            return -EINVAL;
+        } else {
+            if (flags & VFS_O_DIRECTORY) {
+                tmpfs_inode_unref(ino);
+                return -ENOTDIR;
+            }
+            if (flags & VFS_O_TRUNC)
+                tmpfs_truncate(ino, 0);
+        }
+    } else if (flags & VFS_O_CREAT) {
+        if (flags & VFS_O_DIRECTORY)
+            return -ENOTDIR;
+        int rc = tmpfs_create_file(fs, subpath, create_mode, &ino);
+        if (rc != 0 || !ino)
+            return (rc < 0) ? rc : -ENOENT;
+    } else {
+        return -ENOENT;
     }
-    if (inode < 0)
-        return -1;
-    if (flags & VFS_O_TRUNC)
-        memfs_truncate(inode);
 
-    f->backend = VFS_BACKEND_MEMFS;
-    f->u.memfs.inode = inode;
-    f->pos = (flags & VFS_O_APPEND) ? memfs_size(inode) : 0;
+    f->backend = VFS_BACKEND_TMPFS;
+    f->fs_ctx = fs;
+    f->u.tmpfs.inode = ino;
+    f->inode_dev = m->mount_id;
+    f->inode_ino = tmpfs_inode_ino(ino);
+    f->pos = (!f->is_dir && (flags & VFS_O_APPEND)) ? tmpfs_inode_size(ino) : 0;
     return 0;
 }
 
-static int open_regular_buffered(vfs_file_t *f, vfs_backend_t backend,
-                                 void *fs_ctx, const char *subpath, int flags)
+static int open_fat32_file(const vfs_mount_t *m, vfs_file_t *f, vfs_backend_t backend,
+                           void *fs_ctx, const char *subpath, int flags)
 {
+    fat32_volume_t *vol = (backend == VFS_BACKEND_FAT32)
+                              ? fat32_primary_vol()
+                              : (fat32_volume_t *)fs_ctx;
+    uint64_t ino_id = vfs_hash_str(subpath);
     size_t file_size = 0;
-    uint8_t *buf = NULL;
-    int read_bytes = 0;
-    int is_readonly = ((flags & (VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC | VFS_O_APPEND)) == 0);
 
-    if (backend == VFS_BACKEND_FAT12) {
-        fat12_dirent_t de;
-        if (fat12_stat(subpath, &de) != 0) {
-            if (flags & VFS_O_CREAT) {
-                if (fat12_write_file(subpath, "", 0) != 0)
-                    return -1;
-                de.size = 0;
-            } else {
-                return -1;
-            }
-        } else if (de.is_dir) {
-            return -1;
+    if (!vol && backend == VFS_BACKEND_FAT32 && blockdev_first_raw_fat32()) {
+        vol = fat32_vol_mount(blockdev_first_raw_fat32());
+        g_fat32_primary_vol = vol;
+    }
+    if (!vol)
+        return -ENODEV;
+
+    if (kstreq(subpath, "/")) {
+        if ((flags & VFS_O_WRONLY) || (flags & VFS_O_CREAT) || (flags & VFS_O_TRUNC))
+            return -EISDIR;
+        f->backend = backend;
+        f->fs_ctx = vol;
+        f->u.fat32.vol = vol;
+        f->is_dir = 1;
+        f->mode = VFS_MODE_READ;
+        f->inode_dev = m->mount_id;
+        f->inode_ino = 1ULL;
+        return 0;
+    }
+
+    fat32_dirent_t de;
+    if (fat32_vol_stat(vol, subpath, &de) != 0) {
+        if (flags & VFS_O_CREAT) {
+            if (flags & VFS_O_DIRECTORY)
+                return -ENOTDIR;
+            int crc = fat32_vol_create_file(vol, subpath);
+            if (crc != 0)
+                return crc;
+            file_size = 0;
+        } else {
+            return -ENOENT;
+        }
+    } else {
+        if ((flags & VFS_O_CREAT) && (flags & VFS_O_EXCL))
+            return -EEXIST;
+        if (de.is_dir) {
+            if ((flags & VFS_O_WRONLY) || (flags & VFS_O_CREAT) || (flags & VFS_O_TRUNC))
+                return -EISDIR;
+            f->backend = backend;
+            f->fs_ctx = vol;
+            f->u.fat32.vol = vol;
+            f->is_dir = 1;
+            f->mode = VFS_MODE_READ;
+            f->inode_dev = m->mount_id;
+            f->inode_ino = de.first_cluster ? (uint64_t)de.first_cluster : ino_id;
+            return 0;
+        }
+        if (flags & VFS_O_DIRECTORY)
+            return -ENOTDIR;
+        if (de.first_cluster)
+            ino_id = (uint64_t)de.first_cluster;
+        if (flags & VFS_O_TRUNC) {
+            int trc = fat32_vol_truncate(vol, subpath, 0);
+            if (trc != 0)
+                return trc;
+            file_size = 0;
+            f->dirty = 1;
         } else {
             file_size = de.size;
         }
-        if (flags & VFS_O_TRUNC)
-            file_size = 0;
-
-        if (is_readonly) {
-            /* Zero-allocation streaming mode for read-only FAT12 files */
-            buf = NULL;
-        } else if (file_size > 0) {
-            buf = (uint8_t *)kmalloc(file_size);
-            if (!buf)
-                return -1;
-            read_bytes = fat12_read_file(subpath, buf, file_size);
-            if (read_bytes < 0)
-                read_bytes = 0;
-            file_size = (size_t)read_bytes;
-        }
-    } else if (backend == VFS_BACKEND_FAT32) {
-        fat32_dirent_t de;
-        if (fat32_stat(subpath, &de) != 0) {
-            if (flags & VFS_O_CREAT) {
-                fat32_volume_t *vol = g_fat32_primary_vol;
-                if (!vol && blockdev_first_raw_fat32())
-                    vol = fat32_vol_mount(blockdev_first_raw_fat32());
-                if (!vol || fat32_vol_create_file(vol, subpath) != 0)
-                    return -1;
-                g_fat32_primary_vol = vol;
-                file_size = 0;
-            } else {
-                return -1;
-            }
-        } else {
-            if (de.is_dir)
-                return -1;
-            file_size = (flags & VFS_O_TRUNC) ? 0 : de.size;
-        }
-        if (file_size > 0) {
-            buf = (uint8_t *)kmalloc(file_size);
-            if (!buf)
-                return -1;
-            read_bytes = fat32_read_file(subpath, buf, file_size);
-            if (read_bytes < 0)
-                read_bytes = 0;
-            file_size = (size_t)read_bytes;
-        }
-    } else if (backend == VFS_BACKEND_FAT32VOL) {
-        fat32_volume_t *vol = (fat32_volume_t *)fs_ctx;
-        fat32_dirent_t de;
-        if (fat32_vol_stat(vol, subpath, &de) != 0) {
-            if (flags & VFS_O_CREAT) {
-                if (!vol || fat32_vol_create_file(vol, subpath) != 0)
-                    return -1;
-                file_size = 0;
-            } else {
-                return -1;
-            }
-        } else {
-            if (de.is_dir)
-                return -1;
-            file_size = (flags & VFS_O_TRUNC) ? 0 : de.size;
-        }
-        if (file_size > 0) {
-            buf = (uint8_t *)kmalloc(file_size);
-            if (!buf)
-                return -1;
-            read_bytes = fat32_vol_read_file(vol, subpath, buf, file_size);
-            if (read_bytes < 0)
-                read_bytes = 0;
-            file_size = (size_t)read_bytes;
-        }
-    } else {
-        return -1;
     }
 
     f->backend = backend;
-    f->fs_ctx = fs_ctx;
-    f->u.regular.buf = buf;
-    f->u.regular.size = file_size;
-    f->u.regular.capacity = (buf != NULL) ? file_size : 0;
-    f->u.regular.owns_buf = (buf != NULL) ? 1 : 0;
+    f->fs_ctx = vol;
+    f->u.fat32.vol = vol;
+    f->u.fat32.hint_clus_idx = 0;
+    f->u.fat32.hint_clus = 0;
+    f->u.fat32.hint_gen = 0;
+    f->inode_dev = m->mount_id;
+    f->inode_ino = ino_id;
     f->pos = (flags & VFS_O_APPEND) ? file_size : 0;
-    if (flags & VFS_O_TRUNC)
+    return 0;
+}
+
+static int open_ext4_file(const vfs_mount_t *m, vfs_file_t *f,
+                          const char *subpath, int flags, uint32_t create_mode)
+{
+    ext4fs_t *efs = (ext4fs_t *)m->fs_private;
+    void *handle = NULL;
+    int is_dir = 0;
+    uint64_t ino = 0;
+    size_t sz = 0;
+
+    if (!efs || !subpath)
+        return -EINVAL;
+
+    int rc = ext4fs_open(efs, subpath, flags, create_mode, &handle, &is_dir, &ino, &sz);
+    if (rc != 0)
+        return rc;
+
+    f->backend = VFS_BACKEND_EXT4;
+    f->fs_ctx = efs;
+    f->u.ext4.handle = handle;
+    f->is_dir = is_dir;
+    if (is_dir)
+        f->mode = VFS_MODE_READ;
+    f->inode_dev = m->mount_id;
+    f->inode_ino = ino ? ino : vfs_hash_str(subpath);
+    f->pos = (!is_dir && (flags & VFS_O_APPEND)) ? sz : 0;
+    if (!is_dir && (flags & (VFS_O_CREAT | VFS_O_TRUNC)))
         f->dirty = 1;
     return 0;
 }
 
-int vfs_open_flags(const char *path, int flags)
+static int vfs_install_fd(process_t *proc, vfs_file_t *f)
+{
+    void **tbl = fd_table_for_process(proc);
+    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
+    for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
+        if (!tbl[i]) {
+            tbl[i] = f;
+            spin_unlock_irqrestore(&g_fd_lock, flags);
+            return i;
+        }
+    }
+    spin_unlock_irqrestore(&g_fd_lock, flags);
+    return -EMFILE;
+}
+
+int vfs_open_flags_mode(const char *path, int flags, int mode)
 {
     process_t *proc = vfs_current_process();
-    const vfs_mount_t *m;
+    vfs_mount_t *m = NULL;
     char abs[VFS_PATH_MAX];
     char sub[VFS_PATH_MAX];
+    int exists = 0;
+    uint32_t leaf_type = VFS_TYPE_UNKNOWN;
+    int follow_last = (flags & VFS_O_NOFOLLOW) ? 0 : 1;
     int fd;
-    void **tbl;
     vfs_file_t *f;
+    int rc;
 
-    if (!path)
-        return -1;
-    if (normalize_path_for_process(proc, path, abs, VFS_PATH_MAX) != 0)
-        return -1;
-    m = mount_lookup(abs);
-    if (!m)
-        return -1;
-    if (mount_subpath(m, abs, sub, VFS_PATH_MAX) != 0)
-        return -1;
+    if (!path || !path[0])
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, path, follow_last, abs, &m, sub, &exists, &leaf_type);
+    if (rc != 0 || !m)
+        return (rc < 0) ? rc : -ENOENT;
 
-    if (m->read_only && ((flags & VFS_O_WRONLY) || (flags & VFS_O_CREAT) || (flags & VFS_O_TRUNC)))
-        return -1;
+    if ((flags & VFS_O_NOFOLLOW) && exists && leaf_type == VFS_TYPE_SYMLINK) {
+        mount_unref(m);
+        return -ELOOP;
+    }
+
+    if (m->read_only && ((flags & VFS_O_WRONLY) || (flags & VFS_O_CREAT) || (flags & VFS_O_TRUNC))) {
+        mount_unref(m);
+        return -EROFS;
+    }
+
+    if (exists && leaf_type == VFS_TYPE_DIR &&
+        ((flags & VFS_O_WRONLY) || (flags & VFS_O_CREAT) || (flags & VFS_O_TRUNC))) {
+        mount_unref(m);
+        return -EISDIR;
+    }
+
+    if ((flags & VFS_O_DIRECTORY) && exists && leaf_type != VFS_TYPE_DIR) {
+        mount_unref(m);
+        return -ENOTDIR;
+    }
 
     f = file_alloc();
-    if (!f)
-        return -1;
+    if (!f) {
+        mount_unref(m);
+        return -ENOMEM;
+    }
     f->flags = flags;
     f->mode = flags_to_mode(flags);
+    f->mount_id = m->mount_id;
+    mount_note_open_delta(m->mount_id, 1);
     kstrncpy(f->path, sub, VFS_PATH_MAX);
+    kstrncpy(f->abs_path, abs, VFS_PATH_MAX);
+
+    uint32_t um = vfs_current_umask(proc);
+    uint32_t create_mode = ((uint32_t)(mode ? mode : 0666) & ~um) & 07777U;
 
     switch (m->backend) {
-    case VFS_BACKEND_MEMFS:
-        if (open_memfs_file(m, f, sub, flags) != 0) {
+    case VFS_BACKEND_TMPFS:
+        rc = open_tmpfs_file(m, f, sub, flags, create_mode);
+        if (rc != 0) {
+            mount_unref(m);
             file_release(f);
-            return -1;
+            return rc;
         }
         break;
-    case VFS_BACKEND_FAT12:
     case VFS_BACKEND_FAT32:
     case VFS_BACKEND_FAT32VOL:
-        if (open_regular_buffered(f, m->backend, m->ctx, sub, flags) != 0) {
+        rc = open_fat32_file(m, f, m->backend, m->fs_private, sub, flags);
+        if (rc != 0) {
+            mount_unref(m);
             file_release(f);
-            return -1;
+            return rc;
+        }
+        break;
+    case VFS_BACKEND_EXT4:
+        rc = open_ext4_file(m, f, sub, flags, create_mode);
+        if (rc != 0) {
+            mount_unref(m);
+            file_release(f);
+            return rc;
         }
         break;
     case VFS_BACKEND_INITRD:
     {
+        if (kstreq(sub, "/")) {
+            f->backend = VFS_BACKEND_INITRD;
+            f->is_dir = 1;
+            f->mode = VFS_MODE_READ;
+            f->inode_dev = m->mount_id;
+            f->inode_ino = 1ULL;
+            break;
+        }
         const void *data = NULL;
         size_t sz = 0;
         if (initrd_lookup(sub, &data, &sz) != 0) {
+            mount_unref(m);
             file_release(f);
-            return -1;
+            return -ENOENT;
         }
         f->backend = VFS_BACKEND_INITRD;
         f->mode = VFS_MODE_READ;
+        f->inode_dev = m->mount_id;
+        f->inode_ino = vfs_hash_str(sub);
         f->u.regular.buf = (uint8_t *)(uintptr_t)data;
         f->u.regular.size = sz;
         f->u.regular.capacity = sz;
@@ -1396,14 +2440,31 @@ int vfs_open_flags(const char *path, int flags)
     }
     case VFS_BACKEND_PROCFS:
     {
+        vfs_stat_t pst;
+        if (procfs_stat(sub, &pst) != 0) {
+            mount_unref(m);
+            file_release(f);
+            return -ENOENT;
+        }
+        if (pst.type == VFS_TYPE_DIR) {
+            f->backend = VFS_BACKEND_PROCFS;
+            f->is_dir = 1;
+            f->mode = VFS_MODE_READ;
+            f->inode_dev = m->mount_id;
+            f->inode_ino = vfs_hash_str(sub);
+            break;
+        }
         uint8_t *pbuf = NULL;
         size_t psz = 0;
         if (procfs_read_file(sub, &pbuf, &psz) != 0) {
+            mount_unref(m);
             file_release(f);
-            return -1;
+            return -ENOENT;
         }
         f->backend = VFS_BACKEND_PROCFS;
         f->mode = VFS_MODE_READ;
+        f->inode_dev = m->mount_id;
+        f->inode_ino = vfs_hash_str(sub);
         f->u.regular.buf = pbuf;
         f->u.regular.size = psz;
         f->u.regular.capacity = psz;
@@ -1412,14 +2473,31 @@ int vfs_open_flags(const char *path, int flags)
     }
     case VFS_BACKEND_SYSFS:
     {
+        vfs_stat_t sst;
+        if (sysfs_stat(sub, &sst) != 0) {
+            mount_unref(m);
+            file_release(f);
+            return -ENOENT;
+        }
+        if (sst.type == VFS_TYPE_DIR) {
+            f->backend = VFS_BACKEND_SYSFS;
+            f->is_dir = 1;
+            f->mode = VFS_MODE_READ;
+            f->inode_dev = m->mount_id;
+            f->inode_ino = vfs_hash_str(sub);
+            break;
+        }
         uint8_t *sbuf = NULL;
         size_t ssz = 0;
         if (sysfs_read_file(sub, &sbuf, &ssz) != 0) {
+            mount_unref(m);
             file_release(f);
-            return -1;
+            return -ENOENT;
         }
         f->backend = VFS_BACKEND_SYSFS;
         f->mode = VFS_MODE_READ;
+        f->inode_dev = m->mount_id;
+        f->inode_ino = vfs_hash_str(sub);
         f->u.regular.buf = sbuf;
         f->u.regular.size = ssz;
         f->u.regular.capacity = ssz;
@@ -1428,15 +2506,32 @@ int vfs_open_flags(const char *path, int flags)
     }
     case VFS_BACKEND_BOOTFS:
     {
+        vfs_stat_t bst;
+        if (bootfs_stat(sub, &bst) != 0) {
+            mount_unref(m);
+            file_release(f);
+            return -ENOENT;
+        }
+        if (bst.type == VFS_TYPE_DIR) {
+            f->backend = VFS_BACKEND_BOOTFS;
+            f->is_dir = 1;
+            f->mode = VFS_MODE_READ;
+            f->inode_dev = m->mount_id;
+            f->inode_ino = vfs_hash_str(sub);
+            break;
+        }
         const void *bbuf = NULL;
         size_t bsz = 0;
         int owns = 0;
         if (bootfs_read_file(sub, &bbuf, &bsz, &owns) != 0) {
+            mount_unref(m);
             file_release(f);
-            return -1;
+            return -ENOENT;
         }
         f->backend = VFS_BACKEND_BOOTFS;
         f->mode = VFS_MODE_READ;
+        f->inode_dev = m->mount_id;
+        f->inode_ino = vfs_hash_str(sub);
         f->u.regular.buf = (uint8_t *)(uintptr_t)bbuf;
         f->u.regular.size = bsz;
         f->u.regular.capacity = bsz;
@@ -1445,36 +2540,76 @@ int vfs_open_flags(const char *path, int flags)
     }
     case VFS_BACKEND_DEVFS:
     {
+        vfs_stat_t dst;
+        if (devfs_stat(sub, &dst) == 0 && dst.type == VFS_TYPE_DIR) {
+            f->backend = VFS_BACKEND_DEVFS;
+            f->is_dir = 1;
+            f->mode = VFS_MODE_READ;
+            f->inode_dev = m->mount_id;
+            f->inode_ino = vfs_hash_str(sub);
+            break;
+        }
         const devfs_ops_t *ops = NULL;
         void *priv = NULL;
         uint32_t type = VFS_TYPE_CHAR;
         if (devfs_lookup(sub, &ops, &priv, &type) != 0) {
+            mount_unref(m);
             file_release(f);
-            return -1;
+            return -ENOENT;
         }
         f->backend = VFS_BACKEND_DEVFS;
         f->mode = flags_to_mode(flags);
+        f->inode_dev = m->mount_id;
+        f->inode_ino = vfs_hash_str(sub);
         f->u.device.ops = ops;
         f->u.device.priv = priv;
         f->pos = 0;
         if (ops && ops->open) {
             if (ops->open(priv, flags) != 0) {
+                mount_unref(m);
                 file_release(f);
-                return -1;
+                return -EIO;
             }
         }
         break;
     }
     case VFS_BACKEND_TAR:
     {
-        /* Read-only: point the regular-file read path straight into the archive buffer (owns_buf=0, never freed on... */
-        const tar_inode_t *ino = tar_lookup((tar_fs_t *)m->ctx, sub);
-        if (!ino || ino->is_dir) {
+        if (kstreq(sub, "/")) {
+            f->backend = VFS_BACKEND_TAR;
+            f->is_dir = 1;
+            f->mode = VFS_MODE_READ;
+            f->inode_dev = m->mount_id;
+            f->inode_ino = 1ULL;
+            break;
+        }
+        const tar_inode_t *ino = tar_lookup((tar_fs_t *)m->fs_private, sub);
+        if (!ino) {
+            vfs_stat_t tst;
+            if (tar_stat((tar_fs_t *)m->fs_private, sub, &tst) == 0 && tst.type == VFS_TYPE_DIR) {
+                f->backend = VFS_BACKEND_TAR;
+                f->is_dir = 1;
+                f->mode = VFS_MODE_READ;
+                f->inode_dev = m->mount_id;
+                f->inode_ino = vfs_hash_str(sub);
+                break;
+            }
+            mount_unref(m);
             file_release(f);
-            return -1;
+            return -ENOENT;
+        }
+        if (ino->is_dir) {
+            f->backend = VFS_BACKEND_TAR;
+            f->is_dir = 1;
+            f->mode = VFS_MODE_READ;
+            f->inode_dev = m->mount_id;
+            f->inode_ino = vfs_hash_str(sub);
+            break;
         }
         f->backend = VFS_BACKEND_TAR;
         f->mode = VFS_MODE_READ;
+        f->inode_dev = m->mount_id;
+        f->inode_ino = vfs_hash_str(sub);
         f->u.regular.buf = (uint8_t *)(uintptr_t)ino->data;
         f->u.regular.size = (size_t)ino->size;
         f->u.regular.capacity = (size_t)ino->size;
@@ -1482,198 +2617,813 @@ int vfs_open_flags(const char *path, int flags)
         break;
     }
     default:
+        mount_unref(m);
         file_release(f);
-        return -1;
+        return -ENOENT;
     }
 
-    fd = process_fd_alloc(proc);
+    mount_unref(m);
+
+    if ((flags & VFS_O_DIRECTORY) && !f->is_dir) {
+        file_release(f);
+        return -ENOTDIR;
+    }
+
+    fd = vfs_install_fd(proc, f);
     if (fd < 0) {
         file_release(f);
-        return -1;
+        return fd;
     }
-    tbl = fd_table_for_process(proc);
-    tbl[fd] = f;
     return fd;
+}
+
+int vfs_open_flags(const char *path, int flags)
+{
+    return vfs_open_flags_mode(path, flags, 0666);
 }
 
 int vfs_open(const char *path)
 {
-    return vfs_open_flags(path, VFS_O_RDONLY);
+    return vfs_open_flags_mode(path, VFS_O_RDONLY, 0);
 }
 
 int vfs_create(const char *path)
 {
-    return vfs_open_flags(path, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC);
+    return vfs_open_flags_mode(path, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC, 0666);
 }
 
 int vfs_unlink(const char *path)
 {
     process_t *proc = vfs_current_process();
-    const vfs_mount_t *m;
+    vfs_mount_t *m = NULL;
     char abs[VFS_PATH_MAX];
     char sub[VFS_PATH_MAX];
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
+    int rc;
 
     if (!path)
-        return -1;
-    if (normalize_path_for_process(proc, path, abs, VFS_PATH_MAX) != 0)
-        return -1;
-    m = mount_lookup(abs);
-    if (!m || m->read_only)
-        return -1;
-    if (mount_subpath(m, abs, sub, VFS_PATH_MAX) != 0)
-        return -1;
-
-    if (m->backend == VFS_BACKEND_MEMFS) {
-        const char *name = memfs_sub_to_rel(sub);
-        if (!name[0])
-            return -1;
-        if (memfs_dir_find(m, name) >= 0)
-            return -1;
-        return memfs_unlink(name);
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, path, 0, abs, &m, sub, &exists, &type);
+    if (rc != 0 || !m)
+        return (rc < 0) ? rc : -ENOENT;
+    if (!exists) {
+        mount_unref(m);
+        return -ENOENT;
     }
-    return -1;
+    if (m->read_only) {
+        mount_unref(m);
+        return -EROFS;
+    }
+    if (m->backend == VFS_BACKEND_TMPFS) {
+        rc = tmpfs_unlink((tmpfs_fs_t *)m->fs_private, sub);
+    } else if (m->backend == VFS_BACKEND_EXT4) {
+        rc = ext4fs_unlink((ext4fs_t *)m->fs_private, sub);
+    } else if (m->backend == VFS_BACKEND_FAT32VOL) {
+        rc = fat32_vol_unlink((fat32_volume_t *)m->fs_private, sub);
+    } else if (m->backend == VFS_BACKEND_FAT32) {
+        rc = fat32_vol_unlink(fat32_primary_vol(), sub);
+    } else {
+        mount_unref(m);
+        return -EPERM;
+    }
+    mount_unref(m);
+    if (rc == 0)
+        dcache_invalidate_path(abs);
+    return rc;
 }
 
 int vfs_rmdir(const char *path)
 {
     process_t *proc = vfs_current_process();
-    const vfs_mount_t *m;
+    vfs_mount_t *m = NULL;
     char abs[VFS_PATH_MAX];
     char sub[VFS_PATH_MAX];
-    const char *rel;
-    int idx;
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
+    int rc;
 
     if (!path)
-        return -1;
-    if (normalize_path_for_process(proc, path, abs, VFS_PATH_MAX) != 0)
-        return -1;
-    m = mount_lookup(abs);
-    if (!m || m->read_only)
-        return -1;
-    if (mount_subpath(m, abs, sub, VFS_PATH_MAX) != 0)
-        return -1;
-
-    if (m->backend != VFS_BACKEND_MEMFS)
-        return -1;
-
-    rel = memfs_sub_to_rel(sub);
-    if (!rel[0])
-        return -1;
-
-    idx = memfs_dir_find(m, rel);
-    if (idx < 0)
-        return -1;
-    if (memfs_dir_has_children(m, rel))
-        return -1;
-
-    g_memfs_dirs[idx].used = 0;
-    g_memfs_dirs[idx].mount = NULL;
-    g_memfs_dirs[idx].path[0] = '\0';
-    return 0;
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, path, 0, abs, &m, sub, &exists, &type);
+    if (rc != 0 || !m)
+        return (rc < 0) ? rc : -ENOENT;
+    if (!exists) {
+        mount_unref(m);
+        return -ENOENT;
+    }
+    if (m->read_only) {
+        mount_unref(m);
+        return -EROFS;
+    }
+    if (m->backend == VFS_BACKEND_TMPFS) {
+        rc = tmpfs_rmdir((tmpfs_fs_t *)m->fs_private, sub);
+    } else if (m->backend == VFS_BACKEND_EXT4) {
+        rc = ext4fs_rmdir((ext4fs_t *)m->fs_private, sub);
+    } else if (m->backend == VFS_BACKEND_FAT32VOL) {
+        rc = fat32_vol_rmdir((fat32_volume_t *)m->fs_private, sub);
+    } else if (m->backend == VFS_BACKEND_FAT32) {
+        rc = fat32_vol_rmdir(fat32_primary_vol(), sub);
+    } else {
+        mount_unref(m);
+        return -EPERM;
+    }
+    mount_unref(m);
+    if (rc == 0)
+        dcache_invalidate_path(abs);
+    return rc;
 }
 
 int vfs_mkdir(const char *path, int mode)
 {
-    (void)mode;
     process_t *proc = vfs_current_process();
-    const vfs_mount_t *m;
+    vfs_mount_t *m = NULL;
     char abs[VFS_PATH_MAX];
     char sub[VFS_PATH_MAX];
-    const char *rel;
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
+    int rc;
 
     if (!path)
-        return -1;
-    if (normalize_path_for_process(proc, path, abs, VFS_PATH_MAX) != 0)
-        return -1;
-    m = mount_lookup(abs);
-    if (!m || m->read_only)
-        return -1;
-    if (mount_subpath(m, abs, sub, VFS_PATH_MAX) != 0)
-        return -1;
-
-    if (m->backend != VFS_BACKEND_MEMFS)
-        return -1;
-
-    rel = memfs_sub_to_rel(sub);
-    if (!rel[0])
-        return -1;
-    if (unix_find_listener(abs) != NULL)
-        return -1;
-    if (memfs_dir_find(m, rel) >= 0 || memfs_open(rel) >= 0)
-        return -1;
-
-    {
-        char parent[VFS_PATH_MAX];
-        const char *leaf = NULL;
-        if (memfs_split_parent(rel, parent, VFS_PATH_MAX, &leaf) != 0)
-            return -1;
-        if (!leaf || !leaf[0] || kstrlen(leaf) >= VFS_NAME_MAX)
-            return -1;
-        if (parent[0] && memfs_dir_find(m, parent) < 0)
-            return -1;
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, path, 0, abs, &m, sub, &exists, &type);
+    if (rc != 0 || !m)
+        return (rc < 0) ? rc : -ENOENT;
+    if (exists) {
+        mount_unref(m);
+        return -EEXIST;
     }
-
-    for (int i = 0; i < VFS_MEMFS_MAX_DIRS; i++) {
-        if (!g_memfs_dirs[i].used) {
-            g_memfs_dirs[i].used = 1;
-            g_memfs_dirs[i].mount = m;
-            kstrncpy(g_memfs_dirs[i].path, rel, VFS_PATH_MAX);
-            return 0;
-        }
+    if (m->read_only) {
+        mount_unref(m);
+        return -EROFS;
     }
-    return -1;
+    if (unix_find_listener(abs) != NULL) {
+        mount_unref(m);
+        return -EEXIST;
+    }
+    uint32_t um = vfs_current_umask(proc);
+    uint32_t eff_mode = ((uint32_t)(mode ? mode : 0777) & ~um) & 07777U;
+    if (m->backend == VFS_BACKEND_TMPFS) {
+        rc = tmpfs_mkdir((tmpfs_fs_t *)m->fs_private, sub, eff_mode);
+    } else if (m->backend == VFS_BACKEND_EXT4) {
+        rc = ext4fs_mkdir((ext4fs_t *)m->fs_private, sub, eff_mode);
+    } else if (m->backend == VFS_BACKEND_FAT32VOL) {
+        rc = fat32_vol_mkdir((fat32_volume_t *)m->fs_private, sub);
+    } else if (m->backend == VFS_BACKEND_FAT32) {
+        rc = fat32_vol_mkdir(fat32_primary_vol(), sub);
+    } else {
+        mount_unref(m);
+        return -EPERM;
+    }
+    mount_unref(m);
+    if (rc == 0)
+        dcache_invalidate_path(abs);
+    return rc;
 }
 
 int vfs_rename(const char *old_path, const char *new_path)
 {
     process_t *proc = vfs_current_process();
-    const vfs_mount_t *m1, *m2;
+    vfs_mount_t *m1 = NULL, *m2 = NULL;
     char abs1[VFS_PATH_MAX], abs2[VFS_PATH_MAX];
     char sub1[VFS_PATH_MAX], sub2[VFS_PATH_MAX];
+    int ex1 = 0, ex2 = 0;
+    uint32_t t1 = 0, t2 = 0;
+    int rc;
 
     if (!old_path || !new_path)
-        return -1;
-    if (normalize_path_for_process(proc, old_path, abs1, VFS_PATH_MAX) != 0)
-        return -1;
-    if (normalize_path_for_process(proc, new_path, abs2, VFS_PATH_MAX) != 0)
-        return -1;
-
-    m1 = mount_lookup(abs1);
-    m2 = mount_lookup(abs2);
-    if (!m1 || !m2 || m1 != m2 || m1->read_only)
-        return -1;
-
-    if (mount_subpath(m1, abs1, sub1, VFS_PATH_MAX) != 0)
-        return -1;
-    if (mount_subpath(m2, abs2, sub2, VFS_PATH_MAX) != 0)
-        return -1;
-
-    if (m1->backend == VFS_BACKEND_MEMFS) {
-        const char *n1 = memfs_sub_to_rel(sub1);
-        const char *n2 = memfs_sub_to_rel(sub2);
-        char parent[VFS_PATH_MAX];
-        const char *leaf = NULL;
-        if (!n1[0] || !n2[0] || kstrlen(n2) >= MEMFS_MAX_NAME)
-            return -1;
-        if (memfs_dir_find(m1, n1) >= 0 || memfs_dir_find(m1, n2) >= 0)
-            return -1;
-        if (memfs_split_parent(n2, parent, VFS_PATH_MAX, &leaf) != 0)
-            return -1;
-        if (!leaf || !leaf[0])
-            return -1;
-        if (parent[0] && memfs_dir_find(m1, parent) < 0)
-            return -1;
-        return memfs_rename(n1, n2);
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, old_path, 0, abs1, &m1, sub1, &ex1, &t1);
+    if (rc != 0 || !m1)
+        return (rc < 0) ? rc : -ENOENT;
+    if (!ex1) {
+        mount_unref(m1);
+        return -ENOENT;
     }
-    if (m1->backend == VFS_BACKEND_FAT32VOL) {
-        return fat32_vol_rename((fat32_volume_t *)m1->ctx, sub1, sub2);
+    rc = vfs_resolve_path_ex(proc, new_path, 0, abs2, &m2, sub2, &ex2, &t2);
+    if (rc != 0 || !m2) {
+        mount_unref(m1);
+        return (rc < 0) ? rc : -ENOENT;
     }
-    if (m1->backend == VFS_BACKEND_FAT32) {
-        return fat32_rename(sub1, sub2);
+    if (m1 != m2) {
+        mount_unref(m1);
+        mount_unref(m2);
+        return -EXDEV;
     }
-    return -1;
+    if (m1->read_only) {
+        mount_unref(m1);
+        mount_unref(m2);
+        return -EROFS;
+    }
+
+    if (m1->backend == VFS_BACKEND_TMPFS)
+        rc = tmpfs_rename((tmpfs_fs_t *)m1->fs_private, sub1, sub2);
+    else if (m1->backend == VFS_BACKEND_EXT4)
+        rc = ext4fs_rename((ext4fs_t *)m1->fs_private, sub1, sub2);
+    else if (m1->backend == VFS_BACKEND_FAT32VOL)
+        rc = fat32_vol_rename((fat32_volume_t *)m1->fs_private, sub1, sub2);
+    else if (m1->backend == VFS_BACKEND_FAT32)
+        rc = fat32_vol_rename(fat32_primary_vol(), sub1, sub2);
+    else
+        rc = -EPERM;
+
+    mount_unref(m1);
+    mount_unref(m2);
+    if (rc == 0) {
+        dcache_invalidate_path(abs1);
+        dcache_invalidate_path(abs2);
+    }
+    return rc;
 }
 
+int vfs_symlink(const char *target, const char *linkpath)
+{
+    process_t *proc = vfs_current_process();
+    vfs_mount_t *m = NULL;
+    char abs[VFS_PATH_MAX];
+    char sub[VFS_PATH_MAX];
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
+    int rc;
+
+    if (!target || !target[0] || !linkpath || !linkpath[0])
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, linkpath, 0, abs, &m, sub, &exists, &type);
+    if (rc != 0 || !m)
+        return (rc < 0) ? rc : -ENOENT;
+    if (exists) {
+        mount_unref(m);
+        return -EEXIST;
+    }
+    if (m->read_only) {
+        mount_unref(m);
+        return -EROFS;
+    }
+    if (m->backend == VFS_BACKEND_TMPFS) {
+        rc = tmpfs_symlink((tmpfs_fs_t *)m->fs_private, sub, target, 0777U);
+    } else if (m->backend == VFS_BACKEND_EXT4) {
+        rc = ext4fs_symlink((ext4fs_t *)m->fs_private, target, sub);
+    } else {
+        mount_unref(m);
+        return -EPERM;
+    }
+    mount_unref(m);
+    if (rc == 0)
+        dcache_invalidate_path(abs);
+    return rc;
+}
+
+int vfs_readlink(const char *path, char *buf, size_t cap)
+{
+    process_t *proc = vfs_current_process();
+    vfs_mount_t *m = NULL;
+    char abs[VFS_PATH_MAX];
+    char sub[VFS_PATH_MAX];
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
+    int rc;
+
+    if (!path || !buf || cap == 0)
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, path, 0, abs, &m, sub, &exists, &type);
+    if (rc != 0 || !m)
+        return (rc < 0) ? rc : -ENOENT;
+    if (!exists) {
+        mount_unref(m);
+        return -ENOENT;
+    }
+    if (type != VFS_TYPE_SYMLINK) {
+        mount_unref(m);
+        return -EINVAL;
+    }
+    if (m->backend == VFS_BACKEND_TMPFS) {
+        rc = tmpfs_readlink((tmpfs_fs_t *)m->fs_private, sub, buf, cap);
+    } else if (m->backend == VFS_BACKEND_EXT4) {
+        rc = ext4fs_readlink((ext4fs_t *)m->fs_private, sub, buf, cap);
+    } else {
+        mount_unref(m);
+        return -EINVAL;
+    }
+    mount_unref(m);
+    return rc;
+}
+
+int vfs_truncate(const char *path, size_t length)
+{
+    process_t *proc = vfs_current_process();
+    vfs_mount_t *m = NULL;
+    char abs[VFS_PATH_MAX];
+    char sub[VFS_PATH_MAX];
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
+    int rc;
+
+    if (!path)
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, path, 1, abs, &m, sub, &exists, &type);
+    if (rc != 0 || !m)
+        return (rc < 0) ? rc : -ENOENT;
+    if (!exists) {
+        mount_unref(m);
+        return -ENOENT;
+    }
+    if (type == VFS_TYPE_DIR) {
+        mount_unref(m);
+        return -EISDIR;
+    }
+    if (m->read_only) {
+        mount_unref(m);
+        return -EROFS;
+    }
+    if (m->backend == VFS_BACKEND_TMPFS) {
+        tmpfs_inode_t *ino = tmpfs_lookup((tmpfs_fs_t *)m->fs_private, sub, 1);
+        mount_unref(m);
+        if (!ino)
+            return -ENOENT;
+        rc = tmpfs_truncate(ino, length);
+        tmpfs_inode_unref(ino);
+        return rc;
+    }
+    if (m->backend == VFS_BACKEND_EXT4) {
+        rc = ext4fs_truncate((ext4fs_t *)m->fs_private, sub, length);
+        mount_unref(m);
+        return rc;
+    }
+    if (m->backend == VFS_BACKEND_FAT32VOL) {
+        rc = fat32_vol_truncate((fat32_volume_t *)m->fs_private, sub, length);
+        mount_unref(m);
+        return rc;
+    }
+    if (m->backend == VFS_BACKEND_FAT32) {
+        rc = fat32_vol_truncate(fat32_primary_vol(), sub, length);
+        mount_unref(m);
+        return rc;
+    }
+    mount_unref(m);
+    return -EINVAL;
+}
+
+int vfs_ftruncate(int fd, size_t length)
+{
+    process_t *proc = vfs_current_process();
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    if (!f)
+        return -EBADF;
+    if (f->is_dir) {
+        file_release(f);
+        return -EISDIR;
+    }
+    if (!(f->mode & VFS_MODE_WRITE)) {
+        file_release(f);
+        return -EINVAL;
+    }
+    int rc = -EINVAL;
+    if (f->backend == VFS_BACKEND_TMPFS && f->u.tmpfs.inode) {
+        rc = tmpfs_truncate(f->u.tmpfs.inode, length);
+    } else if (f->backend == VFS_BACKEND_EXT4 && f->u.ext4.handle) {
+        rc = ext4fs_ftruncate((ext4fs_t *)f->fs_ctx, f->u.ext4.handle, length);
+        if (rc == 0)
+            f->dirty = 1;
+    } else if ((f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) &&
+               f->u.fat32.vol) {
+        rc = fat32_vol_truncate(f->u.fat32.vol, f->path, length);
+        if (rc == 0)
+            f->dirty = 1;
+    }
+    file_release(f);
+    return rc;
+}
+
+int vfs_chmod(const char *path, uint32_t mode)
+{
+    process_t *proc = vfs_current_process();
+    vfs_mount_t *m = NULL;
+    char abs[VFS_PATH_MAX];
+    char sub[VFS_PATH_MAX];
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
+    int rc;
+
+    if (!path)
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, path, 1, abs, &m, sub, &exists, &type);
+    if (rc != 0 || !m)
+        return (rc < 0) ? rc : -ENOENT;
+    if (!exists) {
+        mount_unref(m);
+        return -ENOENT;
+    }
+    if (m->read_only) {
+        mount_unref(m);
+        return -EROFS;
+    }
+    if (m->backend == VFS_BACKEND_TMPFS) {
+        tmpfs_inode_t *ino = tmpfs_lookup((tmpfs_fs_t *)m->fs_private, sub, 1);
+        mount_unref(m);
+        if (!ino)
+            return -ENOENT;
+        rc = tmpfs_chmod_inode(ino, mode);
+        tmpfs_inode_unref(ino);
+        return rc;
+    }
+    if (m->backend == VFS_BACKEND_EXT4) {
+        rc = ext4fs_chmod((ext4fs_t *)m->fs_private, sub, mode);
+        mount_unref(m);
+        return rc;
+    }
+    mount_unref(m);
+    return 0;
+}
+
+int vfs_fchmod(int fd, uint32_t mode)
+{
+    process_t *proc = vfs_current_process();
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    if (!f)
+        return -EBADF;
+    int rc = 0;
+    if (f->backend == VFS_BACKEND_TMPFS && f->u.tmpfs.inode)
+        rc = tmpfs_chmod_inode(f->u.tmpfs.inode, mode);
+    else if (f->backend == VFS_BACKEND_EXT4 && f->fs_ctx)
+        rc = ext4fs_chmod((ext4fs_t *)f->fs_ctx, f->path, mode);
+    file_release(f);
+    return rc;
+}
+
+int vfs_chown(const char *path, uint32_t uid, uint32_t gid)
+{
+    process_t *proc = vfs_current_process();
+    vfs_mount_t *m = NULL;
+    char abs[VFS_PATH_MAX];
+    char sub[VFS_PATH_MAX];
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
+    int rc;
+
+    if (!path)
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, path, 1, abs, &m, sub, &exists, &type);
+    if (rc != 0 || !m)
+        return (rc < 0) ? rc : -ENOENT;
+    if (!exists) {
+        mount_unref(m);
+        return -ENOENT;
+    }
+    if (m->read_only) {
+        mount_unref(m);
+        return -EROFS;
+    }
+    if (m->backend == VFS_BACKEND_TMPFS) {
+        tmpfs_inode_t *ino = tmpfs_lookup((tmpfs_fs_t *)m->fs_private, sub, 1);
+        mount_unref(m);
+        if (!ino)
+            return -ENOENT;
+        rc = tmpfs_chown_inode(ino, uid, gid);
+        tmpfs_inode_unref(ino);
+        return rc;
+    }
+    if (m->backend == VFS_BACKEND_EXT4) {
+        rc = ext4fs_chown((ext4fs_t *)m->fs_private, sub, uid, gid);
+        mount_unref(m);
+        return rc;
+    }
+    mount_unref(m);
+    return 0;
+}
+
+int vfs_fchown(int fd, uint32_t uid, uint32_t gid)
+{
+    process_t *proc = vfs_current_process();
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    if (!f)
+        return -EBADF;
+    int rc = 0;
+    if (f->backend == VFS_BACKEND_TMPFS && f->u.tmpfs.inode)
+        rc = tmpfs_chown_inode(f->u.tmpfs.inode, uid, gid);
+    else if (f->backend == VFS_BACKEND_EXT4 && f->fs_ctx)
+        rc = ext4fs_chown((ext4fs_t *)f->fs_ctx, f->path, uid, gid);
+    file_release(f);
+    return rc;
+}
+
+int vfs_access(const char *path, int mode)
+{
+    vfs_stat_t st;
+    int rc;
+    if (!path)
+        return -EINVAL;
+    if (mode & ~(R_OK | W_OK | X_OK))
+        return -EINVAL;
+    rc = vfs_stat(path, &st);
+    if (rc != 0)
+        return rc;
+    if (mode == F_OK)
+        return 0;
+
+    process_t *proc = vfs_current_process();
+    uint32_t uid = proc ? proc->uid : 0U;
+    if ((mode & W_OK) && !(st.mode & VFS_MODE_WRITE))
+        return -EROFS;
+    if (uid == 0U) {
+        if ((mode & X_OK) && st.type != VFS_TYPE_DIR && (st.st_mode & 0111U) == 0U)
+            return -EACCES;
+        return 0;
+    }
+    if ((mode & R_OK) && (st.st_mode & 0444U) == 0U)
+        return -EACCES;
+    if ((mode & W_OK) && (st.st_mode & 0222U) == 0U)
+        return -EACCES;
+    if ((mode & X_OK) && (st.st_mode & 0111U) == 0U)
+        return -EACCES;
+    return 0;
+}
+
+uint32_t vfs_umask(uint32_t mask)
+{
+    process_t *proc = vfs_current_process();
+    uint32_t prev;
+    uint32_t next = mask & 0777U;
+    if (proc) {
+        prev = proc->umask & 0777U;
+        proc->umask = next;
+    } else {
+        prev = g_kernel_umask & 0777U;
+        g_kernel_umask = next;
+    }
+    return prev;
+}
+
+int vfs_flock(int fd, int operation)
+{
+    process_t *proc = vfs_current_process();
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    if (!f)
+        return -EBADF;
+
+    int nonblock = (operation & LOCK_NB) != 0;
+    int base = operation & ~LOCK_NB;
+    if (base != LOCK_SH && base != LOCK_EX && base != LOCK_UN) {
+        file_release(f);
+        return -EINVAL;
+    }
+
+    uint64_t dev_id = f->inode_dev;
+    uint64_t ino_id = f->inode_ino;
+    if (dev_id == 0 && ino_id == 0) {
+        dev_id = (uint64_t)(uintptr_t)f;
+        ino_id = 1ULL;
+    }
+
+    if (base == LOCK_UN) {
+        vfs_flock_release_file(f);
+        file_release(f);
+        return 0;
+    }
+
+    for (;;) {
+        unsigned long flags = spin_lock_irqsave(&g_flock_lock);
+        vfs_flock_inode_t *fi = flock_find_inode_locked(dev_id, ino_id, NULL);
+        if (!fi) {
+            fi = (vfs_flock_inode_t *)kmalloc(sizeof(vfs_flock_inode_t));
+            if (!fi) {
+                spin_unlock_irqrestore(&g_flock_lock, flags);
+                file_release(f);
+                return -ENOMEM;
+            }
+            fi->dev_id = dev_id;
+            fi->ino_id = ino_id;
+            fi->holders = NULL;
+            wait_queue_init(&fi->waitq);
+            fi->waiters = 0;
+            size_t b = flock_hash(dev_id, ino_id);
+            fi->next = g_flock_buckets[b];
+            g_flock_buckets[b] = fi;
+        }
+
+        vfs_flock_holder_t *self_h = NULL;
+        int conflict = 0;
+        for (vfs_flock_holder_t *h = fi->holders; h; h = h->next) {
+            if (h->owner_file == f) {
+                self_h = h;
+                continue;
+            }
+            if (base == LOCK_EX || h->type == LOCK_EX)
+                conflict = 1;
+        }
+
+        if (!conflict) {
+            if (self_h) {
+                int was_ex = (self_h->type == LOCK_EX);
+                self_h->type = base;
+                if (was_ex && base == LOCK_SH)
+                    wait_queue_wake_all(&fi->waitq);
+            } else {
+                vfs_flock_holder_t *nh = (vfs_flock_holder_t *)kmalloc(sizeof(vfs_flock_holder_t));
+                if (!nh) {
+                    flock_maybe_free_inode_locked(fi);
+                    spin_unlock_irqrestore(&g_flock_lock, flags);
+                    file_release(f);
+                    return -ENOMEM;
+                }
+                nh->owner_file = f;
+                nh->type = base;
+                nh->next = fi->holders;
+                fi->holders = nh;
+            }
+            spin_unlock_irqrestore(&g_flock_lock, flags);
+            file_release(f);
+            return 0;
+        }
+
+        if (nonblock) {
+            flock_maybe_free_inode_locked(fi);
+            spin_unlock_irqrestore(&g_flock_lock, flags);
+            file_release(f);
+            return -EAGAIN;
+        }
+
+        if (!proc) {
+            flock_maybe_free_inode_locked(fi);
+            spin_unlock_irqrestore(&g_flock_lock, flags);
+            file_release(f);
+            return -EAGAIN;
+        }
+
+        wait_queue_entry_t wqe;
+        wqe.proc = proc;
+        wqe.next = NULL;
+        fi->waiters++;
+        wait_queue_prepare_to_wait(&fi->waitq, &wqe);
+        spin_unlock_irqrestore(&g_flock_lock, flags);
+
+        process_yield();
+        wait_queue_finish_wait(&fi->waitq, &wqe);
+
+        flags = spin_lock_irqsave(&g_flock_lock);
+        if (fi->waiters > 0)
+            fi->waiters--;
+        flock_maybe_free_inode_locked(fi);
+        spin_unlock_irqrestore(&g_flock_lock, flags);
+    }
+}
+
+int vfs_mount(const char *source, const char *target, const char *fstype, unsigned long flags)
+{
+    process_t *proc = vfs_current_process();
+    vfs_mount_t *parent_m = NULL;
+    char abs[VFS_PATH_MAX];
+    char sub[VFS_PATH_MAX];
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
+    int ro = (flags & MS_RDONLY) ? 1 : 0;
+    int rc;
+
+    (void)source;
+    if (!target || !fstype)
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, target, 1, abs, &parent_m, sub, &exists, &type);
+    if (rc != 0 || !parent_m)
+        return (rc < 0) ? rc : -ENOENT;
+    mount_unref(parent_m);
+    if (!exists)
+        return -ENOENT;
+    if (type != VFS_TYPE_DIR)
+        return -ENOTDIR;
+
+    if (kstreq(fstype, "tmpfs")) {
+        tmpfs_fs_t *tfs = tmpfs_create();
+        if (!tfs)
+            return -ENOMEM;
+        rc = mount_register_ctx(abs, VFS_BACKEND_TMPFS, ro, "tmpfs", tfs);
+        if (rc != 0) {
+            tmpfs_destroy(tfs);
+            return rc;
+        }
+        dcache_invalidate_path(abs);
+        return 0;
+    }
+
+    if (kstreq(fstype, "fat32")) {
+        const char *dev_name = source;
+        if (!dev_name)
+            return -EINVAL;
+        if (dev_name[0] == '/' && dev_name[1] == 'd' && dev_name[2] == 'e' &&
+            dev_name[3] == 'v' && dev_name[4] == '/') {
+            dev_name += 5;
+        }
+        block_dev_t *bd = blockdev_find(dev_name);
+        if (!bd)
+            return -ENODEV;
+        fat32_volume_t *vol = fat32_vol_mount(bd);
+        if (!vol)
+            return -EINVAL;
+        rc = mount_register_ctx(abs, VFS_BACKEND_FAT32VOL, ro, "fat32", vol);
+        if (rc != 0) {
+            (void)fat32_vol_umount(vol);
+            return rc;
+        }
+        dcache_invalidate_path(abs);
+        return 0;
+    }
+
+    if (kstreq(fstype, "ext4") || kstreq(fstype, "ext3") || kstreq(fstype, "ext2")) {
+        const char *dev_name = source;
+        if (!dev_name)
+            return -EINVAL;
+        if (dev_name[0] == '/' && dev_name[1] == 'd' && dev_name[2] == 'e' &&
+            dev_name[3] == 'v' && dev_name[4] == '/') {
+            dev_name += 5;
+        }
+        block_dev_t *bd = blockdev_find(dev_name);
+        if (!bd)
+            return -ENODEV;
+        int mrc = -EINVAL;
+        ext4fs_t *efs = ext4fs_mount(bd, ro, &mrc);
+        if (!efs)
+            return (mrc < 0) ? mrc : -EINVAL;
+        rc = mount_register_ctx(abs, VFS_BACKEND_EXT4, ro, "ext4", efs);
+        if (rc != 0) {
+            (void)ext4fs_umount(efs);
+            return rc;
+        }
+        dcache_invalidate_path(abs);
+        return 0;
+    }
+
+    return -ENODEV;
+}
+
+int vfs_umount2(const char *target, int flags)
+{
+    process_t *proc = vfs_current_process();
+    char norm[VFS_PATH_MAX];
+    vfs_mount_t *target_m = NULL;
+    char abs[VFS_PATH_MAX];
+    char sub[VFS_PATH_MAX];
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
+    int rc;
+
+    if (!target)
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, target, (flags & UMOUNT_NOFOLLOW) ? 0 : 1,
+                             abs, &target_m, sub, &exists, &type);
+    if (rc == 0 && target_m) {
+        kstrncpy(norm, abs, VFS_PATH_MAX);
+        mount_unref(target_m);
+    } else if (normalize_path_for_process(proc, target, norm, VFS_PATH_MAX) != 0) {
+        return -EINVAL;
+    }
+
+    if (kstreq(norm, "/"))
+        return -EBUSY;
+
+    unsigned long mflags = spin_lock_irqsave(&g_mounts_lock);
+    vfs_mount_t *found = NULL;
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (g_mounts[i].used && kstreq(g_mounts[i].path, norm)) {
+            found = &g_mounts[i];
+            break;
+        }
+    }
+    if (!found) {
+        spin_unlock_irqrestore(&g_mounts_lock, mflags);
+        return -EINVAL;
+    }
+    if ((found->open_count > 0 || found->active_ops > 0) && !(flags & MNT_DETACH)) {
+        spin_unlock_irqrestore(&g_mounts_lock, mflags);
+        return -EBUSY;
+    }
+
+    uint64_t mid = found->mount_id;
+    vfs_backend_t backend = found->backend;
+    void *priv = found->fs_private;
+
+    found->used = 0;
+    found->mount_id = 0;
+    found->open_count = 0;
+    found->active_ops = 0;
+    found->path[0] = '\0';
+    found->path_len = 0;
+    found->backend = VFS_BACKEND_NONE;
+    found->fs_private = NULL;
+    spin_unlock_irqrestore(&g_mounts_lock, mflags);
+
+    dcache_invalidate_mount(mid);
+    dcache_invalidate_path(norm);
+    if (backend == VFS_BACKEND_TMPFS && priv)
+        tmpfs_destroy((tmpfs_fs_t *)priv);
+    else if (backend == VFS_BACKEND_EXT4 && priv)
+        (void)ext4fs_umount((ext4fs_t *)priv);
+    else if (backend == VFS_BACKEND_FAT32VOL && priv)
+        (void)fat32_vol_umount((fat32_volume_t *)priv);
+    else if (backend == VFS_BACKEND_FAT32) {
+        fat32_volume_t *pv = priv ? (fat32_volume_t *)priv : fat32_primary_vol();
+        if (pv)
+            (void)fat32_vol_umount(pv);
+    }
+    return 0;
+}
 
 void vfs_close(int fd)
 {
@@ -1687,284 +3437,391 @@ void vfs_close(int fd)
 int vfs_fd_has_mode(int fd, int mode)
 {
     process_t *proc = vfs_current_process();
-    vfs_file_t *f = fd_lookup(proc, fd);
-    if (!f || (f->mode & mode) != mode)
-        return -EBADF;
-    return 0;
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    int ok = (f && (f->mode & mode) == mode) ? 0 : -EBADF;
+    if (f)
+        file_release(f);
+    return ok;
 }
 
 size_t vfs_read(int fd, void *buf, size_t count)
 {
     process_t *proc = vfs_current_process();
-    vfs_file_t *f = fd_lookup(proc, fd);
-    if (!f || !buf || !(f->mode & VFS_MODE_READ))
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    if (!f || !buf || !(f->mode & VFS_MODE_READ)) {
+        if (f)
+            file_release(f);
         return 0;
-    if (count == 0)
+    }
+    if (f->is_dir) {
+        file_release(f);
+        return (size_t)-EISDIR;
+    }
+    if (count == 0) {
+        file_release(f);
         return 0;
+    }
 
-    if (f->backend == VFS_BACKEND_MEMFS) {
-        size_t got = memfs_read(f->u.memfs.inode, f->pos, buf, count);
-        f->pos += got;
+    if (f->backend == VFS_BACKEND_TMPFS) {
+        unsigned long fflags = spin_lock_irqsave(&f->lock);
+        size_t pos = f->pos;
+        spin_unlock_irqrestore(&f->lock, fflags);
+        size_t got = tmpfs_read(f->u.tmpfs.inode, pos, buf, count);
+        fflags = spin_lock_irqsave(&f->lock);
+        f->pos = pos + got;
+        spin_unlock_irqrestore(&f->lock, fflags);
+        file_release(f);
         return got;
+    }
+
+    if (f->backend == VFS_BACKEND_EXT4) {
+        unsigned long fflags = spin_lock_irqsave(&f->lock);
+        size_t pos = f->pos;
+        spin_unlock_irqrestore(&f->lock, fflags);
+        long got = ext4fs_read((ext4fs_t *)f->fs_ctx, f->u.ext4.handle, pos, buf, count);
+        if (got > 0) {
+            fflags = spin_lock_irqsave(&f->lock);
+            f->pos = pos + (size_t)got;
+            spin_unlock_irqrestore(&f->lock, fflags);
+        }
+        file_release(f);
+        return (size_t)got;
+    }
+
+    if (f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) {
+        unsigned long fflags = spin_lock_irqsave(&f->lock);
+        size_t pos = f->pos;
+        uint32_t hidx = f->u.fat32.hint_clus_idx;
+        uint32_t hclus = f->u.fat32.hint_clus;
+        uint64_t hgen = f->u.fat32.hint_gen;
+        spin_unlock_irqrestore(&f->lock, fflags);
+        size_t got = 0;
+        int rc = fat32_vol_read_at(f->u.fat32.vol, f->path, pos, buf, count,
+                                   &got, &hidx, &hclus, &hgen);
+        fflags = spin_lock_irqsave(&f->lock);
+        f->u.fat32.hint_clus_idx = hidx;
+        f->u.fat32.hint_clus = hclus;
+        f->u.fat32.hint_gen = hgen;
+        if (got > 0)
+            f->pos = pos + got;
+        spin_unlock_irqrestore(&f->lock, fflags);
+        file_release(f);
+        return (rc < 0 && got == 0) ? (size_t)rc : got;
     }
 
     if (f->backend == VFS_BACKEND_PIPE) {
         vfs_pipe_t *p = f->u.pipe.pipe;
-        if (!p || !f->u.pipe.can_read)
+        if (!p || !f->u.pipe.can_read) {
+            file_release(f);
             return 0;
+        }
 
         for (;;) {
-            unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
+            unsigned long pflags = spin_lock_irqsave(&p->lock);
             if (p->size > 0) {
                 size_t got = pipe_ring_read(p, buf, count);
-                spin_unlock_irqrestore(&g_pipe_lock, pflags);
+                spin_unlock_irqrestore(&p->lock, pflags);
                 if (got > 0)
                     wait_queue_wake_all(&p->waitq);
+                file_release(f);
                 return got;
             }
             if (p->writers == 0) {
-                spin_unlock_irqrestore(&g_pipe_lock, pflags);
-                return 0; /* All writers closed and buffer drained: true EOF */
+                spin_unlock_irqrestore(&p->lock, pflags);
+                file_release(f);
+                return 0;
             }
             if (f->flags & VFS_O_NONBLOCK) {
-                spin_unlock_irqrestore(&g_pipe_lock, pflags);
+                spin_unlock_irqrestore(&p->lock, pflags);
+                file_release(f);
                 return (size_t)-EAGAIN;
             }
-            spin_unlock_irqrestore(&g_pipe_lock, pflags);
 #ifdef __x86_64__
-            process_t *proc = vfs_current_process();
-            if (!proc)
+            process_t *curp = vfs_current_process();
+            if (!curp) {
+                spin_unlock_irqrestore(&p->lock, pflags);
+                file_release(f);
                 return 0;
-            wait_queue_entry_t wqe;
-            wqe.proc = proc;
-            wqe.next = NULL;
-            wait_queue_add(&p->waitq, &wqe);
-            unsigned long irqf = vfs_irq_save_disable();
-            pflags = spin_lock_irqsave(&g_pipe_lock);
-            int ready_now = (p->size > 0 || p->writers == 0);
-            spin_unlock_irqrestore(&g_pipe_lock, pflags);
-            if (ready_now) {
-                vfs_irq_restore(irqf);
-                wait_queue_remove(&p->waitq, &wqe);
-                continue;
             }
-            process_block_current();
+            wait_queue_entry_t wqe;
+            wqe.proc = curp;
+            wqe.next = NULL;
+            wait_queue_prepare_to_wait(&p->waitq, &wqe);
+            spin_unlock_irqrestore(&p->lock, pflags);
             process_yield();
-            vfs_irq_restore(irqf);
-            wait_queue_remove(&p->waitq, &wqe);
+            wait_queue_finish_wait(&p->waitq, &wqe);
 #else
+            spin_unlock_irqrestore(&p->lock, pflags);
+            file_release(f);
             return 0;
 #endif
         }
     }
 
     if (f->backend == VFS_BACKEND_UNIXSOCK) {
-        if (f->u.sock.is_listener || !f->u.sock.rx)
+        if (f->u.sock.is_listener || !f->u.sock.rx) {
+            file_release(f);
             return 0;
-        vfs_pipe_t *rx = f->u.sock.rx;
-        for (;;) {
-            unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
-            if (rx->size > 0) {
-                size_t got = pipe_ring_read(rx, buf, count);
-                spin_unlock_irqrestore(&g_pipe_lock, pflags);
-                if (got > 0)
-                    wait_queue_wake_all(&rx->waitq);
-                return got;
-            }
-            if (rx->writers == 0) {
-                spin_unlock_irqrestore(&g_pipe_lock, pflags);
-                return 0;
-            }
-            if (f->flags & VFS_O_NONBLOCK) {
-                spin_unlock_irqrestore(&g_pipe_lock, pflags);
-                return (size_t)-EAGAIN;
-            }
-            spin_unlock_irqrestore(&g_pipe_lock, pflags);
-#ifdef __x86_64__
-            process_t *p = vfs_current_process();
-            if (!p)
-                return 0;
-            wait_queue_entry_t wqe;
-            wqe.proc = p;
-            wqe.next = NULL;
-            wait_queue_add(&rx->waitq, &wqe);
-            unsigned long irqf = vfs_irq_save_disable();
-            pflags = spin_lock_irqsave(&g_pipe_lock);
-            int ready_now = (rx->size > 0 || rx->writers == 0);
-            spin_unlock_irqrestore(&g_pipe_lock, pflags);
-            if (ready_now) {
-                vfs_irq_restore(irqf);
-                wait_queue_remove(&rx->waitq, &wqe);
-                continue;
-            }
-            process_block_current();
-            process_yield();
-            vfs_irq_restore(irqf);
-            wait_queue_remove(&rx->waitq, &wqe);
-#else
-            return 0;
-#endif
         }
+        int err = 0;
+        size_t got = unix_ring_read(f->u.sock.rx, buf, count,
+                                    (f->flags & VFS_O_NONBLOCK) ? 1 : 0, &err);
+        file_release(f);
+        return (err < 0) ? (size_t)err : got;
     }
 
     if (f->backend == VFS_BACKEND_DEVFS) {
+        size_t n = 0;
         if (f->u.device.ops && f->u.device.ops->read) {
-            size_t n = f->u.device.ops->read(f->u.device.priv, f->pos, buf, count, f->flags);
-            f->pos += n;
-            return n;
+            unsigned long fflags = spin_lock_irqsave(&f->lock);
+            size_t pos = f->pos;
+            spin_unlock_irqrestore(&f->lock, fflags);
+            n = f->u.device.ops->read(f->u.device.priv, pos, buf, count, f->flags);
+            fflags = spin_lock_irqsave(&f->lock);
+            f->pos = pos + n;
+            spin_unlock_irqrestore(&f->lock, fflags);
         }
-        return 0;
+        file_release(f);
+        return n;
     }
 
-    if (f->backend == VFS_BACKEND_FAT12 && !f->u.regular.buf) {
-        if (f->pos >= f->u.regular.size)
-            return 0;
-        if (count > f->u.regular.size - f->pos)
-            count = f->u.regular.size - f->pos;
-        int n = fat12_read_file_offset(f->path, buf, f->pos, count);
-        if (n <= 0)
-            return 0;
-        f->pos += (size_t)n;
-        return (size_t)n;
-    }
-
-    if (!f->u.regular.buf || f->pos >= f->u.regular.size)
+    unsigned long fflags = spin_lock_irqsave(&f->lock);
+    if (!f->u.regular.buf || f->pos >= f->u.regular.size) {
+        spin_unlock_irqrestore(&f->lock, fflags);
+        file_release(f);
         return 0;
+    }
     if (count > f->u.regular.size - f->pos)
         count = f->u.regular.size - f->pos;
     for (size_t i = 0; i < count; i++)
         ((uint8_t *)buf)[i] = f->u.regular.buf[f->pos + i];
     f->pos += count;
+    spin_unlock_irqrestore(&f->lock, fflags);
+    file_release(f);
     return count;
 }
 
 size_t vfs_write(int fd, const void *buf, size_t count)
 {
     process_t *proc = vfs_current_process();
-    vfs_file_t *f = fd_lookup(proc, fd);
-    if (!f || !buf || !(f->mode & VFS_MODE_WRITE))
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    if (!f || !buf || !(f->mode & VFS_MODE_WRITE)) {
+        if (f)
+            file_release(f);
         return 0;
-    if (count == 0)
+    }
+    if (f->is_dir) {
+        file_release(f);
+        return (size_t)-EISDIR;
+    }
+    if (count == 0) {
+        file_release(f);
         return 0;
-
-    if (f->flags & VFS_O_APPEND) {
-        if (f->backend == VFS_BACKEND_MEMFS)
-            f->pos = memfs_size(f->u.memfs.inode);
-        else if (f->backend != VFS_BACKEND_PIPE)
-            f->pos = f->u.regular.size;
     }
 
-    if (f->backend == VFS_BACKEND_MEMFS) {
-        size_t wr = memfs_write(f->u.memfs.inode, f->pos, buf, count);
-        f->pos += wr;
+    if (f->backend == VFS_BACKEND_TMPFS) {
+        unsigned long fflags = spin_lock_irqsave(&f->lock);
+        if (f->flags & VFS_O_APPEND)
+            f->pos = tmpfs_inode_size(f->u.tmpfs.inode);
+        size_t pos = f->pos;
+        spin_unlock_irqrestore(&f->lock, fflags);
+
+        size_t wr = tmpfs_write(f->u.tmpfs.inode, pos, buf, count);
+
+        fflags = spin_lock_irqsave(&f->lock);
+        f->pos = pos + wr;
+        spin_unlock_irqrestore(&f->lock, fflags);
+        file_release(f);
         return wr;
+    }
+
+    if (f->backend == VFS_BACKEND_EXT4) {
+        unsigned long fflags = spin_lock_irqsave(&f->lock);
+        int is_append = (f->flags & VFS_O_APPEND) ? 1 : 0;
+        size_t pos = f->pos;
+        spin_unlock_irqrestore(&f->lock, fflags);
+        if (is_append)
+            pos = ext4fs_file_size((ext4fs_t *)f->fs_ctx, f->u.ext4.handle, f->path);
+
+        long wr = ext4fs_write((ext4fs_t *)f->fs_ctx, f->u.ext4.handle, pos, buf, count);
+        if (wr > 0) {
+            fflags = spin_lock_irqsave(&f->lock);
+            f->pos = pos + (size_t)wr;
+            f->dirty = 1;
+            spin_unlock_irqrestore(&f->lock, fflags);
+        }
+        file_release(f);
+        return (size_t)wr;
+    }
+
+    if (f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) {
+        unsigned long fflags = spin_lock_irqsave(&f->lock);
+        int is_append = (f->flags & VFS_O_APPEND) ? 1 : 0;
+        size_t pos = f->pos;
+        uint32_t hidx = f->u.fat32.hint_clus_idx;
+        uint32_t hclus = f->u.fat32.hint_clus;
+        uint64_t hgen = f->u.fat32.hint_gen;
+        spin_unlock_irqrestore(&f->lock, fflags);
+
+        if (is_append) {
+            fat32_dirent_t de;
+            if (fat32_vol_stat(f->u.fat32.vol, f->path, &de) == 0)
+                pos = de.size;
+        }
+        size_t wr = 0;
+        int rc = fat32_vol_write_at(f->u.fat32.vol, f->path, pos, buf, count,
+                                    &wr, &hidx, &hclus, &hgen);
+        fflags = spin_lock_irqsave(&f->lock);
+        f->u.fat32.hint_clus_idx = hidx;
+        f->u.fat32.hint_clus = hclus;
+        f->u.fat32.hint_gen = hgen;
+        if (wr > 0) {
+            f->pos = pos + wr;
+            f->dirty = 1;
+        }
+        spin_unlock_irqrestore(&f->lock, fflags);
+        file_release(f);
+        return (rc < 0 && wr == 0) ? (size_t)rc : wr;
     }
 
     if (f->backend == VFS_BACKEND_PIPE) {
         vfs_pipe_t *p = f->u.pipe.pipe;
-        if (!p || !f->u.pipe.can_write)
+        if (!p || !f->u.pipe.can_write) {
+            file_release(f);
             return (size_t)-EPIPE;
+        }
         for (;;) {
-            unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
+            unsigned long pflags = spin_lock_irqsave(&p->lock);
             if (p->readers == 0) {
-                spin_unlock_irqrestore(&g_pipe_lock, pflags);
+                spin_unlock_irqrestore(&p->lock, pflags);
+                file_release(f);
                 return (size_t)-EPIPE;
             }
             size_t wr = pipe_ring_write(p, buf, count);
-            spin_unlock_irqrestore(&g_pipe_lock, pflags);
+            spin_unlock_irqrestore(&p->lock, pflags);
             if (wr > 0) {
                 wait_queue_wake_all(&p->waitq);
+                file_release(f);
                 return wr;
             }
-            if (f->flags & VFS_O_NONBLOCK)
+            if (f->flags & VFS_O_NONBLOCK) {
+                file_release(f);
                 return (size_t)-EAGAIN;
+            }
 #ifdef __x86_64__
             process_t *curp = vfs_current_process();
-            if (!curp)
+            if (!curp) {
+                file_release(f);
                 return 0;
+            }
             wait_queue_entry_t wqe;
             wqe.proc = curp;
             wqe.next = NULL;
-            wait_queue_add(&p->waitq, &wqe);
-            unsigned long irqf = vfs_irq_save_disable();
-            pflags = spin_lock_irqsave(&g_pipe_lock);
-            int ready_now = (p->size < VFS_PIPE_CAPACITY || p->readers == 0);
-            spin_unlock_irqrestore(&g_pipe_lock, pflags);
-            if (ready_now) {
-                vfs_irq_restore(irqf);
-                wait_queue_remove(&p->waitq, &wqe);
-                continue;
-            }
-            process_block_current();
+            wait_queue_prepare_to_wait(&p->waitq, &wqe);
             process_yield();
-            vfs_irq_restore(irqf);
-            wait_queue_remove(&p->waitq, &wqe);
+            wait_queue_finish_wait(&p->waitq, &wqe);
 #else
+            file_release(f);
             return 0;
 #endif
         }
     }
 
     if (f->backend == VFS_BACKEND_UNIXSOCK) {
-        /* Connected socket: write this end's tx pipe. */
-        if (f->u.sock.is_listener || !f->u.sock.tx)
+        if (f->u.sock.is_listener || !f->u.sock.tx) {
+            file_release(f);
             return 0;
-        vfs_pipe_t *tx = f->u.sock.tx;
-        unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
-        if (tx->readers == 0) {
-            spin_unlock_irqrestore(&g_pipe_lock, pflags);
-            return (size_t)-EPIPE;
         }
-        size_t wr = pipe_ring_write(tx, buf, count);
-        spin_unlock_irqrestore(&g_pipe_lock, pflags);
-        if (wr > 0)
-            wait_queue_wake_all(&tx->waitq);
-        return wr;
+        int err = 0;
+        size_t wr = unix_ring_write(f->u.sock.tx, buf, count,
+                                    (f->flags & VFS_O_NONBLOCK) ? 1 : 0, &err);
+        file_release(f);
+        return (err < 0) ? (size_t)err : wr;
     }
 
     if (f->backend == VFS_BACKEND_DEVFS) {
+        size_t n = 0;
         if (f->u.device.ops && f->u.device.ops->write) {
-            size_t n = f->u.device.ops->write(f->u.device.priv, f->pos, buf, count);
-            f->pos += n;
-            return n;
+            unsigned long fflags = spin_lock_irqsave(&f->lock);
+            size_t pos = f->pos;
+            spin_unlock_irqrestore(&f->lock, fflags);
+            n = f->u.device.ops->write(f->u.device.priv, pos, buf, count);
+            fflags = spin_lock_irqsave(&f->lock);
+            f->pos = pos + n;
+            spin_unlock_irqrestore(&f->lock, fflags);
         }
-        return 0;
+        file_release(f);
+        return n;
     }
 
     if (f->backend == VFS_BACKEND_INITRD ||
         f->backend == VFS_BACKEND_PROCFS ||
         f->backend == VFS_BACKEND_SYSFS ||
-        f->backend == VFS_BACKEND_BOOTFS)
+        f->backend == VFS_BACKEND_BOOTFS ||
+        f->backend == VFS_BACKEND_TAR) {
+        file_release(f);
         return 0;
+    }
 
-    if (ensure_regular_capacity(f, f->pos + count) != 0)
+    unsigned long fflags = spin_lock_irqsave(&f->lock);
+    if (f->flags & VFS_O_APPEND)
+        f->pos = f->u.regular.size;
+    if (ensure_regular_capacity(f, f->pos + count) != 0) {
+        spin_unlock_irqrestore(&f->lock, fflags);
+        file_release(f);
         return 0;
+    }
     for (size_t i = 0; i < count; i++)
         f->u.regular.buf[f->pos + i] = ((const uint8_t *)buf)[i];
     f->pos += count;
     if (f->pos > f->u.regular.size)
         f->u.regular.size = f->pos;
     f->dirty = 1;
+    spin_unlock_irqrestore(&f->lock, fflags);
+    file_release(f);
     return count;
 }
 
 size_t vfs_seek(int fd, size_t offset, int whence)
 {
     process_t *proc = vfs_current_process();
-    vfs_file_t *f = fd_lookup(proc, fd);
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
     size_t size = 0;
+    size_t new_pos;
     if (!f)
         return (size_t)-1;
-    if (f->backend == VFS_BACKEND_PIPE || f->backend == VFS_BACKEND_UNIXSOCK)
-        return (size_t)-1;
+    if (f->backend == VFS_BACKEND_PIPE || f->backend == VFS_BACKEND_UNIXSOCK) {
+        file_release(f);
+        return (size_t)-ESPIPE;
+    }
 
-    if (f->backend == VFS_BACKEND_MEMFS)
-        size = memfs_size(f->u.memfs.inode);
-    else if (f->backend == VFS_BACKEND_DEVFS)
+    if (f->is_dir) {
+        unsigned long fflags = spin_lock_irqsave(&f->lock);
+        if (whence == VFS_SEEK_SET)
+            f->pos = offset;
+        else if (whence == VFS_SEEK_CUR)
+            f->pos += offset;
+        new_pos = f->pos;
+        spin_unlock_irqrestore(&f->lock, fflags);
+        file_release(f);
+        return new_pos;
+    }
+
+    if (f->backend == VFS_BACKEND_TMPFS)
+        size = tmpfs_inode_size(f->u.tmpfs.inode);
+    else if (f->backend == VFS_BACKEND_EXT4)
+        size = ext4fs_file_size((ext4fs_t *)f->fs_ctx, f->u.ext4.handle, f->path);
+    else if (f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) {
+        fat32_dirent_t de;
+        size = (f->u.fat32.vol && fat32_vol_stat(f->u.fat32.vol, f->path, &de) == 0)
+                   ? de.size
+                   : 0;
+    } else if (f->backend == VFS_BACKEND_DEVFS)
         size = (f->u.device.ops && f->u.device.ops->size) ? f->u.device.ops->size(f->u.device.priv) : 0;
     else
         size = f->u.regular.size;
 
+    unsigned long fflags = spin_lock_irqsave(&f->lock);
     switch (whence) {
     case VFS_SEEK_SET:
         f->pos = offset;
@@ -1976,49 +3833,63 @@ size_t vfs_seek(int fd, size_t offset, int whence)
         f->pos = size + offset;
         break;
     default:
+        spin_unlock_irqrestore(&f->lock, fflags);
+        file_release(f);
         return (size_t)-1;
     }
     if (f->pos > size)
         f->pos = size;
-    return f->pos;
+    new_pos = f->pos;
+    spin_unlock_irqrestore(&f->lock, fflags);
+    file_release(f);
+    return new_pos;
 }
 
 size_t vfs_tell(int fd)
 {
     process_t *proc = vfs_current_process();
-    vfs_file_t *f = fd_lookup(proc, fd);
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
     if (!f)
         return (size_t)-1;
-    return f->pos;
+    unsigned long fflags = spin_lock_irqsave(&f->lock);
+    size_t pos = f->pos;
+    spin_unlock_irqrestore(&f->lock, fflags);
+    file_release(f);
+    return pos;
 }
 
 size_t vfs_size(int fd)
 {
     process_t *proc = vfs_current_process();
-    vfs_file_t *f = fd_lookup(proc, fd);
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    size_t sz = 0;
     if (!f)
         return 0;
-    if (f->backend == VFS_BACKEND_MEMFS)
-        return memfs_size(f->u.memfs.inode);
-    if (f->backend == VFS_BACKEND_PIPE) {
-        if (!f->u.pipe.pipe)
-            return 0;
-        unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
-        size_t sz = f->u.pipe.pipe->size;
-        spin_unlock_irqrestore(&g_pipe_lock, pflags);
-        return sz;
+    if (f->backend == VFS_BACKEND_TMPFS) {
+        sz = tmpfs_inode_size(f->u.tmpfs.inode);
+    } else if (f->backend == VFS_BACKEND_EXT4) {
+        sz = ext4fs_file_size((ext4fs_t *)f->fs_ctx, f->u.ext4.handle, f->path);
+    } else if (f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) {
+        fat32_dirent_t de;
+        sz = (f->u.fat32.vol && fat32_vol_stat(f->u.fat32.vol, f->path, &de) == 0)
+                 ? de.size
+                 : 0;
+    } else if (f->backend == VFS_BACKEND_PIPE) {
+        if (f->u.pipe.pipe) {
+            unsigned long pflags = spin_lock_irqsave(&f->u.pipe.pipe->lock);
+            sz = f->u.pipe.pipe->size;
+            spin_unlock_irqrestore(&f->u.pipe.pipe->lock, pflags);
+        }
+    } else if (f->backend == VFS_BACKEND_UNIXSOCK) {
+        if (!f->u.sock.is_listener && f->u.sock.rx)
+            sz = unix_ring_avail(f->u.sock.rx);
+    } else if (f->backend == VFS_BACKEND_DEVFS) {
+        sz = (f->u.device.ops && f->u.device.ops->size) ? f->u.device.ops->size(f->u.device.priv) : 0;
+    } else {
+        sz = f->u.regular.size;
     }
-    if (f->backend == VFS_BACKEND_UNIXSOCK) {
-        if (f->u.sock.is_listener || !f->u.sock.rx)
-            return 0;
-        unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
-        size_t sz = f->u.sock.rx->size;
-        spin_unlock_irqrestore(&g_pipe_lock, pflags);
-        return sz;
-    }
-    if (f->backend == VFS_BACKEND_DEVFS)
-        return (f->u.device.ops && f->u.device.ops->size) ? f->u.device.ops->size(f->u.device.priv) : 0;
-    return f->u.regular.size;
+    file_release(f);
+    return sz;
 }
 
 /* dup/dup2/pipe/fcntl */
@@ -2027,14 +3898,15 @@ int vfs_dup(int oldfd)
 {
     process_t *proc = vfs_current_process();
     void **tbl = fd_table_for_process(proc);
-    vfs_file_t *f = fd_lookup(proc, oldfd);
-    int newfd = process_fd_alloc(proc);
-    if (!f || newfd < 0)
-        return -1;
-    unsigned long aflags = spin_lock_irqsave(&g_vfs_alloc_lock);
-    f->refcount++;
-    spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
-    tbl[newfd] = f;
+    vfs_file_t *f = fd_lookup_ref(proc, oldfd);
+    if (!f)
+        return -EBADF;
+    int newfd = vfs_install_fd(proc, f);
+    if (newfd < 0) {
+        file_release(f);
+        return newfd;
+    }
+    (void)tbl;
     return newfd;
 }
 
@@ -2042,16 +3914,22 @@ int vfs_dup2(int oldfd, int newfd)
 {
     process_t *proc = vfs_current_process();
     void **tbl = fd_table_for_process(proc);
-    vfs_file_t *f = fd_lookup(proc, oldfd);
-    if (!f || !fd_valid(newfd))
-        return -1;
-    if (oldfd == newfd)
+    if (!fd_valid(newfd))
+        return -EBADF;
+    vfs_file_t *f = fd_lookup_ref(proc, oldfd);
+    if (!f)
+        return -EBADF;
+    if (oldfd == newfd) {
+        file_release(f);
         return newfd;
+    }
     fd_close_on_table(tbl, newfd);
-    unsigned long aflags = spin_lock_irqsave(&g_vfs_alloc_lock);
-    f->refcount++;
-    spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
+    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
+    vfs_file_t *existing = (vfs_file_t *)tbl[newfd];
     tbl[newfd] = f;
+    spin_unlock_irqrestore(&g_fd_lock, flags);
+    if (existing && existing != (vfs_file_t *)(uintptr_t)1)
+        file_release(existing);
     return newfd;
 }
 
@@ -2059,25 +3937,35 @@ int vfs_pipe(int pipefd[2])
 {
     process_t *proc = vfs_current_process();
     void **tbl = fd_table_for_process(proc);
-    int fd_r;
-    int fd_w;
+    int fd_r = -1;
+    int fd_w = -1;
     vfs_pipe_t *p;
     vfs_file_t *fr;
     vfs_file_t *fw;
 
     if (!pipefd)
-        return -1;
+        return -EINVAL;
 
-    fd_r = process_fd_alloc(proc);
-    if (fd_r < 0)
-        return -1;
-    tbl[fd_r] = (void *)1;
-    fd_w = process_fd_alloc(proc);
-    if (fd_w < 0) {
-        tbl[fd_r] = NULL;
-        return -1;
+    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
+    for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
+        if (!tbl[i]) {
+            if (fd_r < 0) {
+                fd_r = i;
+                tbl[i] = (void *)1;
+            } else {
+                fd_w = i;
+                tbl[i] = (void *)1;
+                break;
+            }
+        }
     }
-    tbl[fd_w] = (void *)1;
+    if (fd_r < 0 || fd_w < 0) {
+        if (fd_r >= 0)
+            tbl[fd_r] = NULL;
+        spin_unlock_irqrestore(&g_fd_lock, flags);
+        return -EMFILE;
+    }
+    spin_unlock_irqrestore(&g_fd_lock, flags);
 
     p = pipe_alloc();
     fr = file_alloc();
@@ -2089,14 +3977,18 @@ int vfs_pipe(int pipefd[2])
             file_release(fw);
         if (p)
             pipe_free_slot(p);
+        flags = spin_lock_irqsave(&g_fd_lock);
         tbl[fd_r] = NULL;
         tbl[fd_w] = NULL;
-        return -1;
+        spin_unlock_irqrestore(&g_fd_lock, flags);
+        return -ENOMEM;
     }
 
     fr->backend = VFS_BACKEND_PIPE;
     fr->mode = VFS_MODE_READ;
     fr->flags = VFS_O_RDONLY;
+    fr->inode_dev = 0x50495045ULL;
+    fr->inode_ino = (uint64_t)(uintptr_t)p;
     fr->u.pipe.pipe = p;
     fr->u.pipe.can_read = 1;
     fr->u.pipe.can_write = 0;
@@ -2104,6 +3996,8 @@ int vfs_pipe(int pipefd[2])
     fw->backend = VFS_BACKEND_PIPE;
     fw->mode = VFS_MODE_WRITE;
     fw->flags = VFS_O_WRONLY;
+    fw->inode_dev = 0x50495045ULL;
+    fw->inode_ino = (uint64_t)(uintptr_t)p;
     fw->u.pipe.pipe = p;
     fw->u.pipe.can_read = 0;
     fw->u.pipe.can_write = 1;
@@ -2111,8 +4005,11 @@ int vfs_pipe(int pipefd[2])
     p->readers = 1;
     p->writers = 1;
 
+    flags = spin_lock_irqsave(&g_fd_lock);
     tbl[fd_r] = fr;
     tbl[fd_w] = fw;
+    spin_unlock_irqrestore(&g_fd_lock, flags);
+
     pipefd[0] = fd_r;
     pipefd[1] = fd_w;
     return 0;
@@ -2130,137 +4027,163 @@ int vfs_pipe(int pipefd[2])
 int vfs_socket_create(void)
 {
     process_t *proc = vfs_current_process();
-    void **tbl = fd_table_for_process(proc);
-    int fd = process_fd_alloc(proc);
-    vfs_file_t *f;
-
-    if (fd < 0)
-        return -ENOMEM;
-    f = file_alloc();
+    vfs_file_t *f = file_alloc();
     if (!f)
         return -ENOMEM;
+
     f->backend = VFS_BACKEND_UNIXSOCK;
     f->mode = VFS_MODE_READ | VFS_MODE_WRITE;
     f->flags = VFS_O_RDWR;
+    f->inode_dev = 0x534F434BULL;
+    f->inode_ino = (uint64_t)(uintptr_t)f;
     f->path[0] = '\0';
     f->u.sock.rx = NULL;
     f->u.sock.tx = NULL;
     f->u.sock.listener = NULL;
     f->u.sock.is_listener = 0;
-    tbl[fd] = f;
+
+    int fd = vfs_install_fd(proc, f);
+    if (fd < 0) {
+        file_release(f);
+        return -EMFILE;
+    }
     return fd;
 }
 
 int vfs_socket_bind(int fd, const char *path)
 {
     process_t *proc = vfs_current_process();
-    vfs_file_t *f = fd_lookup(proc, fd);
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
     unix_listener_t *l;
     int rc;
 
-    if (!f || f->backend != VFS_BACKEND_UNIXSOCK)
+    if (!f || f->backend != VFS_BACKEND_UNIXSOCK) {
+        if (f) file_release(f);
         return -EINVAL;
-    if (f->u.sock.is_listener || f->u.sock.rx || f->u.sock.tx)
+    }
+    if (f->u.sock.is_listener || f->u.sock.rx || f->u.sock.tx) {
+        file_release(f);
         return -EINVAL;
-    if (!path || !path[0])
+    }
+    if (!path || !path[0]) {
+        file_release(f);
         return -EINVAL;
+    }
     rc = unix_register_listener(path, proc ? (int)proc->pid : 0, fd);
-    if (rc != 0)
+    if (rc != 0) {
+        file_release(f);
         return rc;
+    }
     l = unix_find_listener(path);
     if (!l) {
         unix_unregister_listener(path);
+        file_release(f);
         return -EINVAL;
     }
     kstrncpy(f->path, path, VFS_PATH_MAX);
     f->u.sock.listener = l;
     f->u.sock.is_listener = 1;
+    file_release(f);
     return 0;
 }
 
 int vfs_socket_listen(int fd)
 {
     process_t *proc = vfs_current_process();
-    vfs_file_t *f = fd_lookup(proc, fd);
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
 
-    if (!f || f->backend != VFS_BACKEND_UNIXSOCK || !f->u.sock.is_listener)
+    if (!f || f->backend != VFS_BACKEND_UNIXSOCK || !f->u.sock.is_listener) {
+        if (f) file_release(f);
         return -EINVAL;
+    }
     unix_listener_set_listening(f->u.sock.listener, 1);
+    file_release(f);
     return 0;
 }
 
 int vfs_socket_connect(int fd, const char *path)
 {
     process_t *proc = vfs_current_process();
-    vfs_file_t *f = fd_lookup(proc, fd);
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
     unix_listener_t *l;
-    vfs_pipe_t *c2s;
-    vfs_pipe_t *s2c;
+    unix_ring_t *c2s;
+    unix_ring_t *s2c;
     unix_pending_conn_t pc;
 
-    if (!f || f->backend != VFS_BACKEND_UNIXSOCK)
+    if (!f || f->backend != VFS_BACKEND_UNIXSOCK) {
+        if (f) file_release(f);
         return -EINVAL;
-    if (f->u.sock.is_listener || f->u.sock.rx || f->u.sock.tx)
+    }
+    if (f->u.sock.is_listener || f->u.sock.rx || f->u.sock.tx) {
+        file_release(f);
         return -EINVAL;
+    }
     l = unix_find_listener(path);
-    if (!l || !unix_listener_is_listening(l))
+    if (!l || !unix_listener_is_listening(l)) {
+        file_release(f);
         return -ECONNREFUSED;
+    }
 
-    c2s = pipe_alloc();
-    s2c = pipe_alloc();
+    c2s = unix_ring_create();
+    s2c = unix_ring_create();
     if (!c2s || !s2c) {
         if (c2s)
-            pipe_free_slot(c2s);
+            unix_ring_drop_claim(c2s, 1, 1);
         if (s2c)
-            pipe_free_slot(s2c);
+            unix_ring_drop_claim(s2c, 1, 1);
+        file_release(f);
         return -ENOMEM;
     }
-    /* Count BOTH sides' claims now: client = reader(s2c) + writer(c2s); the pending record carries the server... */
-    c2s->readers = 1;
-    c2s->writers = 1;
-    s2c->readers = 1;
-    s2c->writers = 1;
 
     pc.pipe1 = c2s;
     pc.pipe2 = s2c;
     pc.client_pid = proc ? (int)proc->pid : 0;
     pc.client_fd = fd;
     if (unix_enqueue_pending(l, &pc) != 0) {
-        pipe_free_slot(c2s);
-        pipe_free_slot(s2c);
+        unix_ring_drop_claim(c2s, 1, 1);
+        unix_ring_drop_claim(s2c, 1, 1);
+        file_release(f);
         return -ECONNREFUSED;
     }
-    
+
     f->u.sock.rx = s2c;
     f->u.sock.tx = c2s;
+    file_release(f);
     return 0;
 }
 
 int vfs_socket_accept(int fd)
 {
     process_t *proc = vfs_current_process();
-    void **tbl = fd_table_for_process(proc);
-    vfs_file_t *f = fd_lookup(proc, fd);
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
     unix_pending_conn_t pc;
     vfs_file_t *nf;
     int nfd;
 
-    if (!f || f->backend != VFS_BACKEND_UNIXSOCK || !f->u.sock.is_listener)
+    if (!f || f->backend != VFS_BACKEND_UNIXSOCK || !f->u.sock.is_listener) {
+        if (f) file_release(f);
         return -EINVAL;
-    if (!unix_listener_is_listening(f->u.sock.listener))
+    }
+    if (!unix_listener_is_listening(f->u.sock.listener)) {
+        file_release(f);
         return -EINVAL;
+    }
 
     for (;;) {
         if (unix_dequeue_pending(f->u.sock.listener, &pc) == 0)
             break;
 
-        if (f->flags & VFS_O_NONBLOCK)
+        if (f->flags & VFS_O_NONBLOCK) {
+            file_release(f);
             return -EAGAIN;
+        }
 
 #ifdef __x86_64__
         wait_queue_head_t *wq = unix_listener_get_accept_waitq(f->u.sock.listener);
-        if (!wq || !proc)
+        if (!wq || !proc) {
+            file_release(f);
             return -EAGAIN;
+        }
 
         wait_queue_entry_t wqe;
         wqe.proc = proc;
@@ -2277,68 +4200,79 @@ int vfs_socket_accept(int fd)
         vfs_irq_restore(irqf);
         wait_queue_remove(wq, &wqe);
 #else
+        file_release(f);
         return -EAGAIN;
 #endif
     }
 
-    nfd = process_fd_alloc(proc);
-    if (nfd < 0) {
-        sock_drop_pipe_claim((vfs_pipe_t *)pc.pipe1, 1, 0);
-        sock_drop_pipe_claim((vfs_pipe_t *)pc.pipe2, 0, 1);
-        return -ENOMEM;
-    }
     nf = file_alloc();
     if (!nf) {
-        sock_drop_pipe_claim((vfs_pipe_t *)pc.pipe1, 1, 0);
-        sock_drop_pipe_claim((vfs_pipe_t *)pc.pipe2, 0, 1);
+        unix_ring_drop_claim(pc.pipe1, 1, 0);
+        unix_ring_drop_claim(pc.pipe2, 0, 1);
+        file_release(f);
         return -ENOMEM;
     }
     nf->backend = VFS_BACKEND_UNIXSOCK;
     nf->mode = VFS_MODE_READ | VFS_MODE_WRITE;
     nf->flags = VFS_O_RDWR;
+    nf->inode_dev = 0x534F434BULL;
+    nf->inode_ino = (uint64_t)(uintptr_t)nf;
     nf->path[0] = '\0';
-    /* Pipe roles swap across the boundary: the server reads what the client wrote (c2s) and writes what the... */
-    nf->u.sock.rx = (vfs_pipe_t *)pc.pipe1;
-    nf->u.sock.tx = (vfs_pipe_t *)pc.pipe2;
+    nf->u.sock.rx = pc.pipe1;
+    nf->u.sock.tx = pc.pipe2;
     nf->u.sock.listener = NULL;
     nf->u.sock.is_listener = 0;
-    tbl[nfd] = nf;
+
+    nfd = vfs_install_fd(proc, nf);
+    if (nfd < 0) {
+        file_release(nf);
+        file_release(f);
+        return -EMFILE;
+    }
+    file_release(f);
     return nfd;
 }
 
 int vfs_fcntl(int fd, int cmd, int arg)
 {
     process_t *proc = vfs_current_process();
-    vfs_file_t *f = fd_lookup(proc, fd);
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    int rc = -EINVAL;
     if (!f)
-        return -1;
+        return -EBADF;
+    unsigned long flags = spin_lock_irqsave(&f->lock);
     switch (cmd) {
     case VFS_F_GETFL:
-        return f->flags;
+        rc = f->flags;
+        break;
     case VFS_F_SETFL:
         f->flags = (f->flags & ~(VFS_O_APPEND | VFS_O_NONBLOCK)) |
                    (arg & (VFS_O_APPEND | VFS_O_NONBLOCK));
-        return 0;
+        rc = 0;
+        break;
     default:
-        return -1;
+        rc = -EINVAL;
+        break;
     }
+    spin_unlock_irqrestore(&f->lock, flags);
+    file_release(f);
+    return rc;
 }
 
 int vfs_ioctl(int fd, unsigned long request, void *arg)
 {
     process_t *proc = vfs_current_process();
-    vfs_file_t *f = fd_lookup(proc, fd);
-
     if (request == VFS_KDSETMODE)
         return fb_ioctl(request, arg);
 
-    if (!f || f->backend != VFS_BACKEND_DEVFS)
-        return -1;
-
-    if (f->u.device.ops && f->u.device.ops->ioctl)
-        return f->u.device.ops->ioctl(f->u.device.priv, request, arg);
-
-    return -1;
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    if (!f)
+        return -EBADF;
+    int rc = -ENOTTY;
+    if (f->backend == VFS_BACKEND_DEVFS && f->u.device.ops && f->u.device.ops->ioctl)
+        rc = f->u.device.ops->ioctl(f->u.device.priv, request, arg);
+    file_release(f);
+    return rc;
 }
 
 int vfs_kd_mode(void)
@@ -2412,14 +4346,15 @@ void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t of
         return (void *)target_va;
     }
 
-    vfs_file_t *f = fd_lookup(proc, fd);
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
     if (!f)
         return (void *)-1;
-    if (f->backend == VFS_BACKEND_DEVFS) {
-        if (f->u.device.ops && f->u.device.ops->mmap)
-            return f->u.device.ops->mmap(f->u.device.priv, addr, length, prot, flags, offset);
-    }
-    return (void *)-1;
+
+    void *res = (void *)-1;
+    if (f->backend == VFS_BACKEND_DEVFS && f->u.device.ops && f->u.device.ops->mmap)
+        res = f->u.device.ops->mmap(f->u.device.priv, addr, length, prot, flags, offset);
+    file_release(f);
+    return res;
 }
 
 int vfs_munmap(void *addr, size_t length)
@@ -2490,7 +4425,7 @@ static int vfs_file_poll_mask(vfs_file_t *f)
         vfs_pipe_t *p = f->u.pipe.pipe;
         if (!p)
             return VFS_POLLERR;
-        unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
+        unsigned long pflags = spin_lock_irqsave(&p->lock);
         if (f->u.pipe.can_read) {
             if (p->size > 0)
                 mask |= VFS_POLLIN;
@@ -2503,7 +4438,7 @@ static int vfs_file_poll_mask(vfs_file_t *f)
             else if (p->size < VFS_PIPE_CAPACITY)
                 mask |= VFS_POLLOUT;
         }
-        spin_unlock_irqrestore(&g_pipe_lock, pflags);
+        spin_unlock_irqrestore(&p->lock, pflags);
         return mask;
     }
 
@@ -2515,17 +4450,7 @@ static int vfs_file_poll_mask(vfs_file_t *f)
         }
         if (!f->u.sock.rx || !f->u.sock.tx)
             return VFS_POLLERR;
-        unsigned long pflags = spin_lock_irqsave(&g_pipe_lock);
-        if (f->u.sock.rx->size > 0)
-            mask |= VFS_POLLIN;
-        if (f->u.sock.rx->writers == 0)
-            mask |= VFS_POLLHUP;
-        if (f->u.sock.tx->readers == 0)
-            mask |= VFS_POLLHUP;
-        else if (f->u.sock.tx->size < VFS_PIPE_CAPACITY)
-            mask |= VFS_POLLOUT;
-        spin_unlock_irqrestore(&g_pipe_lock, pflags);
-        return mask;
+        return unix_ring_poll_mask(f->u.sock.rx, f->u.sock.tx);
     }
 
     if (f->backend == VFS_BACKEND_DEVFS) {
@@ -2537,16 +4462,27 @@ static int vfs_file_poll_mask(vfs_file_t *f)
     }
 
     if (f->backend == VFS_BACKEND_EPOLL) {
-        epoll_item_t *item = f->u.epoll.items;
         process_t *proc = vfs_current_process();
-        while (item) {
-            vfs_file_t *tf = fd_lookup(proc, item->fd);
+        unsigned long eflags = spin_lock_irqsave(&f->lock);
+        int fds[64];
+        uint32_t evs[64];
+        int cnt = 0;
+        epoll_item_t *item = f->u.epoll.items;
+        while (item && cnt < 64) {
+            fds[cnt] = item->fd;
+            evs[cnt] = item->events;
+            cnt++;
+            item = item->next;
+        }
+        spin_unlock_irqrestore(&f->lock, eflags);
+        for (int i = 0; i < cnt; i++) {
+            vfs_file_t *tf = fd_lookup_ref(proc, fds[i]);
             if (tf) {
                 int tmask = vfs_file_poll_mask(tf);
-                if (tmask & (item->events | VFS_POLLERR | VFS_POLLHUP))
+                file_release(tf);
+                if (tmask & (int)(evs[i] | VFS_POLLERR | VFS_POLLHUP))
                     return VFS_POLLIN;
             }
-            item = item->next;
         }
         return 0;
     }
@@ -2569,13 +4505,14 @@ static int vfs_poll_scan(vfs_pollfd_t *fds, size_t nfds)
         fds[i].revents = 0;
         if (fds[i].fd < 0)
             continue;
-        vfs_file_t *f = fd_lookup(proc, fds[i].fd);
+        vfs_file_t *f = fd_lookup_ref(proc, fds[i].fd);
         if (!f) {
             fds[i].revents = VFS_POLLNVAL;
             ready++;
             continue;
         }
         int mask = vfs_file_poll_mask(f);
+        file_release(f);
         int rev = mask & (fds[i].events | VFS_POLLERR | VFS_POLLHUP);
         fds[i].revents = (int16_t)rev;
         if (rev)
@@ -2603,10 +4540,16 @@ static void vfs_poll_register_file(vfs_file_t *f, poll_table_t *pt, int16_t even
                 poll_wtable_queue(wq, pt);
             return;
         }
-        if (f->u.sock.rx)
-            poll_wtable_queue(&f->u.sock.rx->waitq, pt);
-        if (f->u.sock.tx && f->u.sock.tx != f->u.sock.rx)
-            poll_wtable_queue(&f->u.sock.tx->waitq, pt);
+        if (f->u.sock.rx) {
+            wait_queue_head_t *wq = unix_ring_get_waitq(f->u.sock.rx);
+            if (wq)
+                poll_wtable_queue(wq, pt);
+        }
+        if (f->u.sock.tx && f->u.sock.tx != f->u.sock.rx) {
+            wait_queue_head_t *wq = unix_ring_get_waitq(f->u.sock.tx);
+            if (wq)
+                poll_wtable_queue(wq, pt);
+        }
         return;
     }
 
@@ -2628,13 +4571,25 @@ static void vfs_poll_register_file(vfs_file_t *f, poll_table_t *pt, int16_t even
     }
 
     if (f->backend == VFS_BACKEND_EPOLL) {
-        epoll_item_t *item = f->u.epoll.items;
         process_t *proc = vfs_current_process();
-        while (item) {
-            vfs_file_t *tf = fd_lookup(proc, item->fd);
-            if (tf)
-                vfs_poll_register_file(tf, pt, (int16_t)item->events);
+        unsigned long eflags = spin_lock_irqsave(&f->lock);
+        int fds[64];
+        uint32_t evs[64];
+        int cnt = 0;
+        epoll_item_t *item = f->u.epoll.items;
+        while (item && cnt < 64) {
+            fds[cnt] = item->fd;
+            evs[cnt] = item->events;
+            cnt++;
             item = item->next;
+        }
+        spin_unlock_irqrestore(&f->lock, eflags);
+        for (int i = 0; i < cnt; i++) {
+            vfs_file_t *tf = fd_lookup_ref(proc, fds[i]);
+            if (tf) {
+                vfs_poll_register_file(tf, pt, (int16_t)evs[i]);
+                file_release(tf);
+            }
         }
         return;
     }
@@ -2649,9 +4604,11 @@ static void vfs_poll_register(vfs_pollfd_t *fds, size_t nfds, poll_table_t *pt)
     for (size_t i = 0; i < nfds; i++) {
         if (fds[i].fd < 0)
             continue;
-        vfs_file_t *f = fd_lookup(proc, fds[i].fd);
-        if (f)
+        vfs_file_t *f = fd_lookup_ref(proc, fds[i].fd);
+        if (f) {
             vfs_poll_register_file(f, pt, fds[i].events);
+            file_release(f);
+        }
     }
 }
 
@@ -2733,10 +4690,6 @@ int vfs_poll(vfs_pollfd_t *fds, size_t nfds, int timeout_ms)
 int vfs_epoll_create1(int flags)
 {
     process_t *proc = vfs_current_process();
-    void **tbl = fd_table_for_process(proc);
-    int fd = process_fd_alloc(proc);
-    if (fd < 0)
-        return -EMFILE;
     vfs_file_t *f = file_alloc();
     if (!f)
         return -ENFILE;
@@ -2745,7 +4698,11 @@ int vfs_epoll_create1(int flags)
     f->flags = flags;
     f->u.epoll.items = NULL;
     f->u.epoll.count = 0;
-    tbl[fd] = f;
+    int fd = vfs_install_fd(proc, f);
+    if (fd < 0) {
+        file_release(f);
+        return -EMFILE;
+    }
     return fd;
 }
 
@@ -2756,17 +4713,26 @@ int vfs_epoll_ctl(int epfd, int op, int fd, uint32_t events, uint64_t data)
         return -EBADF;
     if (epfd == fd)
         return -EINVAL;
-    vfs_file_t *epf = fd_lookup(proc, epfd);
+    vfs_file_t *epf = fd_lookup_ref(proc, epfd);
     if (!epf)
         return -EBADF;
-    if (epf->backend != VFS_BACKEND_EPOLL)
+    if (epf->backend != VFS_BACKEND_EPOLL) {
+        file_release(epf);
         return -EINVAL;
-    vfs_file_t *target = fd_lookup(proc, fd);
-    if (!target)
+    }
+    vfs_file_t *target = fd_lookup_ref(proc, fd);
+    if (!target) {
+        file_release(epf);
         return -EBADF;
-    if (target->backend == VFS_BACKEND_EPOLL)
+    }
+    if (target->backend == VFS_BACKEND_EPOLL) {
+        file_release(target);
+        file_release(epf);
         return -EINVAL;
+    }
+    file_release(target);
 
+    unsigned long eflags = spin_lock_irqsave(&epf->lock);
     epoll_item_t *prev = NULL;
     epoll_item_t *curr = epf->u.epoll.items;
     while (curr) {
@@ -2776,42 +4742,53 @@ int vfs_epoll_ctl(int epfd, int op, int fd, uint32_t events, uint64_t data)
         curr = curr->next;
     }
 
+    int rc = 0;
     switch (op) {
-    case EPOLL_CTL_ADD:
-        if (curr)
-            return -EEXIST;
+    case EPOLL_CTL_ADD: {
+        if (curr) {
+            rc = -EEXIST;
+            break;
+        }
         epoll_item_t *item = (epoll_item_t *)kmalloc(sizeof(epoll_item_t));
-        if (!item)
-            return -ENOMEM;
+        if (!item) {
+            rc = -ENOMEM;
+            break;
+        }
         item->fd = fd;
         item->events = events;
         item->data = data;
         item->next = epf->u.epoll.items;
         epf->u.epoll.items = item;
         epf->u.epoll.count++;
-        return 0;
-
+        break;
+    }
     case EPOLL_CTL_MOD:
-        if (!curr)
-            return -ENOENT;
+        if (!curr) {
+            rc = -ENOENT;
+            break;
+        }
         curr->events = events;
         curr->data = data;
-        return 0;
-
+        break;
     case EPOLL_CTL_DEL:
-        if (!curr)
-            return -ENOENT;
+        if (!curr) {
+            rc = -ENOENT;
+            break;
+        }
         if (prev)
             prev->next = curr->next;
         else
             epf->u.epoll.items = curr->next;
         epf->u.epoll.count--;
         kfree(curr);
-        return 0;
-
+        break;
     default:
-        return -EINVAL;
+        rc = -EINVAL;
+        break;
     }
+    spin_unlock_irqrestore(&epf->lock, eflags);
+    file_release(epf);
+    return rc;
 }
 
 int vfs_epoll_wait(int epfd, epoll_event_t *events, int maxevents, int timeout_ms)
@@ -2821,14 +4798,19 @@ int vfs_epoll_wait(int epfd, epoll_event_t *events, int maxevents, int timeout_m
         return -EBADF;
     if (!events || maxevents <= 0 || maxevents > 256)
         return -EINVAL;
-    vfs_file_t *epf = fd_lookup(proc, epfd);
+    vfs_file_t *epf = fd_lookup_ref(proc, epfd);
     if (!epf)
         return -EBADF;
-    if (epf->backend != VFS_BACKEND_EPOLL)
+    if (epf->backend != VFS_BACKEND_EPOLL) {
+        file_release(epf);
         return -EINVAL;
+    }
 
+    unsigned long eflags = spin_lock_irqsave(&epf->lock);
     int count = epf->u.epoll.count;
     if (count == 0) {
+        spin_unlock_irqrestore(&epf->lock, eflags);
+        file_release(epf);
         if (timeout_ms == 0)
             return 0;
         return vfs_poll(NULL, 0, timeout_ms);
@@ -2839,8 +4821,11 @@ int vfs_epoll_wait(int epfd, epoll_event_t *events, int maxevents, int timeout_m
     int is_heap = 0;
     if (count > 64) {
         pfds = (vfs_pollfd_t *)kmalloc((size_t)count * sizeof(vfs_pollfd_t));
-        if (!pfds)
+        if (!pfds) {
+            spin_unlock_irqrestore(&epf->lock, eflags);
+            file_release(epf);
             return -ENOMEM;
+        }
         is_heap = 1;
     }
 
@@ -2853,14 +4838,17 @@ int vfs_epoll_wait(int epfd, epoll_event_t *events, int maxevents, int timeout_m
         item = item->next;
         idx++;
     }
+    spin_unlock_irqrestore(&epf->lock, eflags);
 
     int ret = vfs_poll(pfds, (size_t)idx, timeout_ms);
     if (ret <= 0) {
         if (is_heap)
             kfree(pfds);
+        file_release(epf);
         return ret;
     }
 
+    eflags = spin_lock_irqsave(&epf->lock);
     int num_ready = 0;
     for (int i = 0; i < idx && num_ready < maxevents; i++) {
         if (pfds[i].revents) {
@@ -2876,61 +4864,130 @@ int vfs_epoll_wait(int epfd, epoll_event_t *events, int maxevents, int timeout_m
             }
         }
     }
+    spin_unlock_irqrestore(&epf->lock, eflags);
 
     if (is_heap)
         kfree(pfds);
+    file_release(epf);
     return num_ready;
 }
 
-/* stat/fstat/cwd/list */
+/* stat/lstat/fstat/cwd/list/getdents64 */
 
-int vfs_stat(const char *path, vfs_stat_t *out)
+static int vfs_stat_common(const char *path, int follow_last, vfs_stat_t *out)
 {
     process_t *proc = vfs_current_process();
-    const vfs_mount_t *m;
+    vfs_mount_t *m = NULL;
     char abs[VFS_PATH_MAX];
     char sub[VFS_PATH_MAX];
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
+    int rc;
 
     if (!path || !out)
-        return -1;
-    if (normalize_path_for_process(proc, path, abs, VFS_PATH_MAX) != 0)
-        return -1;
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, path, follow_last, abs, &m, sub, &exists, &type);
+    if (rc != 0 || !m)
+        return (rc < 0) ? rc : -ENOENT;
+    if (!exists) {
+        mount_unref(m);
+        return -ENOENT;
+    }
 
-    /* Check if an AF_UNIX listener is bound to this path */
     unix_listener_t *lst = unix_find_listener(abs);
     if (lst) {
-        out->size = 0;
-        out->blocks = 0;
+        for (size_t i = 0; i < sizeof(*out); i++)
+            ((uint8_t *)out)[i] = 0;
         out->type = VFS_TYPE_SOCKET;
         out->mode = VFS_MODE_READ | VFS_MODE_WRITE;
+        vfs_stat_finalize(out, m->mount_id, vfs_hash_str(abs));
+        mount_unref(m);
         return 0;
     }
 
-    m = mount_lookup(abs);
-    if (!m)
-        return -1;
-    if (mount_subpath(m, abs, sub, VFS_PATH_MAX) != 0)
-        return -1;
-    return backend_stat(m, sub, out);
+    rc = backend_stat_mode(m, sub, follow_last, out);
+    mount_unref(m);
+    return rc;
+}
+
+int vfs_stat(const char *path, vfs_stat_t *out)
+{
+    return vfs_stat_common(path, 1, out);
+}
+
+int vfs_lstat(const char *path, vfs_stat_t *out)
+{
+    return vfs_stat_common(path, 0, out);
 }
 
 int vfs_fstat(int fd, vfs_stat_t *out)
 {
     process_t *proc = vfs_current_process();
-    vfs_file_t *f = fd_lookup(proc, fd);
-    if (!f || !out)
-        return -1;
-    out->size = vfs_size(fd);
-    out->blocks = (out->size + 511) / 512;
-    out->mode = f->mode;
-    if (f->backend == VFS_BACKEND_PIPE)
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    if (!f || !out) {
+        if (f) file_release(f);
+        return -EBADF;
+    }
+    for (size_t i = 0; i < sizeof(*out); i++)
+        ((uint8_t *)out)[i] = 0;
+
+    if (f->backend == VFS_BACKEND_TMPFS && f->u.tmpfs.inode) {
+        tmpfs_stat_inode(f->u.tmpfs.inode, out);
+        out->mode = f->mode;
+        vfs_stat_finalize(out, f->inode_dev, f->inode_ino);
+        file_release(f);
+        return 0;
+    }
+    if (f->backend == VFS_BACKEND_EXT4 && f->fs_ctx) {
+        if (ext4fs_fstat((ext4fs_t *)f->fs_ctx, f->u.ext4.handle, f->path, out) == 0) {
+            out->mode = f->mode;
+            vfs_stat_finalize(out, f->inode_dev, f->inode_ino);
+            file_release(f);
+            return 0;
+        }
+    }
+    if (f->backend == VFS_BACKEND_DEVFS && f->abs_path[0]) {
+        int rc = vfs_stat_common(f->abs_path, 1, out);
+        if (rc == 0) {
+            out->mode = f->mode;
+            file_release(f);
+            return 0;
+        }
+    }
+
+    size_t sz = 0;
+    if (f->backend == VFS_BACKEND_PIPE) {
+        if (f->u.pipe.pipe) {
+            unsigned long pflags = spin_lock_irqsave(&f->u.pipe.pipe->lock);
+            sz = f->u.pipe.pipe->size;
+            spin_unlock_irqrestore(&f->u.pipe.pipe->lock, pflags);
+        }
         out->type = VFS_TYPE_PIPE;
-    else if (f->backend == VFS_BACKEND_UNIXSOCK)
+    } else if (f->backend == VFS_BACKEND_UNIXSOCK) {
+        if (!f->u.sock.is_listener && f->u.sock.rx)
+            sz = unix_ring_avail(f->u.sock.rx);
         out->type = VFS_TYPE_SOCKET;
-    else if (f->backend == VFS_BACKEND_DEVFS)
+    } else if (f->backend == VFS_BACKEND_DEVFS) {
+        sz = (f->u.device.ops && f->u.device.ops->size) ? f->u.device.ops->size(f->u.device.priv) : 0;
         out->type = VFS_TYPE_CHAR;
-    else
+    } else if (f->is_dir) {
+        out->type = VFS_TYPE_DIR;
+    } else if (f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) {
+        fat32_dirent_t de;
+        sz = (f->u.fat32.vol && fat32_vol_stat(f->u.fat32.vol, f->path, &de) == 0)
+                 ? de.size
+                 : 0;
         out->type = VFS_TYPE_FILE;
+    } else {
+        sz = f->u.regular.size;
+        out->type = VFS_TYPE_FILE;
+    }
+
+    out->size = sz;
+    out->blocks = (sz + 511) / 512;
+    out->mode = f->mode;
+    vfs_stat_finalize(out, f->inode_dev, f->inode_ino ? f->inode_ino : (uint64_t)(uintptr_t)f);
+    file_release(f);
     return 0;
 }
 
@@ -2939,125 +4996,104 @@ int vfs_getcwd(char *buf, size_t size)
     process_t *proc = vfs_current_process();
     char *cwd = cwd_for_process(proc);
     if (!buf || size == 0 || !cwd)
-        return -1;
+        return -EINVAL;
     return kstrncpy(buf, cwd, (int)size);
 }
 
 int vfs_chdir(const char *path)
 {
     process_t *proc = vfs_current_process();
-    const vfs_mount_t *m;
+    vfs_mount_t *m = NULL;
     char abs[VFS_PATH_MAX];
     char sub[VFS_PATH_MAX];
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
     vfs_stat_t st;
     char *cwd;
+    int rc;
 
     if (!path)
-        return -1;
-    if (normalize_path_for_process(proc, path, abs, VFS_PATH_MAX) != 0)
-        return -1;
-
-    m = mount_lookup(abs);
-    if (!m)
-        return -1;
-    if (mount_subpath(m, abs, sub, VFS_PATH_MAX) != 0)
-        return -1;
-    if (backend_stat(m, sub, &st) != 0 || st.type != VFS_TYPE_DIR)
-        return -1;
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, path, 1, abs, &m, sub, &exists, &type);
+    if (rc != 0 || !m)
+        return (rc < 0) ? rc : -ENOENT;
+    if (!exists) {
+        mount_unref(m);
+        return -ENOENT;
+    }
+    rc = backend_stat(m, sub, &st);
+    mount_unref(m);
+    if (rc != 0)
+        return rc;
+    if (st.type != VFS_TYPE_DIR)
+        return -ENOTDIR;
 
     cwd = cwd_for_process(proc);
     if (!cwd)
-        return -1;
+        return -EINVAL;
     return kstrncpy(cwd, abs, VFS_PATH_MAX);
 }
 
-int vfs_list(const char *dir, char names[][VFS_NAME_MAX], int max)
+static int backend_list_dir(const char *abs, const vfs_mount_t *m, const char *sub,
+                            char names[][VFS_NAME_MAX], int max)
 {
-    process_t *proc = vfs_current_process();
-    const vfs_mount_t *m;
-    char abs[VFS_PATH_MAX];
-    char sub[VFS_PATH_MAX];
     int count = 0;
-
-    if (!dir || !names || max <= 0)
-        return -1;
-    if (normalize_path_for_process(proc, dir, abs, VFS_PATH_MAX) != 0)
-        return -1;
-    m = mount_lookup(abs);
-    if (!m)
-        return -1;
-    if (mount_subpath(m, abs, sub, VFS_PATH_MAX) != 0)
-        return -1;
-
     switch (m->backend) {
-    case VFS_BACKEND_MEMFS:
-    {
-        const char *rel = memfs_sub_to_rel(sub);
-        if (rel[0] && memfs_dir_find(m, rel) < 0)
-            return -1;
-        count = memfs_list_dir_entries(m, rel, names, max);
+    case VFS_BACKEND_TMPFS:
+        count = tmpfs_readdir((tmpfs_fs_t *)m->fs_private, sub, names, max);
+        if (count < 0)
+            return count;
         break;
-    }
-    case VFS_BACKEND_FAT12:
-    {
-        fat12_dirent_t entries[FAT12_MAX_DIRENT];
-        int n = fat12_list_dir(sub, entries, FAT12_MAX_DIRENT);
-        if (n < 0)
-            return -1;
-        for (int i = 0; i < n && count < max; i++) {
-            kstrncpy(names[count], entries[i].name, VFS_NAME_MAX);
-            count++;
-        }
+    case VFS_BACKEND_EXT4:
+        count = ext4fs_readdir((ext4fs_t *)m->fs_private, sub, names, max);
+        if (count < 0)
+            return count;
         break;
-    }
     case VFS_BACKEND_FAT32:
-    {
-        fat32_dirent_t entries[FAT32_MAX_DIRENT];
-        int n = fat32_list_dir(sub, entries, FAT32_MAX_DIRENT);
-        if (n < 0)
-            return -1;
-        for (int i = 0; i < n && count < max; i++) {
-            kstrncpy(names[count], entries[i].name, VFS_NAME_MAX);
-            count++;
-        }
-        break;
-    }
     case VFS_BACKEND_FAT32VOL:
     {
-        fat32_dirent_t entries[FAT32_MAX_DIRENT];
-        int n = fat32_vol_list_dir((fat32_volume_t *)m->ctx, sub,
-                                   entries, FAT32_MAX_DIRENT);
-        if (n < 0)
-            return -1;
+        int cap = (max < FAT32_MAX_DIRENT) ? max : FAT32_MAX_DIRENT;
+        fat32_dirent_t *entries = (fat32_dirent_t *)kmalloc((size_t)cap * sizeof(fat32_dirent_t));
+        if (!entries)
+            return -ENOMEM;
+        fat32_volume_t *vol = (m->backend == VFS_BACKEND_FAT32)
+                                  ? fat32_primary_vol()
+                                  : (fat32_volume_t *)m->fs_private;
+        int n = fat32_vol_list_dir(vol, sub, entries, cap);
+        if (n < 0) {
+            kfree(entries);
+            return -ENOENT;
+        }
         for (int i = 0; i < n && count < max; i++) {
             kstrncpy(names[count], entries[i].name, VFS_NAME_MAX);
             count++;
         }
+        kfree(entries);
         break;
     }
     case VFS_BACKEND_PROCFS:
         count = procfs_list(sub, names, max);
         if (count < 0)
-            return -1;
+            return -ENOENT;
         break;
     case VFS_BACKEND_SYSFS:
         count = sysfs_list(sub, names, max);
         if (count < 0)
-            return -1;
+            return -ENOENT;
         break;
     case VFS_BACKEND_BOOTFS:
         count = bootfs_list(sub, names, max);
         if (count < 0)
-            return -1;
+            return -ENOENT;
         break;
     case VFS_BACKEND_DEVFS:
         count = devfs_list(sub, names, max);
         if (count < 0)
-            return -1;
+            return -ENOENT;
         break;
     case VFS_BACKEND_INITRD:
         if (!kstreq(sub, "/"))
-            return -1;
+            return -ENOTDIR;
         if (g_initrd_ok) {
             kstrncpy(names[0], "initrd", VFS_NAME_MAX);
             count = 1;
@@ -3066,17 +5102,160 @@ int vfs_list(const char *dir, char names[][VFS_NAME_MAX], int max)
         }
         break;
     case VFS_BACKEND_TAR:
-        count = tar_list_dir((tar_fs_t *)m->ctx, sub, names, max);
+        count = tar_list_dir((tar_fs_t *)m->fs_private, sub, names, max);
         if (count < 0)
-            return -1;
+            return -ENOENT;
         break;
     default:
-        return -1;
+        return -ENOENT;
     }
 
     if (kstreq(abs, "/"))
         count = append_root_mount_names(names, count, max);
     return count;
+}
+
+int vfs_list(const char *dir, char names[][VFS_NAME_MAX], int max)
+{
+    process_t *proc = vfs_current_process();
+    vfs_mount_t *m = NULL;
+    char abs[VFS_PATH_MAX];
+    char sub[VFS_PATH_MAX];
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
+    int rc;
+
+    if (!dir || !names || max <= 0)
+        return -EINVAL;
+    rc = vfs_resolve_path_ex(proc, dir, 1, abs, &m, sub, &exists, &type);
+    if (rc != 0 || !m)
+        return (rc < 0) ? rc : -ENOENT;
+    if (!exists) {
+        mount_unref(m);
+        return -ENOENT;
+    }
+    int count = backend_list_dir(abs, m, sub, names, max);
+    mount_unref(m);
+    return (count < 0) ? -1 : count;
+}
+
+static uint8_t vfs_type_to_dt(uint32_t vtype)
+{
+    switch (vtype) {
+    case VFS_TYPE_DIR:     return DT_DIR;
+    case VFS_TYPE_FILE:    return DT_REG;
+    case VFS_TYPE_SYMLINK: return DT_LNK;
+    case VFS_TYPE_CHAR:    return DT_CHR;
+    case VFS_TYPE_BLOCK:   return DT_BLK;
+    case VFS_TYPE_PIPE:    return DT_FIFO;
+    case VFS_TYPE_SOCKET:  return DT_SOCK;
+    default:               return DT_UNKNOWN;
+    }
+}
+
+long vfs_getdents64(int fd, void *dirp, size_t count)
+{
+    process_t *proc = vfs_current_process();
+    if (!dirp)
+        return -EFAULT;
+    if (count == 0)
+        return -EINVAL;
+
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    if (!f)
+        return -EBADF;
+    if (!f->is_dir) {
+        file_release(f);
+        return -ENOTDIR;
+    }
+
+    const int max_entries = 128;
+    char (*names)[VFS_NAME_MAX] = (char (*)[VFS_NAME_MAX])kmalloc((size_t)max_entries * VFS_NAME_MAX);
+    if (!names) {
+        file_release(f);
+        return -ENOMEM;
+    }
+
+    kstrncpy(names[0], ".", VFS_NAME_MAX);
+    kstrncpy(names[1], "..", VFS_NAME_MAX);
+
+    vfs_mount_t *m = mount_lookup_ref(f->abs_path);
+    if (!m) {
+        kfree(names);
+        file_release(f);
+        return -ENOENT;
+    }
+    char sub[VFS_PATH_MAX];
+    if (mount_subpath(m, f->abs_path, sub, VFS_PATH_MAX) != 0) {
+        mount_unref(m);
+        kfree(names);
+        file_release(f);
+        return -EINVAL;
+    }
+    int bcnt = backend_list_dir(f->abs_path, m, sub, names + 2, max_entries - 2);
+    mount_unref(m);
+    if (bcnt < 0)
+        bcnt = 0;
+    int total = 2 + bcnt;
+
+    unsigned long fflags = spin_lock_irqsave(&f->lock);
+    size_t start_idx = f->pos;
+    spin_unlock_irqrestore(&f->lock, fflags);
+
+    size_t written = 0;
+    size_t cur_idx = start_idx;
+    uint8_t *out_bytes = (uint8_t *)dirp;
+
+    for (size_t idx = start_idx; idx < (size_t)total; idx++) {
+        int nlen = kstrlen(names[idx]);
+        size_t hdr = offsetof(struct linux_dirent64, d_name);
+        size_t reclen = (hdr + (size_t)nlen + 1U + 7U) & ~(size_t)7U;
+        if (written + reclen > count) {
+            if (written == 0) {
+                kfree(names);
+                file_release(f);
+                return -EINVAL;
+            }
+            break;
+        }
+
+        uint64_t dino = f->inode_ino ? f->inode_ino : 1ULL;
+        uint8_t dtype = DT_DIR;
+        if (idx >= 2U) {
+            char child_abs[VFS_PATH_MAX];
+            vfs_stat_t cst;
+            if (path_copy_join(child_abs, VFS_PATH_MAX, f->abs_path, names[idx]) == 0 &&
+                vfs_lstat(child_abs, &cst) == 0) {
+                dtype = vfs_type_to_dt(cst.type);
+                dino = cst.st_ino ? cst.st_ino : vfs_hash_str(child_abs);
+            } else {
+                dtype = DT_UNKNOWN;
+                dino = (uint64_t)(idx + 1U);
+            }
+        }
+
+        for (size_t z = 0; z < reclen; z++)
+            out_bytes[written + z] = 0;
+
+        struct linux_dirent64 *de = (struct linux_dirent64 *)(out_bytes + written);
+        de->d_ino = dino;
+        de->d_off = (int64_t)(idx + 1U);
+        de->d_reclen = (uint16_t)reclen;
+        de->d_type = dtype;
+        for (int c = 0; c <= nlen; c++)
+            de->d_name[c] = names[idx][c];
+
+        written += reclen;
+        cur_idx = idx + 1U;
+    }
+
+    fflags = spin_lock_irqsave(&f->lock);
+    f->pos = cur_idx;
+    spin_unlock_irqrestore(&f->lock, fflags);
+
+    kfree(names);
+    file_release(f);
+    return (long)written;
 }
 
 int vfs_process_inherit(struct process *dst, const struct process *src)
@@ -3094,15 +5273,15 @@ int vfs_process_inherit(struct process *dst, const struct process *src)
     if (!src)
         return 0;
 
+    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
     for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
-        vfs_file_t *f = fd_lookup_on_table(src_tbl, i);
-        if (!f)
+        vfs_file_t *f = (vfs_file_t *)src_tbl[i];
+        if (!f || f == (vfs_file_t *)(uintptr_t)1)
             continue;
-        unsigned long aflags = spin_lock_irqsave(&g_vfs_alloc_lock);
-        f->refcount++;
-        spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
+        file_ref(f);
         dst_tbl[i] = f;
     }
+    spin_unlock_irqrestore(&g_fd_lock, flags);
     return 0;
 }
 
@@ -3119,15 +5298,24 @@ int vfs_process_dup2(struct process *dst,
 
     dst_tbl = fd_table_for_process((process_t *)dst);
     src_tbl = fd_table_for_process((process_t *)src);
-    f = fd_lookup_on_table(src_tbl, src_fd);
-    if (!f)
+
+    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
+    f = (vfs_file_t *)src_tbl[src_fd];
+    if (!f || f == (vfs_file_t *)(uintptr_t)1) {
+        spin_unlock_irqrestore(&g_fd_lock, flags);
         return -1;
+    }
+    file_ref(f);
+    spin_unlock_irqrestore(&g_fd_lock, flags);
 
     fd_close_on_table(dst_tbl, dst_fd);
-    unsigned long aflags = spin_lock_irqsave(&g_vfs_alloc_lock);
-    f->refcount++;
-    spin_unlock_irqrestore(&g_vfs_alloc_lock, aflags);
+
+    flags = spin_lock_irqsave(&g_fd_lock);
+    vfs_file_t *old = (vfs_file_t *)dst_tbl[dst_fd];
     dst_tbl[dst_fd] = f;
+    spin_unlock_irqrestore(&g_fd_lock, flags);
+    if (old && old != (vfs_file_t *)(uintptr_t)1)
+        file_release(old);
     return 0;
 }
 
@@ -3264,8 +5452,14 @@ void vfs_run_guide12_selftests(void)
             pl = kstrlen(bd->parent->name);
             for (int c = 0; c < pl; c++)
                 if (bd->name[c] != bd->parent->name[c]) ok = 0;
-            if (bd->name[pl] < '1' || bd->name[pl] > '9' || bd->name[pl + 1])
-                ok = 0;
+            if (bd->parent->type == BLOCKDEV_TYPE_NVME) {
+                if (bd->name[pl] != 'p' || bd->name[pl + 1] < '1' ||
+                    bd->name[pl + 1] > '9')
+                    ok = 0;
+            } else {
+                if (bd->name[pl] < '1' || bd->name[pl] > '9')
+                    ok = 0;
+            }
         }
         if (ok) {
             kprintf("[guide12] registry/naming PASS (%d partition(s))\n",
@@ -3380,7 +5574,7 @@ void vfs_run_guide12_selftests(void)
 
             if (ok) {
                 const vfs_mount_t *m;
-                mnt[0] = '/'; mnt[1] = 'd'; mnt[2] = 'e'; mnt[3] = 'v';
+                mnt[0] = '/'; mnt[1] = 'm'; mnt[2] = 'n'; mnt[3] = 't';
                 mnt[4] = '/';
                 kstrncpy(mnt + 5, data_part->name, VFS_PATH_MAX - 5);
                 m = mount_lookup(mnt);
@@ -3400,7 +5594,7 @@ void vfs_run_guide12_selftests(void)
             }
 
             if (ok) {
-                kprintf("[guide12] planted-file r/w via /dev/%s PASS\n",
+                kprintf("[guide12] planted-file r/w via /mnt/%s PASS\n",
                         data_part->name);
                 pass++;
             } else {
@@ -3473,10 +5667,6 @@ void vfs_run_guide12_selftests(void)
 /* create/LFN/grow write path (exercised on the disposable /disk */
 /* scratch volume), and the preflight validator. */
 
-#ifdef __x86_64__
-#include "../sys/installer.h"
-#endif
-
 void vfs_run_guide13_selftests(void)
 {
     int pass = 0, fail = 0;
@@ -3485,7 +5675,7 @@ void vfs_run_guide13_selftests(void)
 
     {
         static const char *const mods[] = {
-            "/bootblob.bin", "/tsukasa_x64.elf", "/initrd.img",
+            "/bootblob.bin", "/tsukasa_x64.elf", "/initrd.tar.lz4",
             "/limine-bios.sys",
         };
         vfs_stat_t st;
@@ -3580,40 +5770,6 @@ void vfs_run_guide13_selftests(void)
             fail++;
         }
     }
-
-#ifdef __x86_64__
-    {
-        char err[96];
-        int ok = 1;
-        block_dev_t *raw = blockdev_first_raw_fat32();
-        block_dev_t *some_part = NULL;
-        vfs_stat_t st;
-        int sources = (bootfs_stat("/bootblob.bin", &st) == 0 && st.size > 0);
-
-        if (installer_preflight(NULL, err, sizeof(err)) != -1)
-            ok = 0;
-        for (int i = 0; i < blockdev_count() && !some_part; i++) {
-            block_dev_t *bd = blockdev_at(i);
-            if (bd && bd->is_partition)
-                some_part = bd;
-        }
-        if (some_part &&
-            installer_preflight(some_part, err, sizeof(err)) != -1)
-            ok = 0;
-        if (sources && raw &&
-            raw->sector_count >= INSTALLER_MIN_SECTORS) {
-            if (installer_preflight(raw, err, sizeof(err)) != 0)
-                ok = 0;
-        }
-        if (ok) {
-            kprintf("[guide13] installer preflight PASS\n");
-            pass++;
-        } else {
-            kprintf("[guide13] installer preflight FAIL (%s)\n", err);
-            fail++;
-        }
-    }
-#endif
 
     kprintf("[guide13][test] done pass=%d fail=%d\n", pass, fail);
 }

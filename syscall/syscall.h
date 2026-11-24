@@ -61,13 +61,16 @@
 #define FS_CMD_RENAME      25
 
 
-#define TSUKASA_O_RDONLY   0x0001
-#define TSUKASA_O_WRONLY   0x0002
-#define TSUKASA_O_RDWR     (TSUKASA_O_RDONLY | TSUKASA_O_WRONLY)
-#define TSUKASA_O_APPEND   0x0004
-#define TSUKASA_O_CREAT    0x0008
-#define TSUKASA_O_TRUNC    0x0010
-#define TSUKASA_O_NONBLOCK 0x0020
+#define TSUKASA_O_RDONLY    0x0001
+#define TSUKASA_O_WRONLY    0x0002
+#define TSUKASA_O_RDWR      (TSUKASA_O_RDONLY | TSUKASA_O_WRONLY)
+#define TSUKASA_O_APPEND    0x0004
+#define TSUKASA_O_CREAT     0x0008
+#define TSUKASA_O_TRUNC     0x0010
+#define TSUKASA_O_NONBLOCK  0x0020
+#define TSUKASA_O_EXCL      0x0040
+#define TSUKASA_O_NOFOLLOW  0x0080
+#define TSUKASA_O_DIRECTORY 0x0100
 
 #define TSUKASA_F_GETFL    1
 #define TSUKASA_F_SETFL    2
@@ -97,12 +100,26 @@
 #define TSUKASA_STAT_TYPE_CHAR    4
 #define TSUKASA_STAT_TYPE_BLOCK   5
 #define TSUKASA_STAT_TYPE_SOCKET  6
+#define TSUKASA_STAT_TYPE_SYMLINK 7
 
 struct tsukasa_stat {
     uint64_t size;
     uint32_t type;
     uint32_t mode;
     uint64_t blocks;
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint32_t st_mode;
+    uint32_t st_nlink;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint64_t st_rdev;
+    uint64_t st_size;
+    uint64_t st_blksize;
+    uint64_t st_blocks;
+    int64_t  st_atime;
+    int64_t  st_mtime;
+    int64_t  st_ctime;
 };
 
 struct tsukasa_pollfd {
