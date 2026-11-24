@@ -134,26 +134,45 @@ OBJS += lib/ubsan.o
 endif
 ISO_TARGET = iso-x86_64
 
-.PHONY: all iso initrd clean iso-x86_64 limine-artifacts sdk apps vanilla coreutils disktools ports check libc libc-tests
+DEPFLAGS = -MMD -MP -MF $(@:.o=.d)
+DEPS = $(OBJS:.o=.d) $(SDK_OBJS:.o=.d) $(TK_OBJS:.o=.d) lib/ksymbols_table.d
+KERNEL_FLAGS_STAMP = build/.kernel_flags
+SDK_FLAGS_STAMP = build/.sdk_flags
+KERNEL_BUILD_SIG := $(TOOLCHAIN)|$(CC)|$(CFLAGS)|$(ASM)|$(ASMFLAGS)
+SDK_BUILD_SIG := $(TOOLCHAIN)|$(SDK_CC)|$(SDK_CFLAGS)
+
+.PHONY: all iso initrd clean iso-x86_64 limine-artifacts sdk apps vanilla coreutils disktools ports check libc libc-tests FORCE
 
 all: $(KERNEL_BIN)
 
 iso: $(ISO_TARGET)
+
+FORCE:
+
+$(KERNEL_FLAGS_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@printf '%s\n' '$(KERNEL_BUILD_SIG)' > $@.tmp
+	@if [ ! -f $@ ] || ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+$(SDK_FLAGS_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@printf '%s\n' '$(SDK_BUILD_SIG)' > $@.tmp
+	@if [ ! -f $@ ] || ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm -f $@.tmp; fi
 
 LWEXT4_INCLUDES = -Ifs/third_party/lwext4/compat -Ifs/third_party/lwext4/include
 
 fs/third_party/lwext4/src/%.o: CFLAGS := $(LWEXT4_INCLUDES) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter -Wno-unused-but-set-variable
 fs/ext4fs.o: CFLAGS := $(LWEXT4_INCLUDES) $(CFLAGS)
 
-%.o: %.c
+%.o: %.c $(KERNEL_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-%.o: %.s
+%.o: %.s $(KERNEL_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-%.o: %.asm
+%.o: %.asm $(KERNEL_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
 	$(ASM) $(ASMFLAGS) -o $@ $<
 
@@ -164,9 +183,9 @@ lib/ksymbols_table.c:
 	@echo 'const struct ksym ksym_table[] = {};' >> $@
 	@echo 'const unsigned long ksym_count = 0;' >> $@
 
-lib/ksymbols_table.o: lib/ksymbols_table.c
+lib/ksymbols_table.o: lib/ksymbols_table.c $(KERNEL_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(KERNEL_BIN): $(OBJS) lib/ksymbols_table.o
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) lib/ksymbols_table.o
@@ -203,23 +222,23 @@ SDK_CFLAGS = -ffreestanding -fno-pie -fstack-protector-strong -mstack-protector-
              -O2 -Wall -Wextra -Iuser/crt
 SDK_OBJS   = user/crt/crt0.o user/crt/syscalls.o user/crt/stdio_lite.o
 
-user/crt/crt0.o: user/crt/crt0.asm
+user/crt/crt0.o: user/crt/crt0.asm $(SDK_FLAGS_STAMP)
 	nasm -f elf64 -o $@ $<
 
-user/crt/syscalls.o: user/crt/syscalls.c user/crt/tsukasa_sdk.h
-	$(SDK_CC) $(SDK_CFLAGS) -c -o $@ $<
+user/crt/syscalls.o: user/crt/syscalls.c user/crt/tsukasa_sdk.h $(SDK_FLAGS_STAMP)
+	$(SDK_CC) $(SDK_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-user/crt/stdio_lite.o: user/crt/stdio_lite.c user/crt/tsukasa_sdk.h
-	$(SDK_CC) $(SDK_CFLAGS) -c -o $@ $<
+user/crt/stdio_lite.o: user/crt/stdio_lite.c user/crt/tsukasa_sdk.h $(SDK_FLAGS_STAMP)
+	$(SDK_CC) $(SDK_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 
-$(INITRD_BIN)/%.elf: user/cli/%.c $(SDK_OBJS) user/crt/tsukasa_app.ld
+$(INITRD_BIN)/%.elf: user/cli/%.c $(SDK_OBJS) user/crt/tsukasa_app.ld $(SDK_FLAGS_STAMP)
 	@mkdir -p $(INITRD_BIN)
 	$(SDK_CC) $(SDK_CFLAGS) -c -o user/cli/$*.o $<
 	$(LD) -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
 	    -o $@ user/crt/crt0.o user/cli/$*.o user/crt/syscalls.o user/crt/stdio_lite.o
 
-$(INITRD_BIN)/hellosdk.elf: user/examples/hello.c $(SDK_OBJS) user/crt/tsukasa_app.ld
+$(INITRD_BIN)/hellosdk.elf: user/examples/hello.c $(SDK_OBJS) user/crt/tsukasa_app.ld $(SDK_FLAGS_STAMP)
 	@mkdir -p $(INITRD_BIN)
 	$(SDK_CC) $(SDK_CFLAGS) -c -o user/examples/hello.o user/examples/hello.c
 	$(LD) -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
@@ -228,16 +247,16 @@ $(INITRD_BIN)/hellosdk.elf: user/examples/hello.c $(SDK_OBJS) user/crt/tsukasa_a
 TK_OBJS = user/tk/tk_client.sdk.o user/tk/tk_painter.sdk.o user/tk/tk_app.sdk.o \
           user/lib/libwidget.sdk.o gfx/font_8x8.sdk.o
 
-user/tk/%.sdk.o: user/tk/%.c user/crt/tsukasa_sdk.h
-	$(SDK_CC) $(SDK_CFLAGS) -c -o $@ $<
+user/tk/%.sdk.o: user/tk/%.c user/crt/tsukasa_sdk.h $(SDK_FLAGS_STAMP)
+	$(SDK_CC) $(SDK_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-user/lib/libwidget.sdk.o: user/lib/libwidget.c user/include/libwidget.h
-	$(SDK_CC) $(SDK_CFLAGS) -c -o $@ $<
+user/lib/libwidget.sdk.o: user/lib/libwidget.c user/include/libwidget.h $(SDK_FLAGS_STAMP)
+	$(SDK_CC) $(SDK_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-gfx/font_8x8.sdk.o: gfx/font_8x8.c gfx/font_8x8.h
-	$(SDK_CC) $(SDK_CFLAGS) -c -o $@ $<
+gfx/font_8x8.sdk.o: gfx/font_8x8.c gfx/font_8x8.h $(SDK_FLAGS_STAMP)
+	$(SDK_CC) $(SDK_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-$(INITRD_BIN)/wdemo16.elf: user/cli/wdemo16.c $(SDK_OBJS) $(TK_OBJS) user/crt/tsukasa_app.ld
+$(INITRD_BIN)/wdemo16.elf: user/cli/wdemo16.c $(SDK_OBJS) $(TK_OBJS) user/crt/tsukasa_app.ld $(SDK_FLAGS_STAMP)
 	@mkdir -p $(INITRD_BIN)
 	$(SDK_CC) $(SDK_CFLAGS) -c -o user/cli/wdemo16.o $<
 	$(LD) -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
@@ -261,7 +280,7 @@ ports: vanilla
 libc-tests: libc
 	$(MAKE) TOOLCHAIN=$(TOOLCHAIN) -C tsukasa-libc all check
 
-$(INITRD_BIN)/TESTDRV.ELF: user/cli/testdrv.c $(SDK_OBJS) user/crt/tsukasa_app.ld
+$(INITRD_BIN)/TESTDRV.ELF: user/cli/testdrv.c $(SDK_OBJS) user/crt/tsukasa_app.ld $(SDK_FLAGS_STAMP)
 	@mkdir -p $(INITRD_BIN)
 	$(SDK_CC) $(SDK_CFLAGS) -c -o user/cli/testdrv.o $<
 	$(LD) -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
@@ -427,6 +446,7 @@ bootblob.bin: limine-artifacts
 	rm -f .bootblob-template.img
 
 iso-x86_64: $(KERNEL_BIN) limine-artifacts bootblob.bin $(INITRD_IMG)
+	rm -rf $(BOOT_DIR) $(EFI_BOOT_DIR)
 	@mkdir -p $(BOOT_DIR) $(LIMINE_BOOT_DIR) $(EFI_BOOT_DIR)
 	cp $(KERNEL_BIN) $(BOOT_DIR)/tsukasa_x64.elf
 	cp bootblob.bin $(BOOT_DIR)/
@@ -465,9 +485,12 @@ vnc-run: iso-x86_64
 
 clean:
 	find . -name '*.o' -delete
+	find . -name '*.d' -delete
 	rm -f tsukasa_x64.elf $(ISO_IMAGE) $(INITRD_IMG) $(INITRD_TAR) lib/ksymbols_table.c
-	rm -rf $(ISO_DIR) $(SDK_DIR) build
+	rm -rf $(BOOT_DIR) $(EFI_BOOT_DIR) $(SDK_DIR) build
 	$(MAKE) -C vanilla clean
 	$(MAKE) -C tsukasa-disktools clean
 	$(MAKE) -C tsukasa-coreutils clean
 	$(MAKE) -C tsukasa-libc clean
+
+-include $(DEPS)
