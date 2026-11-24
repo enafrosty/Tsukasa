@@ -300,9 +300,22 @@ int process_wake_blocked(process_t *p);
 void process_dump_memory_state(void);
 int process_snapshot(process_snapshot_t *out, int max);
 int process_get_info(int pid, process_snapshot_t *out);
+typedef struct process_mem_breakdown {
+    size_t proc_count;
+    size_t mapped_pages;
+    size_t shm_pages;
+    size_t shm_attachments;
+    size_t anon_pages;
+    size_t file_pages;
+    size_t stack_pages;
+    size_t heap_pages;
+    size_t kernel_stack_pages;
+} process_mem_breakdown_t;
+
 void process_get_memory_totals(size_t *proc_count_out,
                                size_t *mapped_pages_out,
                                size_t *shm_pages_out,
                                size_t *shm_attachments_out);
+void process_get_memory_breakdown(process_mem_breakdown_t *out);
 
 #endif /* TSUKASA_PROCESS_H */

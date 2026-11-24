@@ -75,7 +75,8 @@ static void irq_vec_bit_clear(uint32_t vec)
 
 static int irq_vec_is_valid_handler_slot(uint8_t vec)
 {
-    return (vec >= 48u && vec != 64u && vec != 65u && vec != 128u && vec != 255u);
+    return (vec >= 48u && vec != 64u && vec != 65u && vec != 66u &&
+            vec != 128u && vec != 255u);
 }
 
 int irq_alloc_vectors(int count)

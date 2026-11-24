@@ -4737,72 +4737,69 @@ int vfs_kd_mode(void)
 void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t offset)
 {
     process_t *proc = vfs_current_process();
-    if (!proc || length == 0)
+    if (!proc || !proc->vm_space.owns_pml4 || length == 0)
         return (void *)-1;
 
-    /* Handle anonymous mmap (backing for user heap malloc) */
+    if ((prot & ~(VFS_PROT_READ | VFS_PROT_WRITE | VFS_PROT_EXEC)) != 0)
+        return (void *)(intptr_t)-EINVAL;
+
+    /* Handle anonymous mmap (backing for user heap and anonymous regions). */
     if ((flags & VFS_MAP_ANONYMOUS) || fd == -1) {
         uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
         if (length > SIZE_MAX - page_mask)
-            return (void *)-1;
-        size_t page_count = (length + page_mask) / PAGE_SIZE;
-        uintptr_t target_va;
+            return (void *)(intptr_t)-ENOMEM;
+        size_t span = (length + page_mask) & ~page_mask;
+        size_t page_count = span / PAGE_SIZE;
+        uintptr_t target_va = 0;
 
-        if (addr != NULL && paging_is_page_aligned_uintptr((uintptr_t)addr) &&
-            paging_range_is_user((uintptr_t)addr, page_count * PAGE_SIZE)) {
-            target_va = (uintptr_t)addr;
+        vm_space_mmap_write_lock(&proc->vm_space);
+
+        if (flags & VFS_MAP_FIXED) {
+            uintptr_t req_va = (uintptr_t)addr;
+            if (!req_va || !paging_is_page_aligned_uintptr(req_va)) {
+                vm_space_mmap_write_unlock(&proc->vm_space);
+                return (void *)(intptr_t)-EINVAL;
+            }
+            if (!paging_range_is_user(req_va, span)) {
+                vm_space_mmap_write_unlock(&proc->vm_space);
+                return (void *)(intptr_t)-ENOMEM;
+            }
+            (void)vma_unmap_range(&proc->vm_space, req_va, span);
+            target_va = req_va;
         } else {
-            target_va = vm_space_reserve_anon_range(&proc->vm_space, page_count);
+            if (addr != NULL && paging_is_page_aligned_uintptr((uintptr_t)addr) &&
+                paging_range_is_user((uintptr_t)addr, span)) {
+                uintptr_t hint = (uintptr_t)addr;
+                target_va = vma_find_unmapped_area(&proc->vm_space, hint, hint + span, span);
+            }
             if (!target_va)
-                return (void *)-1;
-        }
-
-        uint64_t map_flags = PAGING_MAP_USER;
-        if (prot & VFS_PROT_READ)
-            map_flags |= PAGING_MAP_READ;
-        if (prot & VFS_PROT_WRITE)
-            map_flags |= PAGING_MAP_WRITE;
-
-        for (size_t i = 0; i < page_count; i++) {
-            uintptr_t phys = pmm_alloc_pages(1);
-            if (!phys) {
-                for (size_t j = 0; j < i; j++) {
-                    uintptr_t va = target_va + j * PAGE_SIZE;
-                    uint64_t q_phys = 0, q_flags = 0;
-                    if (vmm_query_page(proc->vm_space.pml4_phys, va, &q_phys, &q_flags) == 0 &&
-                        (q_flags & VMM_X64_PTE_PRESENT)) {
-                        if (vm_space_unmap_user_pages(&proc->vm_space, va, 1) == 0 &&
-                            q_phys != 0 && (q_flags & VMM_X64_PTE_USER)) {
-                            pmm_free_pages((uintptr_t)q_phys, 1);
-                        }
-                    }
-                }
-                return (void *)-1;
-            }
-            uint8_t *kva = (uint8_t *)vmm_phys_to_virt(phys);
-            k_memset(kva, 0, PAGE_SIZE);
-            if (vm_space_map_user_pages(&proc->vm_space, target_va + i * PAGE_SIZE, phys, 1, map_flags) != 0) {
-                pmm_free_pages(phys, 1);
-                for (size_t j = 0; j < i; j++) {
-                    uintptr_t va = target_va + j * PAGE_SIZE;
-                    uint64_t q_phys = 0, q_flags = 0;
-                    if (vmm_query_page(proc->vm_space.pml4_phys, va, &q_phys, &q_flags) == 0 &&
-                        (q_flags & VMM_X64_PTE_PRESENT)) {
-                        if (vm_space_unmap_user_pages(&proc->vm_space, va, 1) == 0 &&
-                            q_phys != 0 && (q_flags & VMM_X64_PTE_USER)) {
-                            pmm_free_pages((uintptr_t)q_phys, 1);
-                        }
-                    }
-                }
-                return (void *)-1;
+                target_va = vm_space_reserve_anon_range(&proc->vm_space, page_count);
+            if (!target_va) {
+                vm_space_mmap_write_unlock(&proc->vm_space);
+                return (void *)(intptr_t)-ENOMEM;
             }
         }
+
+        uint32_t vma_prot = 0;
+        if (prot & VFS_PROT_READ)  vma_prot |= VMA_PROT_READ;
+        if (prot & VFS_PROT_WRITE) vma_prot |= VMA_PROT_WRITE;
+        if (prot & VFS_PROT_EXEC)  vma_prot |= VMA_PROT_EXEC;
+
+        uint32_t vma_flags = VMA_FLAG_ANON |
+                             ((flags & VFS_MAP_SHARED) ? VMA_FLAG_SHARED : VMA_FLAG_PRIVATE);
+
+        vm_area_t *vma = vma_insert(&proc->vm_space, target_va, target_va + span,
+                                    vma_prot, vma_flags);
+        vm_space_mmap_write_unlock(&proc->vm_space);
+        if (!vma)
+            return (void *)(intptr_t)-ENOMEM;
+
         return (void *)target_va;
     }
 
     vfs_file_t *f = fd_lookup_ref(proc, fd);
     if (!f)
-        return (void *)-1;
+        return (void *)(intptr_t)-EBADF;
 
     void *res = (void *)-1;
     if (f->backend == VFS_BACKEND_DEVFS && f->u.device.ops && f->u.device.ops->mmap)
@@ -4814,25 +4811,27 @@ void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t of
 int vfs_munmap(void *addr, size_t length)
 {
     if (!addr || length == 0)
-        return -1;
+        return -EINVAL;
 
     process_t *proc = vfs_current_process();
     if (!proc || !proc->vm_space.owns_pml4)
-        return -1;
+        return -EINVAL;
 
     uintptr_t p = (uintptr_t)addr;
     uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
+    if (!paging_is_page_aligned_uintptr(p))
+        return -EINVAL;
     if (p + length < p || (p + length) > UINTPTR_MAX - page_mask)
-        return -1;
+        return -EINVAL;
 
-    uintptr_t base = p & ~page_mask;
+    uintptr_t base = p;
     uintptr_t end = (p + length + page_mask) & ~page_mask;
     if (end <= base)
-        return -1;
+        return -EINVAL;
 
     size_t span = (size_t)(end - base);
     if (!paging_range_is_user(base, span))
-        return -1;
+        return -EINVAL;
 
     size_t fb_sz = fb_byte_size();
     if (fb_sz > 0) {
@@ -4842,31 +4841,10 @@ int vfs_munmap(void *addr, size_t length)
             return fb_munmap((void *)base, span);
     }
 
-    size_t page_count = span / (size_t)PAGE_SIZE;
-    int unmap_err = 0;
-
-    for (size_t i = 0; i < page_count; i++) {
-        uint64_t va = (uint64_t)(base + i * (uintptr_t)PAGE_SIZE);
-        uint64_t q_phys = 0;
-        uint64_t q_flags = 0;
-
-        if (vmm_query_page(proc->vm_space.pml4_phys, (uintptr_t)va,
-                           &q_phys, &q_flags) == 0 &&
-            (q_flags & VMM_X64_PTE_PRESENT)) {
-            if (vm_space_unmap_user_pages(&proc->vm_space,
-                                          (uintptr_t)va, 1) == 0) {
-                /* Unmap PTE first, then only free frames owned by anonymous mmap. */
-                if (va >= VM_SPACE_ANON_BASE && va < VM_SPACE_ANON_LIMIT &&
-                    q_phys != 0 && (q_flags & VMM_X64_PTE_USER)) {
-                    pmm_free_pages((uintptr_t)q_phys, 1);
-                }
-            } else {
-                unmap_err = -1;
-            }
-        }
-    }
-
-    return unmap_err;
+    vm_space_mmap_write_lock(&proc->vm_space);
+    int rc = vma_unmap_range(&proc->vm_space, base, span);
+    vm_space_mmap_write_unlock(&proc->vm_space);
+    return rc;
 }
 
 int vfs_msync(void *addr, size_t length, int flags)

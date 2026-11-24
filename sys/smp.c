@@ -111,6 +111,8 @@ static void ap_entry(struct limine_smp_info *info)
     wrmsr(MSR_GS_BASE, (uint64_t)(uintptr_t)&cpu_states[my_id]);
     wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)(uintptr_t)&cpu_states[my_id]);
 
+    pmm_pcp_init_cpu(my_id);
+
     syscall_init_x64();
     cpu_states[my_id].efer_msr = rdmsr(MSR_IA32_EFER);
     cpu_states[my_id].syscall_rsp = cpu_states[my_id].kernel_stack;
@@ -154,6 +156,8 @@ void smp_init_bsp(void)
 
     wrmsr(MSR_GS_BASE, (uint64_t)(uintptr_t)&bsp_cpu_state);
     wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)(uintptr_t)&bsp_cpu_state);
+
+    pmm_pcp_init_cpu(0);
 
     syscall_init_x64();
     bsp_cpu_state.efer_msr = rdmsr(MSR_IA32_EFER);

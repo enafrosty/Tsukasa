@@ -25,6 +25,9 @@
 #include "../include/kprintf.h"
 #include "../include/vfs_abi.h"
 #include "../mm/pagecache.h"
+#include "../mm/pmm.h"
+#include "../mm/slab.h"
+#include "../mm/vm_space.h"
 #include "../mm/vmm_x64.h"
 #include "../proc/process.h"
 #include "../ipc/shm.h"
@@ -376,6 +379,52 @@ static long sys_msync(long addr, long length, long flags, long a4, long a5, long
 {
     (void)a4; (void)a5; (void)a6;
     return (long)vfs_msync((void *)(uintptr_t)addr, (size_t)length, (int)flags);
+}
+
+static long sys_mprotect(long addr, long length, long prot, long a4, long a5, long a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    process_t *cur = process_current();
+    if (!cur || !cur->vm_space.owns_pml4)
+        return -ENOMEM;
+    if (addr == 0 || !paging_is_page_aligned_uintptr((uintptr_t)addr))
+        return -EINVAL;
+    if (length < 0)
+        return -EINVAL;
+    if (length == 0)
+        return 0;
+    if ((prot & ~(VFS_PROT_READ | VFS_PROT_WRITE | VFS_PROT_EXEC)) != 0)
+        return -EINVAL;
+
+    uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
+    size_t ulen = (size_t)length;
+    if (ulen > SIZE_MAX - page_mask)
+        return -ENOMEM;
+    size_t span = (ulen + page_mask) & ~page_mask;
+    if (!paging_range_is_user((uintptr_t)addr, span))
+        return -ENOMEM;
+
+    uint32_t vma_prot = 0;
+    if (prot & VFS_PROT_READ)  vma_prot |= VMA_PROT_READ;
+    if (prot & VFS_PROT_WRITE) vma_prot |= VMA_PROT_WRITE;
+    if (prot & VFS_PROT_EXEC)  vma_prot |= VMA_PROT_EXEC;
+
+    vm_space_mmap_write_lock(&cur->vm_space);
+    int rc = vma_protect_range(&cur->vm_space, (uintptr_t)addr, span, vma_prot);
+    vm_space_mmap_write_unlock(&cur->vm_space);
+    return (long)rc;
+}
+
+static long sys_brk(long addr, long a2, long a3, long a4, long a5, long a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    process_t *cur = process_current();
+    if (!cur || !cur->vm_space.owns_pml4)
+        return -ENOMEM;
+
+    uintptr_t cur_brk = 0;
+    (void)vm_space_brk(&cur->vm_space, (uintptr_t)addr, &cur_brk);
+    return (long)cur_brk;
 }
 
 static long sys_ioctl(long fd, long req, long arg, long a4, long a5, long a6)
@@ -1028,7 +1077,9 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [7] = sys_poll,
     [8] = sys_lseek,
     [9] = sys_mmap,
+    [10] = sys_mprotect,
     [11] = sys_munmap,
+    [12] = sys_brk,
     [13] = sys_rt_sigaction,
     [14] = sys_rt_sigprocmask,
     [16] = sys_ioctl,
@@ -1600,6 +1651,31 @@ static void c01_test_entry(void)
 
     blockdev_run_irq_selftests();
     pagecache_run_selftests();
+    pmm_run_selftests();
+    slab_run_selftests();
+    vm_space_run_selftests();
+
+    if (smp_cpu_count() > 1) {
+        vm_space_t tlb_sp;
+        if (vm_space_create(&tlb_sp) == 0) {
+            uint32_t me = smp_this_cpu_id();
+            uint32_t other = (me == 0) ? 1u : 0u;
+            uint64_t before = vmm_tlb_shootdown_ipi_count();
+            tlb_sp.active_cpus = (1ULL << me) | (1ULL << other);
+            vmm_tlb_shootdown(&tlb_sp, (uintptr_t)VM_SPACE_ANON_BASE, 1);
+            tlb_sp.active_cpus = 0;
+            uint64_t after = vmm_tlb_shootdown_ipi_count();
+            vm_space_destroy(&tlb_sp);
+            if (after > before)
+                kprintf("[selftest] smp tlb shootdown PASS ipis=%llu\n",
+                        (unsigned long long)(after - before));
+            else
+                kprintf("[selftest] smp tlb shootdown FAIL before=%llu after=%llu\n",
+                        (unsigned long long)before, (unsigned long long)after);
+        } else {
+            kprintf("[selftest] smp tlb shootdown FAIL (vm_space_create)\n");
+        }
+    }
 
     kprintf("[selftest] ALL DONE\n");
     acpi_power_off();
