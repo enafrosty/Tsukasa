@@ -76,7 +76,12 @@ int tmpfs_truncate(tmpfs_inode_t *ino, size_t new_size);
 size_t tmpfs_inode_size(const tmpfs_inode_t *ino);
 int tmpfs_inode_type(const tmpfs_inode_t *ino);
 uint32_t tmpfs_inode_mode(const tmpfs_inode_t *ino);
+uint64_t tmpfs_inode_ino(const tmpfs_inode_t *ino);
+uint32_t tmpfs_inode_uid(const tmpfs_inode_t *ino);
+uint32_t tmpfs_inode_gid(const tmpfs_inode_t *ino);
 void tmpfs_set_attrs(tmpfs_inode_t *ino, uint32_t mode, uint32_t uid,
                      uint32_t gid, uint64_t mtime);
+int tmpfs_chmod_inode(tmpfs_inode_t *ino, uint32_t mode);
+int tmpfs_chown_inode(tmpfs_inode_t *ino, uint32_t uid, uint32_t gid);
 
 #endif /* TSUKASA_TMPFS_H */

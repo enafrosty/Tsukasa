@@ -23,6 +23,8 @@
 #include "../fs/vfs.h"
 #include "../include/errno.h"
 #include "../include/kprintf.h"
+#include "../include/vfs_abi.h"
+#include "../mm/pagecache.h"
 #include "../mm/vmm_x64.h"
 #include "../proc/process.h"
 #include "../ipc/shm.h"
@@ -127,12 +129,15 @@ static long sys_write(long fd, long buf, long count, long a4, long a5, long a6)
     return mux_fs(FS_CMD_WRITE, fd, buf, count);
 }
 
-static long sys_open(long path, long flags, long a3, long a4, long a5, long a6)
+_Static_assert(sizeof(vfs_stat_t) == sizeof(struct tsukasa_stat),
+               "vfs_stat_t and struct tsukasa_stat must match in size");
+
+static long sys_open(long path, long flags, long mode, long a4, long a5, long a6)
 {
-    (void)a3; (void)a4; (void)a5; (void)a6;
+    (void)a4; (void)a5; (void)a6;
     if (!user_str_ok(path)) return -EFAULT;
-    long r = mux_fs(FS_CMD_OPEN, path, flags, 0);
-    return (r < 0) ? -ENOENT : r;
+    int r = vfs_open_flags_mode((const char *)(uintptr_t)path, (int)flags, (int)mode);
+    return (r == -1) ? -ENOENT : (long)r;
 }
 
 static long sys_close(long fd, long a2, long a3, long a4, long a5, long a6)
@@ -143,13 +148,55 @@ static long sys_close(long fd, long a2, long a3, long a4, long a5, long a6)
     return mux_fs(FS_CMD_CLOSE, fd, 0, 0);
 }
 
+static long copy_stat_to_user(long st_ptr, const vfs_stat_t *kst)
+{
+    uint8_t *dst = (uint8_t *)(uintptr_t)st_ptr;
+    const uint8_t *src = (const uint8_t *)kst;
+    for (size_t i = 0; i < sizeof(struct tsukasa_stat); i++)
+        dst[i] = src[i];
+    return 0;
+}
+
 static long sys_stat(long path, long st, long a3, long a4, long a5, long a6)
 {
     (void)a3; (void)a4; (void)a5; (void)a6;
     if (!user_str_ok(path)) return -EFAULT;
     if (!user_ok(st, (long)sizeof(struct tsukasa_stat), 1)) return -EFAULT;
-    long r = mux_fs(FS_CMD_STAT, path, st, 0);
-    return (r < 0) ? -ENOENT : r;
+    vfs_stat_t kst;
+    int r = vfs_stat((const char *)(uintptr_t)path, &kst);
+    if (r != 0)
+        return (r < -1) ? (long)r : -ENOENT;
+    return copy_stat_to_user(st, &kst);
+}
+
+static long sys_fstat(long fd, long st, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (!user_ok(st, (long)sizeof(struct tsukasa_stat), 1)) return -EFAULT;
+    vfs_stat_t kst;
+    int r = vfs_fstat((int)fd, &kst);
+    if (r != 0)
+        return (r < -1) ? (long)r : -EBADF;
+    return copy_stat_to_user(st, &kst);
+}
+
+static long sys_lstat(long path, long st, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (!user_str_ok(path)) return -EFAULT;
+    if (!user_ok(st, (long)sizeof(struct tsukasa_stat), 1)) return -EFAULT;
+    vfs_stat_t kst;
+    int r = vfs_lstat((const char *)(uintptr_t)path, &kst);
+    if (r != 0)
+        return (r < -1) ? (long)r : -ENOENT;
+    return copy_stat_to_user(st, &kst);
+}
+
+static long sys_access(long path, long mode, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (!user_str_ok(path)) return -EFAULT;
+    return (long)vfs_access((const char *)(uintptr_t)path, (int)mode);
 }
 
 static long sys_poll(long fds, long nfds, long timeout, long a4, long a5, long a6)
@@ -328,7 +375,27 @@ static long sys_munmap(long addr, long length, long a3, long a4, long a5, long a
 static long sys_ioctl(long fd, long req, long arg, long a4, long a5, long a6)
 {
     (void)a4; (void)a5; (void)a6;
-    return mux_fs(FS_CMD_IOCTL, fd, req, arg);
+    switch ((unsigned long)req) {
+    case VFS_FBIOGET_VSCREENINFO:
+        if (!user_ok(arg, (long)sizeof(vfs_fb_var_screeninfo_t), 1))
+            return -EFAULT;
+        break;
+    case VFS_FBIOGET_FSCREENINFO:
+        if (!user_ok(arg, (long)sizeof(vfs_fb_fix_screeninfo_t), 1))
+            return -EFAULT;
+        break;
+    case 0x1268UL: /* BLKSSZGET */
+        if (!user_ok(arg, (long)sizeof(int), 1))
+            return -EFAULT;
+        break;
+    case 0x80081272UL: /* BLKGETSIZE64 */
+        if (!user_ok(arg, (long)sizeof(uint64_t), 1))
+            return -EFAULT;
+        break;
+    default:
+        break;
+    }
+    return (long)vfs_ioctl((int)fd, (unsigned long)req, (void *)(uintptr_t)arg);
 }
 
 static long sys_pipe(long fds, long a2, long a3, long a4, long a5, long a6)
@@ -446,6 +513,103 @@ static long sys_unlink(long path, long a2, long a3, long a4, long a5, long a6)
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     if (!user_str_ok(path)) return -EFAULT;
     return mux_fs(FS_CMD_UNLINK, path, 0, 0);
+}
+
+static long sys_flock(long fd, long op, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    return (long)vfs_flock((int)fd, (int)op);
+}
+
+static long sys_truncate(long path, long length, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (!user_str_ok(path)) return -EFAULT;
+    if (length < 0) return -EINVAL;
+    return (long)vfs_truncate((const char *)(uintptr_t)path, (size_t)length);
+}
+
+static long sys_ftruncate(long fd, long length, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (length < 0) return -EINVAL;
+    return (long)vfs_ftruncate((int)fd, (size_t)length);
+}
+
+static long sys_symlink(long target, long linkpath, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (!user_str_ok(target) || !user_str_ok(linkpath)) return -EFAULT;
+    return (long)vfs_symlink((const char *)(uintptr_t)target,
+                             (const char *)(uintptr_t)linkpath);
+}
+
+static long sys_readlink(long path, long buf, long bufsiz, long a4, long a5, long a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    if (!user_str_ok(path)) return -EFAULT;
+    if (bufsiz <= 0) return -EINVAL;
+    if (!user_ok(buf, bufsiz, 1)) return -EFAULT;
+    return (long)vfs_readlink((const char *)(uintptr_t)path,
+                              (char *)(uintptr_t)buf, (size_t)bufsiz);
+}
+
+static long sys_chmod(long path, long mode, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (!user_str_ok(path)) return -EFAULT;
+    return (long)vfs_chmod((const char *)(uintptr_t)path, (uint32_t)mode);
+}
+
+static long sys_fchmod(long fd, long mode, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    return (long)vfs_fchmod((int)fd, (uint32_t)mode);
+}
+
+static long sys_chown(long path, long uid, long gid, long a4, long a5, long a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    if (!user_str_ok(path)) return -EFAULT;
+    return (long)vfs_chown((const char *)(uintptr_t)path, (uint32_t)uid, (uint32_t)gid);
+}
+
+static long sys_fchown(long fd, long uid, long gid, long a4, long a5, long a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    return (long)vfs_fchown((int)fd, (uint32_t)uid, (uint32_t)gid);
+}
+
+static long sys_umask(long mask, long a2, long a3, long a4, long a5, long a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    return (long)vfs_umask((uint32_t)mask);
+}
+
+static long sys_mount(long source, long target, long fstype, long flags, long data, long a6)
+{
+    (void)data; (void)a6;
+    if (source && !user_str_ok(source)) return -EFAULT;
+    if (!user_str_ok(target) || !user_str_ok(fstype)) return -EFAULT;
+    return (long)vfs_mount((const char *)(uintptr_t)source,
+                           (const char *)(uintptr_t)target,
+                           (const char *)(uintptr_t)fstype,
+                           (unsigned long)flags);
+}
+
+static long sys_umount2(long target, long flags, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (!user_str_ok(target)) return -EFAULT;
+    return (long)vfs_umount2((const char *)(uintptr_t)target, (int)flags);
+}
+
+static long sys_getdents64(long fd, long dirp, long count, long a4, long a5, long a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    if (count <= 0) return -EINVAL;
+    if (!user_ok(dirp, count, 1)) return -EFAULT;
+    return vfs_getdents64((int)fd, (void *)(uintptr_t)dirp, (size_t)count);
 }
 
 static int is_leap_year(int year)
@@ -838,6 +1002,8 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [2] = sys_open,
     [3] = sys_close,
     [4] = sys_stat,
+    [5] = sys_fstat,
+    [6] = sys_lstat,
     [7] = sys_poll,
     [8] = sys_lseek,
     [9] = sys_mmap,
@@ -845,6 +1011,7 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [13] = sys_rt_sigaction,
     [14] = sys_rt_sigprocmask,
     [16] = sys_ioctl,
+    [21] = sys_access,
     [22] = sys_pipe,
     [23] = sys_select,
     [24] = sys_sched_yield,
@@ -867,17 +1034,30 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [62] = sys_kill,
     [67] = sys_shm_detach,
     [72] = sys_fcntl,
-    [73] = sys_rt_sigpending,
+    [73] = sys_flock,
+    [76] = sys_truncate,
+    [77] = sys_ftruncate,
     [79] = sys_getcwd,
     [80] = sys_chdir,
     [82] = sys_rename,
     [83] = sys_mkdir,
     [84] = sys_rmdir,
     [87] = sys_unlink,
+    [88] = sys_symlink,
+    [89] = sys_readlink,
+    [90] = sys_chmod,
+    [91] = sys_fchmod,
+    [92] = sys_chown,
+    [93] = sys_fchown,
+    [95] = sys_umask,
     [110] = sys_getppid,
+    [127] = sys_rt_sigpending,
+    [165] = sys_mount,
+    [166] = sys_umount2,
     [169] = sys_reboot,
     [201] = sys_time,
     [202] = sys_futex,
+    [217] = sys_getdents64,
     [232] = sys_epoll_wait,
     [233] = sys_epoll_ctl,
     [291] = sys_epoll_create1,
@@ -1372,6 +1552,7 @@ static void c01_test_entry(void)
     }
 
     blockdev_run_irq_selftests();
+    pagecache_run_selftests();
 
     kprintf("[selftest] ALL DONE\n");
     acpi_power_off();

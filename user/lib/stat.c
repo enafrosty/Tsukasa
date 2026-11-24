@@ -25,6 +25,8 @@ static mode_t map_mode(const struct tsukasa_stat *in)
     mode_t mode = 0;
     if (!in)
         return 0;
+    if (in->st_mode != 0)
+        return (mode_t)in->st_mode;
     if (in->type == TSUKASA_STAT_TYPE_DIR)
         mode |= S_IFDIR;
     else if (in->type == TSUKASA_STAT_TYPE_CHAR)
@@ -33,6 +35,8 @@ static mode_t map_mode(const struct tsukasa_stat *in)
         mode |= S_IFIFO;
     else if (in->type == TSUKASA_STAT_TYPE_SOCKET)
         mode |= S_IFSOCK;
+    else if (in->type == TSUKASA_STAT_TYPE_SYMLINK)
+        mode |= S_IFLNK;
     else
         mode |= S_IFREG;
 
@@ -43,6 +47,23 @@ static mode_t map_mode(const struct tsukasa_stat *in)
     return mode;
 }
 
+static void copy_stat(struct stat *dst, const struct tsukasa_stat *st)
+{
+    dst->st_dev = st->st_dev;
+    dst->st_ino = st->st_ino;
+    dst->st_mode = map_mode(st);
+    dst->st_nlink = st->st_nlink ? st->st_nlink : 1U;
+    dst->st_uid = st->st_uid;
+    dst->st_gid = st->st_gid;
+    dst->st_rdev = st->st_rdev;
+    dst->st_size = (off_t)st->size;
+    dst->st_blksize = st->st_blksize ? st->st_blksize : 4096U;
+    dst->st_blocks = st->blocks;
+    dst->st_atime = st->st_atime;
+    dst->st_mtime = st->st_mtime;
+    dst->st_ctime = st->st_ctime;
+}
+
 int stat(const char *pathname, struct stat *statbuf)
 {
     struct tsukasa_stat st;
@@ -50,9 +71,7 @@ int stat(const char *pathname, struct stat *statbuf)
         return -1;
     if (fs_stat(pathname, &st) != 0)
         return -1;
-    statbuf->st_mode = map_mode(&st);
-    statbuf->st_size = (off_t)st.size;
-    statbuf->st_blocks = st.blocks;
+    copy_stat(statbuf, &st);
     return 0;
 }
 
@@ -63,8 +82,6 @@ int fstat(int fd, struct stat *statbuf)
         return -1;
     if (fs_fstat(fd, &st) != 0)
         return -1;
-    statbuf->st_mode = map_mode(&st);
-    statbuf->st_size = (off_t)st.size;
-    statbuf->st_blocks = st.blocks;
+    copy_stat(statbuf, &st);
     return 0;
 }

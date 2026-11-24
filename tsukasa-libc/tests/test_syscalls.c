@@ -26,11 +26,15 @@
 #include <sys/select.h>
 #include <sys/epoll.h>
 #include <sys/shm.h>
+#include <sys/file.h>
+#include <sys/mount.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
 #include <stdio.h>
+#include <string.h>
 #include "../../scripts/test/tsk_test.h"
 
 static uintptr_t s_entry_rsp;
@@ -46,13 +50,92 @@ __attribute__((naked)) int main(void)
     );
 }
 
+static int wait_child_ok(pid_t pid)
+{
+    int status = 0;
+    for (int i = 0; i < 1000; i++) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) {
+            return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+        }
+        usleep(5000);
+    }
+    return -1;
+}
+
+static int run_worker_flock(void)
+{
+    for (int i = 3; i < 256; i++)
+        close(i);
+    int fd = open("/tmp/flock_test.dat", O_RDWR);
+    if (fd < 0)
+        return 1;
+    errno = 0;
+    if (flock(fd, LOCK_EX | LOCK_NB) != -1 || errno != EAGAIN) {
+        close(fd);
+        return 2;
+    }
+    int rfd = open("/tmp/flock_ready", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (rfd >= 0)
+        close(rfd);
+    if (flock(fd, LOCK_EX) != 0) {
+        close(fd);
+        return 3;
+    }
+    lseek(fd, 0, SEEK_SET);
+    if (write(fd, "CHILD_OK", 8) != 8) {
+        flock(fd, LOCK_UN);
+        close(fd);
+        return 4;
+    }
+    flock(fd, LOCK_UN);
+    close(fd);
+    return 0;
+}
+
+static int run_worker_vfs(const char *tag)
+{
+    char p1[64], p2[64], buf[32];
+    snprintf(p1, sizeof(p1), "/tmp/conc_%s_a.txt", tag);
+    snprintf(p2, sizeof(p2), "/tmp/conc_%s_b.txt", tag);
+
+    for (int i = 0; i < 40; i++) {
+        int fd = open(p1, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0)
+            return 1;
+        if (write(fd, "DATA", 4) != 4) {
+            close(fd);
+            return 2;
+        }
+        close(fd);
+        if (rename(p1, p2) != 0)
+            return 3;
+        fd = open(p2, O_RDONLY);
+        if (fd < 0)
+            return 4;
+        memset(buf, 0, sizeof(buf));
+        if (read(fd, buf, 4) != 4 || memcmp(buf, "DATA", 4) != 0) {
+            close(fd);
+            return 5;
+        }
+        close(fd);
+        if (unlink(p2) != 0)
+            return 6;
+    }
+    return 0;
+}
+
 static int real_main(int argc, char **argv, char **envp)
 {
-    (void)argc;
-    (void)argv;
     (void)envp;
+
+    if (argc >= 2 && strcmp(argv[1], "--worker-flock") == 0)
+        return run_worker_flock();
+    if (argc >= 3 && strcmp(argv[1], "--worker-vfs") == 0)
+        return run_worker_vfs(argv[2]);
+
     int passed = 0;
-    int total = 9;
+    int total = 17;
 
     /* Test 1: Stack frame alignment (rsp % 16 == 8 on function entry). */
     if ((s_entry_rsp & 0xF) != 8) {
@@ -117,7 +200,6 @@ static int real_main(int argc, char **argv, char **envp)
         TSK_TEST_FAIL("syscalls", "mmap_munmap", "mmap anonymous 4K failed");
         return 9;
     }
-    /* Write test pattern to mapped memory. */
     char *buf = (char *)mem;
     buf[0] = 'T';
     buf[1] = 'S';
@@ -347,7 +429,6 @@ static int real_main(int argc, char **argv, char **envp)
         return 30;
     }
 
-    /* Test closed fd unregistration from epoll */
     close(pfd[0]);
     int ep_closed = epoll_wait(epfd, events, 2, 0);
     if (ep_closed != 0) {
@@ -365,7 +446,7 @@ static int real_main(int argc, char **argv, char **envp)
     /* Test 9: Zero-length read/write and user pointer validation. */
     {
         const char *zpath = "/tmp/test_zlen.tmp";
-        int zfd = open(zpath, O_RDWR | O_CREAT | O_TRUNC);
+        int zfd = open(zpath, O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (zfd < 0) {
             TSK_TEST_FAIL("syscalls", "zero_len_user_ptr", "open temp file failed");
             return 32;
@@ -441,6 +522,441 @@ static int real_main(int argc, char **argv, char **envp)
             return 38;
         }
         TSK_TEST_PASS("syscalls", "zero_len_user_ptr");
+        passed++;
+    }
+
+    /* Test 10: Symlink, readlink, lstat, O_NOFOLLOW, and ELOOP protection. */
+    {
+        const char *tgt = "/tmp/sym_target.txt";
+        const char *lnk = "/tmp/sym_link.txt";
+        int fd = open(tgt, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0 || write(fd, "hello", 5) != 5) {
+            if (fd >= 0) close(fd);
+            TSK_TEST_FAIL("syscalls", "symlink_eloop", "target create failed");
+            return 39;
+        }
+        close(fd);
+
+        if (symlink(tgt, lnk) != 0) {
+            unlink(tgt);
+            TSK_TEST_FAIL("syscalls", "symlink_eloop", "symlink failed");
+            return 40;
+        }
+
+        struct stat lst, st;
+        if (lstat(lnk, &lst) != 0 || !S_ISLNK(lst.st_mode)) {
+            unlink(lnk);
+            unlink(tgt);
+            TSK_TEST_FAIL("syscalls", "symlink_eloop", "lstat did not return S_IFLNK");
+            return 41;
+        }
+        if (stat(lnk, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size != 5) {
+            unlink(lnk);
+            unlink(tgt);
+            TSK_TEST_FAIL("syscalls", "symlink_eloop", "stat did not follow symlink");
+            return 42;
+        }
+
+        char rbuf[64];
+        memset(rbuf, 0, sizeof(rbuf));
+        ssize_t rl = readlink(lnk, rbuf, sizeof(rbuf) - 1);
+        if (rl != (ssize_t)strlen(tgt) || strcmp(rbuf, tgt) != 0) {
+            unlink(lnk);
+            unlink(tgt);
+            TSK_TEST_FAIL("syscalls", "symlink_eloop", "readlink mismatch");
+            return 43;
+        }
+
+        errno = 0;
+        if (open(lnk, O_RDONLY | O_NOFOLLOW) != -1 || errno != ELOOP) {
+            unlink(lnk);
+            unlink(tgt);
+            TSK_TEST_FAIL("syscalls", "symlink_eloop", "O_NOFOLLOW did not return ELOOP");
+            return 44;
+        }
+
+        unlink(lnk);
+        unlink(tgt);
+
+        if (symlink("/tmp/loop_b", "/tmp/loop_a") != 0 ||
+            symlink("/tmp/loop_a", "/tmp/loop_b") != 0) {
+            unlink("/tmp/loop_a");
+            unlink("/tmp/loop_b");
+            TSK_TEST_FAIL("syscalls", "symlink_eloop", "loop symlink creation failed");
+            return 45;
+        }
+
+        errno = 0;
+        if (stat("/tmp/loop_a", &st) != -1 || errno != ELOOP) {
+            unlink("/tmp/loop_a");
+            unlink("/tmp/loop_b");
+            TSK_TEST_FAIL("syscalls", "symlink_eloop", "symlink loop did not return ELOOP");
+            return 46;
+        }
+
+        unlink("/tmp/loop_a");
+        unlink("/tmp/loop_b");
+        TSK_TEST_PASS("syscalls", "symlink_eloop");
+        passed++;
+    }
+
+    /* Test 11: POSIX metadata (umask, chmod, fchmod, chown, fchown, access, truncate, ftruncate). */
+    {
+        const char *mpath = "/tmp/meta_test.txt";
+        mode_t old_um = umask(0077);
+        int fd = open(mpath, O_RDWR | O_CREAT | O_TRUNC, 0666);
+        umask(old_um);
+        if (fd < 0) {
+            TSK_TEST_FAIL("syscalls", "posix_metadata", "open failed");
+            return 47;
+        }
+        struct stat st;
+        if (fstat(fd, &st) != 0 || (st.st_mode & 0777) != 0600) {
+            close(fd);
+            unlink(mpath);
+            TSK_TEST_FAIL("syscalls", "posix_metadata", "umask 0077 not applied");
+            return 48;
+        }
+
+        if (chmod(mpath, 0755 | S_ISUID) != 0 || stat(mpath, &st) != 0 ||
+            (st.st_mode & 07777) != (0755 | S_ISUID)) {
+            close(fd);
+            unlink(mpath);
+            TSK_TEST_FAIL("syscalls", "posix_metadata", "chmod failed");
+            return 49;
+        }
+
+        if (fchmod(fd, 0640) != 0 || fstat(fd, &st) != 0 || (st.st_mode & 0777) != 0640) {
+            close(fd);
+            unlink(mpath);
+            TSK_TEST_FAIL("syscalls", "posix_metadata", "fchmod failed");
+            return 50;
+        }
+
+        if (chown(mpath, 1000, 1001) != 0 || stat(mpath, &st) != 0 ||
+            st.st_uid != 1000 || st.st_gid != 1001) {
+            close(fd);
+            unlink(mpath);
+            TSK_TEST_FAIL("syscalls", "posix_metadata", "chown failed");
+            return 51;
+        }
+
+        if (fchown(fd, 0, 0) != 0 || fstat(fd, &st) != 0 ||
+            st.st_uid != 0 || st.st_gid != 0) {
+            close(fd);
+            unlink(mpath);
+            TSK_TEST_FAIL("syscalls", "posix_metadata", "fchown failed");
+            return 52;
+        }
+
+        if (access(mpath, F_OK | R_OK | W_OK) != 0) {
+            close(fd);
+            unlink(mpath);
+            TSK_TEST_FAIL("syscalls", "posix_metadata", "access failed");
+            return 53;
+        }
+
+        if (write(fd, "12345678", 8) != 8 || ftruncate(fd, 3) != 0 ||
+            fstat(fd, &st) != 0 || st.st_size != 3) {
+            close(fd);
+            unlink(mpath);
+            TSK_TEST_FAIL("syscalls", "posix_metadata", "ftruncate shrink failed");
+            return 54;
+        }
+
+        close(fd);
+        if (truncate(mpath, 10) != 0 || stat(mpath, &st) != 0 || st.st_size != 10) {
+            unlink(mpath);
+            TSK_TEST_FAIL("syscalls", "posix_metadata", "truncate grow failed");
+            return 55;
+        }
+
+        unlink(mpath);
+        TSK_TEST_PASS("syscalls", "posix_metadata");
+        passed++;
+    }
+
+    /* Test 12: getdents64 and opendir/readdir/closedir. */
+    {
+        mkdir("/tmp/dtest", 0755);
+        int fd1 = open("/tmp/dtest/regfile", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd1 >= 0) close(fd1);
+        mkdir("/tmp/dtest/subdir", 0755);
+        symlink("/tmp/dtest/regfile", "/tmp/dtest/symfile");
+
+        DIR *d = opendir("/tmp/dtest");
+        if (!d) {
+            TSK_TEST_FAIL("syscalls", "getdents64_dirent", "opendir failed");
+            return 56;
+        }
+        int saw_dot = 0, saw_dotdot = 0, saw_reg = 0, saw_sub = 0, saw_sym = 0;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (strcmp(de->d_name, ".") == 0 && de->d_type == DT_DIR) saw_dot = 1;
+            else if (strcmp(de->d_name, "..") == 0 && de->d_type == DT_DIR) saw_dotdot = 1;
+            else if (strcmp(de->d_name, "regfile") == 0 && de->d_type == DT_REG) saw_reg = 1;
+            else if (strcmp(de->d_name, "subdir") == 0 && de->d_type == DT_DIR) saw_sub = 1;
+            else if (strcmp(de->d_name, "symfile") == 0 && de->d_type == DT_LNK) saw_sym = 1;
+        }
+        closedir(d);
+
+        unlink("/tmp/dtest/symfile");
+        unlink("/tmp/dtest/regfile");
+        rmdir("/tmp/dtest/subdir");
+        rmdir("/tmp/dtest");
+
+        if (!saw_dot || !saw_dotdot || !saw_reg || !saw_sub || !saw_sym) {
+            TSK_TEST_FAIL("syscalls", "getdents64_dirent", "missing dirent entries or wrong d_type");
+            return 57;
+        }
+        TSK_TEST_PASS("syscalls", "getdents64_dirent");
+        passed++;
+    }
+
+    /* Test 13: >128 open FDs & >32 pipes/sockets decoupling. */
+    {
+        int fds[180];
+        int opened = 0;
+        for (int i = 0; i < 180; i++) {
+            fds[i] = open("/dev/null", O_RDWR);
+            if (fds[i] < 0)
+                break;
+            opened++;
+        }
+        for (int i = 0; i < opened; i++)
+            close(fds[i]);
+
+        if (opened < 150) {
+            TSK_TEST_FAIL("syscalls", "fd_scaling_decouple", "could not open >=150 FDs");
+            return 58;
+        }
+
+        int pipes[40][2];
+        int p_opened = 0;
+        for (int i = 0; i < 40; i++) {
+            if (pipe(pipes[i]) != 0)
+                break;
+            p_opened++;
+        }
+        int p_ok = (p_opened == 40);
+        if (p_ok) {
+            char ch = 'X';
+            if (write(pipes[39][1], &ch, 1) != 1 || read(pipes[39][0], &ch, 1) != 1 || ch != 'X')
+                p_ok = 0;
+        }
+        for (int i = 0; i < p_opened; i++) {
+            close(pipes[i][0]);
+            close(pipes[i][1]);
+        }
+        if (!p_ok) {
+            TSK_TEST_FAIL("syscalls", "fd_scaling_decouple", "could not open 40 concurrent pipes");
+            return 59;
+        }
+
+        /* Also test >32 AF_UNIX stream connections. */
+        int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un ua;
+        memset(&ua, 0, sizeof(ua));
+        ua.sun_family = AF_UNIX;
+        strcpy(ua.sun_path, "/tmp/scale_sock");
+        int s_ok = (srv >= 0 && bind(srv, (struct sockaddr *)&ua, sizeof(ua)) == 0 && listen(srv, 16) == 0);
+        int cli_fds[36];
+        int acc_fds[36];
+        int s_cnt = 0;
+        if (s_ok) {
+            for (int i = 0; i < 36; i++) {
+                cli_fds[i] = socket(AF_UNIX, SOCK_STREAM, 0);
+                if (cli_fds[i] < 0 || connect(cli_fds[i], (struct sockaddr *)&ua, sizeof(ua)) != 0)
+                    break;
+                acc_fds[i] = accept(srv, NULL, NULL);
+                if (acc_fds[i] < 0) {
+                    close(cli_fds[i]);
+                    break;
+                }
+                s_cnt++;
+            }
+        }
+        if (s_cnt < 36)
+            s_ok = 0;
+        for (int i = 0; i < s_cnt; i++) {
+            close(cli_fds[i]);
+            close(acc_fds[i]);
+        }
+        if (srv >= 0)
+            close(srv);
+        if (!s_ok) {
+            TSK_TEST_FAIL("syscalls", "fd_scaling_decouple", "could not open 36 concurrent unix sockets");
+            return 60;
+        }
+
+        TSK_TEST_PASS("syscalls", "fd_scaling_decouple");
+        passed++;
+    }
+
+    /* Test 14: Cross-process per-inode flock blocking & conflict resolution. */
+    {
+        int fd = open("/tmp/flock_test.dat", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0 || write(fd, "INIT____", 8) != 8) {
+            if (fd >= 0) close(fd);
+            TSK_TEST_FAIL("syscalls", "flock_cross_process", "init file failed");
+            return 61;
+        }
+        if (flock(fd, LOCK_EX) != 0) {
+            close(fd);
+            unlink("/tmp/flock_test.dat");
+            TSK_TEST_FAIL("syscalls", "flock_cross_process", "parent LOCK_EX failed");
+            return 62;
+        }
+
+        int dup_fd = dup(fd);
+        unlink("/tmp/flock_ready");
+        char *wargs[] = { "/bin/TSYSC.ELF", "--worker-flock", NULL };
+        pid_t cpid = spawn("/bin/TSYSC.ELF", wargs, NULL);
+        if (cpid < 0) {
+            close(dup_fd);
+            close(fd);
+            unlink("/tmp/flock_test.dat");
+            TSK_TEST_FAIL("syscalls", "flock_cross_process", "spawn worker failed");
+            return 63;
+        }
+
+        for (int wi = 0; wi < 400; wi++) {
+            if (access("/tmp/flock_ready", F_OK) == 0)
+                break;
+            usleep(5000);
+        }
+        usleep(20000);
+        /* Closing dup_fd must NOT release the flock held by the open file description! */
+        close(dup_fd);
+        usleep(20000);
+
+        char rbuf[16];
+        memset(rbuf, 0, sizeof(rbuf));
+        lseek(fd, 0, SEEK_SET);
+        read(fd, rbuf, 8);
+        if (memcmp(rbuf, "INIT____", 8) != 0) {
+            close(fd);
+            wait_child_ok(cpid);
+            unlink("/tmp/flock_ready");
+            unlink("/tmp/flock_test.dat");
+            TSK_TEST_FAIL("syscalls", "flock_cross_process", "child wrote before final close/unlock");
+            return 64;
+        }
+
+        /* Final close releases the flock so blocked child acquires LOCK_EX and writes CHILD_OK. */
+        close(fd);
+        if (wait_child_ok(cpid) != 0) {
+            unlink("/tmp/flock_ready");
+            unlink("/tmp/flock_test.dat");
+            TSK_TEST_FAIL("syscalls", "flock_cross_process", "worker failed");
+            return 65;
+        }
+        unlink("/tmp/flock_ready");
+
+        fd = open("/tmp/flock_test.dat", O_RDONLY);
+        memset(rbuf, 0, sizeof(rbuf));
+        if (fd < 0 || read(fd, rbuf, 8) != 8 || memcmp(rbuf, "CHILD_OK", 8) != 0) {
+            if (fd >= 0) close(fd);
+            unlink("/tmp/flock_test.dat");
+            TSK_TEST_FAIL("syscalls", "flock_cross_process", "child update missing");
+            return 66;
+        }
+        close(fd);
+        unlink("/tmp/flock_test.dat");
+        TSK_TEST_PASS("syscalls", "flock_cross_process");
+        passed++;
+    }
+
+    /* Test 15: Concurrent open/read/write/unlink/rename + mount/umount2. */
+    {
+        mkdir("/tmp/mnt_test", 0755);
+        if (mount("none", "/tmp/mnt_test", "tmpfs", 0, NULL) != 0) {
+            rmdir("/tmp/mnt_test");
+            TSK_TEST_FAIL("syscalls", "concurrent_vfs_mount", "mount tmpfs failed");
+            return 67;
+        }
+
+        char *w1[] = { "/bin/TSYSC.ELF", "--worker-vfs", "w1", NULL };
+        char *w2[] = { "/bin/TSYSC.ELF", "--worker-vfs", "w2", NULL };
+        pid_t p1 = spawn("/bin/TSYSC.ELF", w1, NULL);
+        pid_t p2 = spawn("/bin/TSYSC.ELF", w2, NULL);
+
+        int mfd = open("/tmp/mnt_test/hello", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        int busy_ok = 0;
+        if (mfd >= 0) {
+            write(mfd, "MNT", 3);
+            errno = 0;
+            if (umount2("/tmp/mnt_test", 0) == -1 && errno == EBUSY)
+                busy_ok = 1;
+            close(mfd);
+        }
+
+        int u_ok = (busy_ok && umount2("/tmp/mnt_test", 0) == 0);
+        int c1 = (p1 > 0) ? wait_child_ok(p1) : -1;
+        int c2 = (p2 > 0) ? wait_child_ok(p2) : -1;
+        rmdir("/tmp/mnt_test");
+
+        if (!u_ok || c1 != 0 || c2 != 0) {
+            TSK_TEST_FAIL("syscalls", "concurrent_vfs_mount", "concurrent vfs or mount/umount2 failed");
+            return 68;
+        }
+        TSK_TEST_PASS("syscalls", "concurrent_vfs_mount");
+        passed++;
+    }
+
+    /* Test 16: Negative user pointer tests across new syscalls (-EFAULT). */
+    {
+        void *kptr = (void *)(uintptr_t)0xFFFFFFFF80000000ULL;
+        void *unmapped_ptr = (void *)(uintptr_t)0x0000000050000000ULL;
+        char sbuf[16];
+        struct stat st;
+        int ok = 1;
+
+        errno = 0; if (stat((const char *)kptr, &st) != -1 || errno != EFAULT) ok = 0;
+        if (__syscall2(SYS_stat, (int64_t)(uintptr_t)"/tmp", (int64_t)(uintptr_t)kptr) != -EFAULT) ok = 0;
+        errno = 0; if (lstat((const char *)unmapped_ptr, &st) != -1 || errno != EFAULT) ok = 0;
+        if (__syscall2(SYS_lstat, (int64_t)(uintptr_t)"/tmp", (int64_t)(uintptr_t)unmapped_ptr) != -EFAULT) ok = 0;
+        if (__syscall2(SYS_fstat, 0, (int64_t)(uintptr_t)kptr) != -EFAULT) ok = 0;
+        errno = 0; if (readlink((const char *)kptr, sbuf, sizeof(sbuf)) != -1 || errno != EFAULT) ok = 0;
+        errno = 0; if (readlink("/tmp", (char *)kptr, sizeof(sbuf)) != -1 || errno != EFAULT) ok = 0;
+        errno = 0; if (readlink("/tmp", (char *)unmapped_ptr, 8) != -1 || errno != EFAULT) ok = 0;
+        errno = 0; if (getdents64(0, kptr, 64) != -1 || errno != EFAULT) ok = 0;
+        errno = 0; if (getdents64(0, unmapped_ptr, 64) != -1 || errno != EFAULT) ok = 0;
+        errno = 0; if (chmod((const char *)kptr, 0644) != -1 || errno != EFAULT) ok = 0;
+        errno = 0; if (chown((const char *)unmapped_ptr, 0, 0) != -1 || errno != EFAULT) ok = 0;
+        errno = 0; if (symlink((const char *)kptr, "/tmp/x") != -1 || errno != EFAULT) ok = 0;
+        errno = 0; if (access((const char *)kptr, F_OK) != -1 || errno != EFAULT) ok = 0;
+        errno = 0; if (truncate((const char *)kptr, 0) != -1 || errno != EFAULT) ok = 0;
+        errno = 0; if (mount("none", (const char *)kptr, "tmpfs", 0, NULL) != -1 || errno != EFAULT) ok = 0;
+        errno = 0; if (umount2((const char *)kptr, 0) != -1 || errno != EFAULT) ok = 0;
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "negative_user_ptrs", "syscall accepted invalid user pointer");
+            return 69;
+        }
+        TSK_TEST_PASS("syscalls", "negative_user_ptrs");
+        passed++;
+    }
+
+    /* Test 17: Page cache procfs telemetry check. */
+    {
+        int pfd_pc = open("/proc/pagecache", O_RDONLY);
+        char pcbuf[512];
+        ssize_t n = 0;
+        if (pfd_pc >= 0) {
+            n = read(pfd_pc, pcbuf, sizeof(pcbuf) - 1);
+            close(pfd_pc);
+        }
+        if (n <= 0) {
+            TSK_TEST_FAIL("syscalls", "pagecache_proc", "failed to read /proc/pagecache");
+            return 70;
+        }
+        pcbuf[n] = '\0';
+        if (!strstr(pcbuf, "max_pages ") || !strstr(pcbuf, "evictions ")) {
+            TSK_TEST_FAIL("syscalls", "pagecache_proc", "missing fields in /proc/pagecache");
+            return 71;
+        }
+        TSK_TEST_PASS("syscalls", "pagecache_proc");
         passed++;
     }
 

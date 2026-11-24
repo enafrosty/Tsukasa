@@ -614,6 +614,9 @@ int devfs_stat(const char *subpath, vfs_stat_t *out)
     if (!subpath || !out)
         return -1;
 
+    for (size_t i = 0; i < sizeof(*out); i++)
+        ((uint8_t *)out)[i] = 0;
+
     const char *p = subpath;
     while (*p == '/')
         p++;
@@ -623,6 +626,10 @@ int devfs_stat(const char *subpath, vfs_stat_t *out)
         out->blocks = 0;
         out->type = VFS_TYPE_DIR;
         out->mode = VFS_MODE_READ;
+        out->st_ino = dev_streq(p, "") ? 1ULL : 2ULL;
+        out->st_mode = VFS_S_IFDIR | 0555U;
+        out->st_nlink = 2U;
+        out->st_blksize = 4096U;
         return 0;
     }
 
@@ -640,6 +647,14 @@ int devfs_stat(const char *subpath, vfs_stat_t *out)
     out->blocks = (sz + 511) / 512;
     out->type = type;
     out->mode = VFS_MODE_READ | VFS_MODE_WRITE;
+    out->st_size = sz;
+    out->st_blocks = out->blocks;
+    out->st_blksize = 4096U;
+    out->st_nlink = 1U;
+    if (type == VFS_TYPE_BLOCK)
+        out->st_mode = VFS_S_IFBLK | 0660U;
+    else
+        out->st_mode = VFS_S_IFCHR | 0666U;
     return 0;
 }
 

@@ -31,13 +31,16 @@
 #define VFS_SEEK_END 2
 
 /* Open flags. */
-#define VFS_O_RDONLY  0x0001
-#define VFS_O_WRONLY  0x0002
-#define VFS_O_RDWR    (VFS_O_RDONLY | VFS_O_WRONLY)
-#define VFS_O_APPEND  0x0004
-#define VFS_O_CREAT   0x0008
-#define VFS_O_TRUNC   0x0010
-#define VFS_O_NONBLOCK 0x0020
+#define VFS_O_RDONLY    0x0001
+#define VFS_O_WRONLY    0x0002
+#define VFS_O_RDWR      (VFS_O_RDONLY | VFS_O_WRONLY)
+#define VFS_O_APPEND    0x0004
+#define VFS_O_CREAT     0x0008
+#define VFS_O_TRUNC     0x0010
+#define VFS_O_NONBLOCK  0x0020
+#define VFS_O_EXCL      0x0040
+#define VFS_O_NOFOLLOW  0x0080
+#define VFS_O_DIRECTORY 0x0100
 
 #define VFS_F_GETFL 1
 #define VFS_F_SETFL 2
@@ -52,6 +55,7 @@
 #define VFS_TYPE_CHAR    4
 #define VFS_TYPE_BLOCK   5
 #define VFS_TYPE_SOCKET  6
+#define VFS_TYPE_SYMLINK 7
 
 #define VFS_MODE_READ  0x01
 #define VFS_MODE_WRITE 0x02
@@ -85,6 +89,19 @@ typedef struct vfs_stat {
     uint32_t type;
     uint32_t mode;
     uint64_t blocks;
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint32_t st_mode;
+    uint32_t st_nlink;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint64_t st_rdev;
+    uint64_t st_size;
+    uint64_t st_blksize;
+    uint64_t st_blocks;
+    int64_t  st_atime;
+    int64_t  st_mtime;
+    int64_t  st_ctime;
 } vfs_stat_t;
 
 typedef struct vfs_mount_info {
@@ -108,11 +125,26 @@ void vfs_init(const void *boot_info);
 
 int vfs_open(const char *path);
 int vfs_open_flags(const char *path, int flags);
+int vfs_open_flags_mode(const char *path, int flags, int mode);
 int vfs_create(const char *path);
 int vfs_mkdir(const char *path, int mode);
 int vfs_unlink(const char *path);
 int vfs_rmdir(const char *path);
 int vfs_rename(const char *old_path, const char *new_path);
+int vfs_symlink(const char *target, const char *linkpath);
+int vfs_readlink(const char *path, char *buf, size_t cap);
+int vfs_truncate(const char *path, size_t length);
+int vfs_ftruncate(int fd, size_t length);
+int vfs_chmod(const char *path, uint32_t mode);
+int vfs_fchmod(int fd, uint32_t mode);
+int vfs_chown(const char *path, uint32_t uid, uint32_t gid);
+int vfs_fchown(int fd, uint32_t uid, uint32_t gid);
+int vfs_access(const char *path, int mode);
+uint32_t vfs_umask(uint32_t mask);
+int vfs_flock(int fd, int operation);
+int vfs_mount(const char *source, const char *target, const char *fstype, unsigned long flags);
+int vfs_umount2(const char *target, int flags);
+long vfs_getdents64(int fd, void *dirp, size_t count);
 
 
 size_t vfs_read(int fd, void *buf, size_t count);
@@ -136,6 +168,7 @@ int vfs_epoll_ctl(int epfd, int op, int fd, uint32_t events, uint64_t data);
 int vfs_epoll_wait(int epfd, epoll_event_t *events, int maxevents, int timeout_ms);
 
 int vfs_stat(const char *path, vfs_stat_t *out);
+int vfs_lstat(const char *path, vfs_stat_t *out);
 int vfs_fstat(int fd, vfs_stat_t *out);
 
 int vfs_socket_create(void);

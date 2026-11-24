@@ -17,6 +17,7 @@
 #include "procfs.h"
 
 #include "../mm/heap.h"
+#include "../mm/pagecache.h"
 #include "../proc/process.h"
 
 #include <stddef.h>
@@ -276,6 +277,10 @@ int procfs_stat(const char *path, vfs_stat_t *out)
         out->type = VFS_TYPE_FILE;
         return 0;
     }
+    if (kstreq(path, "/pagecache")) {
+        out->type = VFS_TYPE_FILE;
+        return 0;
+    }
     if (is_pid_dir(path, &pid) && process_get_info((int)pid, NULL) == 0) {
         out->type = VFS_TYPE_DIR;
         return 0;
@@ -302,6 +307,8 @@ int procfs_list(const char *path, char names[][VFS_NAME_MAX], int max)
             kstrncpy(names[count++], "self", VFS_NAME_MAX);
         if (count < max)
             kstrncpy(names[count++], "stat", VFS_NAME_MAX);
+        if (count < max)
+            kstrncpy(names[count++], "pagecache", VFS_NAME_MAX);
         procs = (process_snapshot_t *)kmalloc(sizeof(process_snapshot_t) * PROCESS_MAX_COUNT);
         if (!procs)
             return count;
@@ -417,6 +424,28 @@ int procfs_read_file(const char *path, uint8_t **buf_out, size_t *size_out)
             if (out_append_u64(&ob, cs.idle_ticks[c]) != 0) goto fail;
             if (out_append_str(&ob, "\n") != 0) goto fail;
         }
+    } else if (kstreq(path, "/pagecache")) {
+        pagecache_stats_t ps;
+        pagecache_stats(&ps);
+        if (out_append_str(&ob, "total_pages ") != 0) goto fail;
+        if (out_append_u64(&ob, ps.total_pages) != 0) goto fail;
+        if (out_append_str(&ob, "\nmax_pages ") != 0) goto fail;
+        if (out_append_u64(&ob, ps.max_pages) != 0) goto fail;
+        if (out_append_str(&ob, "\nactive_pages ") != 0) goto fail;
+        if (out_append_u64(&ob, ps.active_pages) != 0) goto fail;
+        if (out_append_str(&ob, "\ninactive_pages ") != 0) goto fail;
+        if (out_append_u64(&ob, ps.inactive_pages) != 0) goto fail;
+        if (out_append_str(&ob, "\ndirty_pages ") != 0) goto fail;
+        if (out_append_u64(&ob, ps.dirty_pages) != 0) goto fail;
+        if (out_append_str(&ob, "\nhits ") != 0) goto fail;
+        if (out_append_u64(&ob, ps.hits) != 0) goto fail;
+        if (out_append_str(&ob, "\nmisses ") != 0) goto fail;
+        if (out_append_u64(&ob, ps.misses) != 0) goto fail;
+        if (out_append_str(&ob, "\nevictions ") != 0) goto fail;
+        if (out_append_u64(&ob, ps.evictions) != 0) goto fail;
+        if (out_append_str(&ob, "\nwritebacks ") != 0) goto fail;
+        if (out_append_u64(&ob, ps.writebacks) != 0) goto fail;
+        if (out_append_str(&ob, "\n") != 0) goto fail;
     } else if (is_pid_status(path, &pid)) {
         if (fill_status(pid, &ob) != 0)
             goto fail;

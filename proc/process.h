@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../include/spinlock.h"
 #include "../mm/vm_space.h"
 
 #define PROCESS_MAX_COUNT      256
@@ -31,7 +32,7 @@
 #define PROCESS_MAX_SIGNALS    64
 #define PROCESS_MAX_CHILDREN   32
 #define PROCESS_CWD_MAX        256
-#define PROCESS_MAX_OPEN_FILES 32
+#define PROCESS_MAX_OPEN_FILES 256
 #define PROCESS_PRIORITY_LEVELS 256
 #define PROCESS_DEFAULT_PRIORITY 128
 #define PROCESS_DEFAULT_TIMESLICE 4
@@ -181,6 +182,9 @@ struct process {
     void *open_files[PROCESS_MAX_OPEN_FILES];
     fd_entry_t fds[PROCESS_MAX_OPEN_FILES];
     int next_fd;
+    uint32_t umask;
+    spinlock_t fd_lock;
+    uint32_t io_pad;
 
     int used;
     char name[PROCESS_NAME_MAX];

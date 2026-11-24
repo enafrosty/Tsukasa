@@ -256,4 +256,65 @@ struct input_event {
     uint64_t timestamp_ms;
 };
 
+/* POSIX mode/type bits for vfs_stat_t */
+#define VFS_S_IFMT   0170000U
+#define VFS_S_IFSOCK 0140000U
+#define VFS_S_IFLNK  0120000U
+#define VFS_S_IFREG  0100000U
+#define VFS_S_IFBLK  0060000U
+#define VFS_S_IFDIR  0040000U
+#define VFS_S_IFCHR  0020000U
+#define VFS_S_IFIFO  0010000U
+#define VFS_S_ISUID  04000U
+#define VFS_S_ISGID  02000U
+#define VFS_S_ISVTX  01000U
+
+/* flock(2) operations */
+#ifndef LOCK_SH
+#define LOCK_SH 1
+#define LOCK_EX 2
+#define LOCK_NB 4
+#define LOCK_UN 8
+#endif
+
+/* access(2) mode flags */
+#ifndef F_OK
+#define F_OK 0
+#define X_OK 1
+#define W_OK 2
+#define R_OK 4
+#endif
+
+/* mount(2) / umount2(2) flags */
+#ifndef MS_RDONLY
+#define MS_RDONLY       1
+#define MNT_FORCE       1
+#define MNT_DETACH      2
+#define MNT_EXPIRE      4
+#define UMOUNT_NOFOLLOW 8
+#endif
+
+/* getdents64(2) directory entry types and ABI struct */
+#ifndef DT_UNKNOWN
+#define DT_UNKNOWN 0
+#define DT_FIFO    1
+#define DT_CHR     2
+#define DT_DIR     4
+#define DT_BLK     6
+#define DT_REG     8
+#define DT_LNK     10
+#define DT_SOCK    12
+#endif
+
+#ifndef _LINUX_DIRENT64_DEFINED
+#define _LINUX_DIRENT64_DEFINED
+struct linux_dirent64 {
+    uint64_t d_ino;
+    int64_t  d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    char     d_name[];
+};
+#endif
+
 #endif /* TSUKASA_VFS_ABI_H */

@@ -785,6 +785,8 @@ class QemuHarness:
         boot = self.boot_order
         if boot is None and self.boot_disk and not self.iso:
             boot = "c"
+        elif boot is None and self.iso and not self.boot_disk:
+            boot = "d"
         if boot:
             cmd.extend(["-boot", boot])
 
