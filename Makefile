@@ -81,7 +81,7 @@ X64_NET_OBJS = dev/pci.o \
     net/third_party/lwip/netif/ethernet.o
 
 # x64 storage drivers (PCI-based).
-X64_STORAGE_OBJS =
+X64_STORAGE_OBJS = drv/ahci.o drv/virtio_blk.o drv/nvme.o
 
 KERNEL_BIN = tsukasa_x64.elf
 CFLAGS = -m64 -mcmodel=kernel -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \

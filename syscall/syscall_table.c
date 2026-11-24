@@ -33,6 +33,7 @@
 #include "../drv/irq.h"
 #include "../drv/pit.h"
 #include "../drv/fb.h"
+#include "../drv/blockdev.h"
 #include "../dev/pci.h"
 #include "../include/kutils.h"
 #include "../arch/x86_64/cpu/gdt.h"
@@ -1369,6 +1370,8 @@ static void c01_test_entry(void)
         kprintf("[selftest] pci cap/bar %s devs=%d bars=%d caps=%d ecam=%d\n",
                 ok ? "PASS" : "FAIL", ndevs, bars_found, caps_found, pci_ecam_active());
     }
+
+    blockdev_run_irq_selftests();
 
     kprintf("[selftest] ALL DONE\n");
     acpi_power_off();

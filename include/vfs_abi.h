@@ -42,6 +42,11 @@
 #define VFS_KD_TEXT     0x00
 #define VFS_KD_GRAPHICS 0x01
 
+/* Block device ioctls (Linux-compatible) */
+#define BLKRRPART    0x125F
+#define BLKSSZGET    0x1268
+#define BLKGETSIZE64 0x80081272UL
+
 /* poll event bits */
 #define VFS_POLLIN   0x0001
 #define VFS_POLLPRI  0x0002

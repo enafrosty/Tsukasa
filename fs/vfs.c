@@ -28,9 +28,12 @@
 
 #include "../lib/lz4.h"
 
+#include "../drv/ahci.h"
 #include "../drv/ata.h"
 #include "../drv/blockdev.h"
 #include "../drv/diskmgr.h"
+#include "../drv/nvme.h"
+#include "../drv/virtio_blk.h"
 #include "mkfs_fat32.h"
 #include "../drv/fb.h"
 #include "../drv/input_dev.h"
@@ -1147,9 +1150,14 @@ void vfs_init(const void *boot_info)
     g_fat32_primary_vol = NULL;
 
     g_fat32_ok = 0;
-    /* Storage bring-up: register whole disks (ATA PIO first, then AHCI ports) and partitions. */
-    if (!ata_init())
-        kprintf("[ata] no drive detected\n");
+    /* Storage bring-up: probe PCI DMA drivers first, keep legacy ATA PIO as fallback. */
+    ahci_init();
+    virtio_blk_init();
+    nvme_init();
+    if (blockdev_count() == 0) {
+        if (!ata_init())
+            kprintf("[ata] no drive detected\n");
+    }
     diskmgr_scan_all();
     for (int di = 0; di < blockdev_count(); di++) {
         block_dev_t *bd = blockdev_at(di);
@@ -1165,9 +1173,9 @@ void vfs_init(const void *boot_info)
             continue;
         }
         mnt[0] = '/';
-        mnt[1] = 'd';
-        mnt[2] = 'e';
-        mnt[3] = 'v';
+        mnt[1] = 'm';
+        mnt[2] = 'n';
+        mnt[3] = 't';
         mnt[4] = '/';
         kstrncpy(mnt + 5, bd->name, VFS_PATH_MAX - 5);
         if (mount_register_ctx(mnt, VFS_BACKEND_FAT32VOL, 0, "fat32", vol) == 0)
@@ -3132,8 +3140,14 @@ void vfs_run_guide12_selftests(void)
             pl = kstrlen(bd->parent->name);
             for (int c = 0; c < pl; c++)
                 if (bd->name[c] != bd->parent->name[c]) ok = 0;
-            if (bd->name[pl] < '1' || bd->name[pl] > '9' || bd->name[pl + 1])
-                ok = 0;
+            if (bd->parent->type == BLOCKDEV_TYPE_NVME) {
+                if (bd->name[pl] != 'p' || bd->name[pl + 1] < '1' ||
+                    bd->name[pl + 1] > '9')
+                    ok = 0;
+            } else {
+                if (bd->name[pl] < '1' || bd->name[pl] > '9')
+                    ok = 0;
+            }
         }
         if (ok) {
             kprintf("[guide12] registry/naming PASS (%d partition(s))\n",
@@ -3248,7 +3262,7 @@ void vfs_run_guide12_selftests(void)
 
             if (ok) {
                 const vfs_mount_t *m;
-                mnt[0] = '/'; mnt[1] = 'd'; mnt[2] = 'e'; mnt[3] = 'v';
+                mnt[0] = '/'; mnt[1] = 'm'; mnt[2] = 'n'; mnt[3] = 't';
                 mnt[4] = '/';
                 kstrncpy(mnt + 5, data_part->name, VFS_PATH_MAX - 5);
                 m = mount_lookup(mnt);
@@ -3268,7 +3282,7 @@ void vfs_run_guide12_selftests(void)
             }
 
             if (ok) {
-                kprintf("[guide12] planted-file r/w via /dev/%s PASS\n",
+                kprintf("[guide12] planted-file r/w via /mnt/%s PASS\n",
                         data_part->name);
                 pass++;
             } else {

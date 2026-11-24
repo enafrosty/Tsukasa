@@ -35,6 +35,7 @@ typedef struct devfs_ops {
 
 void devfs_init(void);
 int devfs_register_device(const char *name, uint32_t type, const devfs_ops_t *ops, void *priv);
+int devfs_unregister_device(const char *name);
 
 int devfs_stat(const char *path, vfs_stat_t *out);
 int devfs_list(const char *path, char names[][VFS_NAME_MAX], int max);
