@@ -1,416 +1,259 @@
-
-  
-
 ![logo](https://i.imgur.com/PRzEoKE.png)
 
-  
-Tsukasa is a freestanding operating system written in C and x86_64 assembly. The system is designed without standard runtime dependencies, implementing its own boot protocol handlers, virtual memory manager, preemptive scheduler, POSIX system call interface, C runtime library, display server, userland coreutils, and port infrastructure.
+# Project Tsukasa
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Build](https://github.com/enafrosty/Tsukasa/actions/workflows/build.yml/badge.svg)](https://github.com/enafrosty/Tsukasa/actions/workflows/build.yml)
+[![Wiki](https://img.shields.io/badge/Docs-GitHub%20Wiki-blueviolet)](https://github.com/enafrosty/Tsukasa/wiki)
 
-  
-The operating system boots on 64-bit x86 hardware through the Limine bootloader protocol.
+Tsukasa is a freestanding `x86_64` operating system written in C11 and NASM assembly. Built without external standard runtime dependencies (`-ffreestanding -nostdlib`), it implements its own Limine boot handoff, 4-level virtual memory manager, unified LRU page cache, journaled `ext4` and `FAT32` filesystems, IRQ/DMA storage and network drivers, preemptive priority scheduler, POSIX system call interface, standalone C library (`tsukasa-libc`), UNIX userland utilities (`tsukasa-coreutils`), disk partitioning/installation tools (`tsukasa-disktools`), third-party ports (`tsukasa-ports`), and the client-server **Project Vanilla** compositing display server and desktop environment.
 
-  
-
----
-
-  
-
-## Current Architecture and Status
-
-  
-
-Tsukasa has expanded from an early kernel prototype into a multi-package operating system environment. The codebase is organized into a modular monolithic kernel, an independent standard C library (`tsukasa-libc`), a complete userland utility suite (`tsukasa-coreutils`), a window server and compositing subsystem (`vanilla`), disk management tooling (`tsukasa-disktools`), and an ecosystem of ported third-party software (`tsukasa-ports`).
-
-  
-
-### Core Subsystems
-
-  
-
-*  **Boot and Hardware Bringup**: Boots in 64-bit Long Mode via Limine v8. Parses Higher-Half Direct Map (HHDM), ACPI tables (RSDP, MADT, FADT), multi-processor enumeration (SMP), I/O APIC routing, 8259 PIC fallback, 8254 Programmable Interval Timer (PIT), and real-time clock (RTC).
-
-*  **Memory Management**: Physical memory manager (PMM) based on frame allocation bitmaps; 4-level x86_64 paging (PML4, PDPT, PD, PT) with fine-grained protection bits; dynamic kernel heap managed by a Two-Level Segregated Fit (TLSF) allocator with an auxiliary SLAB allocator for kernel object caching.
-
-*  **Processes and Scheduling**: Preemptive multi-level priority scheduler supporting 256 priority bands, per-process timeslicing, kernel work queues, wait queues, and thread synchronization primitives including fast user-space mutexes (futex).
-
-*  **Inter-Process Communication**: Unix domain stream and datagram sockets (`AF_UNIX`), page-mapped shared memory (`shm`), and unidirectional VFS pipes.
-
-*  **Virtual File System (VFS)**: POSIX-style file descriptor table with support for standard streams, path resolution, mount table management, and permissions. Filesystem drivers include:
-
-* FAT12 root ramdisk (`initrd.img`)
-
-* MemFS volatile in-memory filesystem mounted at `/tmp`
-
-* FAT32 partition driver for ATA/IDE hard drives mounted at `/disk`
-
-* DevFS device tree mounted at `/dev` (`/dev/fb0`, `/dev/input/event0`, `/dev/null`, `/dev/zero`, `/dev/urandom`)
-
-* Procfs and Sysfs synthetic filesystems for runtime kernel inspection
-
-*  **Project Vanilla (Display Server and Desktop)**: Decoupled client-server display server communicating over Unix domain sockets and shared framebuffer memory. Features a dirty-rectangle compositor, Z-order window management, window chrome with minimize/maximize/close controls, TTF vector typography via stb_truetype, BMP wallpaper scaling, a system taskbar, application launcher, and built-in client applications.
-
-*  **Standard C Library (`tsukasa-libc`)**: Standalone, freestanding C library implementing the standard headers (`<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<math.h>`, `<unistd.h>`, `<fcntl.h>`, `<sys/socket.h>`, `<sys/mman.h>`, `<sys/wait.h>`). Includes a full IEEE 754 math library and `crt0` application startup code.
-
-*  **Tsukasa Coreutils**: Complete set of standalone POSIX command-line utilities including `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `grep`, `head`, `tail`, `wc`, `cut`, `sort`, `uniq`, `uname`, `ps`, `kill`, `free`, `date`, `sysfetch`, `poweroff`, `reboot`, and the interactive `tsh` shell with history and pipeline redirection.
-
-*  **Third-Party Ports**: Integrated build pipelines for Doom (via `doomgeneric`), Lua 5.4.7, and Tiny C Compiler (TCC).
-
-  
+* **Website:** [tsukasa.heyfrosty.space](https://tsukasa.heyfrosty.space)
+* **Wiki:** [github.com/enafrosty/Tsukasa/wiki](https://github.com/enafrosty/Tsukasa/wiki)
+* **Roadmap:** [ROADMAP.md](ROADMAP.md)
 
 ---
 
-  
+## Key Architecture & Features
+
+### Kernel Core (`x86_64` Long Mode)
+* **Boot & Platform Bringup**: Boots via Limine v8 (BIOS and UEFI) into 64-bit Long Mode with Higher-Half Direct Map (HHDM). Parses ACPI (`RSDT`/`XSDT`, `MADT`, `FADT` `_S5_` shutdown, `MCFG`), initializes multi-I/O APIC routing (with 8259 PIC fallback), Local APIC, SMP (`sys/smp.c`), PIT 8254 (`100 Hz`), CMOS RTC, dynamic IRQ vector allocation (`0x50..0xEF`), and PCIe ECAM configuration space with 64-bit BAR decoding and MSI/MSI-X support.
+* **Isolation, Fault Recovery & Diagnostics**: Ring-3 exception isolation with per-CPU TSS `IST1` stacks for `#DF`/`#NMI`, interruptible system calls (`sti` in syscall dispatch), dedicated scheduler yield vector (`int 0x40`), blocking `nanosleep`, global stack protector (`-fstack-protector-strong`), frame-pointer symbolicated backtraces, optional `UBSAN=1` instrumentation, and an optional COM2 remote GDB stub (`GDBSTUB=1`).
+* **Memory Management**: Bitmap Physical Memory Manager (PMM), 4-level `x86_64` Virtual Memory Manager (PML4/PDPT/PD/PT), PAT Write-Combining (`MMU_FLAG_WC`) for kernel and `/dev/fb0` framebuffer mappings, TLSF constant-time kernel heap, SLAB object caches, per-process `vm_space_t`, strict syscall user-pointer validation (`vmm_validate_user_ptr`), and a unified bounded LRU page cache (`mm/pagecache.c`).
+* **Scheduling & IPC**: Preemptive 256-level priority scheduler (`40 ms` timeslices), wait queues, work queues, futexes, signals, shared memory (`shm`), Unix domain sockets (`AF_UNIX`), and VFS pipes.
+
+### Storage, Filesystems & Installer
+* **PCI Storage Controllers & Partitioning**: Interrupt/DMA drivers for **AHCI SATA** (`/dev/sda*`), **VirtIO-blk** (`/dev/vda*`), and **NVMe** (`/dev/nvme0n1*`), plus legacy ATA PIO fallback (`/dev/hda*`), with full primary+backup GPT CRC32 validation, MBR support, and block device ioctls (`BLKGETSIZE64`, `BLKSSZGET`, `BLKRRPART`).
+* **Virtual File System (VFS)**: Thread-safe VFS with up to 256 open file descriptors per process, hierarchical dentry cache, symlinks (`lstat`/`readlink` with `-ELOOP` detection), per-inode `flock`, POSIX metadata/mount/sync calls (`stat`, `getdents64`, `chmod`, `chown`, `truncate`, `umask`, `access`, `mount`, `umount2`, `fsync`, `sync`), and clean filesystem flush on shutdown/reboot.
+* **Filesystems**:
+  * Multi-instance `tmpfs` mounted at `/`, `/tmp`, and `/var/run` in live boot, populated from an LZ4-compressed USTAR archive (`initrd.tar.lz4`) with a standard UNIX layout (`/bin`, `/sbin`, `/usr`, `/etc`, `/home`, `/root`, `/var`, `/dev`, `/proc`, `/sys`, `/boot`, `/mnt`).
+  * Journaled read/write **ext4** (`lwext4` + page cache), supporting persistent disk root (`root=/dev/...` and `root=PARTUUID=...`).
+  * Page-cached **FAT32** with Long File Name (LFN), nested subdirectories, truncation, and ESP mounting (`/boot`) or `/mnt/*`.
+  * Synthetic and boot filesystems: **DevFS** (`/dev`), **ProcFS** (`/proc`), **SysFS** (`/sys`), and **BootFS**.
+* **Disk Tools (`tsukasa-disktools`)**: `fdisk`, `mkfs.fat32`, `mkfs.ext2`, `mkfs.ext4`, and a unified BIOS+UEFI GPT/`ext4` OS `installer`.
+
+### Project Vanilla (Display Server & Desktop)
+* **Display Server (`vanilla_srv` / `/bin/vsrv`)**: Pure userspace compositor communicating over `/tmp/vanilla.sock` and SHM surfaces, writing directly to PAT Write-Combined `/dev/fb0` via an SSE2 blitter and dirty-rectangle damage tracking. Supports rounded window chrome, drop shadows, DPI scaling, cursors, drag-and-drop, runtime themes, `stb_truetype` vector fonts, and `stb_image`/BMP assets.
+* **Desktop Services & Libraries**: Managed by `/bin/supervisord` (`/etc/services.conf`), including `registryd`, `clipboardd`, `notifyd`, and the decoupled `shell` client (statusbar with live CPU/RAM/clock, dock, quick launcher, system menu, and context menus), built atop `libvanilla`, `libvanilla-ui`, `libvanillalayout`, and generated IPC protocol definitions.
+* **Applications**: `terminal` (VT emulator + `tsh`), `filemgr`, `notepad`, `calc`, `taskmgr`, `settings`, and `devtools` (`microui`). Includes a native SDL2 host emulator (`make -C vanilla host-run`) for rapid UI iteration.
+
+### Userland, Ports & Networking
+* **Standard C Library (`tsukasa-libc`)**: Freestanding C11/POSIX headers, `crt0.o`, `libc.a`, and IEEE 754 `libm.a` with `tsukasa_app.ld`.
+* **Core Utilities (`tsukasa-coreutils`)**: 27 standalone utilities (`cat`, `cp`, `cut`, `date`, `fetch`, `free`, `grep`, `head`, `kill`, `ls`, `mkdir`, `mv`, `net`, `ping`, `poweroff`, `ps`, `reboot`, `rm`, `sort`, `sysfetch`, `tail`, `telnet`, `touch`, `tsh`, `uname`, `uniq`, `wc`).
+* **Third-Party Ports (`tsukasa-ports`)**: Doom (`doomgeneric`), Lua 5.4.7 (`lua`, `luac`), and Tiny C Compiler (`tcc`).
+* **Networking**: Intel E1000 (`0x8086:0x100E/100F`) and VirtIO-net (`0x1AF4:0x1000`) drivers backed by lwIP 2.x (DHCP, DNS, ICMP, TCP, UDP). Note: `sys_socket` currently serves `AF_UNIX`; IP networking goes through `sys_netcall` until full BSD `AF_INET`/`AF_INET6` sockets land.
+
+---
 
 ## Directory Structure
 
-  
-
 ```text
-
-tsukasa/
-
-|-- arch/x86_64/ Kernel entry points, boot info parser, GDT/IDT/TSS, ISRs, syscall entry
-
-|-- drv/ Device drivers: ACPI, I/O APIC, LAPIC, PIC, PIT, RTC, serial, ATA, FB, PS/2
-
-|-- fs/ VFS core, FAT12, FAT32, MemFS, DevFS, Procfs, Sysfs, TAR parser
-
-|-- gfx/ Kernel-level boot graphics, font tables, legacy drawing primitives
-
-|-- include/ Kernel headers, hardware definitions, errno, POSIX types, socket structures
-
-|-- ipc/ Shared memory (SHM) and Unix domain socket implementations
-
-|-- mm/ Physical frame allocator (PMM), 4-level paging (VMM), TLSF heap, SLAB allocator
-
-|-- net/ Network device abstraction, Intel E1000 and VirtIO drivers, lwIP port
-
-|-- proc/ Process control blocks (PCB), thread scheduler, context switching, signals
-
-|-- sys/ Futex subsystem, wait queues, work queues, kernel console, panic handlers
-
-|-- syscall/ Syscall dispatch table and POSIX system call handlers
-
-|-- tsukasa-coreutils/ Standalone CLI programs and interactive tsh shell
-
-|-- tsukasa-disktools/ Storage partition manager (fdisk), mkfs.fat32, mkfs.ext2, disk installer
-
-|-- tsukasa-libc/ Freestanding C library implementation and application linker scripts
-
-|-- tsukasa-ports/ Third-party ported software (Doom, Lua, TCC)
-
-|-- vanilla/ Project Vanilla client-server display server, compositor, and GUI applications
-
-`-- Makefile Master build system orchestrating kernel and userland packaging
-
+Tsukasa/
+|-- arch/x86_64/        Boot entry, Limine boot info parser, GDT/IDT/TSS, ISRs, SYSCALL entry
+|-- assets/             Vanilla desktop themes (.ini) and ARGB cursors
+|-- dev/                PCI/PCIe ECAM bus enumeration, BARs, MSI/MSI-X
+|-- docs/               Architecture overview, automated testing guide, third-party inventory
+|-- drv/                ACPI, IOAPIC, LAPIC, IRQ allocator, AHCI, VirtIO-blk, NVMe, ATA, FB, PS/2, serial
+|-- fs/                 VFS core, dcache, tmpfs, ext4 (lwext4), FAT32, DevFS, ProcFS, SysFS, BootFS, USTAR
+|-- gfx/                Minimal kernel boot/panic graphics helpers (legacy kernel WM retired)
+|-- include/            Kernel headers, hardware registers, errno, syscall & POSIX types
+|-- ipc/                Shared memory (SHM) and Unix domain sockets (AF_UNIX)
+|-- lib/                kprintf, LZ4 decompression, ksymbols/backtrace, stack protector, UBSan handlers
+|-- loader/             ELF64 loader and executable runner
+|-- mm/                 PMM, 4-level x86_64 VMM + PAT WC, TLSF heap, SLAB cache, LRU page cache
+|-- net/                NIC abstraction, E1000/VirtIO-net drivers, lwIP 2.x TCP/IP port
+|-- proc/               PCBs, preemptive 256-band priority scheduler, assembly switch, signals
+|-- scripts/            Build helpers (ksymbols), CI runners, headless QMP QEMU automation & test suites
+|-- sys/                SMP bringup, futex, wait/work queues, panic screen, kconsole, COM2 gdbstub
+|-- syscall/            POSIX flat syscall table and compatibility syscall handlers
+|-- tools/              Host build utilities (lz4pack, GPT image builders, generators)
+|-- tsukasa-coreutils/  27 standalone CLI utilities and the interactive tsh shell
+|-- tsukasa-disktools/  fdisk, mkfs.fat32, mkfs.ext2, mkfs.ext4, and unified BIOS+UEFI installer
+|-- tsukasa-libc/       Freestanding C library (libc.a, libm.a, crt0.o) and test binaries
+|-- tsukasa-ports/      Third-party ports (doomgeneric, Lua 5.4.7, TinyCC)
+|-- tty/                Virtual terminal (TTY) subsystem
+|-- user/               Kernel/SDK test drivers (TESTDRV.ELF) and minimal ELF stubs
+|-- vanilla/            Project Vanilla display server, shell, supervisor, daemons, UI libs, apps, host emulator
+`-- Makefile            Top-level build, ISO packaging, QEMU launch, and test orchestration
 ```
-
-  
 
 ---
 
-  
-
 ## Prerequisites and Toolchain Setup
 
-  
-
 ### Linux / Fedora
-
-Install the required toolchain, image tools, QEMU, and SDL2 development headers:
-
-```bash
-sudo dnf install -y clang lld llvm nasm xorriso mtools dosfstools qemu-system-x86 qemu-img SDL2-devel gcc make git binutils gdb patch python3
-```
-
-Or run the automated setup script in the repository root:
+Run the setup script or install packages directly:
 
 ```bash
 chmod +x setup_fedora.sh
 ./setup_fedora.sh
 ```
 
-### Linux / Ubuntu / Debian / WSL2
-
-  
-
-The build system requires standard GNU and LLVM bare-metal cross tools:
-
-  
+Or manually:
 
 ```bash
-
-sudo  apt-get  update
-
-sudo  apt-get  install  -y build-essential clang lld llvm nasm xorriso mtools dosfstools git qemu-system-x86
-
+sudo dnf install -y clang lld llvm nasm lz4 xorriso mtools dosfstools e2fsprogs \
+    qemu-system-x86 qemu-img SDL2-devel gcc make git binutils gdb patch python3
 ```
 
-  
-
-If you wish to test the host emulator for Project Vanilla on Linux, install the SDL2 development headers:
-
-  
+### Linux / Debian / Ubuntu / WSL2
+Run the setup script or install packages directly:
 
 ```bash
-
-sudo  apt-get  install  -y  libsdl2-dev
-
-```
-
-  
-
-An automated setup script is provided in the repository root:
-
-  
-
-```bash
-
-chmod  +x  setup_wsl.sh
-
+chmod +x setup_wsl.sh
 ./setup_wsl.sh
-
 ```
 
-  
+Or manually:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential clang lld llvm nasm lz4 xorriso mtools \
+    dosfstools e2fsprogs git gdb python3 qemu-system-x86 qemu-utils libsdl2-dev
+```
+
+For optional UEFI OVMF boot testing (`test-installer-e2e.py` / `--firmware uefi`), also install your distribution's EDK2 OVMF package (`edk2-ovmf` on Fedora, `ovmf` on Debian/Ubuntu).
 
 ---
-
-  
 
 ## Building the Operating System
 
-  
-
-Tsukasa uses GNU Make. The master Makefile builds the kernel, standard library, user utilities, desktop server, and prepares a bootable ISO image.
-
-  
-
-### Building the 64-Bit Limine ISO (Primary Target)
-
-  
+### Primary Bootable ISO (`x86_64`)
 
 ```bash
-
-# 1. Clean previous build artifacts
-
-make  clean
-
-  
-
-# 2. Build the standard library, user applications, and root ramdisk
-
-make  initrd
-
-  
-
-# 3. Build the x86_64 kernel and package the bootable ISO
-
-make  iso
-
+make -j$(nproc) iso-x86_64
 ```
 
-  
+This builds `tsukasa-libc`, `tsukasa-coreutils`, `tsukasa-disktools`, `tsukasa-ports`, `vanilla`, guest test suites, packs `build/initrd.tar.lz4`, fetches/caches Limine `v8.x-binary` into `.limine/` (requires network access on first build), compiles `tsukasa_x64.elf`, and produces `tsukasa.iso`.
 
-The resulting bootable image is generated at `tsukasa.iso`.
-
-  
-
-### Building Individual Subsystems
-
-  
-
-You can build specific userland subsystems independently during development:
-
-  
+### Build Options and Subsystems
 
 ```bash
+# Build with GCC instead of LLVM/Clang (default is TOOLCHAIN=llvm)
+make -j$(nproc) TOOLCHAIN=gcc iso-x86_64
 
-# Compile tsukasa-libc
+# Enable Kernel UBSan or COM2 remote GDB stub
+make -j$(nproc) UBSAN=1 iso-x86_64
+make -j$(nproc) GDBSTUB=1 iso-x86_64
 
-make  -C  tsukasa-libc  all
+# Kernel ELF only
+make -j$(nproc)
 
-  
-
-# Compile tsukasa-coreutils
-
-make  -C  tsukasa-coreutils  all
-
-  
-
-# Compile Project Vanilla display server and GUI apps
-
-make  -C  vanilla  all
-
-  
-
-# Compile disk formatting and installation tools
-
-make  -C  tsukasa-disktools  all
-
-  
-
-# Compile ported third-party packages (Doom, Lua)
-
-make  -C  tsukasa-ports  all
-
+# Individual userland targets
+make libc
+make vanilla
+make coreutils
+make disktools
+make ports
 ```
 
-  
+Always run `make clean` before major linker or standalone toolchain changes if you manually customize build flags, though compiler flags and header dependencies (`-MMD -MP`) are tracked automatically.
 
 ---
-
-  
 
 ## Running in QEMU
 
-  
-
-Run scripts and Make targets are configured for QEMU testing.
-
-  
-
-### Standard Execution via Make
-
-  
+### Quick Launch
 
 ```bash
+# Build (if needed) and launch QEMU via Makefile
+make run
 
-make  run
-
+# Or use the helper scripts
+./run_qemu.sh          # Linux / macOS / WSL2
+.\run_qemu.ps1         # Windows PowerShell
 ```
 
-  
+### Q35 + AHCI SATA / VirtIO-blk / NVMe
 
-This target builds the image if necessary and launches QEMU with 256 MiB of RAM, an attached IDE hard drive image (`disk.img`), serial output routed to the terminal, and an emulated Intel E1000 network adapter configured with user-mode NAT networking.
-
-  
-
-### Manual QEMU Command Line
-
-  
-
-For full control over QEMU parameters, run:
-
-  
+Tsukasa automatically discovers and initializes AHCI, VirtIO-blk, NVMe, and legacy IDE/ATA controllers. For modern Q35 SATA testing:
 
 ```bash
-
-qemu-system-x86_64 -cdrom tsukasa.iso -hda  disk.img -boot d -m  256 -smp 2 -vga  std -serial stdio -netdev  user,id=u1 -device e1000,netdev=u1
-
+qemu-img create -f raw disk.img 256M   # minimum 96M if testing OS installation
+qemu-system-x86_64 -machine q35 -cdrom tsukasa.iso -boot d \
+    -drive if=none,id=d0,file=disk.img,format=raw \
+    -device ahci,id=ahci -device ide-hd,drive=d0,bus=ahci.0 \
+    -m 256 -smp 2 -vga std -serial stdio \
+    -netdev user,id=u1 -device e1000,netdev=u1
 ```
 
-  
+> **Note for Wayland / Hyprland users (small laptop screens or fractional scaling):**
+> Tsukasa currently uses a relative PS/2 mouse at `1280x800x32`. If GTK pointer grab clips or skews inside a tiled/scaled window, use SDL display mode with `Ctrl+Alt+G` to capture/release the mouse and `Ctrl+Alt+F` for fullscreen:
+> `SDL_VIDEODRIVER=wayland qemu-system-x86_64 ... -display sdl`
 
-### Script Execution
-
-  
-
-*  **Linux / WSL**: Run `./run_qemu.sh` for an interactive boot session with standard display and serial diagnostics.
-
-*  **Windows PowerShell**: Run `.\run_qemu.ps1` to execute directly from a Windows environment where QEMU for Windows is installed.
-
-  
-
-### Parameter Breakdown
-
-  
-
-*  `-cdrom tsukasa.iso`: Mounts the bootable ISO containing Limine, the 64-bit kernel, and the initrd filesystem.
-
-*  `-hda disk.img`: Attaches an ATA/IDE virtual drive used for secondary storage, partitioning, and filesystem formatting tests.
-
-*  `-m 256`: Allocates 256 MiB of physical RAM.
-
-*  `-smp 2`: Exposes 2 CPU cores to test SMP detection and multi-core data structures.
-
-*  `-vga std`: Configures a standard Bochs/VESA compatible linear framebuffer.
-
-*  `-serial stdio`: Directs COM1 serial output to your terminal for real-time kernel logging.
-
-*  `-netdev user,id=u1 -device e1000,netdev=u1`: Attaches an Intel 82540EM Gigabit NIC connected to QEMU's virtual NAT network.
-
-  
+See [BOOT_QEMU.md](BOOT_QEMU.md) for NVMe, VirtIO-blk, UEFI OVMF, installed-disk boot, and GDB instructions.
 
 ---
 
-  
+## Project Vanilla Host Emulator
 
-## Project Vanilla Desktop Host Emulator
-
-  
-
-To speed up GUI development and avoid restarting virtual machines when tweaking window manager layouts, typography, or widgets, Project Vanilla includes a host emulator that compiles natively on Linux or Windows using SDL2.
-
-  
-
-To build and run the host emulator:
-
-  
+You can run the Vanilla display server, compositor, shell, and apps natively on Linux/WSL2/Windows via SDL2 without booting a VM:
 
 ```bash
-
-cd  vanilla
-
-make  host-run
-
+cd vanilla
+make host-run
 ```
-
-  
-
-This starts the Vanilla display server and desktop shell directly in a host window with keyboard and mouse input forwarding.
-
-  
 
 ---
 
-  
+## Testing and Verification
+
+Tsukasa includes automated host, guest, QMP visual, storage-matrix, and disk-installer E2E test suites:
+
+```bash
+# 1. Host unit tests (8 Vanilla suites) + Headless QEMU guest test suite (169 assertions total)
+make check
+
+# 2. Headless QEMU boot smoke test + kernel selftests
+bash scripts/ci/boot-test.sh tsukasa.iso boot.log
+
+# 3. Automated QMP visual compositor & GUI desktop test suite
+make visual-test
+
+# 4. Storage controller matrix (pc/q35 x ahci/virtio/nvme)
+python3 scripts/test/test-storage-matrix.py --iso tsukasa.iso --machine both --mode probe --require-driver
+
+# 5. Live ISO -> GPT/ext4 install -> SeaBIOS + UEFI double-reboot persistence + host fsck
+python3 scripts/test/test-installer-e2e.py --iso tsukasa.iso --storage ahci
+```
+
+Full documentation of the headless QMP automation framework lives in [docs/AUTOMATED_TESTING.md](docs/AUTOMATED_TESTING.md).
+
+---
 
 ## Kernel Debugging with GDB
 
-  
-
-To debug kernel initialization or step through assembly routines:
-
-  
-
-1. Launch QEMU with the `-s -S` flags to pause CPU execution at the first instruction:
-
-  
+1. Start QEMU paused at the reset vector with GDB server enabled:
 
 ```bash
-
-qemu-system-x86_64 -cdrom tsukasa.iso -s -S -serial stdio
-
+qemu-system-x86_64 -cdrom tsukasa.iso -s -S -no-reboot -serial stdio
 ```
 
-  
-
-2. In a separate terminal, launch GDB and connect to the QEMU target:
-
-  
+2. Attach GDB to `tsukasa_x64.elf`:
 
 ```bash
-
 gdb tsukasa_x64.elf
-
 (gdb) target remote localhost:1234
-
 (gdb) break kernel_main_x64
-
 (gdb) continue
-
 ```
-
-  
 
 ---
 
-  
+## Roadmap & Documentation
+
+* **Project Roadmap & Future Plans:** [ROADMAP.md](ROADMAP.md)
+* **Architecture Overview:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+* **Booting & QEMU Guide:** [BOOT_QEMU.md](BOOT_QEMU.md)
+* **Automated QMP & Storage Testing:** [docs/AUTOMATED_TESTING.md](docs/AUTOMATED_TESTING.md)
+* **Third-Party Sources & Licenses:** [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)
+* **Contributing Guide:** [CONTRIBUTING.md](CONTRIBUTING.md)
+* **Changelog:** [CHANGELOG.md](CHANGELOG.md)
+* **Security Policy:** [SECURITY.md](SECURITY.md)
+* **GitHub Wiki:** [github.com/enafrosty/Tsukasa/wiki](https://github.com/enafrosty/Tsukasa/wiki)
+
+---
 
 ## License
 
-  
-
-Project Tsukasa is released under the GNU General Public License v3.0. Refer to the `LICENSE` file for full terms and licensing details.
+Project Tsukasa is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE) for the full text.
