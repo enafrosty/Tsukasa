@@ -1,5 +1,5 @@
 /*
- * Project Tsukasa — OS Installer & Limine Deployer (installer)
+ * Project Tsukasa - Unified BIOS+UEFI GPT/ext4 OS Installer (installer)
  *
  * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
@@ -15,63 +15,104 @@
  */
 
 #include "../include/disktools.h"
+#include "../include/gpt.h"
 #include "../include/mbr.h"
-#include "../include/fat32.h"
 
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
+#include <sys/stat.h>
 
-#define PART_START_LBA       2048u
-#define BOOTBLOB_SECTORS     2048u
-#define MIN_INSTALL_SECTORS  (64u * 2048u) /* 64 MiB minimum */
+#ifndef _WIN32
+#include <sys/mount.h>
+#endif
+
+#define MIN_INSTALL_SECTORS  (96ULL * 2048ULL) /* 96 MiB minimum (1M BIOS + 64M ESP + >=31M root) */
+#define BIOS_BOOT_SECTORS    2048ULL           /* 1 MiB */
+#define ESP_SECTORS          (64ULL * 2048ULL) /* 64 MiB */
+#define COPY_BUF_SIZE        32768u
 
 static const char *const g_candidate_devices[] = {
-    "/dev/hda",
     "/dev/sda",
     "/dev/vda",
-    "/dev/hdb",
+    "/dev/nvme0n1",
+    "/dev/hda",
     "/dev/sdb",
     "/dev/vdb",
+    "/dev/nvme1n1",
+    "/dev/hdb",
+};
+
+static const char *const g_bootx64_paths[] = {
+    "/usr/share/limine/BOOTX64.EFI",
+    "/boot/EFI/BOOT/BOOTX64.EFI",
+};
+
+static const char *const g_limine_sys_paths[] = {
+    "/usr/share/limine/limine-bios.sys",
+    "/boot/limine/limine-bios.sys",
+    "/boot/limine-bios.sys",
+    "/limine-bios.sys",
 };
 
 static const char *const g_bootblob_paths[] = {
-    "bootblob.bin",
-    "/bootblob.bin",
+    "/usr/share/limine/bootblob.bin",
     "/boot/bootblob.bin",
-    "/boot/limine/bootblob.bin",
+    "/bootblob.bin",
 };
 
 static const char *const g_kernel_paths[] = {
     "/boot/tsukasa_x64.elf",
     "/tsukasa_x64.elf",
-    "tsukasa_x64.elf",
 };
 
-static const char *const g_initrd_paths[] = {
-    "/boot/initrd.img",
-    "/initrd.img",
-    "initrd.img",
-};
+static void log_msg(const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0)
+        return;
 
-static const char *const g_limine_sys_paths[] = {
-    "/boot/limine/limine-bios.sys",
-    "/limine-bios.sys",
-    "/boot/limine-bios.sys",
-    "limine-bios.sys",
-};
+    fputs(buf, stdout);
+    fflush(stdout);
 
-#ifndef O_BINARY
-#define O_BINARY 0
-#endif
+    int tty = open("/dev/tty0", O_WRONLY);
+    if (tty >= 0) {
+        size_t len = strlen(buf);
+        (void)write(tty, buf, len);
+        close(tty);
+    }
+}
 
-static int find_file(const char *const paths[], size_t count, char *out_path, size_t max)
+static int token_is_erase(const char *s)
+{
+    static const char t[] = "erase";
+    int i;
+    if (!s)
+        return 0;
+    for (i = 0; t[i]; i++) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z')
+            c = (char)(c + 32);
+        if (c != t[i])
+            return 0;
+    }
+    return s[i] == '\0';
+}
+
+static int find_existing_file(const char *const paths[], size_t count,
+                              char *out_path, size_t max)
 {
     for (size_t i = 0; i < count; i++) {
-        int fd = open(paths[i], O_RDONLY | O_BINARY);
-        if (fd >= 0) {
-            close(fd);
+        struct stat st;
+        if (stat(paths[i], &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
             strncpy(out_path, paths[i], max - 1);
             out_path[max - 1] = '\0';
             return 0;
@@ -80,9 +121,9 @@ static int find_file(const char *const paths[], size_t count, char *out_path, si
     return -1;
 }
 
-static int read_all_file(const char *path, uint8_t **out_buf, size_t *out_size)
+static int read_entire_file(const char *path, uint8_t **out_buf, size_t *out_size)
 {
-    int fd = open(path, O_RDONLY | O_BINARY);
+    int fd = open(path, O_RDONLY);
     if (fd < 0)
         return -1;
 
@@ -93,21 +134,21 @@ static int read_all_file(const char *path, uint8_t **out_buf, size_t *out_size)
     }
     lseek(fd, 0, SEEK_SET);
 
-    uint8_t *buf = (uint8_t *)malloc((size_t)sz);
-    if (!buf && sz > 0) {
+    uint8_t *buf = (uint8_t *)malloc((size_t)(sz ? sz : 1));
+    if (!buf) {
         close(fd);
         return -1;
     }
 
-    size_t read_bytes = 0;
-    while (read_bytes < (size_t)sz) {
-        ssize_t n = read(fd, buf + read_bytes, (size_t)sz - read_bytes);
+    size_t done = 0;
+    while (done < (size_t)sz) {
+        ssize_t n = read(fd, buf + done, (size_t)sz - done);
         if (n <= 0) {
             free(buf);
             close(fd);
             return -1;
         }
-        read_bytes += (size_t)n;
+        done += (size_t)n;
     }
 
     close(fd);
@@ -116,447 +157,653 @@ static int read_all_file(const char *path, uint8_t **out_buf, size_t *out_size)
     return 0;
 }
 
-static void convert_to_83(const char *src, char dst[11])
+static int copy_file_mode(const char *src, const char *dst, mode_t mode, uint8_t *buf)
 {
-    memset(dst, ' ', 11);
-    const char *dot = strrchr(src, '.');
-    size_t name_len = dot ? (size_t)(dot - src) : strlen(src);
-    if (name_len > 8)
-        name_len = 8;
+    int in_fd = open(src, O_RDONLY);
+    if (in_fd < 0)
+        return -1;
 
-    for (size_t i = 0; i < name_len; i++)
-        dst[i] = (char)toupper((unsigned char)src[i]);
-
-    if (dot) {
-        const char *ext = dot + 1;
-        size_t ext_len = strlen(ext);
-        if (ext_len > 3)
-            ext_len = 3;
-        for (size_t i = 0; i < ext_len; i++)
-            dst[8 + i] = (char)toupper((unsigned char)ext[i]);
+    int out_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode & 07777);
+    if (out_fd < 0) {
+        close(in_fd);
+        return -1;
     }
+
+    int rc = 0;
+    for (;;) {
+        ssize_t r = read(in_fd, buf, COPY_BUF_SIZE);
+        if (r < 0) {
+            rc = -1;
+            break;
+        }
+        if (r == 0)
+            break;
+        size_t off = 0;
+        while (off < (size_t)r) {
+            ssize_t w = write(out_fd, buf + off, (size_t)r - off);
+            if (w <= 0) {
+                rc = -1;
+                break;
+            }
+            off += (size_t)w;
+        }
+        if (rc != 0)
+            break;
+    }
+
+    close(out_fd);
+    close(in_fd);
+    if (rc == 0)
+        (void)chmod(dst, mode & 07777);
+    return rc;
 }
 
-/* In-memory FAT32 volume builder & injector for installation payload */
-typedef struct {
-    device_handle_t *dev;
-    uint32_t         part_start_lba;
-    uint32_t         total_sectors;
-    uint32_t         reserved_sectors;
-    uint32_t         spc;
-    uint32_t         fat_size;
-    uint32_t         cluster_count;
-    uint32_t         next_free_cluster;
-    uint32_t         root_dir_entry_count;
-    fat32_bpb_t      bpb;
-    fat32_fsinfo_t   fsinfo;
-} fat32_writer_t;
-
-static int fat32_writer_init(fat32_writer_t *w, device_handle_t *dev, uint32_t start_lba, uint32_t sec_count)
+static int write_text_file(const char *path, const char *text)
 {
-    memset(w, 0, sizeof(*w));
-    w->dev = dev;
-    w->part_start_lba = start_lba;
-    w->total_sectors = sec_count;
-    w->reserved_sectors = 32;
-
-    /* Adaptive cluster size heuristic */
-    if (sec_count < 532480u)
-        w->spc = 1;
-    else if (sec_count < 1064960u)
-        w->spc = 2;
-    else if (sec_count < 2097152u)
-        w->spc = 4;
-    else if (sec_count < 16777216u)
-        w->spc = 8;
-    else if (sec_count < 33554432u)
-        w->spc = 16;
-    else
-        w->spc = 32;
-
-    uint32_t ds = sec_count - w->reserved_sectors;
-    uint64_t fat_bytes = ((uint64_t)(ds / w->spc) + 2ULL) * 4ULL;
-    w->fat_size = (uint32_t)((fat_bytes + 511ULL) / 512ULL);
-
-    if (sec_count <= w->reserved_sectors + 2u * w->fat_size)
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
         return -1;
-
-    w->cluster_count = (sec_count - (w->reserved_sectors + 2u * w->fat_size)) / w->spc;
-    if (w->cluster_count < FAT32_MIN_CLUSTERS)
-        return -1;
-
-    w->next_free_cluster = 3; /* Cluster 2 is root */
-    w->root_dir_entry_count = 0;
-
-    /* Build BPB */
-    w->bpb.jump_boot[0] = 0xEB;
-    w->bpb.jump_boot[1] = 0x58;
-    w->bpb.jump_boot[2] = 0x90;
-    memcpy(w->bpb.oem_name, "TSUKASA ", 8);
-    w->bpb.bytes_per_sector = 512;
-    w->bpb.sectors_per_cluster = (uint8_t)w->spc;
-    w->bpb.reserved_sector_count = (uint16_t)w->reserved_sectors;
-    w->bpb.num_fats = 2;
-    w->bpb.root_entry_count = 0;
-    w->bpb.total_sectors_16 = 0;
-    w->bpb.media = 0xF8;
-    w->bpb.fat_size_16 = 0;
-    w->bpb.sectors_per_track = 63;
-    w->bpb.num_heads = 255;
-    w->bpb.hidden_sectors = start_lba;
-    w->bpb.total_sectors_32 = sec_count;
-    w->bpb.fat_size_32 = w->fat_size;
-    w->bpb.ext_flags = 0;
-    w->bpb.fs_version = 0;
-    w->bpb.root_cluster = 2;
-    w->bpb.fs_info = 1;
-    w->bpb.backup_boot_sector = 6;
-    w->bpb.drive_number = 0x80;
-    w->bpb.boot_sig = FAT32_EXT_BOOT_SIG;
-    w->bpb.volume_id = 0x5453554Bu;
-    memcpy(w->bpb.volume_label, "TSUKASA_OS ", 11);
-    memcpy(w->bpb.fs_type, "FAT32   ", 8);
-    w->bpb.boot_signature = FAT32_BOOT_SIG;
-
-    /* Build FSInfo */
-    w->fsinfo.lead_sig = FAT32_FSINFO_LEAD_SIG;
-    w->fsinfo.struct_sig = FAT32_FSINFO_STRC_SIG;
-    w->fsinfo.free_count = w->cluster_count - 1;
-    w->fsinfo.next_free = 3;
-    w->fsinfo.trail_sig = FAT32_FSINFO_TRAIL_SIG;
-
-    /* Write BPB */
-    if (device_write_sectors(dev, start_lba, 1, &w->bpb) != 0 ||
-        device_write_sectors(dev, start_lba + 6, 1, &w->bpb) != 0)
-        return -1;
-
-    /* Write FSInfo */
-    if (device_write_sectors(dev, start_lba + 1, 1, &w->fsinfo) != 0 ||
-        device_write_sectors(dev, start_lba + 7, 1, &w->fsinfo) != 0)
-        return -1;
-
-    /* Initialize FAT tables head */
-    uint32_t fat_head[128];
-    memset(fat_head, 0, sizeof(fat_head));
-    fat_head[0] = FAT32_MEDIA_FIXED;
-    fat_head[1] = FAT32_EOC;
-    fat_head[2] = FAT32_EOC;
-
-    uint32_t fat1_lba = start_lba + w->reserved_sectors;
-    uint32_t fat2_lba = fat1_lba + w->fat_size;
-    if (device_write_sectors(dev, fat1_lba, 1, fat_head) != 0 ||
-        device_write_sectors(dev, fat2_lba, 1, fat_head) != 0)
-        return -1;
-
-    uint8_t zero_sec[512];
-    memset(zero_sec, 0, sizeof(zero_sec));
-    for (uint32_t s = 1; s < w->fat_size; s++) {
-        if (device_write_sectors(dev, fat1_lba + s, 1, zero_sec) != 0 ||
-            device_write_sectors(dev, fat2_lba + s, 1, zero_sec) != 0)
+    size_t len = strlen(text);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, text + off, len - off);
+        if (w <= 0) {
+            close(fd);
             return -1;
+        }
+        off += (size_t)w;
     }
-
-    /* Clear Cluster 2 (Root directory) */
-    uint32_t root_lba = start_lba + w->reserved_sectors + 2u * w->fat_size;
-    for (uint32_t s = 0; s < w->spc; s++) {
-        if (device_write_sectors(dev, root_lba + s, 1, zero_sec) != 0)
-            return -1;
-    }
-
+    close(fd);
     return 0;
 }
 
-static int fat32_writer_add_file(fat32_writer_t *w, const char *dos_name, const void *data, size_t size)
+static int ensure_dir(const char *path, mode_t mode)
 {
-    if (!w || !dos_name)
+    if (mkdir(path, mode) == 0)
+        return 0;
+    if (errno == EEXIST)
+        return 0;
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+        return 0;
+    return -1;
+}
+
+static int should_skip_root_entry(const char *name)
+{
+    static const char *const skip[] = {
+        "dev", "proc", "sys", "tmp", "mnt", "boot", "disk", "pkg",
+    };
+    for (size_t i = 0; i < sizeof(skip) / sizeof(skip[0]); i++) {
+        if (strcmp(name, skip[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int copy_tree_recursive(const char *src_dir, const char *dst_dir,
+                               int is_root_level, uint8_t *buf)
+{
+    DIR *d = opendir(src_dir);
+    if (!d)
         return -1;
 
-    uint32_t cluster_bytes = w->spc * SECTOR_SIZE;
-    uint32_t num_clusters = (size > 0) ? (uint32_t)((size + cluster_bytes - 1) / cluster_bytes) : 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (is_root_level && should_skip_root_entry(de->d_name))
+            continue;
 
-    uint32_t first_cluster = 0;
-    if (num_clusters > 0) {
-        first_cluster = w->next_free_cluster;
-        w->next_free_cluster += num_clusters;
+        char src_path[512];
+        char dst_path[512];
+        if (strcmp(src_dir, "/") == 0)
+            snprintf(src_path, sizeof(src_path), "/%s", de->d_name);
+        else
+            snprintf(src_path, sizeof(src_path), "%s/%s", src_dir, de->d_name);
+        snprintf(dst_path, sizeof(dst_path), "%s/%s", dst_dir, de->d_name);
 
-        /* Write data to clusters */
-        size_t written = 0;
-        for (uint32_t i = 0; i < num_clusters; i++) {
-            uint32_t clus = first_cluster + i;
-            uint32_t clus_lba = w->part_start_lba + w->reserved_sectors +
-                                2u * w->fat_size + (clus - 2u) * w->spc;
-
-            uint8_t clus_buf[64 * 512]; /* Max spc=64 */
-            memset(clus_buf, 0, sizeof(clus_buf));
-
-            size_t rem = size - written;
-            size_t chunk = rem < cluster_bytes ? rem : cluster_bytes;
-            if (data && chunk > 0)
-                memcpy(clus_buf, (const uint8_t *)data + written, chunk);
-
-            if (device_write_sectors(w->dev, clus_lba, w->spc, clus_buf) != 0)
+        /* Skip /var/run contents because /var/run is a runtime tmpfs mount. */
+        if (strcmp(src_path, "/var/run") == 0) {
+            if (ensure_dir(dst_path, 0755) != 0) {
+                closedir(d);
                 return -1;
+            }
+            continue;
+        }
 
-            written += chunk;
+        struct stat st;
+        if (lstat(src_path, &st) != 0) {
+            fprintf(stderr, "installer: lstat failed for %s\n", src_path);
+            closedir(d);
+            return -1;
+        }
 
-            /* Update FAT entry */
-            uint32_t next_val = (i == num_clusters - 1) ? FAT32_EOC : (clus + 1);
-            uint32_t fat_offset_bytes = clus * 4u;
-            uint32_t fat_sector_idx = fat_offset_bytes / SECTOR_SIZE;
-            uint32_t entry_in_sec = (fat_offset_bytes % SECTOR_SIZE) / 4u;
-
-            uint32_t sec_buf[128];
-            uint32_t fat1_sec_lba = w->part_start_lba + w->reserved_sectors + fat_sector_idx;
-            uint32_t fat2_sec_lba = fat1_sec_lba + w->fat_size;
-
-            if (device_read_sectors(w->dev, fat1_sec_lba, 1, sec_buf) != 0)
+        if (S_ISLNK(st.st_mode)) {
+            char target[256];
+            ssize_t tlen = readlink(src_path, target, sizeof(target) - 1);
+            if (tlen < 0) {
+                fprintf(stderr, "installer: readlink failed for %s\n", src_path);
+                closedir(d);
                 return -1;
-
-            sec_buf[entry_in_sec] = next_val;
-
-            if (device_write_sectors(w->dev, fat1_sec_lba, 1, sec_buf) != 0 ||
-                device_write_sectors(w->dev, fat2_sec_lba, 1, sec_buf) != 0)
+            }
+            target[tlen] = '\0';
+            if (symlink(target, dst_path) != 0 && errno != EEXIST) {
+                fprintf(stderr, "installer: symlink failed for %s -> %s\n", dst_path, target);
+                closedir(d);
                 return -1;
+            }
+        } else if (S_ISDIR(st.st_mode)) {
+            mode_t dmode = (st.st_mode & 07777) ? (st.st_mode & 07777) : 0755;
+            if (ensure_dir(dst_path, dmode) != 0) {
+                fprintf(stderr, "installer: mkdir failed for %s\n", dst_path);
+                closedir(d);
+                return -1;
+            }
+            if (copy_tree_recursive(src_path, dst_path, 0, buf) != 0) {
+                closedir(d);
+                return -1;
+            }
+            (void)chmod(dst_path, dmode);
+        } else if (S_ISREG(st.st_mode)) {
+            mode_t fmode = (st.st_mode & 07777) ? (st.st_mode & 07777) : 0644;
+            if (copy_file_mode(src_path, dst_path, fmode, buf) != 0) {
+                fprintf(stderr, "installer: copy failed for %s -> %s\n", src_path, dst_path);
+                closedir(d);
+                return -1;
+            }
         }
     }
 
-    /* Add entry to Root Directory Cluster 2 */
-    uint32_t dir_sector = w->root_dir_entry_count / (SECTOR_SIZE / 32u);
-    uint32_t dir_idx = w->root_dir_entry_count % (SECTOR_SIZE / 32u);
+    closedir(d);
+    return 0;
+}
 
-    if (dir_sector >= w->spc) {
-        fprintf(stderr, "Root directory overflow\n");
+static void normalize_dev_path(const char *arg, char *out, size_t cap)
+{
+    if (!arg || !out || cap == 0)
+        return;
+    if (strncmp(arg, "/dev/", 5) == 0 || strchr(arg, '/') != NULL) {
+        strncpy(out, arg, cap - 1);
+        out[cap - 1] = '\0';
+    } else {
+        snprintf(out, cap, "/dev/%s", arg);
+    }
+}
+
+static void make_part_path(const char *disk_path, int part_num, char *out, size_t cap)
+{
+    const char *base = strrchr(disk_path, '/');
+    base = base ? base + 1 : disk_path;
+    if (strncmp(base, "nvme", 4) == 0)
+        snprintf(out, cap, "%sp%d", disk_path, part_num);
+    else
+        snprintf(out, cap, "%s%d", disk_path, part_num);
+}
+
+static void unmount_stale_disk_mounts(const char *disk_path)
+{
+    const char *base = strrchr(disk_path, '/');
+    base = base ? base + 1 : disk_path;
+    char mnt_path[160];
+    for (int p = 1; p <= 8; p++) {
+        if (strncmp(base, "nvme", 4) == 0)
+            snprintf(mnt_path, sizeof(mnt_path), "/mnt/%sp%d", base, p);
+        else
+            snprintf(mnt_path, sizeof(mnt_path), "/mnt/%s%d", base, p);
+        (void)umount2(mnt_path, MNT_DETACH);
+    }
+}
+
+static int wait_for_partition(const char *part_path)
+{
+    struct stat st;
+    if (stat(part_path, &st) == 0)
+        return 0;
+    int fd = open(part_path, O_RDONLY);
+    if (fd >= 0) {
+        close(fd);
+        return 0;
+    }
+    return -1;
+}
+
+static int install_limine_bios_gpt(const char *disk_path, const char *bootblob_path,
+                                   uint64_t bios_part_lba, uint64_t bios_part_sectors)
+{
+    uint8_t *blob = NULL;
+    size_t blob_sz = 0;
+    if (read_entire_file(bootblob_path, &blob, &blob_sz) != 0) {
+        fprintf(stderr, "installer: failed to read %s\n", bootblob_path);
         return -1;
     }
 
-    uint32_t root_sec_lba = w->part_start_lba + w->reserved_sectors + 2u * w->fat_size + dir_sector;
-    fat32_dir_entry_t dir_entries[16];
-    if (device_read_sectors(w->dev, root_sec_lba, 1, dir_entries) != 0)
+    if (blob_sz < 1024u) {
+        free(blob);
+        fprintf(stderr, "installer: invalid bootblob size\n");
         return -1;
+    }
 
-    fat32_dir_entry_t *de = &dir_entries[dir_idx];
-    memset(de, 0, sizeof(*de));
-    convert_to_83(dos_name, de->name);
-    de->attr = FAT32_ATTR_ARCHIVE;
-    de->fst_clus_hi = (uint16_t)(first_cluster >> 16);
-    de->fst_clus_lo = (uint16_t)(first_cluster & 0xFFFFu);
-    de->file_size = (uint32_t)size;
+    uint16_t stage2_size_a = 0;
+    uint16_t stage2_size_b = 0;
+    memcpy(&stage2_size_a, blob + 0x1a4, sizeof(uint16_t));
+    memcpy(&stage2_size_b, blob + 0x1a6, sizeof(uint16_t));
 
-    if (device_write_sectors(w->dev, root_sec_lba, 1, dir_entries) != 0)
+    if (stage2_size_a == 0 || (stage2_size_a % SECTOR_SIZE) != 0 ||
+        (stage2_size_b % SECTOR_SIZE) != 0 ||
+        512u + (size_t)stage2_size_a + (size_t)stage2_size_b > blob_sz) {
+        free(blob);
+        fprintf(stderr, "installer: invalid stage2 sizes in bootblob.bin\n");
         return -1;
+    }
 
-    w->root_dir_entry_count++;
+    uint32_t stage2_secs_a = stage2_size_a / SECTOR_SIZE;
+    uint32_t stage2_secs_b = stage2_size_b / SECTOR_SIZE;
+    if ((uint64_t)stage2_secs_a + (uint64_t)stage2_secs_b > bios_part_sectors) {
+        free(blob);
+        fprintf(stderr, "installer: BIOS boot partition too small for stage2\n");
+        return -1;
+    }
 
-    /* Update FSInfo */
-    if (num_clusters > 0 && w->fsinfo.free_count >= num_clusters)
-        w->fsinfo.free_count -= num_clusters;
-    w->fsinfo.next_free = w->next_free_cluster;
+    device_handle_t dev;
+    if (device_open(disk_path, O_RDWR, &dev) != 0) {
+        free(blob);
+        fprintf(stderr, "installer: failed to reopen %s for Limine BIOS stages\n", disk_path);
+        return -1;
+    }
 
-    device_write_sectors(w->dev, w->part_start_lba + 1, 1, &w->fsinfo);
-    device_write_sectors(w->dev, w->part_start_lba + 7, 1, &w->fsinfo);
+    uint64_t stage2_loc_a = bios_part_lba * SECTOR_SIZE;
+    uint64_t stage2_loc_b = stage2_loc_a + (uint64_t)stage2_size_a;
 
+    if (device_write_sectors(&dev, bios_part_lba, stage2_secs_a, blob + 512) != 0) {
+        free(blob);
+        device_close(&dev);
+        fprintf(stderr, "installer: failed writing stage2 half A\n");
+        return -1;
+    }
+    if (stage2_secs_b > 0 &&
+        device_write_sectors(&dev, bios_part_lba + stage2_secs_a,
+                             stage2_secs_b, blob + 512 + stage2_size_a) != 0) {
+        free(blob);
+        device_close(&dev);
+        fprintf(stderr, "installer: failed writing stage2 half B\n");
+        return -1;
+    }
+
+    uint8_t orig_mbr[SECTOR_SIZE];
+    uint8_t sec0[SECTOR_SIZE];
+    if (device_read_sectors(&dev, 0, 1, orig_mbr) != 0) {
+        free(blob);
+        device_close(&dev);
+        return -1;
+    }
+
+    memcpy(sec0, blob, SECTOR_SIZE);
+    memcpy(sec0 + 218, orig_mbr + 218, 6);
+    memcpy(sec0 + 440, orig_mbr + 440, 70);
+    memcpy(sec0 + 0x1a4, &stage2_size_a, sizeof(uint16_t));
+    memcpy(sec0 + 0x1a6, &stage2_size_b, sizeof(uint16_t));
+    memcpy(sec0 + 0x1a8, &stage2_loc_a, sizeof(uint64_t));
+    memcpy(sec0 + 0x1b0, &stage2_loc_b, sizeof(uint64_t));
+    sec0[510] = 0x55;
+    sec0[511] = 0xAA;
+
+    int rc = device_write_sectors(&dev, 0, 1, sec0);
+    free(blob);
+    device_sync(&dev);
+    device_close(&dev);
+    return rc;
+}
+
+static int run_tui_select_disk(char *out_path, size_t cap)
+{
+    char found[8][64];
+    uint64_t sizes[8];
+    int count = 0;
+
+    printf("Available target disks:\n");
+    for (size_t i = 0; i < sizeof(g_candidate_devices) / sizeof(g_candidate_devices[0]); i++) {
+        device_handle_t d;
+        if (device_open(g_candidate_devices[i], O_RDONLY, &d) == 0) {
+            if (d.sector_count >= MIN_INSTALL_SECTORS && count < 8) {
+                char sz[32];
+                format_size(device_get_size(&d), sz, sizeof(sz));
+                printf("  [%d] %-14s (%s, %llu sectors)\n",
+                       count + 1, g_candidate_devices[i], sz,
+                       (unsigned long long)d.sector_count);
+                strncpy(found[count], g_candidate_devices[i], sizeof(found[count]) - 1);
+                found[count][sizeof(found[count]) - 1] = '\0';
+                sizes[count] = d.sector_count;
+                count++;
+            }
+            device_close(&d);
+        }
+    }
+
+    if (count == 0) {
+        fprintf(stderr, "installer: no suitable disk (>= 96 MiB) found\n");
+        return -1;
+    }
+    (void)sizes;
+
+    printf("\nSelect disk [1-%d] (default 1): ", count);
+    fflush(stdout);
+    char line[64];
+    memset(line, 0, sizeof(line));
+    ssize_t n = read(STDIN_FILENO, line, sizeof(line) - 1);
+    if (n <= 0 || line[0] == '\n' || line[0] == '\r') {
+        strncpy(out_path, found[0], cap - 1);
+        out_path[cap - 1] = '\0';
+        return 0;
+    }
+
+    char *nl = strpbrk(line, "\r\n");
+    if (nl)
+        *nl = '\0';
+    if (isdigit((unsigned char)line[0])) {
+        int idx = atoi(line) - 1;
+        if (idx >= 0 && idx < count) {
+            strncpy(out_path, found[idx], cap - 1);
+            out_path[cap - 1] = '\0';
+            return 0;
+        }
+    }
+    normalize_dev_path(line, out_path, cap);
     return 0;
+}
+
+static void print_usage(const char *prog)
+{
+    fprintf(stderr,
+            "Usage: %s [--auto /dev/<disk>] [--yes] [--no-reboot] [<disk> [ERASE]]\n",
+            prog);
 }
 
 int main(int argc, char *argv[])
 {
-    const char *target_dev_path = NULL;
-    int non_interactive = 0;
+    const char *raw_disk = NULL;
+    int auto_mode = 0;
+    int yes_mode = 0;
+    int no_reboot = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--non-interactive") == 0) {
-            non_interactive = 1;
-        } else if (argv[i][0] != '-') {
-            target_dev_path = argv[i];
+        if (strcmp(argv[i], "--auto") == 0) {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            auto_mode = 1;
+            yes_mode = 1;
+            no_reboot = 1;
+            raw_disk = argv[++i];
+        } else if (strcmp(argv[i], "--yes") == 0 || strcmp(argv[i], "-y") == 0) {
+            yes_mode = 1;
+        } else if (strcmp(argv[i], "--no-reboot") == 0) {
+            no_reboot = 1;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (token_is_erase(argv[i])) {
+            yes_mode = 1;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "installer: unknown option %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 1;
+        } else if (!raw_disk) {
+            raw_disk = argv[i];
         }
     }
+
+    (void)auto_mode;
+    (void)no_reboot;
 
     printf("====================================================\n");
-    printf("        Project Tsukasa — OS Installer Wizard        \n");
+    printf("   Project Tsukasa - Unified BIOS+UEFI Installer    \n");
     printf("====================================================\n\n");
 
-    /* 1. Drive Discovery */
-    if (!target_dev_path) {
-        printf("[1/6] Scanning system for block devices...\n");
-        for (size_t i = 0; i < sizeof(g_candidate_devices) / sizeof(g_candidate_devices[0]); i++) {
-            device_handle_t d;
-            if (device_open(g_candidate_devices[i], O_RDWR, &d) == 0) {
-                if (d.sector_count >= MIN_INSTALL_SECTORS) {
-                    char sz[32];
-                    format_size(device_get_size(&d), sz, sizeof(sz));
-                    printf("  Found suitable disk: %s (%s, %llu sectors)\n",
-                           g_candidate_devices[i], sz, (unsigned long long)d.sector_count);
-                    if (!target_dev_path)
-                        target_dev_path = g_candidate_devices[i];
-                }
-                device_close(&d);
-            }
-        }
+    char disk_path[128];
+    if (raw_disk) {
+        normalize_dev_path(raw_disk, disk_path, sizeof(disk_path));
+    } else {
+        if (run_tui_select_disk(disk_path, sizeof(disk_path)) != 0)
+            return 1;
     }
 
-    if (!target_dev_path) {
-        fprintf(stderr, "Error: No suitable install disk found. Please specify device (e.g. /dev/hda).\n");
+    char bootx64_src[128], limine_sys_src[128], bootblob_src[128], kernel_src[128];
+    if (find_existing_file(g_bootx64_paths, sizeof(g_bootx64_paths) / sizeof(g_bootx64_paths[0]),
+                           bootx64_src, sizeof(bootx64_src)) != 0 ||
+        find_existing_file(g_limine_sys_paths, sizeof(g_limine_sys_paths) / sizeof(g_limine_sys_paths[0]),
+                           limine_sys_src, sizeof(limine_sys_src)) != 0 ||
+        find_existing_file(g_bootblob_paths, sizeof(g_bootblob_paths) / sizeof(g_bootblob_paths[0]),
+                           bootblob_src, sizeof(bootblob_src)) != 0 ||
+        find_existing_file(g_kernel_paths, sizeof(g_kernel_paths) / sizeof(g_kernel_paths[0]),
+                           kernel_src, sizeof(kernel_src)) != 0) {
+        fprintf(stderr, "installer: missing required boot payload (BOOTX64.EFI, limine-bios.sys, bootblob.bin, or kernel)\n");
         return 1;
     }
 
-    device_handle_t dev;
-    if (device_open(target_dev_path, O_RDWR, &dev) != 0) {
-        fprintf(stderr, "Error: Failed to open target device %s\n", target_dev_path);
+    device_handle_t disk_dev;
+    if (device_open(disk_path, O_RDWR, &disk_dev) != 0) {
+        fprintf(stderr, "installer: cannot open target disk %s\n", disk_path);
         return 1;
     }
 
     char disk_sz[32];
-    format_size(device_get_size(&dev), disk_sz, sizeof(disk_sz));
-    printf("Target Drive: %s (%s, %llu sectors)\n",
-           target_dev_path, disk_sz, (unsigned long long)dev.sector_count);
+    format_size(device_get_size(&disk_dev), disk_sz, sizeof(disk_sz));
+    log_msg("[installer] target=%s (%s, %llu sectors)\n",
+            disk_path, disk_sz, (unsigned long long)disk_dev.sector_count);
 
-    if (dev.sector_count < MIN_INSTALL_SECTORS) {
-        fprintf(stderr, "Error: Target disk smaller than minimum required 64 MiB.\n");
-        device_close(&dev);
+    if (disk_dev.sector_count < MIN_INSTALL_SECTORS) {
+        fprintf(stderr, "installer: target disk smaller than 96 MiB minimum\n");
+        device_close(&disk_dev);
         return 1;
     }
 
-    /* 2. Target Confirmation */
-    if (!non_interactive) {
-        printf("\nWARNING: All existing data on %s will be permanently lost!\n", target_dev_path);
-        printf("Proceed with installation? (y/N): ");
-        char ans[16];
+    if (!yes_mode) {
+        printf("\nWARNING: All existing data on %s will be ERASED!\n", disk_path);
+        printf("Layout: 1 MiB BIOS Boot + 64 MiB FAT32 ESP + ext4 Root\n");
+        printf("Proceed with installation? (yes/N): ");
+        fflush(stdout);
+        char ans[32];
         memset(ans, 0, sizeof(ans));
-        read(STDIN_FILENO, ans, sizeof(ans) - 1);
-        if (ans[0] != 'y' && ans[0] != 'Y') {
-            printf("Installation aborted by user.\n");
-            device_close(&dev);
+        ssize_t n = read(STDIN_FILENO, ans, sizeof(ans) - 1);
+        if (n <= 0 || (ans[0] != 'y' && ans[0] != 'Y')) {
+            printf("Installation aborted.\n");
+            device_close(&disk_dev);
             return 0;
         }
     }
 
-    /* 3. Partitioning: Create Primary Partition 1 starting at LBA 2048 */
-    printf("\n[2/6] Writing MBR partition table...\n");
-    uint32_t part_sectors = (uint32_t)(dev.sector_count - PART_START_LBA);
-    mbr_sector_t mbr;
-    memset(&mbr, 0, sizeof(mbr));
+    /* 1. Partition target disk as GPT. */
+    log_msg("[installer] [1/7] writing GPT partition table...\n");
+    unmount_stale_disk_mounts(disk_path);
 
-    mbr.entries[0].boot_indicator = MBR_BOOTABLE;
-    mbr.entries[0].partition_type = MBR_TYPE_FAT32_LBA;
-    mbr.entries[0].lba_start = PART_START_LBA;
-    mbr.entries[0].sector_count = part_sectors;
+    uint8_t disk_guid[16];
+    gpt_gen_uuid(disk_guid);
 
-    lba_to_chs(PART_START_LBA, &mbr.entries[0].start_head,
-               &mbr.entries[0].start_sector, &mbr.entries[0].start_cylinder);
-    lba_to_chs(PART_START_LBA + part_sectors - 1, &mbr.entries[0].end_head,
-               &mbr.entries[0].end_sector, &mbr.entries[0].end_cylinder);
+    gpt_entry_t entries[GPT_MAX_ENTRIES];
+    memset(entries, 0, sizeof(entries));
 
-    mbr.boot_signature = MBR_SIGNATURE;
+    uint64_t part1_lba = 2048ULL;
+    uint64_t part1_secs = BIOS_BOOT_SECTORS;
+    uint64_t part2_lba = part1_lba + part1_secs;
+    uint64_t part2_secs = ESP_SECTORS;
+    uint64_t part3_lba = part2_lba + part2_secs;
+    uint64_t last_usable = disk_dev.sector_count - 1ULL - GPT_ARRAY_SECTORS - 1ULL;
 
-    if (device_write_sectors(&dev, 0, 1, &mbr) != 0) {
-        fprintf(stderr, "Error: Failed to write MBR to %s\n", target_dev_path);
-        device_close(&dev);
+    memcpy(entries[0].type_guid, GPT_GUID_BIOS_BOOT, 16);
+    gpt_gen_uuid(entries[0].part_guid);
+    entries[0].start_lba = part1_lba;
+    entries[0].end_lba = part1_lba + part1_secs - 1ULL;
+    gpt_set_name_ascii(&entries[0], "BIOS Boot");
+
+    memcpy(entries[1].type_guid, GPT_GUID_ESP, 16);
+    gpt_gen_uuid(entries[1].part_guid);
+    entries[1].start_lba = part2_lba;
+    entries[1].end_lba = part2_lba + part2_secs - 1ULL;
+    gpt_set_name_ascii(&entries[1], "EFI System Partition");
+
+    memcpy(entries[2].type_guid, GPT_GUID_LINUX_FS, 16);
+    gpt_gen_uuid(entries[2].part_guid);
+    entries[2].start_lba = part3_lba;
+    entries[2].end_lba = last_usable;
+    gpt_set_name_ascii(&entries[2], "Tsukasa Root");
+
+    char root_partuuid[37];
+    gpt_format_uuid(entries[2].part_guid, root_partuuid);
+
+    if (gpt_write_table(&disk_dev, disk_guid, entries, 3u) != 0) {
+        fprintf(stderr, "installer: failed to write GPT\n");
+        device_close(&disk_dev);
         return 1;
     }
-    device_sync(&dev);
+    if (device_reread_partitions(&disk_dev) != 0) {
+        fprintf(stderr, "installer: BLKRRPART ioctl failed\n");
+        device_close(&disk_dev);
+        return 1;
+    }
+    device_close(&disk_dev);
 
-    /* 4. Formatting: Synthesize FAT32 Filesystem at LBA 2048 */
-    printf("[3/6] Formatting FAT32 partition (TSUKASA_OS)...\n");
-    fat32_writer_t fat_writer;
-    if (fat32_writer_init(&fat_writer, &dev, PART_START_LBA, part_sectors) != 0) {
-        fprintf(stderr, "Error: FAT32 partition formatting failed\n");
-        device_close(&dev);
+    char part1_path[144], part2_path[144], part3_path[144];
+    make_part_path(disk_path, 1, part1_path, sizeof(part1_path));
+    make_part_path(disk_path, 2, part2_path, sizeof(part2_path));
+    make_part_path(disk_path, 3, part3_path, sizeof(part3_path));
+
+    if (wait_for_partition(part1_path) != 0 ||
+        wait_for_partition(part2_path) != 0 ||
+        wait_for_partition(part3_path) != 0) {
+        fprintf(stderr, "installer: partitions (%s, %s, %s) did not appear after BLKRRPART\n",
+                part1_path, part2_path, part3_path);
         return 1;
     }
 
-    /* 5. Payload Deployment */
-    printf("[4/6] Copying OS boot payload...\n");
-    char found_path[128];
-
-    /* Kernel */
-    if (find_file(g_kernel_paths, sizeof(g_kernel_paths) / sizeof(g_kernel_paths[0]), found_path, sizeof(found_path)) == 0) {
-        uint8_t *kdata = NULL;
-        size_t ksize = 0;
-        if (read_all_file(found_path, &kdata, &ksize) == 0) {
-            printf("  Installing %s (%u bytes)...\n", found_path, (unsigned)ksize);
-            fat32_writer_add_file(&fat_writer, "tsukasa.elf", kdata, ksize);
-            free(kdata);
-        }
+    /* 2. Format ESP (FAT32) and Root (ext4). */
+    log_msg("[installer] [2/7] formatting ESP (%s FAT32) and root (%s ext4)...\n",
+            part2_path, part3_path);
+    device_handle_t esp_dev, root_dev;
+    if (device_open(part2_path, O_RDWR, &esp_dev) != 0) {
+        fprintf(stderr, "installer: cannot open %s\n", part2_path);
+        return 1;
+    }
+    int fmt_rc = fat32_format_device(&esp_dev, "TSUKASA_ESP", (uint32_t)part2_lba, 0, 0);
+    device_close(&esp_dev);
+    if (fmt_rc != 0) {
+        fprintf(stderr, "installer: FAT32 format failed on %s\n", part2_path);
+        return 1;
     }
 
-    /* Initrd */
-    if (find_file(g_initrd_paths, sizeof(g_initrd_paths) / sizeof(g_initrd_paths[0]), found_path, sizeof(found_path)) == 0) {
-        uint8_t *idata = NULL;
-        size_t isize = 0;
-        if (read_all_file(found_path, &idata, &isize) == 0) {
-            printf("  Installing %s (%u bytes)...\n", found_path, (unsigned)isize);
-            fat32_writer_add_file(&fat_writer, "initrd.img", idata, isize);
-            free(idata);
-        }
+    if (device_open(part3_path, O_RDWR, &root_dev) != 0) {
+        fprintf(stderr, "installer: cannot open %s\n", part3_path);
+        return 1;
+    }
+    fmt_rc = ext4_format_device(&root_dev, "TSUKASA_ROOT", 0);
+    device_close(&root_dev);
+    if (fmt_rc != 0) {
+        fprintf(stderr, "installer: ext4 format failed on %s\n", part3_path);
+        return 1;
     }
 
-    /* Limine BIOS System Stage */
-    if (find_file(g_limine_sys_paths, sizeof(g_limine_sys_paths) / sizeof(g_limine_sys_paths[0]), found_path, sizeof(found_path)) == 0) {
-        uint8_t *ldata = NULL;
-        size_t lsize = 0;
-        if (read_all_file(found_path, &ldata, &lsize) == 0) {
-            printf("  Installing %s (%u bytes)...\n", found_path, (unsigned)lsize);
-            fat32_writer_add_file(&fat_writer, "limine.sys", ldata, lsize);
-            free(ldata);
-        }
+    /* 3. Mount ext4 root at /mnt and FAT32 ESP at /mnt/boot. */
+    log_msg("[installer] [3/7] mounting %s -> /mnt and %s -> /mnt/boot...\n",
+            part3_path, part2_path);
+    if (mount(part3_path, "/mnt", "ext4", 0, NULL) != 0) {
+        fprintf(stderr, "installer: failed to mount %s at /mnt\n", part3_path);
+        return 1;
+    }
+    if (ensure_dir("/mnt/boot", 0755) != 0 ||
+        mount(part2_path, "/mnt/boot", "fat32", 0, NULL) != 0) {
+        fprintf(stderr, "installer: failed to mount %s at /mnt/boot\n", part2_path);
+        (void)umount2("/mnt", MNT_DETACH);
+        return 1;
     }
 
-    /* Limine Config */
-    static const char def_limine_cfg[] =
-        "timeout: 2\n"
-        "verbose: yes\n"
-        "\n"
-        "/Project Tsukasa (Installed)\n"
-        "    protocol: limine\n"
-        "    kernel_path: boot():/tsukasa.elf\n"
-        "    cmdline: arch=x86_64 single_core=1\n"
-        "    module_path: boot():/initrd.img\n";
-    printf("  Writing limine.cfg...\n");
-    fat32_writer_add_file(&fat_writer, "limine.cfg", def_limine_cfg, sizeof(def_limine_cfg) - 1);
-
-    device_sync(&dev);
-
-    /* 6. Limine Bootloader Deployment (Stage 1 & 2) */
-    printf("[5/6] Deploying Limine BIOS bootloader stages...\n");
-    if (find_file(g_bootblob_paths, sizeof(g_bootblob_paths) / sizeof(g_bootblob_paths[0]), found_path, sizeof(found_path)) == 0) {
-        uint8_t *blob = NULL;
-        size_t blob_sz = 0;
-        if (read_all_file(found_path, &blob, &blob_sz) == 0) {
-            printf("  Found bootloader blob %s (%u bytes)\n", found_path, (unsigned)blob_sz);
-
-            /* Read current LBA 0 to preserve partition table */
-            mbr_sector_t current_mbr;
-            device_read_sectors(&dev, 0, 1, &current_mbr);
-
-            /* Overwrite only bytes 0..445 with Stage 1 */
-            memcpy(current_mbr.boot_code, blob, 446);
-            current_mbr.boot_signature = MBR_SIGNATURE;
-            device_write_sectors(&dev, 0, 1, &current_mbr);
-
-            /* Write Stage 2 to reserved sectors (LBA 1..2047) */
-            if (blob_sz > 512) {
-                size_t stage2_bytes = blob_sz - 512;
-                uint32_t stage2_sectors = (uint32_t)((stage2_bytes + 511) / 512);
-                if (stage2_sectors > 2047)
-                    stage2_sectors = 2047;
-
-                device_write_sectors(&dev, 1, stage2_sectors, blob + 512);
-            }
-            free(blob);
-        }
-    } else {
-        printf("  Note: bootblob.bin not found on live media. Skipping BIOS stage injection.\n");
+    uint8_t *copy_buf = (uint8_t *)malloc(COPY_BUF_SIZE);
+    if (!copy_buf) {
+        (void)umount2("/mnt/boot", MNT_DETACH);
+        (void)umount2("/mnt", MNT_DETACH);
+        return 1;
     }
 
-    /* 7. Final Sync */
-    printf("[6/6] Syncing target disk cache...\n");
-    device_sync(&dev);
-    device_close(&dev);
+    /* 4. Copy live rootfs to /mnt. */
+    log_msg("[installer] [4/7] copying live root filesystem to /mnt...\n");
+    if (copy_tree_recursive("/", "/mnt", 1, copy_buf) != 0 ||
+        ensure_dir("/mnt/dev", 0755) != 0 ||
+        ensure_dir("/mnt/proc", 0555) != 0 ||
+        ensure_dir("/mnt/sys", 0555) != 0 ||
+        ensure_dir("/mnt/tmp", 01777) != 0 ||
+        ensure_dir("/mnt/var", 0755) != 0 ||
+        ensure_dir("/mnt/var/run", 0755) != 0 ||
+        ensure_dir("/mnt/mnt", 0755) != 0) {
+        free(copy_buf);
+        (void)umount2("/mnt/boot", MNT_DETACH);
+        (void)umount2("/mnt", MNT_DETACH);
+        return 1;
+    }
 
-    printf("\n====================================================\n");
-    printf("  Installation Complete! Tsukasa OS is ready to boot.\n");
-    printf("  You can now reboot and remove installation media.   \n");
-    printf("====================================================\n");
+    /* 5. Install UEFI + BIOS Limine boot files onto ESP (/mnt/boot). */
+    log_msg("[installer] [5/7] installing UEFI & BIOS boot payload to /mnt/boot...\n");
+    if (ensure_dir("/mnt/boot/EFI", 0755) != 0 ||
+        ensure_dir("/mnt/boot/EFI/BOOT", 0755) != 0 ||
+        ensure_dir("/mnt/boot/boot", 0755) != 0 ||
+        ensure_dir("/mnt/boot/boot/limine", 0755) != 0) {
+        free(copy_buf);
+        (void)umount2("/mnt/boot", MNT_DETACH);
+        (void)umount2("/mnt", MNT_DETACH);
+        return 1;
+    }
 
+    if (copy_file_mode(bootx64_src, "/mnt/boot/EFI/BOOT/BOOTX64.EFI", 0644, copy_buf) != 0 ||
+        copy_file_mode(limine_sys_src, "/mnt/boot/boot/limine/limine-bios.sys", 0644, copy_buf) != 0 ||
+        copy_file_mode(limine_sys_src, "/mnt/boot/limine-bios.sys", 0644, copy_buf) != 0 ||
+        copy_file_mode(kernel_src, "/mnt/boot/boot/tsukasa_x64.elf", 0644, copy_buf) != 0) {
+        free(copy_buf);
+        (void)umount2("/mnt/boot", MNT_DETACH);
+        (void)umount2("/mnt", MNT_DETACH);
+        return 1;
+    }
+    free(copy_buf);
+
+    char limine_cfg[512];
+    snprintf(limine_cfg, sizeof(limine_cfg),
+             "timeout: 2\n"
+             "verbose: yes\n"
+             "\n"
+             "/Tsukasa x86_64\n"
+             "    protocol: limine\n"
+             "    kernel_path: boot():/boot/tsukasa_x64.elf\n"
+             "    cmdline: arch=x86_64 single_core=1 root=PARTUUID=%s\n",
+             root_partuuid);
+
+    if (write_text_file("/mnt/boot/limine.conf", limine_cfg) != 0 ||
+        write_text_file("/mnt/boot/boot/limine/limine.conf", limine_cfg) != 0) {
+        (void)umount2("/mnt/boot", MNT_DETACH);
+        (void)umount2("/mnt", MNT_DETACH);
+        return 1;
+    }
+
+    /* 6. Sync and cleanly unmount /mnt/boot and /mnt. */
+    log_msg("[installer] [6/7] syncing and unmounting target filesystems...\n");
+    sync();
+    if (umount2("/mnt/boot", 0) != 0) {
+        fprintf(stderr, "installer: failed to unmount /mnt/boot\n");
+        (void)umount2("/mnt", MNT_DETACH);
+        return 1;
+    }
+    if (umount2("/mnt", 0) != 0) {
+        fprintf(stderr, "installer: failed to unmount /mnt\n");
+        return 1;
+    }
+
+    /* 7. Install Limine BIOS stage1 + stage2 onto GPT disk (BIOS Boot partition). */
+    log_msg("[installer] [7/7] installing Limine BIOS stage1+stage2 to %s (PARTUUID=%s)...\n",
+            disk_path, root_partuuid);
+    if (install_limine_bios_gpt(disk_path, bootblob_src, part1_lba, part1_secs) != 0) {
+        fprintf(stderr, "installer: failed to install Limine BIOS stages\n");
+        return 1;
+    }
+
+    log_msg("[installer] INSTALL COMPLETE\n");
+    log_msg("Installation complete. Tsukasa installed to %s (root=PARTUUID=%s).\n",
+            disk_path, root_partuuid);
     return 0;
 }

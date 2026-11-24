@@ -123,6 +123,10 @@ typedef struct vfs_mmap_request {
 struct process;
 
 void vfs_init(const void *boot_info);
+int  vfs_is_root_mounted(void);
+void vfs_sync_all(void);
+void vfs_shutdown(void);
+int  vfs_sync_fd(int fd);
 
 int vfs_open(const char *path);
 int vfs_open_flags(const char *path, int flags);

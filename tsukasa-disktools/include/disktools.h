@@ -26,6 +26,16 @@
 
 #define SECTOR_SIZE 512u
 
+#ifndef BLKRRPART
+#define BLKRRPART    0x125F
+#endif
+#ifndef BLKSSZGET
+#define BLKSSZGET    0x1268
+#endif
+#ifndef BLKGETSIZE64
+#define BLKGETSIZE64 0x80081272UL
+#endif
+
 typedef struct {
     int      fd;
     uint64_t sector_count;
@@ -39,7 +49,13 @@ void     device_close(device_handle_t *dev);
 int      device_read_sectors(device_handle_t *dev, uint64_t lba, uint32_t count, void *buf);
 int      device_write_sectors(device_handle_t *dev, uint64_t lba, uint32_t count, const void *buf);
 int      device_sync(device_handle_t *dev);
+int      device_reread_partitions(device_handle_t *dev);
 uint64_t device_get_size(device_handle_t *dev);
 void     format_size(uint64_t bytes, char *out, size_t max);
+
+/* Filesystem formatting helpers */
+int      fat32_format_device(device_handle_t *dev, const char *label,
+                             uint32_t hidden_sectors, uint32_t user_spc, int verbose);
+int      ext4_format_device(device_handle_t *dev, const char *label, int verbose);
 
 #endif /* _TSUKASA_DISKTOOLS_H */

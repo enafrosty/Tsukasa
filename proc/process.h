@@ -227,6 +227,7 @@ int process_get_pgid(int pid);
 uint64_t process_stack_top_aligned(const process_t *p);
 
 process_t *process_spawn_kernel(const char *name, process_entry_t entry);
+process_t *process_spawn_kernel_paused(const char *name, process_entry_t entry);
 
 process_t *process_spawn_kernel_pinned(const char *name, process_entry_t entry,
                                        uint32_t cpu_id);
@@ -291,6 +292,7 @@ void process_run_guide16_selftests(void);
 
 /* process_block_current marks the CALLER blocked (both state fields) without descheduling — the caller... */
 void process_block_current(void);
+void process_finish_wait_current(void);
 void process_set_poll_blocked(uint64_t deadline_ms);
 void process_clear_poll_deadline(void);
 void process_block_on_poll(uint64_t deadline_ms);

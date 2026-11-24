@@ -61,6 +61,7 @@
 #define SYS_shm_detach     67
 #define SYS_fcntl          72
 #define SYS_flock          73
+#define SYS_fsync          74
 #define SYS_truncate       76
 #define SYS_ftruncate      77
 #define SYS_getcwd         79
@@ -78,6 +79,7 @@
 #define SYS_umask          95
 #define SYS_getppid        110
 #define SYS_rt_sigpending  127
+#define SYS_sync           162
 #define SYS_mount          165
 #define SYS_umount2        166
 #define SYS_reboot         169

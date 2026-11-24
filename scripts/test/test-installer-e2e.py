@@ -197,12 +197,12 @@ def main():
     )
     parser.add_argument(
         "--install-cmd",
-        default="/bin/install hda ERASE",
-        help="Automated installer command typed via QMP send_text",
+        default=None,
+        help="Automated installer command typed via QMP send_text (default: /bin/installer --auto /dev/<disk> --yes --no-reboot)",
     )
     parser.add_argument(
         "--install-wait-serial",
-        default=r"(?i)installation complete",
+        default=r"(?i)(INSTALL COMPLETE|installation complete)",
         help="Serial regex confirming installation finished",
     )
     parser.add_argument("--poweroff-cmd", default="/bin/poweroff", help="Guest poweroff command")
@@ -213,6 +213,15 @@ def main():
     parser.add_argument("--skip-uefi", action="store_true", help="Skip UEFI OVMF direct-disk verification stage")
     parser.add_argument("--no-fsck", action="store_true", help="Skip host e2fsck/fsck.fat partition checks")
     args = parser.parse_args()
+
+    if not args.install_cmd:
+        dev_by_storage = {
+            "ide": "/dev/hda",
+            "ahci": "/dev/sda",
+            "virtio": "/dev/vda",
+            "nvme": "/dev/nvme0n1",
+        }
+        args.install_cmd = f"/bin/installer --auto {dev_by_storage[args.storage]} --yes --no-reboot"
 
     os.makedirs(args.out_dir, exist_ok=True)
     disk_path = args.disk or os.path.join(args.out_dir, "disk.img")

@@ -104,8 +104,12 @@ int close(int fd)
 
 int fsync(int fd)
 {
-    (void)fd;
-    return 0;
+    return (int)__syscall_check(__syscall1(SYS_fsync, fd));
+}
+
+void sync(void)
+{
+    (void)__syscall0(SYS_sync);
 }
 
 off_t lseek(int fd, off_t offset, int whence)

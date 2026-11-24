@@ -116,7 +116,7 @@ OBJS = arch/x86_64/boot/entry.o \
        arch/x86_64/cpu/gdt.o arch/x86_64/cpu/idt.o arch/x86_64/cpu/isr.o \
        arch/x86_64/cpu/syscall_entry.o arch/x86_64/cpu/syscall_init.o \
        drv/acpi.o drv/ioapic.o drv/lapic.o sys/smp.o sys/wait_queue.o sys/work_queue.o \
-       sys/futex.o sys/installer.o \
+       sys/futex.o \
        sys/panic.o sys/kconsole.o \
        proc/process.o proc/scheduler.o proc/signal.o \
        tty/tty.o \
@@ -352,6 +352,8 @@ $(INITRD_IMG): apps limine-artifacts bootblob.bin $(LZ4PACK)
 	ln -sf mkfs.fat32 $(INITRD_BIN)/MKFSFAT.ELF
 	cp tsukasa-disktools/bin/mkfs.ext2.elf $(INITRD_BIN)/mkfs.ext2
 	ln -sf mkfs.ext2 $(INITRD_BIN)/MKFSEXT2.ELF
+	cp tsukasa-disktools/bin/mkfs.ext4.elf $(INITRD_BIN)/mkfs.ext4
+	ln -sf mkfs.ext4 $(INITRD_BIN)/MKFSEXT4.ELF
 	cp tsukasa-disktools/bin/installer.elf $(INITRD_BIN)/installer
 	ln -sf installer $(INITRD_BIN)/installer.elf
 	ln -sf installer $(INITRD_BIN)/INSTALL.ELF

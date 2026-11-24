@@ -125,12 +125,8 @@ void wait_queue_finish_wait(wait_queue_head_t *h, wait_queue_entry_t *entry)
 
     wait_queue_remove(h, entry);
 
-    /* If thread resumed without yielding, ensure running state is restored */
-    process_t *self = process_current();
-    if (self && self->state == PROCESS_BLOCKED) {
-        self->state = PROCESS_RUNNING;
-        self->main_thread.state = THREAD_RUNNING;
-    }
+    /* Restore running state and clear any concurrent wakeup runqueue entry. */
+    process_finish_wait_current();
 }
 
 void poll_wtable_queue(wait_queue_head_t *h, poll_table_t *pt) {

@@ -1780,13 +1780,108 @@ static void unpack_lz4_initrd(const void *boot_info, tmpfs_fs_t *root_fs)
     kprintf("[vfs] initrd.tar.lz4: ok (%d entries unpacked)\n", entries);
 }
 
+static int is_ws(char c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static int starts_with_ci(const char *s, const char *prefix)
+{
+    if (!s || !prefix)
+        return 0;
+    for (int i = 0; prefix[i]; i++) {
+        char a = s[i];
+        char b = prefix[i];
+        if (a >= 'A' && a <= 'Z')
+            a = (char)(a + 32);
+        if (b >= 'A' && b <= 'Z')
+            b = (char)(b + 32);
+        if (a != b)
+            return 0;
+    }
+    return 1;
+}
+
+static int extract_cmdline_root(const char *cmdline, char *out, size_t cap)
+{
+    int found = 0;
+    if (!out || cap == 0)
+        return 0;
+    out[0] = '\0';
+    if (!cmdline)
+        return 0;
+
+    const char *p = cmdline;
+    while (*p) {
+        while (*p && is_ws(*p))
+            p++;
+        if (!*p)
+            break;
+        const char *tok = p;
+        while (*p && !is_ws(*p))
+            p++;
+        size_t tlen = (size_t)(p - tok);
+        if (tlen >= 5 && tok[0] == 'r' && tok[1] == 'o' &&
+            tok[2] == 'o' && tok[3] == 't' && tok[4] == '=') {
+            size_t vlen = tlen - 5;
+            if (vlen >= cap)
+                vlen = cap - 1;
+            for (size_t i = 0; i < vlen; i++)
+                out[i] = tok[5 + i];
+            out[vlen] = '\0';
+            found = 1;
+        }
+    }
+    return found;
+}
+
+static block_dev_t *resolve_root_blockdev(const char *spec)
+{
+    if (!spec || !spec[0])
+        return NULL;
+    if (starts_with_ci(spec, "partuuid="))
+        return blockdev_find_by_partuuid(spec + 9);
+    if (spec[0] == '/' && spec[1] == 'd' && spec[2] == 'e' &&
+        spec[3] == 'v' && spec[4] == '/')
+        return blockdev_find(spec + 5);
+    return blockdev_find(spec);
+}
+
+static block_dev_t *find_esp_on_disk(block_dev_t *root_bd)
+{
+    if (!root_bd)
+        return NULL;
+    block_dev_t *parent = root_bd->is_partition ? root_bd->parent : root_bd;
+    if (!parent)
+        return NULL;
+
+    for (int i = 0; i < blockdev_count(); i++) {
+        block_dev_t *bd = blockdev_at(i);
+        if (bd && bd != root_bd && bd->is_partition &&
+            bd->parent == parent && bd->is_fat32 && bd->is_esp)
+            return bd;
+    }
+    for (int i = 0; i < blockdev_count(); i++) {
+        block_dev_t *bd = blockdev_at(i);
+        if (bd && bd != root_bd && bd->is_partition &&
+            bd->parent == parent && bd->is_fat32)
+            return bd;
+    }
+    return NULL;
+}
+
 void vfs_init(const void *boot_info)
 {
+    const struct tsukasa_boot_info *bi = (const struct tsukasa_boot_info *)boot_info;
+    const char *cmdline = (bi && bi->magic == TSUKASA_BOOT_INFO_MAGIC) ? bi->cmdline : NULL;
     const void *initrd_data = NULL;
     size_t initrd_size = 0;
     tmpfs_fs_t *root_fs;
     tmpfs_fs_t *tmp_fs;
     tmpfs_fs_t *run_fs;
+    char root_spec[128];
+    int has_root_arg;
+    block_dev_t *esp_bd = NULL;
 
     mount_table_reset();
     file_pool_reset();
@@ -1809,12 +1904,59 @@ void vfs_init(const void *boot_info)
             kprintf("[ata] no drive detected\n");
     }
     diskmgr_scan_all();
+
+    has_root_arg = extract_cmdline_root(cmdline, root_spec, sizeof(root_spec));
+    if (has_root_arg) {
+        block_dev_t *root_bd = resolve_root_blockdev(root_spec);
+        if (!root_bd) {
+            kprintf("[vfs] ERROR: failed to mount root=%s (device not found)\n",
+                    root_spec);
+            return;
+        }
+        int mrc = -EINVAL;
+        ext4fs_t *efs = ext4fs_mount(root_bd, 0, &mrc);
+        if (!efs) {
+            kprintf("[vfs] ERROR: failed to mount root=%s on %s as ext4 (err=%d)\n",
+                    root_spec, root_bd->name, mrc);
+            return;
+        }
+        if (mount_register_ctx("/", VFS_BACKEND_EXT4, 0, "ext4", efs) != 0) {
+            (void)ext4fs_umount(efs);
+            kprintf("[vfs] ERROR: failed to mount root=%s at / (register failed)\n",
+                    root_spec);
+            return;
+        }
+        kprintf("[vfs] root=%s mounted ext4 rw (%s)\n", root_spec, root_bd->name);
+
+        (void)ext4fs_mkdir(efs, "/tmp", 01777U);
+        (void)ext4fs_mkdir(efs, "/var", 0755U);
+        (void)ext4fs_mkdir(efs, "/var/run", 0755U);
+        (void)ext4fs_mkdir(efs, "/dev", 0755U);
+        (void)ext4fs_mkdir(efs, "/proc", 0555U);
+        (void)ext4fs_mkdir(efs, "/sys", 0555U);
+        (void)ext4fs_mkdir(efs, "/boot", 0755U);
+        (void)ext4fs_mkdir(efs, "/mnt", 0755U);
+
+        esp_bd = find_esp_on_disk(root_bd);
+        if (esp_bd) {
+            fat32_volume_t *esp_vol = fat32_vol_mount(esp_bd);
+            if (esp_vol && mount_register_ctx("/boot", VFS_BACKEND_FAT32VOL, 0, "fat32", esp_vol) == 0) {
+                kprintf("[vfs] ESP /boot mounted rw (%s)\n", esp_bd->name);
+            } else {
+                if (esp_vol)
+                    (void)fat32_vol_umount(esp_vol);
+                kprintf("[vfs] WARN: failed to mount ESP %s at /boot\n", esp_bd->name);
+                esp_bd = NULL;
+            }
+        }
+    }
+
     for (int di = 0; di < blockdev_count(); di++) {
         block_dev_t *bd = blockdev_at(di);
         fat32_volume_t *vol;
         char mnt[VFS_PATH_MAX];
 
-        if (!bd || !bd->is_partition || !bd->is_fat32)
+        if (!bd || !bd->is_partition || !bd->is_fat32 || bd == esp_bd)
             continue;
         vol = fat32_vol_mount(bd);
         if (!vol) {
@@ -1840,20 +1982,22 @@ void vfs_init(const void *boot_info)
         kprintf("[vfs] FAT32 /disk: %s\n", g_fat32_ok ? "ok" : "not found");
     }
 
-    initrd_init_from_multiboot(boot_info);
-    g_initrd_ok = (initrd_lookup("/", &initrd_data, &initrd_size) == 0) ? 1 : 0;
+    if (!has_root_arg) {
+        initrd_init_from_multiboot(boot_info);
+        g_initrd_ok = (initrd_lookup("/", &initrd_data, &initrd_size) == 0) ? 1 : 0;
 
-    root_fs = tmpfs_create();
-    if (root_fs) {
-        mount_register_ctx("/", VFS_BACKEND_TMPFS, 0, "tmpfs", root_fs);
-        unpack_lz4_initrd(boot_info, root_fs);
-        tmpfs_mkdir_p(root_fs, "/tmp", 01777U);
-        tmpfs_mkdir_p(root_fs, "/var/run", 0755U);
-        tmpfs_mkdir_p(root_fs, "/dev", 0755U);
-        tmpfs_mkdir_p(root_fs, "/proc", 0555U);
-        tmpfs_mkdir_p(root_fs, "/sys", 0555U);
-        tmpfs_mkdir_p(root_fs, "/boot", 0755U);
-        tmpfs_mkdir_p(root_fs, "/mnt", 0755U);
+        root_fs = tmpfs_create();
+        if (root_fs) {
+            mount_register_ctx("/", VFS_BACKEND_TMPFS, 0, "tmpfs", root_fs);
+            unpack_lz4_initrd(boot_info, root_fs);
+            tmpfs_mkdir_p(root_fs, "/tmp", 01777U);
+            tmpfs_mkdir_p(root_fs, "/var/run", 0755U);
+            tmpfs_mkdir_p(root_fs, "/dev", 0755U);
+            tmpfs_mkdir_p(root_fs, "/proc", 0555U);
+            tmpfs_mkdir_p(root_fs, "/sys", 0555U);
+            tmpfs_mkdir_p(root_fs, "/boot", 0755U);
+            tmpfs_mkdir_p(root_fs, "/mnt", 0755U);
+        }
     }
 
     tmp_fs = tmpfs_create();
@@ -1869,7 +2013,7 @@ void vfs_init(const void *boot_info)
     mount_register("/proc", VFS_BACKEND_PROCFS, 1, "procfs");
     mount_register("/sys", VFS_BACKEND_SYSFS, 1, "sysfs");
     mount_register("/dev", VFS_BACKEND_DEVFS, 0, "devfs");
-    if (bootfs_module_count() > 0)
+    if (!esp_bd && bootfs_module_count() > 0)
         mount_register("/boot", VFS_BACKEND_BOOTFS, 1, "bootfs");
 
     if (tar_test_archive_len > 0) {
@@ -1880,6 +2024,127 @@ void vfs_init(const void *boot_info)
             kprintf("[vfs] TAR /pkg: mounted ro (%d entries)\n",
                     tar_file_count(tpkg));
     }
+}
+
+int vfs_is_root_mounted(void)
+{
+    unsigned long flags = spin_lock_irqsave(&g_mounts_lock);
+    int mounted = 0;
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (g_mounts[i].used && kstreq(g_mounts[i].path, "/")) {
+            mounted = 1;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&g_mounts_lock, flags);
+    return mounted;
+}
+
+void vfs_sync_all(void)
+{
+    vfs_backend_t backends[VFS_MAX_MOUNTS];
+    void *privs[VFS_MAX_MOUNTS];
+    int count = 0;
+
+    unsigned long flags = spin_lock_irqsave(&g_mounts_lock);
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (!g_mounts[i].used || g_mounts[i].read_only)
+            continue;
+        backends[count] = g_mounts[i].backend;
+        privs[count] = g_mounts[i].fs_private;
+        count++;
+    }
+    spin_unlock_irqrestore(&g_mounts_lock, flags);
+
+    for (int i = 0; i < count; i++) {
+        if (backends[i] == VFS_BACKEND_EXT4 && privs[i]) {
+            (void)ext4fs_sync((ext4fs_t *)privs[i]);
+        } else if (backends[i] == VFS_BACKEND_FAT32VOL && privs[i]) {
+            (void)fat32_vol_sync((fat32_volume_t *)privs[i]);
+        } else if (backends[i] == VFS_BACKEND_FAT32) {
+            fat32_volume_t *pv = privs[i] ? (fat32_volume_t *)privs[i] : fat32_primary_vol();
+            if (pv)
+                (void)fat32_vol_sync(pv);
+        }
+    }
+    (void)pagecache_sync_all();
+}
+
+void vfs_shutdown(void)
+{
+    vfs_sync_all();
+
+    for (;;) {
+        char path[VFS_PATH_MAX];
+        int found = 0;
+        unsigned long flags = spin_lock_irqsave(&g_mounts_lock);
+        for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+            if (g_mounts[i].used && !kstreq(g_mounts[i].path, "/")) {
+                kstrncpy(path, g_mounts[i].path, VFS_PATH_MAX);
+                found = 1;
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&g_mounts_lock, flags);
+        if (!found)
+            break;
+        if (vfs_umount2(path, MNT_DETACH) != 0)
+            break;
+    }
+
+    unsigned long flags = spin_lock_irqsave(&g_mounts_lock);
+    vfs_backend_t root_backend = VFS_BACKEND_NONE;
+    void *root_priv = NULL;
+    uint64_t root_mid = 0;
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (g_mounts[i].used && kstreq(g_mounts[i].path, "/")) {
+            root_mid = g_mounts[i].mount_id;
+            root_backend = g_mounts[i].backend;
+            root_priv = g_mounts[i].fs_private;
+            g_mounts[i].used = 0;
+            g_mounts[i].mount_id = 0;
+            g_mounts[i].open_count = 0;
+            g_mounts[i].active_ops = 0;
+            g_mounts[i].path[0] = '\0';
+            g_mounts[i].path_len = 0;
+            g_mounts[i].backend = VFS_BACKEND_NONE;
+            g_mounts[i].fs_private = NULL;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&g_mounts_lock, flags);
+
+    if (root_mid)
+        dcache_invalidate_mount(root_mid);
+    if (root_backend == VFS_BACKEND_EXT4 && root_priv)
+        (void)ext4fs_umount((ext4fs_t *)root_priv);
+    else if (root_backend == VFS_BACKEND_FAT32VOL && root_priv)
+        (void)fat32_vol_umount((fat32_volume_t *)root_priv);
+    else if (root_backend == VFS_BACKEND_TMPFS && root_priv)
+        tmpfs_destroy((tmpfs_fs_t *)root_priv);
+    (void)pagecache_sync_all();
+}
+
+int vfs_sync_fd(int fd)
+{
+    process_t *proc = vfs_current_process();
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    if (!f)
+        return -EBADF;
+
+    int rc = 0;
+    if (f->backend == VFS_BACKEND_EXT4 && f->fs_ctx) {
+        rc = ext4fs_sync((ext4fs_t *)f->fs_ctx);
+    } else if ((f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) &&
+               f->u.fat32.vol) {
+        rc = fat32_vol_sync(f->u.fat32.vol);
+    } else if (f->backend == VFS_BACKEND_DEVFS && f->u.device.priv &&
+               f->u.device.ops && f->u.device.ops->ioctl) {
+        /* Block devices sync on every write; nothing extra needed unless sync exists. */
+        rc = 0;
+    }
+    file_release(f);
+    return rc;
 }
 
 /* Open/create/close */
@@ -5402,10 +5667,6 @@ void vfs_run_guide12_selftests(void)
 /* create/LFN/grow write path (exercised on the disposable /disk */
 /* scratch volume), and the preflight validator. */
 
-#ifdef __x86_64__
-#include "../sys/installer.h"
-#endif
-
 void vfs_run_guide13_selftests(void)
 {
     int pass = 0, fail = 0;
@@ -5509,40 +5770,6 @@ void vfs_run_guide13_selftests(void)
             fail++;
         }
     }
-
-#ifdef __x86_64__
-    {
-        char err[96];
-        int ok = 1;
-        block_dev_t *raw = blockdev_first_raw_fat32();
-        block_dev_t *some_part = NULL;
-        vfs_stat_t st;
-        int sources = (bootfs_stat("/bootblob.bin", &st) == 0 && st.size > 0);
-
-        if (installer_preflight(NULL, err, sizeof(err)) != -1)
-            ok = 0;
-        for (int i = 0; i < blockdev_count() && !some_part; i++) {
-            block_dev_t *bd = blockdev_at(i);
-            if (bd && bd->is_partition)
-                some_part = bd;
-        }
-        if (some_part &&
-            installer_preflight(some_part, err, sizeof(err)) != -1)
-            ok = 0;
-        if (sources && raw &&
-            raw->sector_count >= INSTALLER_MIN_SECTORS) {
-            if (installer_preflight(raw, err, sizeof(err)) != 0)
-                ok = 0;
-        }
-        if (ok) {
-            kprintf("[guide13] installer preflight PASS\n");
-            pass++;
-        } else {
-            kprintf("[guide13] installer preflight FAIL (%s)\n", err);
-            fail++;
-        }
-    }
-#endif
 
     kprintf("[guide13][test] done pass=%d fail=%d\n", pass, fail);
 }

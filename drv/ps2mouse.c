@@ -85,6 +85,14 @@ static int ps2mouse_enable_scroll(void)
     return (id == 0x03);
 }
 
+static void ps2_flush_output(void)
+{
+    int timeout = 1024;
+    while (timeout-- > 0 && (inb(PS2_CMD) & 0x01)) {
+        (void)inb(PS2_DATA);
+    }
+}
+
 void ps2mouse_init(void)
 {
     mouse_cycle = 0;
@@ -92,16 +100,19 @@ void ps2mouse_init(void)
 
     ps2_wait_write();
     outb(PS2_CMD, 0xA8);
+    ps2_flush_output();
 
     ps2_wait_write();
     outb(PS2_CMD, 0x20);
     ps2_wait_read();
     uint8_t config = inb(PS2_DATA);
-    config |= 0x02;
+    /* Mask IRQ12 while sending configuration commands, enable aux clock. */
+    uint8_t init_cfg = (uint8_t)((config & ~0x02u) & ~0x20u);
     ps2_wait_write();
     outb(PS2_CMD, 0x60);
     ps2_wait_write();
-    outb(PS2_DATA, config);
+    outb(PS2_DATA, init_cfg);
+    ps2_flush_output();
 
     ps2_mouse_write(0xF6);
     ps2_mouse_read();
@@ -114,15 +125,20 @@ void ps2mouse_init(void)
 
     ps2_mouse_write(0xF4);
     ps2_mouse_read();
+    ps2_flush_output();
+
+    config = (uint8_t)((config | 0x02u) & ~0x20u);
+    ps2_wait_write();
+    outb(PS2_CMD, 0x60);
+    ps2_wait_write();
+    outb(PS2_DATA, config);
 
     pic_unmask_irq(12);
     pic_unmask_irq(2);
 }
 
-void ps2mouse_handler(void)
+static void ps2mouse_process_byte(uint8_t data)
 {
-    uint8_t data = inb(PS2_DATA);
-
     switch (mouse_cycle) {
     case 0:
         mouse_bytes[0] = (int8_t)data;
@@ -185,6 +201,17 @@ void ps2mouse_handler(void)
             mouse_cycle = 0;
         }
         break;
+    }
+}
+
+void ps2mouse_handler(void)
+{
+    int guard = 64;
+    while (guard-- > 0) {
+        uint8_t st = inb(PS2_CMD);
+        if ((st & 0x01u) == 0 || (st & 0x20u) == 0)
+            break;
+        ps2mouse_process_byte(inb(PS2_DATA));
     }
 
     irq_ack(12);

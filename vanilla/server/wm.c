@@ -1210,7 +1210,11 @@ int handle_msg_map_window(vanilla_server_t *srv, int client_idx, const vanilla_m
         int was_mapped = w->is_mapped;
         w->is_mapped = 1;
         w->frame_begin_in_flight = 0;
-        vanilla_server_focus_window(srv, w->window_id);
+        if (!((w->flags & WINDOW_FLAG_ALWAYS_TOP) &&
+              (w->flags & WINDOW_FLAG_BORDERLESS) &&
+              !(w->flags & WINDOW_FLAG_POPUP))) {
+            vanilla_server_focus_window(srv, w->window_id);
+        }
         wm_raise_window(srv, w->window_id);
 
         if (g_theme->reduce_motion == 0) {

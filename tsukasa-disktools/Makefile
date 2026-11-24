@@ -38,33 +38,40 @@ $(CRT0) $(LIBC_A):
 
 BIN_DIR = bin
 
-COMMON_OBJ     = src/common.o
+COMMON_OBJS    = src/common.o src/gpt.o
+FAT32_FMT_OBJ  = src/fat32_fmt.o
+EXT4_FMT_OBJ   = src/ext4_fmt.o
 FDISK_BIN      = $(BIN_DIR)/fdisk.elf
 MKFS_FAT32_BIN = $(BIN_DIR)/mkfs.fat32.elf
 MKFS_EXT2_BIN  = $(BIN_DIR)/mkfs.ext2.elf
+MKFS_EXT4_BIN  = $(BIN_DIR)/mkfs.ext4.elf
 INSTALLER_BIN  = $(BIN_DIR)/installer.elf
 
-ALL_BINS = $(FDISK_BIN) $(MKFS_FAT32_BIN) $(MKFS_EXT2_BIN) $(INSTALLER_BIN)
+ALL_BINS = $(FDISK_BIN) $(MKFS_FAT32_BIN) $(MKFS_EXT2_BIN) $(MKFS_EXT4_BIN) $(INSTALLER_BIN)
 
-.PHONY: all clean check
+.PHONY: all clean check host
 
 all: $(ALL_BINS)
 
-$(FDISK_BIN): $(CRT0) src/fdisk.o $(COMMON_OBJ) $(LIBC_A)
+$(FDISK_BIN): $(CRT0) src/fdisk.o $(COMMON_OBJS) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) src/fdisk.o $(COMMON_OBJ) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) src/fdisk.o $(COMMON_OBJS) $(LIBC_A)
 
-$(MKFS_FAT32_BIN): $(CRT0) src/mkfs_fat32.o $(COMMON_OBJ) $(LIBC_A)
+$(MKFS_FAT32_BIN): $(CRT0) src/mkfs_fat32.o $(FAT32_FMT_OBJ) $(COMMON_OBJS) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) src/mkfs_fat32.o $(COMMON_OBJ) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) src/mkfs_fat32.o $(FAT32_FMT_OBJ) $(COMMON_OBJS) $(LIBC_A)
 
-$(MKFS_EXT2_BIN): $(CRT0) src/mkfs_ext2.o $(COMMON_OBJ) $(LIBC_A)
+$(MKFS_EXT2_BIN): $(CRT0) src/mkfs_ext2.o $(COMMON_OBJS) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) src/mkfs_ext2.o $(COMMON_OBJ) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) src/mkfs_ext2.o $(COMMON_OBJS) $(LIBC_A)
 
-$(INSTALLER_BIN): $(CRT0) src/installer.o $(COMMON_OBJ) $(LIBC_A)
+$(MKFS_EXT4_BIN): $(CRT0) src/mkfs_ext4.o $(EXT4_FMT_OBJ) $(COMMON_OBJS) $(LIBC_A)
 	@mkdir -p $(BIN_DIR)
-	$(LD) $(LDFLAGS) -o $@ $(CRT0) src/installer.o $(COMMON_OBJ) $(LIBC_A)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) src/mkfs_ext4.o $(EXT4_FMT_OBJ) $(COMMON_OBJS) $(LIBC_A)
+
+$(INSTALLER_BIN): $(CRT0) src/installer.o $(FAT32_FMT_OBJ) $(EXT4_FMT_OBJ) $(COMMON_OBJS) $(LIBC_A)
+	@mkdir -p $(BIN_DIR)
+	$(LD) $(LDFLAGS) -o $@ $(CRT0) src/installer.o $(FAT32_FMT_OBJ) $(EXT4_FMT_OBJ) $(COMMON_OBJS) $(LIBC_A)
 
 src/%.o: src/%.c
 	@mkdir -p $(dir $@)
@@ -75,6 +82,7 @@ check: all
 	@echo "     - bin/fdisk.elf"
 	@echo "     - bin/mkfs.fat32.elf"
 	@echo "     - bin/mkfs.ext2.elf"
+	@echo "     - bin/mkfs.ext4.elf"
 	@echo "     - bin/installer.elf"
 
 clean:
@@ -91,8 +99,9 @@ endif
 
 host:
 	@mkdir -p $(BIN_DIR)
-	$(HOST_CC) $(HOST_CFLAGS) -o $(BIN_DIR)/fdisk$(HOST_EXT) src/fdisk.c src/common.c
-	$(HOST_CC) $(HOST_CFLAGS) -o $(BIN_DIR)/mkfs.fat32$(HOST_EXT) src/mkfs_fat32.c src/common.c
-	$(HOST_CC) $(HOST_CFLAGS) -o $(BIN_DIR)/mkfs.ext2$(HOST_EXT) src/mkfs_ext2.c src/common.c
-	$(HOST_CC) $(HOST_CFLAGS) -o $(BIN_DIR)/installer$(HOST_EXT) src/installer.c src/common.c
+	$(HOST_CC) $(HOST_CFLAGS) -o $(BIN_DIR)/fdisk$(HOST_EXT) src/fdisk.c src/common.c src/gpt.c
+	$(HOST_CC) $(HOST_CFLAGS) -o $(BIN_DIR)/mkfs.fat32$(HOST_EXT) src/mkfs_fat32.c src/fat32_fmt.c src/common.c src/gpt.c
+	$(HOST_CC) $(HOST_CFLAGS) -o $(BIN_DIR)/mkfs.ext2$(HOST_EXT) src/mkfs_ext2.c src/common.c src/gpt.c
+	$(HOST_CC) $(HOST_CFLAGS) -o $(BIN_DIR)/mkfs.ext4$(HOST_EXT) src/mkfs_ext4.c src/ext4_fmt.c src/common.c src/gpt.c
+	$(HOST_CC) $(HOST_CFLAGS) -o $(BIN_DIR)/installer$(HOST_EXT) src/installer.c src/fat32_fmt.c src/ext4_fmt.c src/common.c src/gpt.c
 	@echo "[OK] Host disktools binaries built in $(BIN_DIR)/"

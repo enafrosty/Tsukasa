@@ -657,12 +657,27 @@ static long sys_time(long tloc, long a2, long a3, long a4, long a5, long a6)
     return (long)epoch;
 }
 
+static long sys_fsync(long fd, long a2, long a3, long a4, long a5, long a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    return (long)vfs_sync_fd((int)fd);
+}
+
+static long sys_sync(long a1, long a2, long a3, long a4, long a5, long a6)
+{
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    vfs_sync_all();
+    return 0;
+}
+
 static long sys_reboot(long magic1, long magic2, long cmd, long a4, long a5, long a6)
 {
     (void)magic1; (void)magic2; (void)a4; (void)a5; (void)a6;
     if (cmd == 0x4321fedc || cmd == 1) {
+        vfs_shutdown();
         acpi_power_off();
     } else if (cmd == 0x01234567 || cmd == 2) {
+        vfs_shutdown();
         k_reboot();
     }
     return 0;
@@ -1035,6 +1050,7 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [67] = sys_shm_detach,
     [72] = sys_fcntl,
     [73] = sys_flock,
+    [74] = sys_fsync,
     [76] = sys_truncate,
     [77] = sys_ftruncate,
     [79] = sys_getcwd,
@@ -1052,6 +1068,7 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [95] = sys_umask,
     [110] = sys_getppid,
     [127] = sys_rt_sigpending,
+    [162] = sys_sync,
     [165] = sys_mount,
     [166] = sys_umount2,
     [169] = sys_reboot,

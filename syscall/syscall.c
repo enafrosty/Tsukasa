@@ -203,10 +203,18 @@ static uintptr_t handle_system(uintptr_t cmd,
         if (!path)
             return (uintptr_t)-1;
         if (exec_resolve_builtin(path, &entry) == 0 && entry) {
-            child = process_spawn_kernel(path, entry);
-            if (child)
-                process_set_cmdline((int)child->pid, (args && args[0]) ? args : path);
-            return child ? (uintptr_t)child->pid : (uintptr_t)-1;
+            int parent_pid = process_current_pid();
+            child = process_spawn_kernel_paused(path, entry);
+            if (!child)
+                return (uintptr_t)-1;
+            process_set_cmdline((int)child->pid, (args && args[0]) ? args : path);
+            if (parent_pid > 0) {
+                process_clone_fd((int)child->pid, 0, parent_pid, 0);
+                process_clone_fd((int)child->pid, 1, parent_pid, 1);
+                process_clone_fd((int)child->pid, 2, parent_pid, 2);
+            }
+            process_wake_blocked(child);
+            return (uintptr_t)child->pid;
         }
         /* Not a compiled-in builtin: load an ELF64 binary from the VFS into a fresh private address space and run it. */
         {
@@ -235,11 +243,12 @@ static uintptr_t handle_system(uintptr_t cmd,
         int child_pid;
         if (!req || !req->path)
             return (uintptr_t)-1;
+        process_t *builtin_child = NULL;
         if (exec_resolve_builtin(req->path, &entry) == 0 && entry) {
-            process_t *child = process_spawn_kernel(req->path, entry);
-            if (!child)
+            builtin_child = process_spawn_kernel_paused(req->path, entry);
+            if (!builtin_child)
                 return (uintptr_t)-1;
-            child_pid = (int)child->pid;
+            child_pid = (int)builtin_child->pid;
         } else {
             /* Not a compiled-in builtin: load an ELF64 binary from the VFS. */
             child_pid = elf64_spawn_cmdline(req->path, req->args, req->path);
@@ -259,6 +268,8 @@ static uintptr_t handle_system(uintptr_t cmd,
             if (req->stderr_fd >= 0)
                 process_clone_fd(child_pid, 2, parent_pid, req->stderr_fd);
         }
+        if (builtin_child)
+            process_wake_blocked(builtin_child);
         return (uintptr_t)child_pid;
     }
 
