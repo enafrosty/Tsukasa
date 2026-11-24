@@ -32,8 +32,11 @@
 #define VMM_X64_PTE_PAT           (1ULL << 7)   /* PAT bit for 4 KiB PTE */
 #define VMM_X64_PDE_PS            (1ULL << 7)   /* Page Size bit for 2 MiB/1 GiB entry */
 #define VMM_X64_PTE_GLOBAL        (1ULL << 8)
-#define VMM_X64_PDE_PAT           (1ULL << 12)  /* PAT bit for 2 MiB/1 GiB entry */
+#define VMM_X64_PTE_PROTNONE      (1ULL << 10) /* OS-available bit for PROT_NONE */
+#define VMM_X64_PDE_PAT           (1ULL << 12) /* PAT bit for 2 MiB/1 GiB entry */
 #define VMM_X64_PTE_NO_EXEC       (1ULL << 63)
+
+struct vm_space;
 
 /*
  * IA32_PAT layout (Intel SDM Vol. 3A, Section 11.12.2):
@@ -48,6 +51,9 @@ int vmm_x64_init_pat_cpu(void);
 uint64_t vmm_x64_read_pat_cpu(void);
 int vmm_x64_pat_supported(void);
 uint64_t vmm_x64_pat_msr(void);
+int vmm_x64_init_nxe_cpu(void);
+int vmm_x64_nxe_supported(void);
+int vmm_x64_nxe_enabled(void);
 
 uint64_t vmm_get_current_pml4(void);
 uint64_t vmm_get_kernel_pml4(void);
@@ -71,6 +77,30 @@ int vmm_protect_pages(uint64_t pml4_phys,
                       uintptr_t virt_addr,
                       size_t page_count,
                       uint64_t map_flags);
+int vmm_protect_present_pages(uint64_t pml4_phys,
+                              uintptr_t virt_addr,
+                              size_t page_count,
+                              uint64_t map_flags);
+int vmm_unmap_page_collect(uint64_t pml4_phys,
+                           uintptr_t virt_addr,
+                           uint64_t *phys_out,
+                           uint64_t *flags_out);
+int vmm_map_user_page_if_absent(uint64_t pml4_phys,
+                                uintptr_t virt_addr,
+                                uint64_t phys_addr,
+                                uint64_t map_flags);
+int vmm_cow_replace_user_page(uint64_t pml4_phys,
+                              uintptr_t virt_addr,
+                              uint64_t expected_old_phys,
+                              uint64_t new_phys,
+                              uint64_t map_flags);
+int vmm_upgrade_user_page_write(uint64_t pml4_phys,
+                                uintptr_t virt_addr,
+                                uint64_t expected_phys,
+                                uint64_t map_flags);
+void vmm_tlb_shootdown(struct vm_space *space, uintptr_t va, size_t page_count);
+void tlb_shootdown_ipi_handler(void);
+uint64_t vmm_tlb_shootdown_ipi_count(void);
 int vmm_query_page(uint64_t pml4_phys,
                    uintptr_t virt_addr,
                    uint64_t *phys_out,

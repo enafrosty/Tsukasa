@@ -246,7 +246,7 @@ static void pc_remove_and_free_locked(pagecache_page_t *pg, unsigned long *flags
 }
 
 /* Try to evict one clean unpinned page, or write back a dirty unpinned page. */
-static int pc_reclaim_one_locked(unsigned long *flags)
+static int pc_reclaim_one_locked(unsigned long *flags, uint32_t get_flags)
 {
     for (int pass = 0; pass < 2; pass++) {
         pagecache_page_t *curr = g_pc.inactive.tail;
@@ -269,6 +269,11 @@ static int pc_reclaim_one_locked(unsigned long *flags)
         while (curr) {
             if (curr->pin_count == 0 && !curr->busy && curr->dirty &&
                 curr->ops && curr->ops->writepage) {
+                if ((get_flags & PAGECACHE_GET_NO_FS_WB) != 0U &&
+                    (curr->ops->flags & PAGECACHE_OPS_FS_LOCK) != 0U) {
+                    curr = curr->lru_prev;
+                    continue;
+                }
                 dirty_pg = curr;
                 break;
             }
@@ -309,25 +314,26 @@ static int pc_reclaim_one_locked(unsigned long *flags)
     return (rc == 0) ? 1 : 0;
 }
 
-static int pc_enforce_watermarks_locked(unsigned long *flags)
+static int pc_enforce_watermarks_locked(unsigned long *flags, uint32_t get_flags)
 {
     size_t spins = 0;
     while (g_pc.total_pages >= g_pc.max_pages ||
            (g_pc.total_pages > 0 && pmm_free_page_count() <= g_pc.low_free_watermark)) {
-        if (!pc_reclaim_one_locked(flags))
+        if (!pc_reclaim_one_locked(flags, get_flags))
             break;
         if (++spins > g_pc.max_pages + 64U)
             break;
     }
-    if (g_pc.total_pages >= g_pc.max_pages)
+    if (g_pc.total_pages >= g_pc.max_pages && (get_flags & PAGECACHE_GET_NO_FS_WB) == 0U)
         return -ENOMEM;
     return 0;
 }
 
-pagecache_page_t *pagecache_get_page(uint64_t obj_id,
-                                     uint64_t page_index,
-                                     const pagecache_ops_t *ops,
-                                     void *ops_ctx)
+pagecache_page_t *pagecache_get_page_flags(uint64_t obj_id,
+                                           uint64_t page_index,
+                                           const pagecache_ops_t *ops,
+                                           void *ops_ctx,
+                                           uint32_t get_flags)
 {
     unsigned long flags = spin_lock_irqsave(&g_pc.lock);
     pc_ensure_init_locked();
@@ -368,7 +374,7 @@ retry:
         }
     }
 
-    if (pc_enforce_watermarks_locked(&flags) != 0) {
+    if (pc_enforce_watermarks_locked(&flags, get_flags) != 0) {
         spin_unlock_irqrestore(&g_pc.lock, flags);
         return NULL;
     }
@@ -387,7 +393,7 @@ retry:
     if (!phys) {
         /* Last-ditch reclaim and retry PMM allocation once. */
         flags = spin_lock_irqsave(&g_pc.lock);
-        (void)pc_reclaim_one_locked(&flags);
+        (void)pc_reclaim_one_locked(&flags, get_flags);
         spin_unlock_irqrestore(&g_pc.lock, flags);
         phys = pmm_alloc();
         if (!phys) {
@@ -422,8 +428,8 @@ retry:
         flags = spin_lock_irqsave(&g_pc.lock);
         goto retry;
     }
-    if (g_pc.total_pages >= g_pc.max_pages) {
-        if (pc_enforce_watermarks_locked(&flags) != 0) {
+    if (g_pc.total_pages >= g_pc.max_pages && (get_flags & PAGECACHE_GET_NO_FS_WB) == 0U) {
+        if (pc_enforce_watermarks_locked(&flags, get_flags) != 0) {
             spin_unlock_irqrestore(&g_pc.lock, flags);
             pmm_free(phys);
             kfree(pg);
@@ -468,6 +474,52 @@ retry:
     return pg;
 }
 
+pagecache_page_t *pagecache_get_page(uint64_t obj_id,
+                                     uint64_t page_index,
+                                     const pagecache_ops_t *ops,
+                                     void *ops_ctx)
+{
+    return pagecache_get_page_flags(obj_id, page_index, ops, ops_ctx, 0U);
+}
+
+pagecache_page_t *pagecache_lookup_page(uint64_t obj_id, uint64_t page_index)
+{
+    unsigned long flags = spin_lock_irqsave(&g_pc.lock);
+    pc_ensure_init_locked();
+
+    pagecache_page_t *hit = pc_hash_find_locked(obj_id, page_index);
+    if (!hit) {
+        spin_unlock_irqrestore(&g_pc.lock, flags);
+        return NULL;
+    }
+
+    hit->pin_count++;
+    if (hit->busy) {
+        spin_unlock_irqrestore(&g_pc.lock, flags);
+        while (__atomic_load_n(&hit->busy, __ATOMIC_ACQUIRE))
+            process_yield();
+        flags = spin_lock_irqsave(&g_pc.lock);
+        if (hit->invalid || !hit->uptodate) {
+            if (hit->pin_count > 0)
+                hit->pin_count--;
+            if (hit->invalid && hit->pin_count == 0) {
+                uintptr_t phys = hit->phys_addr;
+                spin_unlock_irqrestore(&g_pc.lock, flags);
+                if (phys)
+                    pmm_free(phys);
+                kfree(hit);
+                return NULL;
+            }
+            spin_unlock_irqrestore(&g_pc.lock, flags);
+            return NULL;
+        }
+    }
+
+    pc_touch_locked(hit);
+    spin_unlock_irqrestore(&g_pc.lock, flags);
+    return hit;
+}
+
 void pagecache_put_page(pagecache_page_t *page)
 {
     if (!page)
@@ -500,7 +552,8 @@ void pagecache_mark_dirty(pagecache_page_t *page)
     spin_unlock_irqrestore(&g_pc.lock, flags);
 }
 
-static int pc_sync_matching(uint64_t obj_id, int match_all)
+static int pc_sync_matching(uint64_t obj_id, int match_all,
+                            uint64_t start_page, uint64_t end_page)
 {
     int first_err = 0;
     unsigned long flags = spin_lock_irqsave(&g_pc.lock);
@@ -516,7 +569,9 @@ restart_bucket:
             while (curr) {
                 if (!curr->invalid && curr->dirty && !curr->busy &&
                     curr->sync_seq != seq &&
-                    (match_all || curr->obj_id == obj_id)) {
+                    (match_all || (curr->obj_id == obj_id &&
+                                   curr->page_index >= start_page &&
+                                   curr->page_index < end_page))) {
                     const pagecache_ops_t *ops = curr->ops;
                     void *ctx = curr->ops_ctx;
                     uint64_t oid = curr->obj_id;
@@ -574,12 +629,19 @@ restart_bucket:
 
 int pagecache_sync_obj(uint64_t obj_id)
 {
-    return pc_sync_matching(obj_id, 0);
+    return pc_sync_matching(obj_id, 0, 0ULL, UINT64_MAX);
+}
+
+int pagecache_sync_obj_range(uint64_t obj_id, uint64_t start_page, uint64_t end_page)
+{
+    if (start_page >= end_page)
+        return 0;
+    return pc_sync_matching(obj_id, 0, start_page, end_page);
 }
 
 int pagecache_sync_all(void)
 {
-    return pc_sync_matching(0, 1);
+    return pc_sync_matching(0, 1, 0ULL, UINT64_MAX);
 }
 
 void pagecache_invalidate_obj(uint64_t obj_id)

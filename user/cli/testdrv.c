@@ -1191,6 +1191,85 @@ static void test_ext4_fat32_images(void)
         goto umount_fail;
     }
 
+    /* 2b. ext4 demand-paged file mmap (close(fd), MAP_PRIVATE COW, MAP_SHARED + msync). */
+    fd = open("/mnt/e4/wdir/mmap_e4.bin", TSK_O_RDWR | TSK_O_CREAT | TSK_O_TRUNC);
+    if (fd < 0)
+        goto umount_fail;
+    for (int i = 0; i < 9000; i++)
+        g_fs_io_buf[i] = (uint8_t)((i * 19 + 5) & 0xFFu);
+    if (write(fd, g_fs_io_buf, 9000) != 9000) {
+        close(fd);
+        goto umount_fail;
+    }
+    close(fd);
+
+    fd = open("/mnt/e4/wdir/mmap_e4.bin", TSK_O_RDONLY);
+    if (fd < 0)
+        goto umount_fail;
+    volatile uint8_t *e4p = (volatile uint8_t *)mmap(
+        NULL, 9000, VFS_PROT_READ | VFS_PROT_WRITE, VFS_MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (!e4p || (long)(uintptr_t)e4p < 0) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 MAP_PRIVATE mmap failed\n");
+        goto umount_fail;
+    }
+    for (int i = 0; i < 9000; i++) {
+        if (e4p[i] != (uint8_t)((i * 19 + 5) & 0xFFu)) {
+            (void)munmap((void *)(uintptr_t)e4p, 9000);
+            dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 MAP_PRIVATE read mismatch at %d\n", i);
+            goto umount_fail;
+        }
+    }
+    e4p[0] ^= 0xFFu;
+    e4p[4096] ^= 0xFFu;
+    e4p[8500] ^= 0xFFu;
+    (void)munmap((void *)(uintptr_t)e4p, 9000);
+
+    fd = open("/mnt/e4/wdir/mmap_e4.bin", TSK_O_RDWR);
+    if (fd < 0)
+        goto umount_fail;
+    e4p = (volatile uint8_t *)mmap(
+        NULL, 9000, VFS_PROT_READ | VFS_PROT_WRITE, VFS_MAP_SHARED, fd, 0);
+    close(fd);
+    if (!e4p || (long)(uintptr_t)e4p < 0) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 MAP_SHARED mmap failed\n");
+        goto umount_fail;
+    }
+    if (e4p[0] != 5u || e4p[4096] != (uint8_t)((4096 * 19 + 5) & 0xFFu)) {
+        (void)munmap((void *)(uintptr_t)e4p, 9000);
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 MAP_PRIVATE mutated disk\n");
+        goto umount_fail;
+    }
+    e4p[17] = 0xA5u;
+    e4p[5000] = 0x5Au;
+    e4p[8999] = 0x3Cu;
+    if (msync((void *)(uintptr_t)e4p, 9000, VFS_MS_SYNC) != 0) {
+        (void)munmap((void *)(uintptr_t)e4p, 9000);
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 msync failed\n");
+        goto umount_fail;
+    }
+    e4p[18] = 0x7Eu;
+    if (msync((void *)(uintptr_t)e4p, 4096, VFS_MS_SYNC) != 0) {
+        (void)munmap((void *)(uintptr_t)e4p, 9000);
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 second msync failed\n");
+        goto umount_fail;
+    }
+    (void)munmap((void *)(uintptr_t)e4p, 9000);
+
+    if (sys_stat("/mnt/e4/wdir/mmap_e4.bin", &st) != 0 || st.size != 9000) {
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 MAP_SHARED changed file size\n");
+        goto umount_fail;
+    }
+    fd = open("/mnt/e4/wdir/mmap_e4.bin", TSK_O_RDONLY);
+    if (fd < 0 || read(fd, g_fs_io_buf, 9000) != 9000 ||
+        g_fs_io_buf[17] != 0xA5u || g_fs_io_buf[18] != 0x7Eu ||
+        g_fs_io_buf[5000] != 0x5Au || g_fs_io_buf[8999] != 0x3Cu) {
+        if (fd >= 0) close(fd);
+        dprintf(1, "[TEST] ext4_fat32_images FAIL: ext4 MAP_SHARED persistence mismatch\n");
+        goto umount_fail;
+    }
+    close(fd);
+
     /* 3. Verify FAT32 pre-populated contents (>10 MiB file, nested dir, mixed-case LFN). */
     v_big = verify_big_file("/mnt/fat/BIGFILE.BIN", 10u * 1024u * 1024u + 1u);
     if (v_big != 0) {
@@ -1293,11 +1372,226 @@ umount_fail:
     (void)sys_umount2("/mnt/fat", 0);
 }
 
+static void test_demand_file_mmap(void)
+{
+    const char *path = "/tmp/mmap_surv.bin";
+    const size_t flen = 12345u;
+    int fd = open(path, TSK_O_RDWR | TSK_O_CREAT | TSK_O_TRUNC);
+    if (fd < 0) {
+        dprintf(1, "[TEST] demand_file_mmap FAIL: create failed\n");
+        return;
+    }
+    for (size_t i = 0; i < flen; i++)
+        g_fs_io_buf[i] = (uint8_t)((i * 37u + 13u) & 0xFFu);
+    if (write(fd, g_fs_io_buf, flen) != (long)flen) {
+        close(fd);
+        dprintf(1, "[TEST] demand_file_mmap FAIL: seed write failed\n");
+        return;
+    }
+    close(fd);
+
+    /* 1. Survives close(fd) + partial EOF tail zeroing + multi-page demand reads. */
+    fd = open(path, TSK_O_RDONLY);
+    if (fd < 0) {
+        dprintf(1, "[TEST] demand_file_mmap FAIL: reopen rdonly\n");
+        return;
+    }
+    volatile uint8_t *p = (volatile uint8_t *)mmap(
+        NULL, flen, VFS_PROT_READ, VFS_MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (!p || (long)(uintptr_t)p < 0) {
+        dprintf(1, "[TEST] demand_file_mmap FAIL: MAP_PRIVATE ro mmap failed\n");
+        return;
+    }
+    for (size_t i = 0; i < flen; i++) {
+        if (p[i] != (uint8_t)((i * 37u + 13u) & 0xFFu)) {
+            (void)munmap((void *)(uintptr_t)p, flen);
+            dprintf(1, "[TEST] demand_file_mmap FAIL: read mismatch at %u\n", (unsigned)i);
+            return;
+        }
+    }
+    for (size_t i = flen; i < 16384u; i++) {
+        if (p[i] != 0u) {
+            (void)munmap((void *)(uintptr_t)p, flen);
+            dprintf(1, "[TEST] demand_file_mmap FAIL: EOF tail nonzero at %u\n", (unsigned)i);
+            return;
+        }
+    }
+    if (munmap((void *)(uintptr_t)p, flen) != 0) {
+        dprintf(1, "[TEST] demand_file_mmap FAIL: munmap 1 failed\n");
+        return;
+    }
+
+    /* 2. MAP_PRIVATE COW isolation (writes stay private, file unchanged). */
+    fd = open(path, TSK_O_RDONLY);
+    if (fd < 0) {
+        dprintf(1, "[TEST] demand_file_mmap FAIL: reopen for COW\n");
+        return;
+    }
+    p = (volatile uint8_t *)mmap(NULL, flen, VFS_PROT_READ | VFS_PROT_WRITE,
+                                 VFS_MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (!p || (long)(uintptr_t)p < 0) {
+        dprintf(1, "[TEST] demand_file_mmap FAIL: MAP_PRIVATE rw mmap failed\n");
+        return;
+    }
+    p[0] ^= 0xFFu;
+    p[4096] ^= 0xFFu;
+    p[9000] ^= 0xFFu;
+    if (p[0] != (uint8_t)(13u ^ 0xFFu) ||
+        p[4096] != (uint8_t)(((4096u * 37u + 13u) & 0xFFu) ^ 0xFFu) ||
+        p[9000] != (uint8_t)(((9000u * 37u + 13u) & 0xFFu) ^ 0xFFu)) {
+        (void)munmap((void *)(uintptr_t)p, flen);
+        dprintf(1, "[TEST] demand_file_mmap FAIL: COW write not visible in mapping\n");
+        return;
+    }
+    (void)munmap((void *)(uintptr_t)p, flen);
+
+    fd = open(path, TSK_O_RDONLY);
+    if (fd < 0 || read(fd, g_fs_io_buf, flen) != (long)flen) {
+        if (fd >= 0) close(fd);
+        dprintf(1, "[TEST] demand_file_mmap FAIL: verify read failed\n");
+        return;
+    }
+    close(fd);
+    if (g_fs_io_buf[0] != 13u ||
+        g_fs_io_buf[4096] != (uint8_t)((4096u * 37u + 13u) & 0xFFu) ||
+        g_fs_io_buf[9000] != (uint8_t)((9000u * 37u + 13u) & 0xFFu)) {
+        dprintf(1, "[TEST] demand_file_mmap FAIL: MAP_PRIVATE mutated underlying file\n");
+        return;
+    }
+
+    /* 3. MAP_SHARED + page offset + msync + re-dirty writeback. */
+    fd = open(path, TSK_O_RDWR);
+    if (fd < 0) {
+        dprintf(1, "[TEST] demand_file_mmap FAIL: open rdwr for MAP_SHARED\n");
+        return;
+    }
+    p = (volatile uint8_t *)mmap(NULL, 8192u, VFS_PROT_READ | VFS_PROT_WRITE,
+                                 VFS_MAP_SHARED, fd, 4096L);
+    close(fd);
+    if (!p || (long)(uintptr_t)p < 0) {
+        dprintf(1, "[TEST] demand_file_mmap FAIL: MAP_SHARED mmap failed\n");
+        return;
+    }
+    if (p[0] != (uint8_t)((4096u * 37u + 13u) & 0xFFu)) {
+        (void)munmap((void *)(uintptr_t)p, 8192u);
+        dprintf(1, "[TEST] demand_file_mmap FAIL: MAP_SHARED offset mismatch\n");
+        return;
+    }
+    p[0] = 0xAAu;
+    p[4095] = 0xBBu;
+    p[4096] = 0xCCu;
+    if (msync((void *)(uintptr_t)p, 8192u, VFS_MS_SYNC) != 0) {
+        (void)munmap((void *)(uintptr_t)p, 8192u);
+        dprintf(1, "[TEST] demand_file_mmap FAIL: msync 1 failed\n");
+        return;
+    }
+    p[10] = 0xDDu;
+    if (msync((void *)(uintptr_t)p, 4096u, VFS_MS_SYNC) != 0) {
+        (void)munmap((void *)(uintptr_t)p, 8192u);
+        dprintf(1, "[TEST] demand_file_mmap FAIL: msync 2 failed\n");
+        return;
+    }
+    if (munmap((void *)(uintptr_t)p, 8192u) != 0) {
+        dprintf(1, "[TEST] demand_file_mmap FAIL: munmap shared failed\n");
+        return;
+    }
+
+    fd = open(path, TSK_O_RDONLY);
+    if (fd < 0 || read(fd, g_fs_io_buf, flen) != (long)flen) {
+        if (fd >= 0) close(fd);
+        dprintf(1, "[TEST] demand_file_mmap FAIL: shared readback failed\n");
+        return;
+    }
+    close(fd);
+    if (g_fs_io_buf[4096] != 0xAAu || g_fs_io_buf[8191] != 0xBBu ||
+        g_fs_io_buf[8192] != 0xCCu || g_fs_io_buf[4106] != 0xDDu) {
+        dprintf(1, "[TEST] demand_file_mmap FAIL: MAP_SHARED changes lost\n");
+        return;
+    }
+
+    /* 4. Negative argument validation for mmap and msync. */
+    fd = open(path, TSK_O_RDONLY);
+    if (fd < 0) {
+        dprintf(1, "[TEST] demand_file_mmap FAIL: open rdonly for negative checks\n");
+        return;
+    }
+    if (mmap(NULL, 4096, VFS_PROT_READ, VFS_MAP_PRIVATE, fd, 123L) != (void *)-1 ||
+        mmap(NULL, 4096, VFS_PROT_READ | VFS_PROT_WRITE, VFS_MAP_SHARED, fd, 0) != (void *)-1 ||
+        mmap(NULL, 4096, VFS_PROT_READ, VFS_MAP_SHARED | VFS_MAP_PRIVATE, fd, 0) != (void *)-1 ||
+        mmap(NULL, 4096, VFS_PROT_READ, VFS_MAP_PRIVATE, 999, 0) != (void *)-1) {
+        close(fd);
+        dprintf(1, "[TEST] demand_file_mmap FAIL: negative mmap accepted invalid args\n");
+        return;
+    }
+    close(fd);
+
+    if (msync((void *)0x80000123ULL, 4096u, VFS_MS_SYNC) != -22 ||
+        msync((void *)0x80000000ULL, 4096u, VFS_MS_ASYNC | VFS_MS_SYNC) != -22 ||
+        msync((void *)0x80000000ULL, 4096u, 0x80) != -22 ||
+        msync((void *)0x50000000ULL, 4096u, VFS_MS_SYNC) != -12) {
+        dprintf(1, "[TEST] demand_file_mmap FAIL: negative msync validation failed\n");
+        return;
+    }
+
+    /* 5. Negative Ring-3 #PF protection & NX enforcement + positive PROT_EXEC. */
+    int rfd = open("/tmp/mmap_ro.dat", TSK_O_WRONLY | TSK_O_CREAT | TSK_O_TRUNC);
+    if (rfd < 0 || write(rfd, "READONLY", 8) != 8) {
+        if (rfd >= 0) close(rfd);
+        dprintf(1, "[TEST] demand_file_mmap FAIL: seed mmap_ro.dat failed\n");
+        return;
+    }
+    close(rfd);
+
+    const char *fault_modes[3] = { "ro_write", "nx_exec", "prot_none" };
+    for (int m = 0; m < 3; m++) {
+        char cmdline[64];
+        const char *pfx = "mmapflt ";
+        int k = 0;
+        while (pfx[k]) {
+            cmdline[k] = pfx[k];
+            k++;
+        }
+        int j = 0;
+        while (fault_modes[m][j]) {
+            cmdline[k++] = fault_modes[m][j++];
+        }
+        cmdline[k] = '\0';
+
+        int st = 0;
+        long detail = 0;
+        int rc = spawn_and_wait("/bin/mmapflt.elf", cmdline, &st, &detail);
+        if (rc != 0 || TSK_WIFEXITED(st) || !TSK_WIFSIGNALED(st) ||
+            TSK_WTERMSIG(st) != TSK_SIGSEGV) {
+            dprintf(1, "[TEST] demand_file_mmap FAIL: %s expected SIGSEGV rc=%d st=0x%x\n",
+                    fault_modes[m], rc, (unsigned)st);
+            return;
+        }
+    }
+
+    {
+        int st = 0;
+        long detail = 0;
+        int rc = spawn_and_wait("/bin/mmapflt.elf", "mmapflt exec_ok", &st, &detail);
+        if (rc != 0 || !TSK_WIFEXITED(st) || TSK_WEXITSTATUS(st) != 42) {
+            dprintf(1, "[TEST] demand_file_mmap FAIL: exec_ok expected exit 42 rc=%d st=0x%x\n",
+                    rc, (unsigned)st);
+            return;
+        }
+    }
+
+    (void)sys_unlink(path);
+    (void)sys_unlink("/tmp/mmap_ro.dat");
+    dprintf(1, "[TEST] demand_file_mmap PASS\n");
+}
+
 static void run_kernel_regression_tests(void)
 {
     test_spawn_argv();
     test_pmm_reclaim();
     test_munmap_safety();
+    test_demand_file_mmap();
     test_urandom_entropy();
     test_vfs_tmp_crud();
     test_initrd_rootfs_layout();

@@ -76,6 +76,8 @@ pid_t getpid(void);
 pid_t getppid(void);
 int kill(pid_t pid, int sig);
 int sched_yield(void);
+int brk(void *addr);
+void *sbrk(intptr_t increment);
 int reboot(int cmd);
 
 unsigned int sleep(unsigned int seconds);

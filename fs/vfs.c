@@ -116,6 +116,7 @@ typedef struct vfs_file {
     uint64_t inode_dev;
     uint64_t inode_ino;
     size_t pos;
+    struct vfs_pc_inode *pc_inode;
 
     char path[VFS_PATH_MAX];
     char abs_path[VFS_PATH_MAX];
@@ -198,6 +199,26 @@ static spinlock_t g_mounts_lock = SPINLOCK_INIT;
 static spinlock_t g_vfs_alloc_lock = SPINLOCK_INIT;
 static spinlock_t g_fd_lock = SPINLOCK_INIT;
 static spinlock_t g_dcache_lock = SPINLOCK_INIT;
+static spinlock_t g_pc_inode_lock = SPINLOCK_INIT;
+
+#define VFS_PC_OBJ_ID_BASE   0x5646530000000000ULL
+#define VFS_PC_INODE_BUCKETS 128U
+
+typedef struct vfs_pc_inode {
+    uint64_t obj_id;
+    uint64_t mount_id;
+    uint64_t key_ino;
+    vfs_backend_t backend;
+    void *fs_ctx;
+    tmpfs_inode_t *tmpfs_ino;
+    char subpath[VFS_PATH_MAX];
+    const uint8_t *ro_buf;
+    size_t ro_size;
+    struct vfs_pc_inode *next;
+} vfs_pc_inode_t;
+
+static vfs_pc_inode_t *g_pc_inodes[VFS_PC_INODE_BUCKETS];
+static uint64_t g_next_pc_obj_seq = 1ULL;
 static spinlock_t g_flock_lock = SPINLOCK_INIT;
 
 static vfs_dentry_t *g_dcache_buckets[VFS_DCACHE_BUCKETS];
@@ -1187,6 +1208,414 @@ static void file_release(vfs_file_t *f)
     kfree(f);
 }
 
+vfs_file_t *vfs_file_ref(vfs_file_t *f)
+{
+    if (!f)
+        return NULL;
+    file_ref(f);
+    return f;
+}
+
+void vfs_file_unref(vfs_file_t *f)
+{
+    file_release(f);
+}
+
+int vfs_file_is_mmap_regular(const vfs_file_t *f)
+{
+    if (!f || f->is_dir)
+        return 0;
+    switch (f->backend) {
+    case VFS_BACKEND_EXT4:
+    case VFS_BACKEND_FAT32:
+    case VFS_BACKEND_FAT32VOL:
+    case VFS_BACKEND_TMPFS:
+    case VFS_BACKEND_INITRD:
+    case VFS_BACKEND_TAR:
+    case VFS_BACKEND_BOOTFS:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int vfs_file_is_writable(const vfs_file_t *f)
+{
+    if (!f || f->is_dir || !(f->mode & VFS_MODE_WRITE))
+        return 0;
+    switch (f->backend) {
+    case VFS_BACKEND_EXT4:
+    case VFS_BACKEND_FAT32:
+    case VFS_BACKEND_FAT32VOL:
+    case VFS_BACKEND_TMPFS:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+uint64_t vfs_file_size_bytes(vfs_file_t *f)
+{
+    if (!f || f->is_dir)
+        return 0;
+    switch (f->backend) {
+    case VFS_BACKEND_TMPFS:
+        return f->u.tmpfs.inode ? (uint64_t)tmpfs_inode_size(f->u.tmpfs.inode) : 0ULL;
+    case VFS_BACKEND_EXT4:
+        return (uint64_t)ext4fs_file_size((ext4fs_t *)f->fs_ctx, f->u.ext4.handle, f->path);
+    case VFS_BACKEND_FAT32:
+    case VFS_BACKEND_FAT32VOL: {
+        fat32_dirent_t de;
+        if (f->u.fat32.vol && fat32_vol_stat(f->u.fat32.vol, f->path, &de) == 0)
+            return (uint64_t)de.size;
+        return 0ULL;
+    }
+    case VFS_BACKEND_INITRD:
+    case VFS_BACKEND_TAR:
+    case VFS_BACKEND_BOOTFS:
+        return (uint64_t)f->u.regular.size;
+    default:
+        return 0ULL;
+    }
+}
+
+static uint64_t vfs_pc_key_ino(const vfs_file_t *f)
+{
+    if (!f)
+        return 0;
+    if (f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL)
+        return vfs_hash_str(f->path);
+    return f->inode_ino ? f->inode_ino : vfs_hash_str(f->path);
+}
+
+static size_t vfs_pc_bucket(uint64_t mount_id, uint64_t key_ino)
+{
+    uint64_t h = mount_id * 0x9E3779B97F4A7C15ULL ^ key_ino * 0xBF58476D1CE4E5B9ULL;
+    return (size_t)((h ^ (h >> 32)) & (VFS_PC_INODE_BUCKETS - 1U));
+}
+
+static int vfs_pc_readpage(void *ctx, uint64_t obj_id, uint64_t page_index, void *buf)
+{
+    vfs_pc_inode_t *pc = (vfs_pc_inode_t *)ctx;
+    (void)obj_id;
+    if (!pc || !buf)
+        return -EINVAL;
+
+    k_memset(buf, 0, PAGECACHE_PAGE_SIZE);
+    uint64_t pos = page_index * (uint64_t)PAGECACHE_PAGE_SIZE;
+
+    switch (pc->backend) {
+    case VFS_BACKEND_TMPFS:
+        if (!pc->tmpfs_ino)
+            return -EIO;
+        (void)tmpfs_read(pc->tmpfs_ino, (size_t)pos, buf, PAGECACHE_PAGE_SIZE);
+        return 0;
+    case VFS_BACKEND_EXT4: {
+        long rc = ext4fs_read_subpath((ext4fs_t *)pc->fs_ctx, pc->subpath,
+                                      (size_t)pos, buf, PAGECACHE_PAGE_SIZE);
+        return (rc < 0) ? (int)rc : 0;
+    }
+    case VFS_BACKEND_FAT32:
+    case VFS_BACKEND_FAT32VOL: {
+        size_t got = 0;
+        int rc = fat32_vol_read_at((fat32_volume_t *)pc->fs_ctx, pc->subpath,
+                                   (size_t)pos, buf, PAGECACHE_PAGE_SIZE,
+                                   &got, NULL, NULL, NULL);
+        return (rc < 0) ? rc : 0;
+    }
+    case VFS_BACKEND_INITRD:
+    case VFS_BACKEND_TAR:
+    case VFS_BACKEND_BOOTFS:
+        if (pc->ro_buf && pos < (uint64_t)pc->ro_size) {
+            size_t avail = pc->ro_size - (size_t)pos;
+            if (avail > PAGECACHE_PAGE_SIZE)
+                avail = PAGECACHE_PAGE_SIZE;
+            k_memcpy(buf, pc->ro_buf + pos, avail);
+        }
+        return 0;
+    default:
+        return -EINVAL;
+    }
+}
+
+static int vfs_pc_writepage(void *ctx, uint64_t obj_id, uint64_t page_index, const void *buf)
+{
+    vfs_pc_inode_t *pc = (vfs_pc_inode_t *)ctx;
+    (void)obj_id;
+    if (!pc || !buf)
+        return -EINVAL;
+
+    uint64_t pos = page_index * (uint64_t)PAGECACHE_PAGE_SIZE;
+
+    switch (pc->backend) {
+    case VFS_BACKEND_TMPFS: {
+        if (!pc->tmpfs_ino)
+            return -EIO;
+        size_t sz = tmpfs_inode_size(pc->tmpfs_ino);
+        if (pos >= (uint64_t)sz)
+            return 0;
+        size_t to_write = sz - (size_t)pos;
+        if (to_write > PAGECACHE_PAGE_SIZE)
+            to_write = PAGECACHE_PAGE_SIZE;
+        size_t wr = tmpfs_write(pc->tmpfs_ino, (size_t)pos, buf, to_write);
+        return (wr == to_write) ? 0 : -EIO;
+    }
+    case VFS_BACKEND_EXT4: {
+        long rc = ext4fs_write_subpath((ext4fs_t *)pc->fs_ctx, pc->subpath,
+                                       (size_t)pos, buf, PAGECACHE_PAGE_SIZE);
+        return (rc < 0) ? (int)rc : 0;
+    }
+    case VFS_BACKEND_FAT32:
+    case VFS_BACKEND_FAT32VOL: {
+        fat32_volume_t *vol = (fat32_volume_t *)pc->fs_ctx;
+        fat32_dirent_t de;
+        int src = fat32_vol_stat(vol, pc->subpath, &de);
+        if (src != 0)
+            return src;
+        if (pos >= (uint64_t)de.size)
+            return 0;
+        size_t to_write = (size_t)de.size - (size_t)pos;
+        if (to_write > PAGECACHE_PAGE_SIZE)
+            to_write = PAGECACHE_PAGE_SIZE;
+        size_t wr = 0;
+        int rc = fat32_vol_write_at(vol, pc->subpath, (size_t)pos,
+                                    buf, to_write, &wr, NULL, NULL, NULL);
+        return (rc < 0) ? rc : 0;
+    }
+    default:
+        return -EROFS;
+    }
+}
+
+static const pagecache_ops_t g_vfs_file_pc_ops = {
+    .readpage = vfs_pc_readpage,
+    .writepage = vfs_pc_writepage,
+    .flags = PAGECACHE_OPS_FS_LOCK,
+};
+
+static vfs_pc_inode_t *vfs_pc_find_locked(uint64_t mount_id, uint64_t key_ino)
+{
+    size_t b = vfs_pc_bucket(mount_id, key_ino);
+    vfs_pc_inode_t *curr = g_pc_inodes[b];
+    while (curr) {
+        if (curr->mount_id == mount_id && curr->key_ino == key_ino)
+            return curr;
+        curr = curr->next;
+    }
+    return NULL;
+}
+
+static vfs_pc_inode_t *vfs_pc_find_for_file(vfs_file_t *f)
+{
+    if (!f || !vfs_file_is_mmap_regular(f))
+        return NULL;
+    if (f->pc_inode)
+        return f->pc_inode;
+    uint64_t key_ino = vfs_pc_key_ino(f);
+    unsigned long flags = spin_lock_irqsave(&g_pc_inode_lock);
+    vfs_pc_inode_t *pc = vfs_pc_find_locked(f->mount_id, key_ino);
+    spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+    if (pc)
+        f->pc_inode = pc;
+    return pc;
+}
+
+static vfs_pc_inode_t *vfs_pc_get_or_create(vfs_file_t *f)
+{
+    if (!f || !vfs_file_is_mmap_regular(f))
+        return NULL;
+    if (f->pc_inode)
+        return f->pc_inode;
+
+    uint64_t key_ino = vfs_pc_key_ino(f);
+    unsigned long flags = spin_lock_irqsave(&g_pc_inode_lock);
+    vfs_pc_inode_t *pc = vfs_pc_find_locked(f->mount_id, key_ino);
+    spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+    if (pc) {
+        f->pc_inode = pc;
+        return pc;
+    }
+
+    vfs_pc_inode_t *npc = (vfs_pc_inode_t *)kmalloc(sizeof(vfs_pc_inode_t));
+    if (!npc)
+        return NULL;
+    k_memset(npc, 0, sizeof(*npc));
+    npc->mount_id = f->mount_id;
+    npc->key_ino = key_ino;
+    npc->backend = f->backend;
+    npc->fs_ctx = f->fs_ctx;
+    kstrncpy(npc->subpath, f->path, VFS_PATH_MAX);
+    if (f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL)
+        npc->fs_ctx = f->u.fat32.vol;
+    if (f->backend == VFS_BACKEND_INITRD || f->backend == VFS_BACKEND_TAR ||
+        f->backend == VFS_BACKEND_BOOTFS) {
+        npc->ro_buf = f->u.regular.buf;
+        npc->ro_size = f->u.regular.size;
+    }
+
+    flags = spin_lock_irqsave(&g_pc_inode_lock);
+    vfs_pc_inode_t *existing = vfs_pc_find_locked(f->mount_id, key_ino);
+    if (existing) {
+        spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+        kfree(npc);
+        f->pc_inode = existing;
+        return existing;
+    }
+    if (f->backend == VFS_BACKEND_TMPFS && f->u.tmpfs.inode) {
+        tmpfs_inode_ref(f->u.tmpfs.inode);
+        npc->tmpfs_ino = f->u.tmpfs.inode;
+    }
+    uint64_t seq = __atomic_fetch_add(&g_next_pc_obj_seq, 1ULL, __ATOMIC_RELAXED);
+    npc->obj_id = VFS_PC_OBJ_ID_BASE | (seq & 0x0000FFFFFFFFFFFFULL);
+    size_t b = vfs_pc_bucket(f->mount_id, key_ino);
+    npc->next = g_pc_inodes[b];
+    g_pc_inodes[b] = npc;
+    spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+
+    f->pc_inode = npc;
+    return npc;
+}
+
+static void vfs_pc_sync_all(void)
+{
+    for (size_t b = 0; b < VFS_PC_INODE_BUCKETS; b++) {
+        uint64_t oids[16];
+        size_t count = 0;
+        unsigned long flags = spin_lock_irqsave(&g_pc_inode_lock);
+        vfs_pc_inode_t *curr = g_pc_inodes[b];
+        while (curr && count < 16) {
+            oids[count++] = curr->obj_id;
+            curr = curr->next;
+        }
+        spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+        for (size_t i = 0; i < count; i++)
+            (void)pagecache_sync_obj(oids[i]);
+    }
+}
+
+static void vfs_pc_unmount(uint64_t mount_id)
+{
+    for (size_t b = 0; b < VFS_PC_INODE_BUCKETS; b++) {
+        for (;;) {
+            vfs_pc_inode_t *victim = NULL;
+            unsigned long flags = spin_lock_irqsave(&g_pc_inode_lock);
+            vfs_pc_inode_t *prev = NULL;
+            vfs_pc_inode_t *curr = g_pc_inodes[b];
+            while (curr) {
+                if (curr->mount_id == mount_id) {
+                    if (prev)
+                        prev->next = curr->next;
+                    else
+                        g_pc_inodes[b] = curr->next;
+                    victim = curr;
+                    break;
+                }
+                prev = curr;
+                curr = curr->next;
+            }
+            spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+            if (!victim)
+                break;
+            (void)pagecache_sync_obj(victim->obj_id);
+            pagecache_invalidate_obj(victim->obj_id);
+            if (victim->tmpfs_ino)
+                tmpfs_inode_unref(victim->tmpfs_ino);
+            kfree(victim);
+        }
+    }
+}
+
+static void vfs_pc_invalidate_key(uint64_t mount_id, uint64_t key_ino)
+{
+    vfs_pc_inode_t *victim = NULL;
+    size_t b = vfs_pc_bucket(mount_id, key_ino);
+    unsigned long flags = spin_lock_irqsave(&g_pc_inode_lock);
+    vfs_pc_inode_t *prev = NULL;
+    vfs_pc_inode_t *curr = g_pc_inodes[b];
+    while (curr) {
+        if (curr->mount_id == mount_id && curr->key_ino == key_ino) {
+            if (prev)
+                prev->next = curr->next;
+            else
+                g_pc_inodes[b] = curr->next;
+            victim = curr;
+            break;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+    spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+    if (victim) {
+        pagecache_invalidate_obj(victim->obj_id);
+        if (victim->tmpfs_ino)
+            tmpfs_inode_unref(victim->tmpfs_ino);
+        kfree(victim);
+    }
+}
+
+static void vfs_pc_update_write(vfs_file_t *f, size_t pos, const void *buf, size_t len)
+{
+    vfs_pc_inode_t *pc = vfs_pc_find_for_file(f);
+    if (!pc || !buf || len == 0)
+        return;
+
+    size_t done = 0;
+    const uint8_t *src = (const uint8_t *)buf;
+    while (done < len) {
+        uint64_t cur = (uint64_t)pos + (uint64_t)done;
+        uint64_t pidx = cur >> 12;
+        size_t off = (size_t)(cur & 0xFFFULL);
+        size_t chunk = PAGECACHE_PAGE_SIZE - off;
+        if (chunk > len - done)
+            chunk = len - done;
+
+        pagecache_page_t *pg = pagecache_lookup_page(pc->obj_id, pidx);
+        if (pg) {
+            k_memcpy((uint8_t *)pg->data + off, src + done, chunk);
+            pagecache_put_page(pg);
+        }
+        done += chunk;
+    }
+}
+
+uint64_t vfs_file_pc_obj_id(vfs_file_t *f)
+{
+    vfs_pc_inode_t *pc = vfs_pc_get_or_create(f);
+    return pc ? pc->obj_id : 0ULL;
+}
+
+struct pagecache_page *vfs_file_get_page(vfs_file_t *f, uint64_t page_index)
+{
+    vfs_pc_inode_t *pc = vfs_pc_get_or_create(f);
+    if (!pc)
+        return NULL;
+    return pagecache_get_page(pc->obj_id, page_index, &g_vfs_file_pc_ops, pc);
+}
+
+int vfs_file_sync_range(vfs_file_t *f, uint64_t start_page, uint64_t end_page, int do_fs_sync)
+{
+    if (!f)
+        return -EINVAL;
+    vfs_pc_inode_t *pc = vfs_pc_find_for_file(f);
+    int rc = 0;
+    if (pc) {
+        rc = pagecache_sync_obj_range(pc->obj_id, start_page, end_page);
+    }
+    if (do_fs_sync) {
+        if (f->backend == VFS_BACKEND_EXT4 && f->fs_ctx) {
+            int frc = ext4fs_sync((ext4fs_t *)f->fs_ctx);
+            if (rc == 0 && frc != 0)
+                rc = frc;
+        } else if ((f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) &&
+                   f->u.fat32.vol) {
+            int frc = fat32_vol_sync(f->u.fat32.vol);
+            if (rc == 0 && frc != 0)
+                rc = frc;
+        }
+    }
+    return rc;
+}
+
 static vfs_file_t *fd_lookup_ref(process_t *proc, int fd)
 {
     void **tbl = fd_table_for_process(proc);
@@ -2042,6 +2471,8 @@ int vfs_is_root_mounted(void)
 
 void vfs_sync_all(void)
 {
+    vfs_pc_sync_all();
+
     vfs_backend_t backends[VFS_MAX_MOUNTS];
     void *privs[VFS_MAX_MOUNTS];
     int count = 0;
@@ -2114,8 +2545,10 @@ void vfs_shutdown(void)
     }
     spin_unlock_irqrestore(&g_mounts_lock, flags);
 
-    if (root_mid)
+    if (root_mid) {
+        vfs_pc_unmount(root_mid);
         dcache_invalidate_mount(root_mid);
+    }
     if (root_backend == VFS_BACKEND_EXT4 && root_priv)
         (void)ext4fs_umount((ext4fs_t *)root_priv);
     else if (root_backend == VFS_BACKEND_FAT32VOL && root_priv)
@@ -2133,15 +2566,21 @@ int vfs_sync_fd(int fd)
         return -EBADF;
 
     int rc = 0;
+    vfs_pc_inode_t *pc = vfs_pc_find_for_file(f);
+    if (pc)
+        rc = pagecache_sync_obj(pc->obj_id);
     if (f->backend == VFS_BACKEND_EXT4 && f->fs_ctx) {
-        rc = ext4fs_sync((ext4fs_t *)f->fs_ctx);
+        int frc = ext4fs_sync((ext4fs_t *)f->fs_ctx);
+        if (rc == 0)
+            rc = frc;
     } else if ((f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) &&
                f->u.fat32.vol) {
-        rc = fat32_vol_sync(f->u.fat32.vol);
+        int frc = fat32_vol_sync(f->u.fat32.vol);
+        if (rc == 0)
+            rc = frc;
     } else if (f->backend == VFS_BACKEND_DEVFS && f->u.device.priv &&
                f->u.device.ops && f->u.device.ops->ioctl) {
         /* Block devices sync on every write; nothing extra needed unless sync exists. */
-        rc = 0;
     }
     file_release(f);
     return rc;
@@ -3409,6 +3848,7 @@ int vfs_umount2(const char *target, int flags)
     found->fs_private = NULL;
     spin_unlock_irqrestore(&g_mounts_lock, mflags);
 
+    vfs_pc_unmount(mid);
     dcache_invalidate_mount(mid);
     dcache_invalidate_path(norm);
     if (backend == VFS_BACKEND_TMPFS && priv)
@@ -3463,6 +3903,9 @@ size_t vfs_read(int fd, void *buf, size_t count)
     }
 
     if (f->backend == VFS_BACKEND_TMPFS) {
+        vfs_pc_inode_t *pc = vfs_pc_find_for_file(f);
+        if (pc)
+            (void)pagecache_sync_obj(pc->obj_id);
         unsigned long fflags = spin_lock_irqsave(&f->lock);
         size_t pos = f->pos;
         spin_unlock_irqrestore(&f->lock, fflags);
@@ -3475,6 +3918,9 @@ size_t vfs_read(int fd, void *buf, size_t count)
     }
 
     if (f->backend == VFS_BACKEND_EXT4) {
+        vfs_pc_inode_t *pc = vfs_pc_find_for_file(f);
+        if (pc)
+            (void)pagecache_sync_obj(pc->obj_id);
         unsigned long fflags = spin_lock_irqsave(&f->lock);
         size_t pos = f->pos;
         spin_unlock_irqrestore(&f->lock, fflags);
@@ -3489,6 +3935,9 @@ size_t vfs_read(int fd, void *buf, size_t count)
     }
 
     if (f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) {
+        vfs_pc_inode_t *pc = vfs_pc_find_for_file(f);
+        if (pc)
+            (void)pagecache_sync_obj(pc->obj_id);
         unsigned long fflags = spin_lock_irqsave(&f->lock);
         size_t pos = f->pos;
         uint32_t hidx = f->u.fat32.hint_clus_idx;
@@ -3627,6 +4076,8 @@ size_t vfs_write(int fd, const void *buf, size_t count)
         spin_unlock_irqrestore(&f->lock, fflags);
 
         size_t wr = tmpfs_write(f->u.tmpfs.inode, pos, buf, count);
+        if (wr > 0)
+            vfs_pc_update_write(f, pos, buf, wr);
 
         fflags = spin_lock_irqsave(&f->lock);
         f->pos = pos + wr;
@@ -3645,6 +4096,7 @@ size_t vfs_write(int fd, const void *buf, size_t count)
 
         long wr = ext4fs_write((ext4fs_t *)f->fs_ctx, f->u.ext4.handle, pos, buf, count);
         if (wr > 0) {
+            vfs_pc_update_write(f, pos, buf, (size_t)wr);
             fflags = spin_lock_irqsave(&f->lock);
             f->pos = pos + (size_t)wr;
             f->dirty = 1;
@@ -3671,6 +4123,8 @@ size_t vfs_write(int fd, const void *buf, size_t count)
         size_t wr = 0;
         int rc = fat32_vol_write_at(f->u.fat32.vol, f->path, pos, buf, count,
                                     &wr, &hidx, &hclus, &hgen);
+        if (wr > 0)
+            vfs_pc_update_write(f, pos, buf, wr);
         fflags = spin_lock_irqsave(&f->lock);
         f->u.fat32.hint_clus_idx = hidx;
         f->u.fat32.hint_clus = hclus;
@@ -4280,139 +4734,610 @@ int vfs_kd_mode(void)
     return fb_kd_mode();
 }
 
+#ifdef __x86_64__
+static uint64_t vfs_vma_map_flags(uint32_t prot, uint32_t flags, int allow_write)
+{
+    uint64_t mf = PAGING_MAP_USER | PAGING_MAP_READ;
+    if (allow_write && (prot & VMA_PROT_WRITE))
+        mf |= PAGING_MAP_WRITE;
+    if (prot & VMA_PROT_EXEC)
+        mf |= PAGING_MAP_EXEC;
+    if (flags & VMA_FLAG_DEVICE)
+        mf |= PAGING_MAP_DEVICE;
+    return mf;
+}
+
+static void vfs_mmap_vma_open(vm_area_t *vma)
+{
+    if (vma && vma->file)
+        (void)vfs_file_ref((vfs_file_t *)vma->file);
+}
+
+static void vfs_mmap_vma_close(vm_area_t *vma)
+{
+    if (vma && vma->file) {
+        vfs_file_t *f = (vfs_file_t *)vma->file;
+        vma->file = NULL;
+        vfs_file_unref(f);
+    }
+}
+
+static void vfs_mmap_vma_unmap(vm_area_t *vma, uintptr_t u_start, uintptr_t u_end)
+{
+    if (!vma || !vma->file || !vma->vm_space || !vma->vm_space->pml4_phys)
+        return;
+    if ((vma->flags & (VMA_FLAG_FILE | VMA_FLAG_SHARED)) != (VMA_FLAG_FILE | VMA_FLAG_SHARED))
+        return;
+
+    vfs_file_t *f = (vfs_file_t *)vma->file;
+    uint64_t obj_id = vfs_file_pc_obj_id(f);
+    if (!obj_id)
+        return;
+
+    uintptr_t zero_phys = pmm_zero_page_phys();
+    uint64_t min_pidx = UINT64_MAX;
+    uint64_t max_pidx = 0;
+    int any_dirty = 0;
+
+    for (uintptr_t va = u_start; va < u_end; va += PAGE_SIZE) {
+        uint64_t q_phys = 0;
+        uint64_t q_flags = 0;
+        if (vmm_query_page(vma->vm_space->pml4_phys, va, &q_phys, &q_flags) != 0 ||
+            !(q_flags & VMM_X64_PTE_PRESENT)) {
+            continue;
+        }
+        if (q_phys == (uint64_t)zero_phys)
+            continue;
+
+        uint64_t file_off = vma->file_offset + (uint64_t)(va - vma->start);
+        uint64_t pidx = file_off >> 12;
+        pagecache_page_t *pg = pagecache_lookup_page(obj_id, pidx);
+        if (pg) {
+            if (pg->phys_addr == (uintptr_t)q_phys) {
+                if (q_flags & VMM_X64_PTE_WRITABLE) {
+                    pagecache_mark_dirty(pg);
+                    any_dirty = 1;
+                }
+                if (pg->dirty)
+                    any_dirty = 1;
+                if (pidx < min_pidx)
+                    min_pidx = pidx;
+                if (pidx + 1ULL > max_pidx)
+                    max_pidx = pidx + 1ULL;
+                /* Drop the pin held for this MAP_SHARED PTE. */
+                pagecache_put_page(pg);
+            }
+            /* Drop the lookup pin from pagecache_lookup_page. */
+            pagecache_put_page(pg);
+        }
+    }
+
+    if (any_dirty && min_pidx < max_pidx)
+        (void)vfs_file_sync_range(f, min_pidx, max_pidx, 1);
+}
+
+static int vfs_mmap_vma_fault(vm_area_t *vma, uintptr_t va, uint64_t error_code)
+{
+    if (!vma || !vma->file || !vma->vm_space || !vma->vm_space->pml4_phys)
+        return -1;
+
+    vm_space_t *space = vma->vm_space;
+    vfs_file_t *f = (vfs_file_t *)vma->file;
+    int is_write = (error_code & 0x2ULL) ? 1 : 0;
+    int is_present = (error_code & 0x1ULL) ? 1 : 0;
+    int is_shared = (vma->flags & VMA_FLAG_SHARED) ? 1 : 0;
+    uint64_t file_off = vma->file_offset + (uint64_t)(va - vma->start);
+    uint64_t page_idx = file_off >> 12;
+    uint64_t cur_fsize = vfs_file_size_bytes(f);
+
+    if (file_off >= cur_fsize) {
+        if (!is_write) {
+            if (is_present)
+                return -1;
+            uintptr_t zero_phys = pmm_zero_page_phys();
+            if (!zero_phys)
+                return -1;
+            uint64_t ro_flags = vfs_vma_map_flags(vma->prot, vma->flags, 0);
+            (void)pmm_page_get(zero_phys);
+            int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va, (uint64_t)zero_phys, ro_flags);
+            if (mrc == 0) {
+                vm_space_account_vma_page(space, vma, 1);
+                return 0;
+            }
+            (void)pmm_page_put(zero_phys);
+            return (mrc == 1) ? 0 : -1;
+        }
+
+        uint64_t rw_flags = vfs_vma_map_flags(vma->prot, vma->flags, 1);
+        if (is_present) {
+            uint64_t q_phys = 0, q_flags = 0;
+            if (vmm_query_page(space->pml4_phys, va, &q_phys, &q_flags) != 0 ||
+                !(q_flags & VMM_X64_PTE_PRESENT)) {
+                return -1;
+            }
+            if (q_flags & VMM_X64_PTE_WRITABLE)
+                return 0;
+            uintptr_t zero_phys = pmm_zero_page_phys();
+            if (q_phys != (uint64_t)zero_phys && pmm_page_refcount((uintptr_t)q_phys) == 1u) {
+                int urc = vmm_upgrade_user_page_write(space->pml4_phys, va, q_phys, rw_flags);
+                if (urc == 0)
+                    vmm_tlb_shootdown(space, va, 1);
+                return (urc >= 0) ? 0 : -1;
+            }
+            uintptr_t new_phys = pmm_alloc_pages(1);
+            if (!new_phys)
+                return -1;
+            k_memset((void *)vmm_phys_to_virt((uint64_t)new_phys), 0, PAGE_SIZE);
+            page_t *npg = pmm_phys_to_page(new_phys);
+            if (npg)
+                npg->flags |= PAGE_FLAG_ANON;
+            int crc = vmm_cow_replace_user_page(space->pml4_phys, va, q_phys, (uint64_t)new_phys, rw_flags);
+            if (crc == 0) {
+                vmm_tlb_shootdown(space, va, 1);
+                (void)pmm_page_put((uintptr_t)q_phys);
+                return 0;
+            }
+            (void)pmm_page_put(new_phys);
+            return (crc == 1) ? 0 : -1;
+        }
+
+        uintptr_t phys = pmm_alloc_pages(1);
+        if (!phys)
+            return -1;
+        k_memset((void *)vmm_phys_to_virt((uint64_t)phys), 0, PAGE_SIZE);
+        page_t *pg = pmm_phys_to_page(phys);
+        if (pg)
+            pg->flags |= PAGE_FLAG_ANON;
+        int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va, (uint64_t)phys, rw_flags);
+        if (mrc == 0) {
+            vm_space_account_vma_page(space, vma, 1);
+            return 0;
+        }
+        (void)pmm_page_put(phys);
+        return (mrc == 1) ? 0 : -1;
+    }
+
+    pagecache_page_t *pc_pg = vfs_file_get_page(f, page_idx);
+    if (!pc_pg)
+        return -1;
+
+    if (!is_shared) {
+        if (!is_write) {
+            if (is_present) {
+                pagecache_put_page(pc_pg);
+                return -1;
+            }
+            uint64_t ro_flags = vfs_vma_map_flags(vma->prot, vma->flags, 0);
+            (void)pmm_page_get(pc_pg->phys_addr);
+            int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va,
+                                                  (uint64_t)pc_pg->phys_addr, ro_flags);
+            if (mrc == 0)
+                vm_space_account_vma_page(space, vma, 1);
+            else
+                (void)pmm_page_put(pc_pg->phys_addr);
+            pagecache_put_page(pc_pg);
+            return (mrc >= 0) ? 0 : -1;
+        }
+
+        uintptr_t new_phys = pmm_alloc_pages(1);
+        if (!new_phys) {
+            pagecache_put_page(pc_pg);
+            return -1;
+        }
+        uint8_t *dst_kva = (uint8_t *)vmm_phys_to_virt((uint64_t)new_phys);
+        size_t valid = PAGECACHE_PAGE_SIZE;
+        if (cur_fsize - file_off < (uint64_t)PAGECACHE_PAGE_SIZE)
+            valid = (size_t)(cur_fsize - file_off);
+        k_memcpy(dst_kva, pc_pg->data, valid);
+        if (valid < PAGECACHE_PAGE_SIZE)
+            k_memset(dst_kva + valid, 0, PAGECACHE_PAGE_SIZE - valid);
+        pagecache_put_page(pc_pg);
+
+        page_t *npg = pmm_phys_to_page(new_phys);
+        if (npg)
+            npg->flags |= PAGE_FLAG_ANON;
+
+        uint64_t rw_flags = vfs_vma_map_flags(vma->prot, vma->flags, 1);
+        if (!is_present) {
+            int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va, (uint64_t)new_phys, rw_flags);
+            if (mrc == 0) {
+                vm_space_account_vma_page(space, vma, 1);
+                return 0;
+            }
+            if (mrc < 0) {
+                (void)pmm_page_put(new_phys);
+                return -1;
+            }
+            /* Concurrent read-fault mapped RO before this write: fall through to COW replace. */
+        }
+
+        uint64_t q_phys = 0, q_flags = 0;
+        if (vmm_query_page(space->pml4_phys, va, &q_phys, &q_flags) != 0 ||
+            !(q_flags & VMM_X64_PTE_PRESENT)) {
+            (void)pmm_page_put(new_phys);
+            return -1;
+        }
+        if (q_flags & VMM_X64_PTE_WRITABLE) {
+            (void)pmm_page_put(new_phys);
+            return 0;
+        }
+        int crc = vmm_cow_replace_user_page(space->pml4_phys, va, q_phys, (uint64_t)new_phys, rw_flags);
+        if (crc == 0) {
+            vmm_tlb_shootdown(space, va, 1);
+            (void)pmm_page_put((uintptr_t)q_phys);
+            return 0;
+        }
+        (void)pmm_page_put(new_phys);
+        return (crc == 1) ? 0 : -1;
+    }
+
+    /* MAP_SHARED file-backed fault. */
+    {
+        page_t *pp = pmm_phys_to_page(pc_pg->phys_addr);
+        if (pp)
+            pp->flags |= PAGE_FLAG_PAGECACHE;
+    }
+
+    if (!is_write) {
+        if (is_present) {
+            pagecache_put_page(pc_pg);
+            return -1;
+        }
+        uint64_t ro_flags = vfs_vma_map_flags(vma->prot, vma->flags, 0);
+        (void)pmm_page_get(pc_pg->phys_addr);
+        int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va,
+                                              (uint64_t)pc_pg->phys_addr, ro_flags);
+        if (mrc == 0) {
+            vm_space_account_vma_page(space, vma, 1);
+            /* Retain pc_pg pin until vfs_mmap_vma_unmap unmaps this PTE. */
+            return 0;
+        }
+        (void)pmm_page_put(pc_pg->phys_addr);
+        pagecache_put_page(pc_pg);
+        return (mrc == 1) ? 0 : -1;
+    }
+
+    pagecache_mark_dirty(pc_pg);
+    uint64_t rw_flags = vfs_vma_map_flags(vma->prot, vma->flags, 1);
+    if (!is_present) {
+        (void)pmm_page_get(pc_pg->phys_addr);
+        int mrc = vmm_map_user_page_if_absent(space->pml4_phys, va,
+                                              (uint64_t)pc_pg->phys_addr, rw_flags);
+        if (mrc == 0) {
+            vm_space_account_vma_page(space, vma, 1);
+            return 0;
+        }
+        (void)pmm_page_put(pc_pg->phys_addr);
+        if (mrc < 0) {
+            pagecache_put_page(pc_pg);
+            return -1;
+        }
+    }
+
+    int urc = vmm_upgrade_user_page_write(space->pml4_phys, va, (uint64_t)pc_pg->phys_addr, rw_flags);
+    if (urc == 0)
+        vmm_tlb_shootdown(space, va, 1);
+    pagecache_put_page(pc_pg);
+    return (urc >= 0) ? 0 : -1;
+}
+#endif
+
 void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t offset)
 {
     process_t *proc = vfs_current_process();
-    if (!proc || length == 0)
-        return (void *)-1;
+    if (!proc || !proc->vm_space.owns_pml4 || length == 0)
+        return (void *)(intptr_t)-EINVAL;
 
-    /* Handle anonymous mmap (backing for user heap malloc) */
+    if ((prot & ~(VFS_PROT_READ | VFS_PROT_WRITE | VFS_PROT_EXEC)) != 0)
+        return (void *)(intptr_t)-EINVAL;
+
+    const int allowed_flags = VFS_MAP_SHARED | VFS_MAP_PRIVATE | VFS_MAP_FIXED | VFS_MAP_ANONYMOUS;
+    if ((flags & ~allowed_flags) != 0)
+        return (void *)(intptr_t)-EINVAL;
+
+    int is_shared = (flags & VFS_MAP_SHARED) ? 1 : 0;
+    int is_priv = (flags & VFS_MAP_PRIVATE) ? 1 : 0;
+    if (is_shared == is_priv)
+        return (void *)(intptr_t)-EINVAL;
+
+    uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
+    if (length > SIZE_MAX - page_mask)
+        return (void *)(intptr_t)-ENOMEM;
+    size_t span = (length + page_mask) & ~page_mask;
+    size_t page_count = span / PAGE_SIZE;
+
+    uint32_t vma_prot = 0;
+    if (prot & VFS_PROT_READ)  vma_prot |= VMA_PROT_READ;
+    if (prot & VFS_PROT_WRITE) vma_prot |= VMA_PROT_WRITE;
+    if (prot & VFS_PROT_EXEC)  vma_prot |= VMA_PROT_EXEC;
+
+    /* Anonymous mmap: demand-paged zero-fill on read, private frame on write. */
     if ((flags & VFS_MAP_ANONYMOUS) || fd == -1) {
-        uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
-        if (length > SIZE_MAX - page_mask)
-            return (void *)-1;
-        size_t page_count = (length + page_mask) / PAGE_SIZE;
-        uintptr_t target_va;
+        if ((flags & VFS_MAP_ANONYMOUS) == 0)
+            return (void *)(intptr_t)-EBADF;
 
-        if (addr != NULL && paging_is_page_aligned_uintptr((uintptr_t)addr) &&
-            paging_range_is_user((uintptr_t)addr, page_count * PAGE_SIZE)) {
-            target_va = (uintptr_t)addr;
+        uintptr_t target_va = 0;
+        vm_space_mmap_write_lock(&proc->vm_space);
+
+        if (flags & VFS_MAP_FIXED) {
+            uintptr_t req_va = (uintptr_t)addr;
+            if (!req_va || !paging_is_page_aligned_uintptr(req_va)) {
+                vm_space_mmap_write_unlock(&proc->vm_space);
+                return (void *)(intptr_t)-EINVAL;
+            }
+            if (!paging_range_is_user(req_va, span)) {
+                vm_space_mmap_write_unlock(&proc->vm_space);
+                return (void *)(intptr_t)-ENOMEM;
+            }
+            (void)vma_unmap_range(&proc->vm_space, req_va, span);
+            target_va = req_va;
         } else {
-            target_va = vm_space_reserve_anon_range(&proc->vm_space, page_count);
+            if (addr != NULL && paging_is_page_aligned_uintptr((uintptr_t)addr) &&
+                paging_range_is_user((uintptr_t)addr, span)) {
+                uintptr_t hint = (uintptr_t)addr;
+                target_va = vma_find_unmapped_area(&proc->vm_space, hint, hint + span, span);
+            }
             if (!target_va)
-                return (void *)-1;
-        }
-
-        uint64_t map_flags = PAGING_MAP_USER;
-        if (prot & VFS_PROT_READ)
-            map_flags |= PAGING_MAP_READ;
-        if (prot & VFS_PROT_WRITE)
-            map_flags |= PAGING_MAP_WRITE;
-
-        for (size_t i = 0; i < page_count; i++) {
-            uintptr_t phys = pmm_alloc_pages(1);
-            if (!phys) {
-                for (size_t j = 0; j < i; j++) {
-                    uintptr_t va = target_va + j * PAGE_SIZE;
-                    uint64_t q_phys = 0, q_flags = 0;
-                    if (vmm_query_page(proc->vm_space.pml4_phys, va, &q_phys, &q_flags) == 0 &&
-                        (q_flags & VMM_X64_PTE_PRESENT)) {
-                        if (vm_space_unmap_user_pages(&proc->vm_space, va, 1) == 0 &&
-                            q_phys != 0 && (q_flags & VMM_X64_PTE_USER)) {
-                            pmm_free_pages((uintptr_t)q_phys, 1);
-                        }
-                    }
-                }
-                return (void *)-1;
-            }
-            uint8_t *kva = (uint8_t *)vmm_phys_to_virt(phys);
-            k_memset(kva, 0, PAGE_SIZE);
-            if (vm_space_map_user_pages(&proc->vm_space, target_va + i * PAGE_SIZE, phys, 1, map_flags) != 0) {
-                pmm_free_pages(phys, 1);
-                for (size_t j = 0; j < i; j++) {
-                    uintptr_t va = target_va + j * PAGE_SIZE;
-                    uint64_t q_phys = 0, q_flags = 0;
-                    if (vmm_query_page(proc->vm_space.pml4_phys, va, &q_phys, &q_flags) == 0 &&
-                        (q_flags & VMM_X64_PTE_PRESENT)) {
-                        if (vm_space_unmap_user_pages(&proc->vm_space, va, 1) == 0 &&
-                            q_phys != 0 && (q_flags & VMM_X64_PTE_USER)) {
-                            pmm_free_pages((uintptr_t)q_phys, 1);
-                        }
-                    }
-                }
-                return (void *)-1;
+                target_va = vm_space_reserve_anon_range(&proc->vm_space, page_count);
+            if (!target_va) {
+                vm_space_mmap_write_unlock(&proc->vm_space);
+                return (void *)(intptr_t)-ENOMEM;
             }
         }
+
+        uint32_t vma_flags = VMA_FLAG_ANON | (is_shared ? VMA_FLAG_SHARED : VMA_FLAG_PRIVATE);
+        vm_area_t *vma = vma_insert(&proc->vm_space, target_va, target_va + span,
+                                    vma_prot, vma_flags);
+        vm_space_mmap_write_unlock(&proc->vm_space);
+        if (!vma)
+            return (void *)(intptr_t)-ENOMEM;
+
         return (void *)target_va;
     }
 
+    if ((offset & (size_t)page_mask) != 0)
+        return (void *)(intptr_t)-EINVAL;
+    if ((uint64_t)offset > UINT64_MAX - (uint64_t)span)
+        return (void *)(intptr_t)-EINVAL;
+
     vfs_file_t *f = fd_lookup_ref(proc, fd);
     if (!f)
-        return (void *)-1;
+        return (void *)(intptr_t)-EBADF;
 
-    void *res = (void *)-1;
-    if (f->backend == VFS_BACKEND_DEVFS && f->u.device.ops && f->u.device.ops->mmap)
-        res = f->u.device.ops->mmap(f->u.device.priv, addr, length, prot, flags, offset);
+    if (f->backend == VFS_BACKEND_DEVFS) {
+        void *res = (void *)(intptr_t)-ENODEV;
+        if (f->u.device.ops && f->u.device.ops->mmap) {
+            res = f->u.device.ops->mmap(f->u.device.priv, addr, length, prot, flags, offset);
+            if ((intptr_t)res >= 0 && res != (void *)-1) {
+                uintptr_t dev_va = (uintptr_t)res & ~page_mask;
+                size_t dev_off_in_pg = (size_t)((uintptr_t)res & page_mask);
+                size_t dev_span = (length + dev_off_in_pg + (size_t)page_mask) & ~(size_t)page_mask;
+                vm_space_mmap_write_lock(&proc->vm_space);
+                if (!vma_find(&proc->vm_space, dev_va)) {
+                    vm_area_t *dvma = vma_insert(&proc->vm_space, dev_va, dev_va + dev_span,
+                                                 vma_prot, VMA_FLAG_DEVICE | VMA_FLAG_SHARED);
+                    if (dvma) {
+                        dvma->file = vfs_file_ref(f);
+                        dvma->file_offset = (uint64_t)offset;
+                        dvma->open_cb = vfs_mmap_vma_open;
+                        dvma->close_cb = vfs_mmap_vma_close;
+                    }
+                }
+                vm_space_mmap_write_unlock(&proc->vm_space);
+            }
+        }
+        file_release(f);
+        return res;
+    }
+
+    if (!vfs_file_is_mmap_regular(f)) {
+        file_release(f);
+        return (void *)(intptr_t)-ENODEV;
+    }
+    if (!(f->mode & VFS_MODE_READ)) {
+        file_release(f);
+        return (void *)(intptr_t)-EACCES;
+    }
+    if (is_shared && (prot & VFS_PROT_WRITE) && !vfs_file_is_writable(f)) {
+        file_release(f);
+        return (void *)(intptr_t)-EACCES;
+    }
+    if (vfs_file_pc_obj_id(f) == 0ULL) {
+        file_release(f);
+        return (void *)(intptr_t)-EIO;
+    }
+
+    uint64_t fsize = vfs_file_size_bytes(f);
+    uintptr_t target_va = 0;
+
+    vm_space_mmap_write_lock(&proc->vm_space);
+    if (flags & VFS_MAP_FIXED) {
+        uintptr_t req_va = (uintptr_t)addr;
+        if (!req_va || !paging_is_page_aligned_uintptr(req_va)) {
+            vm_space_mmap_write_unlock(&proc->vm_space);
+            file_release(f);
+            return (void *)(intptr_t)-EINVAL;
+        }
+        if (!paging_range_is_user(req_va, span)) {
+            vm_space_mmap_write_unlock(&proc->vm_space);
+            file_release(f);
+            return (void *)(intptr_t)-ENOMEM;
+        }
+        (void)vma_unmap_range(&proc->vm_space, req_va, span);
+        target_va = req_va;
+    } else {
+        if (addr != NULL && paging_is_page_aligned_uintptr((uintptr_t)addr) &&
+            paging_range_is_user((uintptr_t)addr, span)) {
+            uintptr_t hint = (uintptr_t)addr;
+            target_va = vma_find_unmapped_area(&proc->vm_space, hint, hint + span, span);
+        }
+        if (!target_va)
+            target_va = vm_space_reserve_anon_range(&proc->vm_space, page_count);
+        if (!target_va) {
+            vm_space_mmap_write_unlock(&proc->vm_space);
+            file_release(f);
+            return (void *)(intptr_t)-ENOMEM;
+        }
+    }
+
+    uint32_t vma_flags = VMA_FLAG_FILE | (is_shared ? VMA_FLAG_SHARED : VMA_FLAG_PRIVATE);
+    vm_area_t *vma = vma_insert(&proc->vm_space, target_va, target_va + span,
+                                vma_prot, vma_flags);
+    if (!vma) {
+        vm_space_mmap_write_unlock(&proc->vm_space);
+        file_release(f);
+        return (void *)(intptr_t)-ENOMEM;
+    }
+
+    vma->file = vfs_file_ref(f);
+    vma->file_offset = (uint64_t)offset;
+    vma->file_size = fsize;
+    vma->open_cb = vfs_mmap_vma_open;
+    vma->close_cb = vfs_mmap_vma_close;
+    vma->unmap_cb = vfs_mmap_vma_unmap;
+    vma->fault_cb = vfs_mmap_vma_fault;
+    vm_space_mmap_write_unlock(&proc->vm_space);
+
     file_release(f);
-    return res;
+    return (void *)target_va;
 }
 
 int vfs_munmap(void *addr, size_t length)
 {
     if (!addr || length == 0)
-        return -1;
+        return -EINVAL;
 
     process_t *proc = vfs_current_process();
     if (!proc || !proc->vm_space.owns_pml4)
-        return -1;
+        return -EINVAL;
+
+    uintptr_t p = (uintptr_t)addr;
+    uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
+    if (!paging_is_page_aligned_uintptr(p))
+        return -EINVAL;
+    if (p + length < p || (p + length) > UINTPTR_MAX - page_mask)
+        return -EINVAL;
+
+    uintptr_t base = p;
+    uintptr_t end = (p + length + page_mask) & ~page_mask;
+    if (end <= base)
+        return -EINVAL;
+
+    size_t span = (size_t)(end - base);
+    if (!paging_range_is_user(base, span))
+        return -EINVAL;
+
+    vm_space_mmap_write_lock(&proc->vm_space);
+    int has_vma = (vma_find(&proc->vm_space, base) != NULL);
+    int rc = vma_unmap_range(&proc->vm_space, base, span);
+    vm_space_mmap_write_unlock(&proc->vm_space);
+
+    if (!has_vma) {
+        size_t fb_sz = fb_byte_size();
+        if (fb_sz > 0) {
+            uintptr_t fb_end = (uintptr_t)VFS_FB_USER_BASE +
+                               ((fb_sz + page_mask) & ~page_mask);
+            if (base >= (uintptr_t)VFS_FB_USER_BASE && end <= fb_end)
+                return fb_munmap((void *)base, span);
+        }
+    }
+
+    return rc;
+}
+
+int vfs_msync(void *addr, size_t length, int flags)
+{
+    const int allowed = VFS_MS_ASYNC | VFS_MS_INVALIDATE | VFS_MS_SYNC;
+    if ((flags & ~allowed) != 0)
+        return -EINVAL;
+    if ((flags & VFS_MS_ASYNC) != 0 && (flags & VFS_MS_SYNC) != 0)
+        return -EINVAL;
+    if (!addr || !paging_is_page_aligned_uintptr((uintptr_t)addr))
+        return -EINVAL;
+
+    process_t *proc = vfs_current_process();
+    if (!proc || !proc->vm_space.owns_pml4)
+        return -ENOMEM;
+
+    if (length == 0)
+        return paging_range_is_user((uintptr_t)addr, PAGE_SIZE) ? 0 : -ENOMEM;
 
     uintptr_t p = (uintptr_t)addr;
     uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
     if (p + length < p || (p + length) > UINTPTR_MAX - page_mask)
-        return -1;
+        return -ENOMEM;
 
-    uintptr_t base = p & ~page_mask;
     uintptr_t end = (p + length + page_mask) & ~page_mask;
-    if (end <= base)
-        return -1;
+    if (end <= p || !paging_range_is_user(p, (size_t)(end - p)))
+        return -ENOMEM;
 
-    size_t span = (size_t)(end - base);
-    if (!paging_range_is_user(base, span))
-        return -1;
+    vm_space_mmap_read_lock(&proc->vm_space);
 
-    size_t fb_sz = fb_byte_size();
-    if (fb_sz > 0) {
-        uintptr_t fb_end = (uintptr_t)VFS_FB_USER_BASE +
-                           ((fb_sz + page_mask) & ~page_mask);
-        if (base >= (uintptr_t)VFS_FB_USER_BASE && end <= fb_end)
-            return fb_munmap((void *)base, span);
+    /* Ensure the entire requested range is covered by VMAs with no holes. */
+    uintptr_t pos = p;
+    while (pos < end) {
+        vm_area_t *check = vma_find(&proc->vm_space, pos);
+        if (!check || check->start > pos) {
+            vm_space_mmap_read_unlock(&proc->vm_space);
+            return -ENOMEM;
+        }
+        pos = check->end;
     }
 
-    size_t page_count = span / (size_t)PAGE_SIZE;
-    int unmap_err = 0;
+    int first_err = 0;
+    uintptr_t zero_phys = pmm_zero_page_phys();
+    pos = p;
+    while (pos < end) {
+        vm_area_t *vma = vma_find(&proc->vm_space, pos);
+        if (!vma) {
+            vm_space_mmap_read_unlock(&proc->vm_space);
+            return -ENOMEM;
+        }
+        uintptr_t u_start = (vma->start > pos) ? vma->start : pos;
+        uintptr_t u_end = (vma->end < end) ? vma->end : end;
 
-    for (size_t i = 0; i < page_count; i++) {
-        uint64_t va = (uint64_t)(base + i * (uintptr_t)PAGE_SIZE);
-        uint64_t q_phys = 0;
-        uint64_t q_flags = 0;
+        if ((vma->flags & (VMA_FLAG_FILE | VMA_FLAG_SHARED)) == (VMA_FLAG_FILE | VMA_FLAG_SHARED) &&
+            vma->file) {
+            vfs_file_t *f = (vfs_file_t *)vma->file;
+            uint64_t obj_id = vfs_file_pc_obj_id(f);
+            uint64_t ro_flags = vfs_vma_map_flags(vma->prot, vma->flags, 0);
 
-        if (vmm_query_page(proc->vm_space.pml4_phys, (uintptr_t)va,
-                           &q_phys, &q_flags) == 0 &&
-            (q_flags & VMM_X64_PTE_PRESENT)) {
-            if (vm_space_unmap_user_pages(&proc->vm_space,
-                                          (uintptr_t)va, 1) == 0) {
-                /* Unmap PTE first, then only free frames owned by anonymous mmap. */
-                if (va >= VM_SPACE_ANON_BASE && va < VM_SPACE_ANON_LIMIT &&
-                    q_phys != 0 && (q_flags & VMM_X64_PTE_USER)) {
-                    pmm_free_pages((uintptr_t)q_phys, 1);
+            for (uintptr_t va = u_start; va < u_end; va += PAGE_SIZE) {
+                uint64_t q_phys = 0, q_flags = 0;
+                if (vmm_query_page(proc->vm_space.pml4_phys, va, &q_phys, &q_flags) != 0 ||
+                    !(q_flags & VMM_X64_PTE_PRESENT)) {
+                    continue;
                 }
-            } else {
-                unmap_err = -1;
+                if (q_phys == (uint64_t)zero_phys)
+                    continue;
+                if (q_flags & VMM_X64_PTE_WRITABLE) {
+                    uint64_t pidx = (vma->file_offset + (uint64_t)(va - vma->start)) >> 12;
+                    pagecache_page_t *pg = pagecache_lookup_page(obj_id, pidx);
+                    if (pg) {
+                        if (pg->phys_addr == (uintptr_t)q_phys)
+                            pagecache_mark_dirty(pg);
+                        pagecache_put_page(pg);
+                    }
+                    /* Clear WRITABLE so subsequent writes after msync fault and re-dirty. */
+                    if (vmm_protect_present_pages(proc->vm_space.pml4_phys, va, 1, ro_flags) == 0)
+                        vmm_tlb_shootdown(&proc->vm_space, va, 1);
+                }
+            }
+
+            if ((flags & VFS_MS_ASYNC) == 0) {
+                uint64_t start_pidx = (vma->file_offset + (uint64_t)(u_start - vma->start)) >> 12;
+                uint64_t end_pidx = ((vma->file_offset + (uint64_t)(u_end - vma->start) - 1ULL) >> 12) + 1ULL;
+                int src = vfs_file_sync_range(f, start_pidx, end_pidx, (flags & VFS_MS_SYNC) ? 1 : 0);
+                if (first_err == 0 && src != 0)
+                    first_err = src;
             }
         }
+
+        pos = u_end;
     }
 
-    return unmap_err;
+    vm_space_mmap_read_unlock(&proc->vm_space);
+    return first_err;
 }
 
 static int vfs_file_poll_mask(vfs_file_t *f)

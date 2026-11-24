@@ -21,6 +21,7 @@
 #include "../dev/pci.h"
 #include "../ipc/shm.h"
 #include "../mm/heap.h"
+#include "../mm/pagecache.h"
 #include "../mm/pmm.h"
 #include "../net/network.h"
 #include "../proc/process.h"
@@ -238,14 +239,15 @@ static int build_memory(out_buf_t *ob)
 {
     heap_stats_t hs = {0};
     struct shm_stats ss = {0};
-    size_t pc = 0;
-    size_t pm = 0;
-    size_t psp = 0;
-    size_t psa = 0;
+    pmm_zone_stats_t zs = {0};
+    pagecache_stats_t pcs = {0};
+    process_mem_breakdown_t pb = {0};
 
     heap_get_stats(&hs);
     shm_get_stats(&ss);
-    process_get_memory_totals(&pc, &pm, &psp, &psa);
+    pmm_get_zone_stats(&zs);
+    pagecache_stats(&pcs);
+    process_get_memory_breakdown(&pb);
 
     if (out_append_str(ob, "pmm_total_pages: ") != 0) return -1;
     if (out_append_u64(ob, pmm_total_page_count()) != 0) return -1;
@@ -253,6 +255,14 @@ static int build_memory(out_buf_t *ob)
     if (out_append_u64(ob, pmm_used_page_count()) != 0) return -1;
     if (out_append_str(ob, "\npmm_free_pages: ") != 0) return -1;
     if (out_append_u64(ob, pmm_free_page_count()) != 0) return -1;
+    if (out_append_str(ob, "\npmm_dma_free_pages: ") != 0) return -1;
+    if (out_append_u64(ob, zs.free_pages[PMM_ZONE_DMA]) != 0) return -1;
+    if (out_append_str(ob, "\npmm_dma32_free_pages: ") != 0) return -1;
+    if (out_append_u64(ob, zs.free_pages[PMM_ZONE_DMA32]) != 0) return -1;
+    if (out_append_str(ob, "\npmm_normal_free_pages: ") != 0) return -1;
+    if (out_append_u64(ob, zs.free_pages[PMM_ZONE_NORMAL]) != 0) return -1;
+    if (out_append_str(ob, "\npmm_pcp_pages: ") != 0) return -1;
+    if (out_append_u64(ob, zs.pcp_pages) != 0) return -1;
 
     if (out_append_str(ob, "\nheap_pool_bytes: ") != 0) return -1;
     if (out_append_u64(ob, hs.pool_bytes) != 0) return -1;
@@ -268,14 +278,30 @@ static int build_memory(out_buf_t *ob)
     if (out_append_str(ob, "\nslab_pages: ") != 0) return -1;
     if (out_append_u64(ob, hs.slab_pages) != 0) return -1;
 
+    if (out_append_str(ob, "\npagecache_pages: ") != 0) return -1;
+    if (out_append_u64(ob, pcs.total_pages) != 0) return -1;
+    if (out_append_str(ob, "\npagecache_dirty_pages: ") != 0) return -1;
+    if (out_append_u64(ob, pcs.dirty_pages) != 0) return -1;
+
+    if (out_append_str(ob, "\nkernel_stack_pages: ") != 0) return -1;
+    if (out_append_u64(ob, pb.kernel_stack_pages) != 0) return -1;
+
     if (out_append_str(ob, "\nprocess_count: ") != 0) return -1;
-    if (out_append_u64(ob, pc) != 0) return -1;
+    if (out_append_u64(ob, pb.proc_count) != 0) return -1;
     if (out_append_str(ob, "\nprocess_mapped_pages: ") != 0) return -1;
-    if (out_append_u64(ob, pm) != 0) return -1;
+    if (out_append_u64(ob, pb.mapped_pages) != 0) return -1;
+    if (out_append_str(ob, "\nprocess_anon_pages: ") != 0) return -1;
+    if (out_append_u64(ob, pb.anon_pages) != 0) return -1;
+    if (out_append_str(ob, "\nprocess_file_pages: ") != 0) return -1;
+    if (out_append_u64(ob, pb.file_pages) != 0) return -1;
+    if (out_append_str(ob, "\nprocess_stack_pages: ") != 0) return -1;
+    if (out_append_u64(ob, pb.stack_pages) != 0) return -1;
+    if (out_append_str(ob, "\nprocess_heap_pages: ") != 0) return -1;
+    if (out_append_u64(ob, pb.heap_pages) != 0) return -1;
     if (out_append_str(ob, "\nprocess_shm_pages: ") != 0) return -1;
-    if (out_append_u64(ob, psp) != 0) return -1;
+    if (out_append_u64(ob, pb.shm_pages) != 0) return -1;
     if (out_append_str(ob, "\nprocess_shm_attachments: ") != 0) return -1;
-    if (out_append_u64(ob, psa) != 0) return -1;
+    if (out_append_u64(ob, pb.shm_attachments) != 0) return -1;
 
     if (out_append_str(ob, "\nshm_regions: ") != 0) return -1;
     if (out_append_u64(ob, ss.region_count) != 0) return -1;

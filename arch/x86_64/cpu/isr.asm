@@ -19,10 +19,12 @@ BITS 64
 section .text
 
 global isr_x64_ignore
+global isr_x64_66
 global isr_x64_128
 global process_entry_resume
 extern idt_exception_handler_x64
 extern irq_handler_x64
+extern tlb_shootdown_ipi_handler
 extern process_entry_trampoline
 extern syscall_dispatch
 
@@ -138,7 +140,7 @@ IRQ_STUB 65
 
 %assign vec 48
 %rep (254 - 48 + 1)
-    %if (vec != 64) && (vec != 65) && (vec != 128)
+    %if (vec != 64) && (vec != 65) && (vec != 66) && (vec != 128)
         IRQ_STUB vec
     %endif
     %assign vec vec + 1
@@ -197,6 +199,24 @@ isr_exception_common:
     add rsp, 16
     iretq
 
+isr_x64_66:
+    PUSH_GPRS
+    test qword [rsp + 128], 3
+    jz .from_kernel
+    swapgs
+.from_kernel:
+    cld
+    mov r15, rsp
+    and rsp, -16
+    call tlb_shootdown_ipi_handler
+    mov rsp, r15
+    test qword [rsp + 128], 3
+    jz .skip_swap
+    swapgs
+.skip_swap:
+    POP_GPRS
+    iretq
+
 isr_x64_ignore:
     iretq
 
@@ -240,7 +260,7 @@ global isr_x64_irq_table
 isr_x64_irq_table:
 %assign vec 48
 %rep (254 - 48 + 1)
-    %if (vec == 64) || (vec == 65) || (vec == 128)
+    %if (vec == 64) || (vec == 65) || (vec == 66) || (vec == 128)
         dq 0
     %else
         dq isr_x64_%+vec

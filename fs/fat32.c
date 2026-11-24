@@ -201,7 +201,9 @@ static int pc_read_bytes(struct fat32_volume *v, uint64_t byte_off, void *dst, s
         if (chunk > len - done)
             chunk = len - done;
 
-        pagecache_page_t *pg = pagecache_get_page(v->pc_obj_id, page_idx, &g_fat32_pc_ops, v);
+        pagecache_page_t *pg = pagecache_get_page_flags(v->pc_obj_id, page_idx,
+                                                        &g_fat32_pc_ops, v,
+                                                        PAGECACHE_GET_NO_FS_WB);
         if (!pg)
             return -EIO;
         k_memcpy(out + done, (const uint8_t *)pg->data + off_in_page, chunk);
@@ -227,7 +229,9 @@ static int pc_write_bytes(struct fat32_volume *v, uint64_t byte_off, const void 
         if (chunk > len - done)
             chunk = len - done;
 
-        pagecache_page_t *pg = pagecache_get_page(v->pc_obj_id, page_idx, &g_fat32_pc_ops, v);
+        pagecache_page_t *pg = pagecache_get_page_flags(v->pc_obj_id, page_idx,
+                                                        &g_fat32_pc_ops, v,
+                                                        PAGECACHE_GET_NO_FS_WB);
         if (!pg)
             return -EIO;
         k_memcpy((uint8_t *)pg->data + off_in_page, in + done, chunk);
@@ -253,7 +257,9 @@ static int pc_zero_bytes(struct fat32_volume *v, uint64_t byte_off, size_t len)
         if (chunk > len - done)
             chunk = len - done;
 
-        pagecache_page_t *pg = pagecache_get_page(v->pc_obj_id, page_idx, &g_fat32_pc_ops, v);
+        pagecache_page_t *pg = pagecache_get_page_flags(v->pc_obj_id, page_idx,
+                                                        &g_fat32_pc_ops, v,
+                                                        PAGECACHE_GET_NO_FS_WB);
         if (!pg)
             return -EIO;
         k_memset((uint8_t *)pg->data + off_in_page, 0, chunk);
