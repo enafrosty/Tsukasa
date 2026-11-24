@@ -55,6 +55,8 @@ _Static_assert(
 /* concurrent shm attaches). */
 static spinlock_t g_vmm_lock = SPINLOCK_INIT;
 static volatile int g_pat_supported = 0;
+static volatile int g_nxe_supported = 0;
+static volatile int g_nxe_enabled = 0;
 
 static int map_pages_nolock(uint64_t pml4_phys, uintptr_t virt_addr,
                             uint64_t phys_addr, size_t page_count,
@@ -165,7 +167,7 @@ static uint64_t pte_flags_from_map(uint64_t map_flags)
         else
             pte |= VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_WRITE_THROUGH;
     }
-    if ((map_flags & PAGING_MAP_EXEC) == 0)
+    if ((map_flags & PAGING_MAP_EXEC) == 0 && g_nxe_enabled)
         pte |= VMM_X64_PTE_NO_EXEC;
 
     return pte;
@@ -321,11 +323,59 @@ uint64_t vmm_x64_read_pat_cpu(void)
 #endif
 }
 
+static int cpu_has_nx(void)
+{
+#ifdef __x86_64__
+    uint32_t eax = 0x80000000u, ebx = 0u, ecx = 0u, edx = 0u;
+    __asm__ volatile ("cpuid"
+                      : "+a"(eax), "=b"(ebx), "+c"(ecx), "+d"(edx)
+                      :
+                      : "memory");
+    if (eax < 0x80000001u)
+        return 0;
+    eax = 0x80000001u;
+    __asm__ volatile ("cpuid"
+                      : "+a"(eax), "=b"(ebx), "+c"(ecx), "+d"(edx)
+                      :
+                      : "memory");
+    return (edx & (1u << 20)) != 0;
+#else
+    return 0;
+#endif
+}
+
+int vmm_x64_init_nxe_cpu(void)
+{
+#ifdef __x86_64__
+    if (!cpu_has_nx())
+        return 0;
+    uint64_t efer = rdmsr(MSR_IA32_EFER);
+    if ((efer & (1ULL << 11)) == 0)
+        wrmsr(MSR_IA32_EFER, efer | (1ULL << 11));
+    efer = rdmsr(MSR_IA32_EFER);
+    return (efer & (1ULL << 11)) != 0 ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+int vmm_x64_nxe_supported(void)
+{
+    return g_nxe_supported;
+}
+
+int vmm_x64_nxe_enabled(void)
+{
+    return g_nxe_enabled;
+}
+
 void vmm_x64_init(uint64_t hhdm_offset)
 {
     g_hhdm_offset = hhdm_offset;
 #ifdef __x86_64__
     g_boot_kernel_pml4 = read_cr3() & VMM_X64_ADDR_MASK;
+    g_nxe_supported = cpu_has_nx();
+    g_nxe_enabled = vmm_x64_init_nxe_cpu();
     if (vmm_x64_init_pat_cpu() == 0 && vmm_x64_read_pat_cpu() == VMM_X64_PAT_VALUE)
         g_pat_supported = 1;
     else
@@ -1147,7 +1197,9 @@ static int map_kernel_phys_region(uint64_t phys_base,
                         entry |= VMM_X64_PDE_PAT;
                     else
                         entry |= VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_WRITE_THROUGH;
-                    entry |= VMM_X64_PTE_WRITABLE | VMM_X64_PTE_NO_EXEC | VMM_X64_PDE_PS;
+                    entry |= VMM_X64_PTE_WRITABLE | VMM_X64_PDE_PS;
+                    if (g_nxe_enabled)
+                        entry |= VMM_X64_PTE_NO_EXEC;
                     pd->entries[pd_idx] = entry;
                     invlpg_addr(va);
                     i += 512;
@@ -1172,7 +1224,9 @@ static int map_kernel_phys_region(uint64_t phys_base,
                     entry |= VMM_X64_PTE_PAT;
                 else
                     entry |= VMM_X64_PTE_CACHE_DISABLE | VMM_X64_PTE_WRITE_THROUGH;
-                entry |= VMM_X64_PTE_WRITABLE | VMM_X64_PTE_NO_EXEC;
+                entry |= VMM_X64_PTE_WRITABLE;
+                if (g_nxe_enabled)
+                    entry |= VMM_X64_PTE_NO_EXEC;
                 pt->entries[pt_idx] = entry;
             } else {
                 uint64_t pte_flags = pte_flags_from_map(PAGING_MAP_READ | PAGING_MAP_WRITE |

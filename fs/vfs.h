@@ -121,6 +121,9 @@ typedef struct vfs_mmap_request {
 } vfs_mmap_request_t;
 
 struct process;
+struct vfs_file;
+typedef struct vfs_file vfs_file_t;
+struct pagecache_page;
 
 void vfs_init(const void *boot_info);
 int  vfs_is_root_mounted(void);
@@ -167,7 +170,17 @@ int vfs_fcntl(int fd, int cmd, int arg);
 int vfs_ioctl(int fd, unsigned long request, void *arg);
 void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t offset);
 int vfs_munmap(void *addr, size_t length);
+int vfs_msync(void *addr, size_t length, int flags);
 int vfs_poll(vfs_pollfd_t *fds, size_t nfds, int timeout_ms);
+
+vfs_file_t *vfs_file_ref(vfs_file_t *f);
+void vfs_file_unref(vfs_file_t *f);
+int vfs_file_is_mmap_regular(const vfs_file_t *f);
+int vfs_file_is_writable(const vfs_file_t *f);
+uint64_t vfs_file_size_bytes(vfs_file_t *f);
+uint64_t vfs_file_pc_obj_id(vfs_file_t *f);
+struct pagecache_page *vfs_file_get_page(vfs_file_t *f, uint64_t page_index);
+int vfs_file_sync_range(vfs_file_t *f, uint64_t start_page, uint64_t end_page, int do_fs_sync);
 int vfs_epoll_create1(int flags);
 int vfs_epoll_ctl(int epfd, int op, int fd, uint32_t events, uint64_t data);
 int vfs_epoll_wait(int epfd, epoll_event_t *events, int maxevents, int timeout_ms);

@@ -116,6 +116,7 @@ typedef struct vfs_file {
     uint64_t inode_dev;
     uint64_t inode_ino;
     size_t pos;
+    struct vfs_pc_inode *pc_inode;
 
     char path[VFS_PATH_MAX];
     char abs_path[VFS_PATH_MAX];
@@ -198,6 +199,26 @@ static spinlock_t g_mounts_lock = SPINLOCK_INIT;
 static spinlock_t g_vfs_alloc_lock = SPINLOCK_INIT;
 static spinlock_t g_fd_lock = SPINLOCK_INIT;
 static spinlock_t g_dcache_lock = SPINLOCK_INIT;
+static spinlock_t g_pc_inode_lock = SPINLOCK_INIT;
+
+#define VFS_PC_OBJ_ID_BASE   0x5646530000000000ULL
+#define VFS_PC_INODE_BUCKETS 128U
+
+typedef struct vfs_pc_inode {
+    uint64_t obj_id;
+    uint64_t mount_id;
+    uint64_t key_ino;
+    vfs_backend_t backend;
+    void *fs_ctx;
+    tmpfs_inode_t *tmpfs_ino;
+    char subpath[VFS_PATH_MAX];
+    const uint8_t *ro_buf;
+    size_t ro_size;
+    struct vfs_pc_inode *next;
+} vfs_pc_inode_t;
+
+static vfs_pc_inode_t *g_pc_inodes[VFS_PC_INODE_BUCKETS];
+static uint64_t g_next_pc_obj_seq = 1ULL;
 static spinlock_t g_flock_lock = SPINLOCK_INIT;
 
 static vfs_dentry_t *g_dcache_buckets[VFS_DCACHE_BUCKETS];
@@ -1187,6 +1208,414 @@ static void file_release(vfs_file_t *f)
     kfree(f);
 }
 
+vfs_file_t *vfs_file_ref(vfs_file_t *f)
+{
+    if (!f)
+        return NULL;
+    file_ref(f);
+    return f;
+}
+
+void vfs_file_unref(vfs_file_t *f)
+{
+    file_release(f);
+}
+
+int vfs_file_is_mmap_regular(const vfs_file_t *f)
+{
+    if (!f || f->is_dir)
+        return 0;
+    switch (f->backend) {
+    case VFS_BACKEND_EXT4:
+    case VFS_BACKEND_FAT32:
+    case VFS_BACKEND_FAT32VOL:
+    case VFS_BACKEND_TMPFS:
+    case VFS_BACKEND_INITRD:
+    case VFS_BACKEND_TAR:
+    case VFS_BACKEND_BOOTFS:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int vfs_file_is_writable(const vfs_file_t *f)
+{
+    if (!f || f->is_dir || !(f->mode & VFS_MODE_WRITE))
+        return 0;
+    switch (f->backend) {
+    case VFS_BACKEND_EXT4:
+    case VFS_BACKEND_FAT32:
+    case VFS_BACKEND_FAT32VOL:
+    case VFS_BACKEND_TMPFS:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+uint64_t vfs_file_size_bytes(vfs_file_t *f)
+{
+    if (!f || f->is_dir)
+        return 0;
+    switch (f->backend) {
+    case VFS_BACKEND_TMPFS:
+        return f->u.tmpfs.inode ? (uint64_t)tmpfs_inode_size(f->u.tmpfs.inode) : 0ULL;
+    case VFS_BACKEND_EXT4:
+        return (uint64_t)ext4fs_file_size((ext4fs_t *)f->fs_ctx, f->u.ext4.handle, f->path);
+    case VFS_BACKEND_FAT32:
+    case VFS_BACKEND_FAT32VOL: {
+        fat32_dirent_t de;
+        if (f->u.fat32.vol && fat32_vol_stat(f->u.fat32.vol, f->path, &de) == 0)
+            return (uint64_t)de.size;
+        return 0ULL;
+    }
+    case VFS_BACKEND_INITRD:
+    case VFS_BACKEND_TAR:
+    case VFS_BACKEND_BOOTFS:
+        return (uint64_t)f->u.regular.size;
+    default:
+        return 0ULL;
+    }
+}
+
+static uint64_t vfs_pc_key_ino(const vfs_file_t *f)
+{
+    if (!f)
+        return 0;
+    if (f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL)
+        return vfs_hash_str(f->path);
+    return f->inode_ino ? f->inode_ino : vfs_hash_str(f->path);
+}
+
+static size_t vfs_pc_bucket(uint64_t mount_id, uint64_t key_ino)
+{
+    uint64_t h = mount_id * 0x9E3779B97F4A7C15ULL ^ key_ino * 0xBF58476D1CE4E5B9ULL;
+    return (size_t)((h ^ (h >> 32)) & (VFS_PC_INODE_BUCKETS - 1U));
+}
+
+static int vfs_pc_readpage(void *ctx, uint64_t obj_id, uint64_t page_index, void *buf)
+{
+    vfs_pc_inode_t *pc = (vfs_pc_inode_t *)ctx;
+    (void)obj_id;
+    if (!pc || !buf)
+        return -EINVAL;
+
+    k_memset(buf, 0, PAGECACHE_PAGE_SIZE);
+    uint64_t pos = page_index * (uint64_t)PAGECACHE_PAGE_SIZE;
+
+    switch (pc->backend) {
+    case VFS_BACKEND_TMPFS:
+        if (!pc->tmpfs_ino)
+            return -EIO;
+        (void)tmpfs_read(pc->tmpfs_ino, (size_t)pos, buf, PAGECACHE_PAGE_SIZE);
+        return 0;
+    case VFS_BACKEND_EXT4: {
+        long rc = ext4fs_read_subpath((ext4fs_t *)pc->fs_ctx, pc->subpath,
+                                      (size_t)pos, buf, PAGECACHE_PAGE_SIZE);
+        return (rc < 0) ? (int)rc : 0;
+    }
+    case VFS_BACKEND_FAT32:
+    case VFS_BACKEND_FAT32VOL: {
+        size_t got = 0;
+        int rc = fat32_vol_read_at((fat32_volume_t *)pc->fs_ctx, pc->subpath,
+                                   (size_t)pos, buf, PAGECACHE_PAGE_SIZE,
+                                   &got, NULL, NULL, NULL);
+        return (rc < 0) ? rc : 0;
+    }
+    case VFS_BACKEND_INITRD:
+    case VFS_BACKEND_TAR:
+    case VFS_BACKEND_BOOTFS:
+        if (pc->ro_buf && pos < (uint64_t)pc->ro_size) {
+            size_t avail = pc->ro_size - (size_t)pos;
+            if (avail > PAGECACHE_PAGE_SIZE)
+                avail = PAGECACHE_PAGE_SIZE;
+            k_memcpy(buf, pc->ro_buf + pos, avail);
+        }
+        return 0;
+    default:
+        return -EINVAL;
+    }
+}
+
+static int vfs_pc_writepage(void *ctx, uint64_t obj_id, uint64_t page_index, const void *buf)
+{
+    vfs_pc_inode_t *pc = (vfs_pc_inode_t *)ctx;
+    (void)obj_id;
+    if (!pc || !buf)
+        return -EINVAL;
+
+    uint64_t pos = page_index * (uint64_t)PAGECACHE_PAGE_SIZE;
+
+    switch (pc->backend) {
+    case VFS_BACKEND_TMPFS: {
+        if (!pc->tmpfs_ino)
+            return -EIO;
+        size_t sz = tmpfs_inode_size(pc->tmpfs_ino);
+        if (pos >= (uint64_t)sz)
+            return 0;
+        size_t to_write = sz - (size_t)pos;
+        if (to_write > PAGECACHE_PAGE_SIZE)
+            to_write = PAGECACHE_PAGE_SIZE;
+        size_t wr = tmpfs_write(pc->tmpfs_ino, (size_t)pos, buf, to_write);
+        return (wr == to_write) ? 0 : -EIO;
+    }
+    case VFS_BACKEND_EXT4: {
+        long rc = ext4fs_write_subpath((ext4fs_t *)pc->fs_ctx, pc->subpath,
+                                       (size_t)pos, buf, PAGECACHE_PAGE_SIZE);
+        return (rc < 0) ? (int)rc : 0;
+    }
+    case VFS_BACKEND_FAT32:
+    case VFS_BACKEND_FAT32VOL: {
+        fat32_volume_t *vol = (fat32_volume_t *)pc->fs_ctx;
+        fat32_dirent_t de;
+        int src = fat32_vol_stat(vol, pc->subpath, &de);
+        if (src != 0)
+            return src;
+        if (pos >= (uint64_t)de.size)
+            return 0;
+        size_t to_write = (size_t)de.size - (size_t)pos;
+        if (to_write > PAGECACHE_PAGE_SIZE)
+            to_write = PAGECACHE_PAGE_SIZE;
+        size_t wr = 0;
+        int rc = fat32_vol_write_at(vol, pc->subpath, (size_t)pos,
+                                    buf, to_write, &wr, NULL, NULL, NULL);
+        return (rc < 0) ? rc : 0;
+    }
+    default:
+        return -EROFS;
+    }
+}
+
+static const pagecache_ops_t g_vfs_file_pc_ops = {
+    .readpage = vfs_pc_readpage,
+    .writepage = vfs_pc_writepage,
+    .flags = PAGECACHE_OPS_FS_LOCK,
+};
+
+static vfs_pc_inode_t *vfs_pc_find_locked(uint64_t mount_id, uint64_t key_ino)
+{
+    size_t b = vfs_pc_bucket(mount_id, key_ino);
+    vfs_pc_inode_t *curr = g_pc_inodes[b];
+    while (curr) {
+        if (curr->mount_id == mount_id && curr->key_ino == key_ino)
+            return curr;
+        curr = curr->next;
+    }
+    return NULL;
+}
+
+static vfs_pc_inode_t *vfs_pc_find_for_file(vfs_file_t *f)
+{
+    if (!f || !vfs_file_is_mmap_regular(f))
+        return NULL;
+    if (f->pc_inode)
+        return f->pc_inode;
+    uint64_t key_ino = vfs_pc_key_ino(f);
+    unsigned long flags = spin_lock_irqsave(&g_pc_inode_lock);
+    vfs_pc_inode_t *pc = vfs_pc_find_locked(f->mount_id, key_ino);
+    spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+    if (pc)
+        f->pc_inode = pc;
+    return pc;
+}
+
+static vfs_pc_inode_t *vfs_pc_get_or_create(vfs_file_t *f)
+{
+    if (!f || !vfs_file_is_mmap_regular(f))
+        return NULL;
+    if (f->pc_inode)
+        return f->pc_inode;
+
+    uint64_t key_ino = vfs_pc_key_ino(f);
+    unsigned long flags = spin_lock_irqsave(&g_pc_inode_lock);
+    vfs_pc_inode_t *pc = vfs_pc_find_locked(f->mount_id, key_ino);
+    spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+    if (pc) {
+        f->pc_inode = pc;
+        return pc;
+    }
+
+    vfs_pc_inode_t *npc = (vfs_pc_inode_t *)kmalloc(sizeof(vfs_pc_inode_t));
+    if (!npc)
+        return NULL;
+    k_memset(npc, 0, sizeof(*npc));
+    npc->mount_id = f->mount_id;
+    npc->key_ino = key_ino;
+    npc->backend = f->backend;
+    npc->fs_ctx = f->fs_ctx;
+    kstrncpy(npc->subpath, f->path, VFS_PATH_MAX);
+    if (f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL)
+        npc->fs_ctx = f->u.fat32.vol;
+    if (f->backend == VFS_BACKEND_INITRD || f->backend == VFS_BACKEND_TAR ||
+        f->backend == VFS_BACKEND_BOOTFS) {
+        npc->ro_buf = f->u.regular.buf;
+        npc->ro_size = f->u.regular.size;
+    }
+
+    flags = spin_lock_irqsave(&g_pc_inode_lock);
+    vfs_pc_inode_t *existing = vfs_pc_find_locked(f->mount_id, key_ino);
+    if (existing) {
+        spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+        kfree(npc);
+        f->pc_inode = existing;
+        return existing;
+    }
+    if (f->backend == VFS_BACKEND_TMPFS && f->u.tmpfs.inode) {
+        tmpfs_inode_ref(f->u.tmpfs.inode);
+        npc->tmpfs_ino = f->u.tmpfs.inode;
+    }
+    uint64_t seq = __atomic_fetch_add(&g_next_pc_obj_seq, 1ULL, __ATOMIC_RELAXED);
+    npc->obj_id = VFS_PC_OBJ_ID_BASE | (seq & 0x0000FFFFFFFFFFFFULL);
+    size_t b = vfs_pc_bucket(f->mount_id, key_ino);
+    npc->next = g_pc_inodes[b];
+    g_pc_inodes[b] = npc;
+    spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+
+    f->pc_inode = npc;
+    return npc;
+}
+
+static void vfs_pc_sync_all(void)
+{
+    for (size_t b = 0; b < VFS_PC_INODE_BUCKETS; b++) {
+        uint64_t oids[16];
+        size_t count = 0;
+        unsigned long flags = spin_lock_irqsave(&g_pc_inode_lock);
+        vfs_pc_inode_t *curr = g_pc_inodes[b];
+        while (curr && count < 16) {
+            oids[count++] = curr->obj_id;
+            curr = curr->next;
+        }
+        spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+        for (size_t i = 0; i < count; i++)
+            (void)pagecache_sync_obj(oids[i]);
+    }
+}
+
+static void vfs_pc_unmount(uint64_t mount_id)
+{
+    for (size_t b = 0; b < VFS_PC_INODE_BUCKETS; b++) {
+        for (;;) {
+            vfs_pc_inode_t *victim = NULL;
+            unsigned long flags = spin_lock_irqsave(&g_pc_inode_lock);
+            vfs_pc_inode_t *prev = NULL;
+            vfs_pc_inode_t *curr = g_pc_inodes[b];
+            while (curr) {
+                if (curr->mount_id == mount_id) {
+                    if (prev)
+                        prev->next = curr->next;
+                    else
+                        g_pc_inodes[b] = curr->next;
+                    victim = curr;
+                    break;
+                }
+                prev = curr;
+                curr = curr->next;
+            }
+            spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+            if (!victim)
+                break;
+            (void)pagecache_sync_obj(victim->obj_id);
+            pagecache_invalidate_obj(victim->obj_id);
+            if (victim->tmpfs_ino)
+                tmpfs_inode_unref(victim->tmpfs_ino);
+            kfree(victim);
+        }
+    }
+}
+
+static void vfs_pc_invalidate_key(uint64_t mount_id, uint64_t key_ino)
+{
+    vfs_pc_inode_t *victim = NULL;
+    size_t b = vfs_pc_bucket(mount_id, key_ino);
+    unsigned long flags = spin_lock_irqsave(&g_pc_inode_lock);
+    vfs_pc_inode_t *prev = NULL;
+    vfs_pc_inode_t *curr = g_pc_inodes[b];
+    while (curr) {
+        if (curr->mount_id == mount_id && curr->key_ino == key_ino) {
+            if (prev)
+                prev->next = curr->next;
+            else
+                g_pc_inodes[b] = curr->next;
+            victim = curr;
+            break;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+    spin_unlock_irqrestore(&g_pc_inode_lock, flags);
+    if (victim) {
+        pagecache_invalidate_obj(victim->obj_id);
+        if (victim->tmpfs_ino)
+            tmpfs_inode_unref(victim->tmpfs_ino);
+        kfree(victim);
+    }
+}
+
+static void vfs_pc_update_write(vfs_file_t *f, size_t pos, const void *buf, size_t len)
+{
+    vfs_pc_inode_t *pc = vfs_pc_find_for_file(f);
+    if (!pc || !buf || len == 0)
+        return;
+
+    size_t done = 0;
+    const uint8_t *src = (const uint8_t *)buf;
+    while (done < len) {
+        uint64_t cur = (uint64_t)pos + (uint64_t)done;
+        uint64_t pidx = cur >> 12;
+        size_t off = (size_t)(cur & 0xFFFULL);
+        size_t chunk = PAGECACHE_PAGE_SIZE - off;
+        if (chunk > len - done)
+            chunk = len - done;
+
+        pagecache_page_t *pg = pagecache_lookup_page(pc->obj_id, pidx);
+        if (pg) {
+            k_memcpy((uint8_t *)pg->data + off, src + done, chunk);
+            pagecache_put_page(pg);
+        }
+        done += chunk;
+    }
+}
+
+uint64_t vfs_file_pc_obj_id(vfs_file_t *f)
+{
+    vfs_pc_inode_t *pc = vfs_pc_get_or_create(f);
+    return pc ? pc->obj_id : 0ULL;
+}
+
+struct pagecache_page *vfs_file_get_page(vfs_file_t *f, uint64_t page_index)
+{
+    vfs_pc_inode_t *pc = vfs_pc_get_or_create(f);
+    if (!pc)
+        return NULL;
+    return pagecache_get_page(pc->obj_id, page_index, &g_vfs_file_pc_ops, pc);
+}
+
+int vfs_file_sync_range(vfs_file_t *f, uint64_t start_page, uint64_t end_page, int do_fs_sync)
+{
+    if (!f)
+        return -EINVAL;
+    vfs_pc_inode_t *pc = vfs_pc_find_for_file(f);
+    int rc = 0;
+    if (pc) {
+        rc = pagecache_sync_obj_range(pc->obj_id, start_page, end_page);
+    }
+    if (do_fs_sync) {
+        if (f->backend == VFS_BACKEND_EXT4 && f->fs_ctx) {
+            int frc = ext4fs_sync((ext4fs_t *)f->fs_ctx);
+            if (rc == 0 && frc != 0)
+                rc = frc;
+        } else if ((f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) &&
+                   f->u.fat32.vol) {
+            int frc = fat32_vol_sync(f->u.fat32.vol);
+            if (rc == 0 && frc != 0)
+                rc = frc;
+        }
+    }
+    return rc;
+}
+
 static vfs_file_t *fd_lookup_ref(process_t *proc, int fd)
 {
     void **tbl = fd_table_for_process(proc);
@@ -2042,6 +2471,8 @@ int vfs_is_root_mounted(void)
 
 void vfs_sync_all(void)
 {
+    vfs_pc_sync_all();
+
     vfs_backend_t backends[VFS_MAX_MOUNTS];
     void *privs[VFS_MAX_MOUNTS];
     int count = 0;
@@ -2114,8 +2545,10 @@ void vfs_shutdown(void)
     }
     spin_unlock_irqrestore(&g_mounts_lock, flags);
 
-    if (root_mid)
+    if (root_mid) {
+        vfs_pc_unmount(root_mid);
         dcache_invalidate_mount(root_mid);
+    }
     if (root_backend == VFS_BACKEND_EXT4 && root_priv)
         (void)ext4fs_umount((ext4fs_t *)root_priv);
     else if (root_backend == VFS_BACKEND_FAT32VOL && root_priv)
@@ -2133,15 +2566,21 @@ int vfs_sync_fd(int fd)
         return -EBADF;
 
     int rc = 0;
+    vfs_pc_inode_t *pc = vfs_pc_find_for_file(f);
+    if (pc)
+        rc = pagecache_sync_obj(pc->obj_id);
     if (f->backend == VFS_BACKEND_EXT4 && f->fs_ctx) {
-        rc = ext4fs_sync((ext4fs_t *)f->fs_ctx);
+        int frc = ext4fs_sync((ext4fs_t *)f->fs_ctx);
+        if (rc == 0)
+            rc = frc;
     } else if ((f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) &&
                f->u.fat32.vol) {
-        rc = fat32_vol_sync(f->u.fat32.vol);
+        int frc = fat32_vol_sync(f->u.fat32.vol);
+        if (rc == 0)
+            rc = frc;
     } else if (f->backend == VFS_BACKEND_DEVFS && f->u.device.priv &&
                f->u.device.ops && f->u.device.ops->ioctl) {
         /* Block devices sync on every write; nothing extra needed unless sync exists. */
-        rc = 0;
     }
     file_release(f);
     return rc;
@@ -3409,6 +3848,7 @@ int vfs_umount2(const char *target, int flags)
     found->fs_private = NULL;
     spin_unlock_irqrestore(&g_mounts_lock, mflags);
 
+    vfs_pc_unmount(mid);
     dcache_invalidate_mount(mid);
     dcache_invalidate_path(norm);
     if (backend == VFS_BACKEND_TMPFS && priv)
@@ -3463,6 +3903,9 @@ size_t vfs_read(int fd, void *buf, size_t count)
     }
 
     if (f->backend == VFS_BACKEND_TMPFS) {
+        vfs_pc_inode_t *pc = vfs_pc_find_for_file(f);
+        if (pc)
+            (void)pagecache_sync_obj(pc->obj_id);
         unsigned long fflags = spin_lock_irqsave(&f->lock);
         size_t pos = f->pos;
         spin_unlock_irqrestore(&f->lock, fflags);
@@ -3475,6 +3918,9 @@ size_t vfs_read(int fd, void *buf, size_t count)
     }
 
     if (f->backend == VFS_BACKEND_EXT4) {
+        vfs_pc_inode_t *pc = vfs_pc_find_for_file(f);
+        if (pc)
+            (void)pagecache_sync_obj(pc->obj_id);
         unsigned long fflags = spin_lock_irqsave(&f->lock);
         size_t pos = f->pos;
         spin_unlock_irqrestore(&f->lock, fflags);
@@ -3489,6 +3935,9 @@ size_t vfs_read(int fd, void *buf, size_t count)
     }
 
     if (f->backend == VFS_BACKEND_FAT32 || f->backend == VFS_BACKEND_FAT32VOL) {
+        vfs_pc_inode_t *pc = vfs_pc_find_for_file(f);
+        if (pc)
+            (void)pagecache_sync_obj(pc->obj_id);
         unsigned long fflags = spin_lock_irqsave(&f->lock);
         size_t pos = f->pos;
         uint32_t hidx = f->u.fat32.hint_clus_idx;
@@ -3627,6 +4076,8 @@ size_t vfs_write(int fd, const void *buf, size_t count)
         spin_unlock_irqrestore(&f->lock, fflags);
 
         size_t wr = tmpfs_write(f->u.tmpfs.inode, pos, buf, count);
+        if (wr > 0)
+            vfs_pc_update_write(f, pos, buf, wr);
 
         fflags = spin_lock_irqsave(&f->lock);
         f->pos = pos + wr;
@@ -3645,6 +4096,7 @@ size_t vfs_write(int fd, const void *buf, size_t count)
 
         long wr = ext4fs_write((ext4fs_t *)f->fs_ctx, f->u.ext4.handle, pos, buf, count);
         if (wr > 0) {
+            vfs_pc_update_write(f, pos, buf, (size_t)wr);
             fflags = spin_lock_irqsave(&f->lock);
             f->pos = pos + (size_t)wr;
             f->dirty = 1;
@@ -3671,6 +4123,8 @@ size_t vfs_write(int fd, const void *buf, size_t count)
         size_t wr = 0;
         int rc = fat32_vol_write_at(f->u.fat32.vol, f->path, pos, buf, count,
                                     &wr, &hidx, &hclus, &hgen);
+        if (wr > 0)
+            vfs_pc_update_write(f, pos, buf, wr);
         fflags = spin_lock_irqsave(&f->lock);
         f->u.fat32.hint_clus_idx = hidx;
         f->u.fat32.hint_clus = hclus;
@@ -4413,6 +4867,45 @@ int vfs_munmap(void *addr, size_t length)
     }
 
     return unmap_err;
+}
+
+int vfs_msync(void *addr, size_t length, int flags)
+{
+    const int allowed = VFS_MS_ASYNC | VFS_MS_INVALIDATE | VFS_MS_SYNC;
+    if ((flags & ~allowed) != 0)
+        return -EINVAL;
+    if ((flags & VFS_MS_ASYNC) != 0 && (flags & VFS_MS_SYNC) != 0)
+        return -EINVAL;
+    if (!addr || !paging_is_page_aligned_uintptr((uintptr_t)addr))
+        return -EINVAL;
+
+    process_t *proc = vfs_current_process();
+    if (!proc || !proc->vm_space.owns_pml4)
+        return -ENOMEM;
+
+    if (length == 0)
+        return paging_range_is_user((uintptr_t)addr, PAGE_SIZE) ? 0 : -ENOMEM;
+
+    uintptr_t p = (uintptr_t)addr;
+    uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
+    if (p + length < p || (p + length) > UINTPTR_MAX - page_mask)
+        return -ENOMEM;
+
+    uintptr_t end = (p + length + page_mask) & ~page_mask;
+    if (end <= p || !paging_range_is_user(p, (size_t)(end - p)))
+        return -ENOMEM;
+
+    for (uintptr_t va = p; va < end; va += PAGE_SIZE) {
+        uint64_t q_phys = 0, q_flags = 0;
+        if (vmm_query_page(proc->vm_space.pml4_phys, va, &q_phys, &q_flags) != 0 ||
+            !(q_flags & VMM_X64_PTE_PRESENT)) {
+            return -ENOMEM;
+        }
+    }
+
+    if (flags & VFS_MS_SYNC)
+        vfs_sync_all();
+    return 0;
 }
 
 static int vfs_file_poll_mask(vfs_file_t *f)

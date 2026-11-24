@@ -36,6 +36,8 @@ int ext4fs_open(ext4fs_t *fs, const char *subpath, int vfs_flags, uint32_t creat
 void ext4fs_close(ext4fs_t *fs, void *handle, int dirty);
 long ext4fs_read(ext4fs_t *fs, void *handle, size_t pos, void *buf, size_t count);
 long ext4fs_write(ext4fs_t *fs, void *handle, size_t pos, const void *buf, size_t count);
+long ext4fs_read_subpath(ext4fs_t *fs, const char *subpath, size_t pos, void *buf, size_t count);
+long ext4fs_write_subpath(ext4fs_t *fs, const char *subpath, size_t pos, const void *buf, size_t count);
 size_t ext4fs_file_size(ext4fs_t *fs, void *handle, const char *subpath);
 int ext4fs_fstat(ext4fs_t *fs, void *handle, const char *subpath, vfs_stat_t *out);
 

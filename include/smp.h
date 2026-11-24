@@ -31,6 +31,7 @@ typedef struct cpu_state {
     uint64_t syscall_rsp;
     uint64_t user_rsp;
     uint64_t pat_msr;
+    uint64_t efer_msr;
 } cpu_state_t;
 
 /* Fixed %gs offsets used by arch/x86_64/cpu/syscall_entry.asm. */
@@ -40,6 +41,7 @@ typedef struct cpu_state {
 #define X64_CPU_USER_RSP_OFF_STR    "48"
 
 #define MSR_IA32_PAT        0x00000277u
+#define MSR_IA32_EFER       0xC0000080u
 #define MSR_GS_BASE         0xC0000101
 #define MSR_KERNEL_GS_BASE  0xC0000102
 

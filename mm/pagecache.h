@@ -22,9 +22,13 @@
 
 #define PAGECACHE_PAGE_SIZE 4096U
 
+#define PAGECACHE_OPS_FS_LOCK   (1U << 0)
+#define PAGECACHE_GET_NO_FS_WB  (1U << 0)
+
 typedef struct pagecache_ops {
     int (*readpage)(void *ctx, uint64_t obj_id, uint64_t page_index, void *buf);
     int (*writepage)(void *ctx, uint64_t obj_id, uint64_t page_index, const void *buf);
+    uint32_t flags;
 } pagecache_ops_t;
 
 typedef struct pagecache_page {
@@ -66,10 +70,17 @@ pagecache_page_t *pagecache_get_page(uint64_t obj_id,
                                      uint64_t page_index,
                                      const pagecache_ops_t *ops,
                                      void *ops_ctx);
+pagecache_page_t *pagecache_get_page_flags(uint64_t obj_id,
+                                           uint64_t page_index,
+                                           const pagecache_ops_t *ops,
+                                           void *ops_ctx,
+                                           uint32_t get_flags);
+pagecache_page_t *pagecache_lookup_page(uint64_t obj_id, uint64_t page_index);
 void pagecache_put_page(pagecache_page_t *page);
 void pagecache_mark_dirty(pagecache_page_t *page);
 
 int pagecache_sync_obj(uint64_t obj_id);
+int pagecache_sync_obj_range(uint64_t obj_id, uint64_t start_page, uint64_t end_page);
 int pagecache_sync_all(void);
 void pagecache_invalidate_obj(uint64_t obj_id);
 void pagecache_stats(pagecache_stats_t *out);

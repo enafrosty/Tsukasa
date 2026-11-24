@@ -24,15 +24,35 @@
 #define MSR_CSTAR       0xC0000083
 #define MSR_SFMASK      0xC0000084
 
-#define EFER_SCE        0x00000001 /* Syscall Enable */
+#define EFER_SCE        (1ULL << 0)  /* Syscall Enable */
+#define EFER_NXE        (1ULL << 11) /* No-Execute Enable */
 
 extern void syscall_entry_x64(void);
 
+static int cpu_supports_nx(void)
+{
+    uint32_t eax = 0x80000000u, ebx = 0u, ecx = 0u, edx = 0u;
+    __asm__ volatile ("cpuid"
+                      : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                      :
+                      : "memory");
+    if (eax < 0x80000001u)
+        return 0;
+    eax = 0x80000001u;
+    __asm__ volatile ("cpuid"
+                      : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx)
+                      :
+                      : "memory");
+    return (edx & (1u << 20)) != 0;
+}
+
 void syscall_init_x64(void)
 {
-    /* Enable SCE (Syscall Enable) bit in IA32_EFER */
-    uint64_t efer = rdmsr(MSR_EFER);
-    wrmsr(MSR_EFER, efer | EFER_SCE);
+    /* Enable SCE and NXE (when CPUID 0x80000001 EDX.NX is supported) in IA32_EFER. */
+    uint64_t efer = rdmsr(MSR_EFER) | EFER_SCE;
+    if (cpu_supports_nx())
+        efer |= EFER_NXE;
+    wrmsr(MSR_EFER, efer);
 
     /*
      * STAR MSR layout:

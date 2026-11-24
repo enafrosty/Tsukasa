@@ -63,6 +63,7 @@ long recvfrom(int fd, void *buf, size_t len, int flags,
 
 void *mmap(void *addr, unsigned long length, int prot, int flags, int fd, long offset);
 int   munmap(void *addr, unsigned long length);
+int   msync(void *addr, unsigned long length, int flags);
 int   ioctl(int fd, unsigned long request, long arg);
 int   poll(vfs_pollfd_t *fds, long nfds, int timeout_ms);
 int   shm_create(unsigned long size);

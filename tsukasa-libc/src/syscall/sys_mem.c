@@ -40,3 +40,9 @@ int mprotect(void *addr, size_t length, int prot)
     (void)prot;
     return 0;
 }
+
+int msync(void *addr, size_t length, int flags)
+{
+    return (int)__syscall_check(__syscall3(SYS_msync, (int64_t)(uintptr_t)addr,
+                                           (int64_t)length, (int64_t)flags));
+}

@@ -372,6 +372,12 @@ static long sys_munmap(long addr, long length, long a3, long a4, long a5, long a
     return mux_fs(FS_CMD_MUNMAP, addr, length, 0);
 }
 
+static long sys_msync(long addr, long length, long flags, long a4, long a5, long a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    return (long)vfs_msync((void *)(uintptr_t)addr, (size_t)length, (int)flags);
+}
+
 static long sys_ioctl(long fd, long req, long arg, long a4, long a5, long a6)
 {
     (void)a4; (void)a5; (void)a6;
@@ -1030,6 +1036,7 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [22] = sys_pipe,
     [23] = sys_select,
     [24] = sys_sched_yield,
+    [26] = sys_msync,
     [29] = sys_shm_create,
     [30] = sys_shm_attach,
     [31] = sys_shm_destroy,
@@ -1455,6 +1462,29 @@ static void c01_test_entry(void)
             kprintf("[selftest] pat msr FAIL cpus=%u sup=%d bad_cpu=%u pat=0x%08x%08x\n",
                     cpus, vmm_x64_pat_supported(), bad_cpu,
                     (uint32_t)(bad_pat >> 32), (uint32_t)bad_pat);
+    }
+
+    {
+        uint32_t cpus = smp_cpu_count();
+        int nxe_ok = (vmm_x64_nxe_supported() == 1 && vmm_x64_nxe_enabled() == 1);
+        uint32_t bad_cpu = 0u;
+        uint64_t bad_efer = 0ULL;
+        for (uint32_t c = 0; c < cpus; c++) {
+            cpu_state_t *cs = smp_get_cpu(c);
+            if (!cs || (cs->efer_msr & (1ULL << 11)) == 0) {
+                if (nxe_ok) {
+                    bad_cpu = c;
+                    bad_efer = cs ? cs->efer_msr : 0ULL;
+                }
+                nxe_ok = 0;
+            }
+        }
+        if (nxe_ok)
+            kprintf("[selftest] efer nxe PASS cpus=%u\n", cpus);
+        else
+            kprintf("[selftest] efer nxe FAIL cpus=%u sup=%d en=%d bad_cpu=%u efer=0x%08x%08x\n",
+                    cpus, vmm_x64_nxe_supported(), vmm_x64_nxe_enabled(), bad_cpu,
+                    (uint32_t)(bad_efer >> 32), (uint32_t)bad_efer);
     }
 
     if (fb_info.addr && fb_byte_size() > 0) {

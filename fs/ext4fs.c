@@ -188,7 +188,9 @@ static int ext4_bd_bread(struct ext4_blockdev *bdev, void *buf, uint64_t blk_id,
         if (chunk > total - done)
             chunk = (size_t)(total - done);
 
-        pagecache_page_t *pg = pagecache_get_page(fs->pc_obj_id, page_idx, &g_ext4_pc_ops, fs);
+        pagecache_page_t *pg = pagecache_get_page_flags(fs->pc_obj_id, page_idx,
+                                                        &g_ext4_pc_ops, fs,
+                                                        PAGECACHE_GET_NO_FS_WB);
         if (!pg)
             return EIO;
         k_memcpy((uint8_t *)buf + done, (const uint8_t *)pg->data + off_in_page, chunk);
@@ -224,7 +226,9 @@ static int ext4_bd_bwrite(struct ext4_blockdev *bdev, const void *buf, uint64_t 
         if (chunk > total - done)
             chunk = (size_t)(total - done);
 
-        pagecache_page_t *pg = pagecache_get_page(fs->pc_obj_id, page_idx, &g_ext4_pc_ops, fs);
+        pagecache_page_t *pg = pagecache_get_page_flags(fs->pc_obj_id, page_idx,
+                                                        &g_ext4_pc_ops, fs,
+                                                        PAGECACHE_GET_NO_FS_WB);
         if (!pg)
             return EIO;
         k_memcpy((uint8_t *)pg->data + off_in_page, (const uint8_t *)buf + done, chunk);
@@ -757,6 +761,104 @@ long ext4fs_write(ext4fs_t *fs, void *handle, size_t pos, const void *buf, size_
 
     size_t wcnt = 0;
     r = ext4_fwrite(ef, buf, count, &wcnt);
+    fs_mutex_unlock(&fs->lock);
+    if (r != EOK)
+        return lwext4_to_vfs_err(r);
+    return (long)wcnt;
+}
+
+long ext4fs_read_subpath(ext4fs_t *fs, const char *subpath, size_t pos, void *buf, size_t count)
+{
+    if (!fs || !fs->used || !subpath || !buf)
+        return -EINVAL;
+    if (count == 0)
+        return 0;
+
+    char full[VFS_PATH_MAX + 32];
+    int rc = ext4fs_make_path(fs, subpath, full, sizeof(full));
+    if (rc != 0)
+        return rc;
+
+    fs_mutex_lock(&fs->lock);
+    ext4_file ef;
+    k_memset(&ef, 0, sizeof(ef));
+    int r = ext4_fopen2(&ef, full, O_RDONLY);
+    if (r != EOK) {
+        fs_mutex_unlock(&fs->lock);
+        return lwext4_to_vfs_err(r);
+    }
+
+    size_t cur_sz = ext4fs_refresh_size_locked(fs, &ef);
+    if (pos >= cur_sz) {
+        (void)ext4_fclose(&ef);
+        fs_mutex_unlock(&fs->lock);
+        return 0;
+    }
+
+    size_t to_read = cur_sz - pos;
+    if (to_read > count)
+        to_read = count;
+
+    r = ext4_fseek(&ef, (int64_t)pos, SEEK_SET);
+    if (r != EOK) {
+        (void)ext4_fclose(&ef);
+        fs_mutex_unlock(&fs->lock);
+        return lwext4_to_vfs_err(r);
+    }
+
+    size_t rcnt = 0;
+    r = ext4_fread(&ef, buf, to_read, &rcnt);
+    (void)ext4_fclose(&ef);
+    fs_mutex_unlock(&fs->lock);
+    if (r != EOK)
+        return lwext4_to_vfs_err(r);
+    return (long)rcnt;
+}
+
+long ext4fs_write_subpath(ext4fs_t *fs, const char *subpath, size_t pos, const void *buf, size_t count)
+{
+    if (!fs || !fs->used || !subpath || !buf)
+        return -EINVAL;
+    if (fs->read_only)
+        return -EROFS;
+    if (count == 0)
+        return 0;
+
+    char full[VFS_PATH_MAX + 32];
+    int rc = ext4fs_make_path(fs, subpath, full, sizeof(full));
+    if (rc != 0)
+        return rc;
+
+    fs_mutex_lock(&fs->lock);
+    ext4_file ef;
+    k_memset(&ef, 0, sizeof(ef));
+    int r = ext4_fopen2(&ef, full, O_RDWR);
+    if (r != EOK) {
+        fs_mutex_unlock(&fs->lock);
+        return lwext4_to_vfs_err(r);
+    }
+
+    size_t cur_sz = ext4fs_refresh_size_locked(fs, &ef);
+    if (pos >= cur_sz) {
+        (void)ext4_fclose(&ef);
+        fs_mutex_unlock(&fs->lock);
+        return 0;
+    }
+
+    size_t to_write = cur_sz - pos;
+    if (to_write > count)
+        to_write = count;
+
+    r = ext4_fseek(&ef, (int64_t)pos, SEEK_SET);
+    if (r != EOK) {
+        (void)ext4_fclose(&ef);
+        fs_mutex_unlock(&fs->lock);
+        return lwext4_to_vfs_err(r);
+    }
+
+    size_t wcnt = 0;
+    r = ext4_fwrite(&ef, buf, to_write, &wcnt);
+    (void)ext4_fclose(&ef);
     fs_mutex_unlock(&fs->lock);
     if (r != EOK)
         return lwext4_to_vfs_err(r);

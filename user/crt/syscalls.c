@@ -158,6 +158,11 @@ int munmap(void *addr, unsigned long length)
     return (int)tsk_syscall3(11, (long)(uintptr_t)addr, (long)length, 0);
 }
 
+int msync(void *addr, unsigned long length, int flags)
+{
+    return (int)tsk_syscall3(26, (long)(uintptr_t)addr, (long)length, (long)flags);
+}
+
 int ioctl(int fd, unsigned long request, long arg)
 {
     return (int)tsk_syscall3(16, (long)fd, (long)request, arg);

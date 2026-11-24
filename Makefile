@@ -290,7 +290,7 @@ USER_TEST_BINS = $(INITRD_BIN)/hello.elf $(INITRD_BIN)/hello_sc.elf $(INITRD_BIN
                  $(INITRD_BIN)/exit7.elf $(INITRD_BIN)/hellosdk.elf $(INITRD_BIN)/echo.elf \
                  $(INITRD_BIN)/cat.elf $(INITRD_BIN)/argvchk.elf $(INITRD_BIN)/futex10.elf \
                  $(INITRD_BIN)/usock20.elf $(INITRD_BIN)/wsrv15.elf $(INITRD_BIN)/wapp15.elf \
-                 $(INITRD_BIN)/wdemo16.elf $(INITRD_BIN)/TESTDRV.ELF
+                 $(INITRD_BIN)/wdemo16.elf $(INITRD_BIN)/mmapflt.elf $(INITRD_BIN)/TESTDRV.ELF
 
 COREUTILS_NAMES = ls cat mkdir rm cp mv grep ps free sysfetch kill date poweroff reboot \
                   head tail wc sort uniq cut uname touch net ping telnet fetch tsh

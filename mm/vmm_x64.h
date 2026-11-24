@@ -48,6 +48,9 @@ int vmm_x64_init_pat_cpu(void);
 uint64_t vmm_x64_read_pat_cpu(void);
 int vmm_x64_pat_supported(void);
 uint64_t vmm_x64_pat_msr(void);
+int vmm_x64_init_nxe_cpu(void);
+int vmm_x64_nxe_supported(void);
+int vmm_x64_nxe_enabled(void);
 
 uint64_t vmm_get_current_pml4(void);
 uint64_t vmm_get_kernel_pml4(void);
