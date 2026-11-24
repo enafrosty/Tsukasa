@@ -33,8 +33,9 @@
 #include "../arch/x86_64/cpu/gdt.h"
 
 #define ELF64_PATH_MAX 128
-#define USER_STACK_TOP   0x00007FFFFFFF0000ULL
-#define USER_STACK_PAGES 512
+#define USER_STACK_TOP             0x00007FFFFFFF0000ULL
+#define USER_STACK_MAX_SIZE        (8ULL * 1024ULL * 1024ULL)
+#define USER_STACK_PREFAULT_PAGES  2ULL
 
 typedef struct {
     unsigned char e_ident[16];
@@ -99,9 +100,38 @@ static int stream_load_segment(process_t *p, int fd, const elf64_phdr_t *ph)
     if (ph->p_flags & PF_X_64)
         map_flags |= PAGING_MAP_EXEC;
 
+    uint32_t vma_prot = VMA_PROT_READ;
+    if (ph->p_flags & PF_W_64)
+        vma_prot |= VMA_PROT_WRITE;
+    if (ph->p_flags & PF_X_64)
+        vma_prot |= VMA_PROT_EXEC;
+
     uint64_t start = ph->p_vaddr & ~(VMM_X64_PAGE_SIZE - 1);
     uint64_t end = (ph->p_vaddr + ph->p_memsz + VMM_X64_PAGE_SIZE - 1) & ~(VMM_X64_PAGE_SIZE - 1);
     uint64_t file_end = ph->p_vaddr + ph->p_filesz;
+
+    vm_space_mmap_write_lock(&p->vm_space);
+    for (uint64_t vp = start; vp < end;) {
+        vm_area_t *ex = vma_find(&p->vm_space, (uintptr_t)vp);
+        if (ex) {
+            uint64_t seg_end = (ex->end < end) ? ex->end : end;
+            uint32_t merged = ex->prot | vma_prot;
+            if (merged != ex->prot)
+                (void)vma_protect_range(&p->vm_space, (uintptr_t)vp, (size_t)(seg_end - vp), merged);
+            vp = seg_end;
+        } else {
+            uint64_t run_end = vp + VMM_X64_PAGE_SIZE;
+            while (run_end < end && !vma_find(&p->vm_space, (uintptr_t)run_end))
+                run_end += VMM_X64_PAGE_SIZE;
+            if (!vma_insert(&p->vm_space, (uintptr_t)vp, (uintptr_t)run_end, vma_prot,
+                            VMA_FLAG_ELF | VMA_FLAG_ANON | VMA_FLAG_PRIVATE)) {
+                vm_space_mmap_write_unlock(&p->vm_space);
+                return -1;
+            }
+            vp = run_end;
+        }
+    }
+    vm_space_mmap_write_unlock(&p->vm_space);
 
     for (uint64_t page = start; page < end; page += VMM_X64_PAGE_SIZE) {
         uint64_t phys = 0;
@@ -125,6 +155,9 @@ static int stream_load_segment(process_t *p, int fd, const elf64_phdr_t *ph)
             uintptr_t new_phys = pmm_alloc_pages(1);
             if (!new_phys)
                 return -1;
+            page_t *pg = pmm_phys_to_page(new_phys);
+            if (pg)
+                pg->flags |= PAGE_FLAG_ANON;
             kva = (uint8_t *)vmm_phys_to_virt(new_phys);
             k_memset(kva, 0, VMM_X64_PAGE_SIZE);
             if (vm_space_map_user_pages(&p->vm_space, (uintptr_t)page, new_phys, 1,
@@ -132,6 +165,7 @@ static int stream_load_segment(process_t *p, int fd, const elf64_phdr_t *ph)
                 pmm_free_pages(new_phys, 1);
                 return -1;
             }
+            __atomic_fetch_add(&p->vm_space.anon_pages, 1u, __ATOMIC_RELAXED);
         }
 
         uint64_t ov_start = (page > ph->p_vaddr) ? page : ph->p_vaddr;
@@ -297,6 +331,7 @@ static void elf64_bootstrap(void)
         process_exit(-1);
     }
 
+    uint64_t max_elf_end = 0;
     for (uint16_t i = 0; i < eh.e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD_64)
             continue;
@@ -306,16 +341,41 @@ static void elf64_bootstrap(void)
             vfs_close(fd);
             process_exit(-1);
         }
+        uint64_t seg_end = (ph[i].p_vaddr + ph[i].p_memsz + VMM_X64_PAGE_SIZE - 1) &
+                           ~(VMM_X64_PAGE_SIZE - 1);
+        if (seg_end > max_elf_end)
+            max_elf_end = seg_end;
     }
 
-    uint64_t stack_base = USER_STACK_TOP - (uint64_t)USER_STACK_PAGES * VMM_X64_PAGE_SIZE;
-    if (map_zero_pages(self, stack_base,
-                       (uint64_t)USER_STACK_PAGES * VMM_X64_PAGE_SIZE) != 0) {
+    if (max_elf_end < 0x400000ULL)
+        max_elf_end = 0x10000000ULL;
+    self->vm_space.brk_start = (uintptr_t)max_elf_end;
+    self->vm_space.brk_current = (uintptr_t)max_elf_end;
+    self->vm_space.brk_limit = (uintptr_t)VM_SPACE_SHM_BASE;
+
+    uint64_t stack_bottom = USER_STACK_TOP - USER_STACK_MAX_SIZE;
+    vm_space_mmap_write_lock(&self->vm_space);
+    vm_area_t *stack_vma = vma_insert(&self->vm_space,
+                                      (uintptr_t)stack_bottom,
+                                      (uintptr_t)USER_STACK_TOP,
+                                      VMA_PROT_READ | VMA_PROT_WRITE,
+                                      VMA_FLAG_GROWSDOWN | VMA_FLAG_ANON | VMA_FLAG_PRIVATE);
+    vm_space_mmap_write_unlock(&self->vm_space);
+    if (!stack_vma) {
+        kprintf("[elf64] stack VMA insert failed\n");
+        kfree(ph);
+        vfs_close(fd);
+        process_exit(-1);
+    }
+
+    uint64_t prefault_bytes = USER_STACK_PREFAULT_PAGES * VMM_X64_PAGE_SIZE;
+    if (map_zero_pages(self, USER_STACK_TOP - prefault_bytes, prefault_bytes) != 0) {
         kprintf("[elf64] stack map failed\n");
         kfree(ph);
         vfs_close(fd);
         process_exit(-1);
     }
+    __atomic_fetch_add(&self->vm_space.stack_pages, (uint32_t)USER_STACK_PREFAULT_PAGES, __ATOMIC_RELAXED);
 
     uint64_t entry = eh.e_entry;
     kfree(ph);

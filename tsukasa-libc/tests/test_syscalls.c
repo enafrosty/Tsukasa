@@ -30,6 +30,7 @@
 #include <sys/mount.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
@@ -125,6 +126,42 @@ static int run_worker_vfs(const char *tag)
     return 0;
 }
 
+static int run_worker_mprotect_segv(void)
+{
+    volatile uint32_t *p = (volatile uint32_t *)mmap(NULL, 4096,
+                                                     PROT_READ | PROT_WRITE,
+                                                     MAP_PRIVATE | MAP_ANONYMOUS,
+                                                     -1, 0);
+    if (p == MAP_FAILED)
+        return 1;
+    *p = 0x11223344u;
+    if (mprotect((void *)p, 4096, PROT_READ) != 0)
+        return 2;
+    if (*p != 0x11223344u)
+        return 3;
+    *p = 0x55667788u; /* Must trigger Ring-3 #PF -> SIGSEGV */
+    return 4;
+}
+
+__attribute__((noinline))
+static int stack_autogrow_probe(int depth, uint8_t expected)
+{
+    volatile uint8_t buf[262144];
+    buf[0] = (uint8_t)(expected + (uint8_t)depth);
+    buf[sizeof(buf) / 2] = (uint8_t)(expected ^ (uint8_t)depth);
+    buf[sizeof(buf) - 1] = (uint8_t)(expected + 7u);
+    int rc = 0;
+    if (depth > 1)
+        rc = stack_autogrow_probe(depth - 1, expected);
+    if (rc != 0)
+        return rc;
+    if (buf[0] != (uint8_t)(expected + (uint8_t)depth) ||
+        buf[sizeof(buf) / 2] != (uint8_t)(expected ^ (uint8_t)depth) ||
+        buf[sizeof(buf) - 1] != (uint8_t)(expected + 7u))
+        return -1;
+    return 0;
+}
+
 static int real_main(int argc, char **argv, char **envp)
 {
     (void)envp;
@@ -133,9 +170,11 @@ static int real_main(int argc, char **argv, char **envp)
         return run_worker_flock();
     if (argc >= 3 && strcmp(argv[1], "--worker-vfs") == 0)
         return run_worker_vfs(argv[2]);
+    if (argc >= 2 && strcmp(argv[1], "--worker-mprotect-segv") == 0)
+        return run_worker_mprotect_segv();
 
     int passed = 0;
-    int total = 17;
+    int total = 21;
 
     /* Test 1: Stack frame alignment (rsp % 16 == 8 on function entry). */
     if ((s_entry_rsp & 0xF) != 8) {
@@ -957,6 +996,166 @@ static int real_main(int argc, char **argv, char **envp)
             return 71;
         }
         TSK_TEST_PASS("syscalls", "pagecache_proc");
+        passed++;
+    }
+
+    /* Test 18: mprotect, MAP_FIXED, split/merge stress, and PROT_READ SIGSEGV isolation. */
+    {
+        int ok = 1;
+        errno = 0;
+        if (mprotect((void *)0x80000123ULL, 4096, PROT_READ) != -1 || errno != EINVAL)
+            ok = 0;
+        errno = 0;
+        if (mprotect((void *)0x50000000ULL, 4096, PROT_READ) != -1 || errno != ENOMEM)
+            ok = 0;
+        errno = 0;
+        if (mprotect((void *)0xFFFFFFFF80000000ULL, 4096, PROT_READ) != -1 || errno != ENOMEM)
+            ok = 0;
+        errno = 0;
+        if (mmap((void *)0x80000123ULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED ||
+            errno != EINVAL)
+            ok = 0;
+        errno = 0;
+        if (mmap((void *)0xFFFFFFFF80000000ULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED ||
+            errno != ENOMEM)
+            ok = 0;
+
+        /* MAP_FIXED replacement + rapid split/merge churn. */
+        for (int iter = 0; iter < 50 && ok; iter++) {
+            uint8_t *reg = (uint8_t *)mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE,
+                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (reg == MAP_FAILED) {
+                ok = 0;
+                break;
+            }
+            reg[0] = 0xAA;
+            reg[4096] = 0xBB;
+            reg[2 * 4096] = 0xCC;
+            reg[3 * 4096] = 0xDD;
+
+            if (mprotect(reg + 4096, 2 * 4096, PROT_READ) != 0) {
+                ok = 0;
+                munmap(reg, 4 * 4096);
+                break;
+            }
+            if (reg[4096] != 0xBB || reg[2 * 4096] != 0xCC)
+                ok = 0;
+            if (mprotect(reg + 4096, 2 * 4096, PROT_READ | PROT_WRITE) != 0) {
+                ok = 0;
+                munmap(reg, 4 * 4096);
+                break;
+            }
+            reg[4096] = 0xEE;
+
+            void *rep = mmap(reg + 4096, 4096, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (rep != (void *)(reg + 4096) || reg[0] != 0xAA || reg[4096] != 0)
+                ok = 0;
+
+            if (munmap(reg, 4 * 4096) != 0)
+                ok = 0;
+        }
+
+        if (ok) {
+            char *wargs[] = { "/bin/TSYSC.ELF", "--worker-mprotect-segv", NULL };
+            pid_t cpid = spawn("/bin/TSYSC.ELF", wargs, NULL);
+            if (cpid < 0) {
+                ok = 0;
+            } else {
+                int st = 0;
+                int waited = 0;
+                for (int i = 0; i < 1000; i++) {
+                    if (waitpid(cpid, &st, WNOHANG) == cpid) {
+                        waited = 1;
+                        break;
+                    }
+                    usleep(5000);
+                }
+                if (!waited || !WIFSIGNALED(st) || WTERMSIG(st) != SIGSEGV)
+                    ok = 0;
+            }
+        }
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "mprotect_map_fixed", "mprotect/MAP_FIXED/SIGSEGV check failed");
+            return 72;
+        }
+        TSK_TEST_PASS("syscalls", "mprotect_map_fixed");
+        passed++;
+    }
+
+    /* Test 19: brk / sbrk growth, shrink, and negative bounds checks. */
+    {
+        int ok = 1;
+        void *b0 = sbrk(0);
+        if (!b0 || b0 == (void *)-1)
+            ok = 0;
+
+        void *b1 = sbrk(8192);
+        if (b1 != b0 || sbrk(0) != (void *)((char *)b0 + 8192))
+            ok = 0;
+        if (ok) {
+            volatile uint32_t *w = (volatile uint32_t *)b1;
+            w[0] = 0xCAFE1234u;
+            w[2047] = 0xDEAD5678u;
+            if (w[0] != 0xCAFE1234u || w[2047] != 0xDEAD5678u)
+                ok = 0;
+        }
+        if (ok && (brk(b0) != 0 || sbrk(0) != b0))
+            ok = 0;
+
+        errno = 0;
+        if (brk((void *)0x1000ULL) != -1 || errno != ENOMEM)
+            ok = 0;
+        errno = 0;
+        if (brk((void *)0xFFFFFFFF80000000ULL) != -1 || errno != ENOMEM)
+            ok = 0;
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "brk_sbrk_heap", "brk/sbrk test failed");
+            return 73;
+        }
+        TSK_TEST_PASS("syscalls", "brk_sbrk_heap");
+        passed++;
+    }
+
+    /* Test 20: 8 MiB auto-growing stack fault test (> 3 MiB depth). */
+    {
+        if (stack_autogrow_probe(14, 0x5Au) != 0) {
+            TSK_TEST_FAIL("syscalls", "stack_autogrow_8mib", "deep stack fault failed");
+            return 74;
+        }
+        TSK_TEST_PASS("syscalls", "stack_autogrow_8mib");
+        passed++;
+    }
+
+    /* Test 21: /sys/memory breakdown keys check. */
+    {
+        int mfd = open("/sys/memory", O_RDONLY);
+        char mbuf[1024];
+        ssize_t mn = 0;
+        if (mfd >= 0) {
+            mn = read(mfd, mbuf, sizeof(mbuf) - 1);
+            close(mfd);
+        }
+        if (mn <= 0) {
+            TSK_TEST_FAIL("syscalls", "sysfs_memory_breakdown", "failed to read /sys/memory");
+            return 75;
+        }
+        mbuf[mn] = '\0';
+        if (!strstr(mbuf, "pmm_total_pages:") ||
+            !strstr(mbuf, "pmm_dma_free_pages:") ||
+            !strstr(mbuf, "pmm_dma32_free_pages:") ||
+            !strstr(mbuf, "pmm_normal_free_pages:") ||
+            !strstr(mbuf, "pagecache_pages:") ||
+            !strstr(mbuf, "kernel_stack_pages:") ||
+            !strstr(mbuf, "process_anon_pages:") ||
+            !strstr(mbuf, "process_stack_pages:") ||
+            !strstr(mbuf, "process_heap_pages:")) {
+            TSK_TEST_FAIL("syscalls", "sysfs_memory_breakdown", "missing fields in /sys/memory");
+            return 76;
+        }
+        TSK_TEST_PASS("syscalls", "sysfs_memory_breakdown");
         passed++;
     }
 

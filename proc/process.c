@@ -1067,14 +1067,13 @@ int process_adopt_private_address_space(void)
         vm_space_destroy(&priv);
         return p ? 0 : -1;
     }
-    p->vm_space.pml4_phys = priv.pml4_phys;
-    p->vm_space.user_min = priv.user_min;
-    p->vm_space.user_max = priv.user_max;
-    p->vm_space.shm_cursor = priv.shm_cursor;
-    p->vm_space.anon_cursor = priv.anon_cursor;
-    p->vm_space.mapped_pages = 0;
-    p->vm_space.shm_pages = 0;
-    p->vm_space.owns_pml4 = 1;
+    uint32_t cpu = sched_this_cpu();
+    p->vm_space = priv;
+    p->vm_space.mmap_rwsem.lock = SPINLOCK_INIT;
+    wait_queue_init(&p->vm_space.mmap_rwsem.waitq);
+    p->va_space = &p->vm_space;
+    if (cpu < 64u)
+        __atomic_or_fetch(&p->vm_space.active_cpus, (1ULL << cpu), __ATOMIC_SEQ_CST);
     vmm_switch_pml4(priv.pml4_phys);
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
@@ -1815,10 +1814,19 @@ static uint64_t process_schedule_core(uint64_t current_rsp, int is_timer_tick)
         if (next && next->kernel_stack)
             tss_set_rsp0_x64(process_stack_top_aligned(next));
     }
-    if (next && next->vm_space.owns_pml4 && next->vm_space.pml4_phys)
-        vmm_switch_pml4(next->vm_space.pml4_phys);
-    else if (vmm_get_kernel_pml4())
-        vmm_switch_pml4(vmm_get_kernel_pml4());
+    {
+        vm_space_t *prev_vs = (cur && cur->va_space) ? cur->va_space : (cur ? &cur->vm_space : NULL);
+        vm_space_t *next_vs = (next && next->va_space) ? next->va_space : (next ? &next->vm_space : NULL);
+        if (next_vs && next_vs->owns_pml4 && next_vs->pml4_phys) {
+            if (cpu < 64u)
+                __atomic_or_fetch(&next_vs->active_cpus, (1ULL << cpu), __ATOMIC_SEQ_CST);
+            vmm_switch_pml4(next_vs->pml4_phys);
+        } else if (vmm_get_kernel_pml4()) {
+            vmm_switch_pml4(vmm_get_kernel_pml4());
+        }
+        if (prev_vs && prev_vs != next_vs && prev_vs->owns_pml4 && cpu < 64u)
+            __atomic_and_fetch(&prev_vs->active_cpus, ~(1ULL << cpu), __ATOMIC_SEQ_CST);
+    }
 
     if (next && next != cur) {
         if (cur) {
@@ -1987,6 +1995,36 @@ int process_get_info(int pid, process_snapshot_t *out)
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
     return 0;
+}
+
+void process_get_memory_breakdown(process_mem_breakdown_t *out)
+{
+    process_mem_breakdown_t b = { 0 };
+    uint64_t flags = irq_save_disable();
+
+    spin_lock(&g_sched_lock);
+    for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
+        process_t *p = &g_processes[i];
+        if (!p->used || p->state == PROCESS_DEAD)
+            continue;
+        b.proc_count++;
+        b.mapped_pages += p->vm_space.mapped_pages;
+        b.shm_pages += p->vm_space.shm_pages;
+        b.shm_attachments += p->shm_attachment_count;
+        b.anon_pages += p->vm_space.anon_pages;
+        b.file_pages += p->vm_space.file_pages;
+        b.stack_pages += p->vm_space.stack_pages;
+        b.heap_pages += p->vm_space.heap_pages;
+        if (p->kernel_stack && p->kernel_stack_from_pmm)
+            b.kernel_stack_pages += PROCESS_STACK_PAGES;
+    }
+    if (g_cpu_count > 1)
+        b.kernel_stack_pages += (size_t)(g_cpu_count - 1) * 16u;
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+
+    if (out)
+        *out = b;
 }
 
 void process_get_memory_totals(size_t *proc_count_out,

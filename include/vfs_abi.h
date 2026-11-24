@@ -20,12 +20,15 @@
 #include <stdint.h>
 
 /* mmap prot bits (VFS_PROT_*) */
+#define VFS_PROT_NONE  0x0
 #define VFS_PROT_READ  0x1
 #define VFS_PROT_WRITE 0x2
+#define VFS_PROT_EXEC  0x4
 
 /* mmap flags (VFS_MAP_*) */
 #define VFS_MAP_SHARED     0x01
 #define VFS_MAP_PRIVATE    0x02
+#define VFS_MAP_FIXED      0x10
 #define VFS_MAP_ANONYMOUS  0x20
 #define VFS_MAP_ANON       VFS_MAP_ANONYMOUS
 

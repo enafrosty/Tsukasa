@@ -20,7 +20,8 @@
 #include <stdint.h>
 #include "sys/panic.h"
 
-#define IDT_VEC_YIELD 64u
+#define IDT_VEC_YIELD         64u
+#define IDT_VEC_TLB_SHOOTDOWN 0x42u
 
 void idt_init_x64(void);
 void idt_load(void);

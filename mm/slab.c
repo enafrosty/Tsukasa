@@ -39,6 +39,7 @@ typedef struct slab_page {
     uint16_t obj_start;
     uint16_t class_idx;
     uint16_t pad0;
+    uintptr_t phys_addr;
     struct slab_page *next;
     void *freelist;
 } slab_page_t;
@@ -140,7 +141,12 @@ static slab_page_t *slab_new_page(int cls)
     page->obj_start = (uint16_t)obj_start;
     page->class_idx = (uint16_t)cls;
     page->pad0 = 0;
+    page->phys_addr = phys;
     page->next = NULL;
+
+    page_t *pmm_pg = pmm_phys_to_page(phys);
+    if (pmm_pg)
+        pmm_pg->flags |= PAGE_FLAG_SLAB;
 
     uintptr_t base = (uintptr_t)page + obj_start;
     for (uint16_t k = 0; k + 1 < count; k++)
@@ -262,35 +268,73 @@ void *slab_kmalloc(size_t size)
     return obj;
 }
 
-int slab_kfree_if_owned(void *ptr)
+static int slab_free_locked(void *ptr, uintptr_t *reclaim_phys_out)
 {
     slab_page_t *page = NULL;
+    if (reclaim_phys_out)
+        *reclaim_phys_out = 0;
+
+    if (!slab_owns_locked(ptr, &page))
+        return 0;
+
+    if (page->free_count >= page->total_count ||
+        ptr_is_free_in_page(page, ptr)) {
+        if (!g_warned_double_free) {
+            g_warned_double_free = 1;
+            kprintf("[slab] WARN: double free rejected ptr=0x%08x%08x cls=%u\n",
+                    (uint32_t)(((uint64_t)(uintptr_t)ptr) >> 32),
+                    (uint32_t)((uintptr_t)ptr & 0xFFFFFFFFu),
+                    page->class_idx);
+        }
+        return 1;
+    }
+
+    *(void **)ptr = page->freelist;
+    page->freelist = ptr;
+    page->free_count++;
+    g_caches[page->class_idx].frees++;
+    g_total_frees++;
+
+    if (page->free_count == page->total_count) {
+        slab_cache_t *cache = &g_caches[page->class_idx];
+        if (cache->pages == page) {
+            cache->pages = page->next;
+        } else {
+            slab_page_t *prev = cache->pages;
+            while (prev && prev->next != page)
+                prev = prev->next;
+            if (prev)
+                prev->next = page->next;
+        }
+        if (cache->page_count > 0)
+            cache->page_count--;
+        if (g_total_pages > 0)
+            g_total_pages--;
+        if (reclaim_phys_out)
+            *reclaim_phys_out = page->phys_addr;
+        page->magic = 0;
+        page->magic_inv = 0;
+        page->next = NULL;
+        page->freelist = NULL;
+    }
+    return 1;
+}
+
+int slab_kfree_if_owned(void *ptr)
+{
+    uintptr_t reclaim_phys = 0;
     int handled = 0;
 
     if (!ptr)
         return 0;
 
     unsigned long irq_flags = spin_lock_irqsave(&g_slab_lock);
-    if (slab_owns_locked(ptr, &page)) {
-        handled = 1;
-        if (page->free_count >= page->total_count ||
-            ptr_is_free_in_page(page, ptr)) {
-            if (!g_warned_double_free) {
-                g_warned_double_free = 1;
-                kprintf("[slab] WARN: double free rejected ptr=0x%08x%08x cls=%u\n",
-                        (uint32_t)(((uint64_t)(uintptr_t)ptr) >> 32),
-                        (uint32_t)((uintptr_t)ptr & 0xFFFFFFFFu),
-                        page->class_idx);
-            }
-        } else {
-            *(void **)ptr = page->freelist;
-            page->freelist = ptr;
-            page->free_count++;
-            g_caches[page->class_idx].frees++;
-            g_total_frees++;
-        }
-    }
+    handled = slab_free_locked(ptr, &reclaim_phys);
     spin_unlock_irqrestore(&g_slab_lock, irq_flags);
+
+    if (reclaim_phys)
+        pmm_free_pages(reclaim_phys, 1);
+
     return handled;
 }
 
@@ -315,35 +359,82 @@ void slab_run_selftests(void)
     kprintf("[guide09][test] start\n");
 
     {
-        void *first = slab_kmalloc(8);
-        uintptr_t page_base = (uintptr_t)first & ~(uintptr_t)(PAGE_SIZE - 1);
-        const slab_page_t *pg = (const slab_page_t *)page_base;
-        uint16_t total = pg->total_count;
-        uintptr_t prev = (uintptr_t)first;
-        int ok = (first != NULL) && (total > 400);
+        static void *pre[512];
+        static uintptr_t reclaim_list[16];
+        size_t pre_cnt = 0;
+        size_t rec_cnt = 0;
+        uint16_t total = 0;
+        int ok = 1;
 
-        for (uint16_t k = 1; ok && k < total; k++) {
-            void *p = slab_kmalloc(8);
-            if (!p || ((uintptr_t)p & ~(uintptr_t)(PAGE_SIZE - 1)) != page_base ||
-                (uintptr_t)p != prev + 8) {
+        unsigned long irq_flags = spin_lock_irqsave(&g_slab_lock);
+        void *first = slab_alloc_locked(0);
+        while (first) {
+            uintptr_t pb = (uintptr_t)first & ~(uintptr_t)(PAGE_SIZE - 1);
+            const slab_page_t *pg = (const slab_page_t *)pb;
+            if (pg->free_count == (uint16_t)(pg->total_count - 1u))
+                break;
+            if (pre_cnt >= 512u) {
                 ok = 0;
                 break;
             }
-            prev = (uintptr_t)p;
+            pre[pre_cnt++] = first;
+            first = slab_alloc_locked(0);
         }
-        if (ok && pg->free_count != 0)
-            ok = 0;
 
-        for (uintptr_t p = prev; ok && p >= page_base + pg->obj_start; p -= 8) {
-            if (!slab_kfree_if_owned((void *)p))
-                ok = 0;
-        }
-        if (ok && (pg->free_count != total))
+        if (!first)
             ok = 0;
 
         if (ok) {
+            uintptr_t page_base = (uintptr_t)first & ~(uintptr_t)(PAGE_SIZE - 1);
+            const slab_page_t *pg = (const slab_page_t *)page_base;
+            total = pg->total_count;
+            uint16_t obj_start = pg->obj_start;
+            uintptr_t prev = (uintptr_t)first;
+
+            if (total <= 400)
+                ok = 0;
+
+            for (uint16_t k = 1; ok && k < total; k++) {
+                void *p = slab_alloc_locked(0);
+                if (!p || ((uintptr_t)p & ~(uintptr_t)(PAGE_SIZE - 1)) != page_base ||
+                    (uintptr_t)p != prev + 8) {
+                    ok = 0;
+                    break;
+                }
+                prev = (uintptr_t)p;
+            }
+            if (ok && pg->free_count != 0)
+                ok = 0;
+
+            int saw_reclaim = 0;
+            for (uintptr_t p = prev; ok && p >= page_base + obj_start; p -= 8) {
+                uintptr_t rp = 0;
+                if (!slab_free_locked((void *)p, &rp))
+                    ok = 0;
+                if (rp) {
+                    saw_reclaim = 1;
+                    if (rec_cnt < 16u)
+                        reclaim_list[rec_cnt++] = rp;
+                }
+            }
+            if (ok && !saw_reclaim)
+                ok = 0;
+        }
+
+        for (size_t i = 0; i < pre_cnt; i++) {
+            uintptr_t rp = 0;
+            (void)slab_free_locked(pre[i], &rp);
+            if (rp && rec_cnt < 16u)
+                reclaim_list[rec_cnt++] = rp;
+        }
+        spin_unlock_irqrestore(&g_slab_lock, irq_flags);
+
+        for (size_t i = 0; i < rec_cnt; i++)
+            pmm_free_pages(reclaim_list[i], 1);
+
+        if (ok) {
             pass++;
-            kprintf("[guide09] slot walk PASS (class0 slots=%u, freelist restored)\n",
+            kprintf("[guide09] slot walk PASS (class0 slots=%u, reclaimed)\n",
                     total);
         } else {
             fail++;
@@ -394,8 +485,9 @@ void slab_run_selftests(void)
 
     {
         slab_stats_t s0, s1;
+        void *anchor = slab_kmalloc(32);
         void *p = slab_kmalloc(32);
-        int ok = (p != NULL);
+        int ok = (anchor != NULL && p != NULL);
 
         if (ok)
             ok = slab_kfree_if_owned(p) == 1;
@@ -405,6 +497,8 @@ void slab_run_selftests(void)
         slab_get_stats(&s1);
         if (ok && s1.frees != s0.frees)
             ok = 0;
+        if (anchor)
+            (void)slab_kfree_if_owned(anchor);
 
         if (ok) {
             pass++;
@@ -459,5 +553,45 @@ void slab_run_selftests(void)
         }
     }
 
-    kprintf("[guide09][test] done pass=%d fail=%d\n", pass, fail);
+    {
+        enum { RECLAIM_OBJS = 512, RECLAIM_ROUNDS = 20 };
+        static void *objs[RECLAIM_OBJS];
+        slab_stats_t s0, s1;
+        uintptr_t pmm_before = pmm_free_page_count();
+        int ok = 1;
+
+        slab_get_stats(&s0);
+        for (int r = 0; r < RECLAIM_ROUNDS && ok; r++) {
+            for (int i = 0; i < RECLAIM_OBJS; i++) {
+                objs[i] = slab_kmalloc(256);
+                if (!objs[i]) {
+                    ok = 0;
+                    break;
+                }
+            }
+            for (int i = 0; i < RECLAIM_OBJS; i++) {
+                if (objs[i]) {
+                    (void)slab_kfree_if_owned(objs[i]);
+                    objs[i] = NULL;
+                }
+            }
+        }
+        slab_get_stats(&s1);
+        uintptr_t pmm_after = pmm_free_page_count();
+        if (ok && (s1.pages != s0.pages || pmm_after != pmm_before))
+            ok = 0;
+
+        if (ok) {
+            pass++;
+            kprintf("[selftest] slab reclaim PASS (10240 cycles pages=%u pmm_free=%u)\n",
+                    (unsigned)s1.pages, (unsigned)pmm_after);
+        } else {
+            fail++;
+            kprintf("[selftest] slab reclaim FAIL (pages %u->%u pmm %u->%u)\n",
+                    (unsigned)s0.pages, (unsigned)s1.pages,
+                    (unsigned)pmm_before, (unsigned)pmm_after);
+        }
+    }
+
+    kprintf("[guide09][test] done pass=%d errors=%d\n", pass, fail);
 }
