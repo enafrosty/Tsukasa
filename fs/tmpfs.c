@@ -525,15 +525,35 @@ static int split_parent(const char *subpath, char *parent_out, size_t cap,
 
 void tmpfs_stat_inode(const tmpfs_inode_t *ino, vfs_stat_t *out)
 {
+    uint32_t ifmt;
     if (!ino || !out)
         return;
+    t_zero(out, sizeof(*out));
     out->size = (uint64_t)ino->size;
     out->blocks = ((uint64_t)ino->size + 511ULL) / 512ULL;
     out->mode = VFS_MODE_READ | VFS_MODE_WRITE;
-    if (ino->type == TMPFS_TYPE_DIR)
+    if (ino->type == TMPFS_TYPE_DIR) {
         out->type = VFS_TYPE_DIR;
-    else
+        ifmt = 0040000U;
+    } else if (ino->type == TMPFS_TYPE_SYMLINK) {
+        out->type = VFS_TYPE_SYMLINK;
+        ifmt = 0120000U;
+    } else {
         out->type = VFS_TYPE_FILE;
+        ifmt = 0100000U;
+    }
+    out->st_ino = ino->ino;
+    out->st_mode = ifmt | (ino->mode & TMPFS_MODE_MASK);
+    out->st_nlink = ino->nlink ? ino->nlink : 1U;
+    out->st_uid = ino->uid;
+    out->st_gid = ino->gid;
+    out->st_rdev = 0;
+    out->st_size = (uint64_t)ino->size;
+    out->st_blksize = TMPFS_PAGE_SIZE;
+    out->st_blocks = out->blocks;
+    out->st_atime = (int64_t)ino->atime;
+    out->st_mtime = (int64_t)ino->mtime;
+    out->st_ctime = (int64_t)ino->ctime;
 }
 
 int tmpfs_stat(tmpfs_fs_t *fs, const char *subpath, int follow_symlinks, vfs_stat_t *out)
@@ -581,7 +601,7 @@ int tmpfs_mkdir(tmpfs_fs_t *fs, const char *subpath, uint32_t mode)
         return -EEXIST;
     }
 
-    dir = inode_alloc(fs, TMPFS_TYPE_DIR, mode ? mode : 0755U);
+    dir = inode_alloc(fs, TMPFS_TYPE_DIR, mode & TMPFS_MODE_MASK);
     if (!dir) {
         spin_unlock_irqrestore(&fs->lock, flags);
         return -ENOMEM;
@@ -678,7 +698,7 @@ int tmpfs_rmdir(tmpfs_fs_t *fs, const char *subpath)
     }
     if (de->inode->children != NULL) {
         spin_unlock_irqrestore(&fs->lock, flags);
-        return -EINVAL;
+        return -ENOTEMPTY;
     }
 
     if (prev)
@@ -772,7 +792,7 @@ int tmpfs_create_file(tmpfs_fs_t *fs, const char *subpath, uint32_t mode,
         return 0;
     }
 
-    ino = inode_alloc(fs, TMPFS_TYPE_FILE, mode ? mode : 0644U);
+    ino = inode_alloc(fs, TMPFS_TYPE_FILE, mode & TMPFS_MODE_MASK);
     if (!ino) {
         spin_unlock_irqrestore(&fs->lock, flags);
         return -ENOMEM;
@@ -862,8 +882,12 @@ int tmpfs_readlink(tmpfs_fs_t *fs, const char *subpath, char *buf, size_t cap)
         if (ino->type != TMPFS_TYPE_SYMLINK || !ino->symlink_target) {
             rc = -EINVAL;
         } else {
-            t_strcpy(buf, ino->symlink_target, (int)cap);
-            rc = t_strlen(buf);
+            int tlen = t_strlen(ino->symlink_target);
+            size_t copy_len = ((size_t)tlen < cap) ? (size_t)tlen : cap;
+            t_memcpy(buf, ino->symlink_target, copy_len);
+            if (copy_len < cap)
+                buf[copy_len] = '\0';
+            rc = (int)copy_len;
         }
     }
     spin_unlock_irqrestore(&fs->lock, flags);
@@ -902,7 +926,7 @@ int tmpfs_unlink(tmpfs_fs_t *fs, const char *subpath)
     }
     if (de->inode->type == TMPFS_TYPE_DIR) {
         spin_unlock_irqrestore(&fs->lock, flags);
-        return -EINVAL;
+        return -EISDIR;
     }
 
     if (prev)
@@ -1203,6 +1227,21 @@ uint32_t tmpfs_inode_mode(const tmpfs_inode_t *ino)
     return ino ? ino->mode : 0;
 }
 
+uint64_t tmpfs_inode_ino(const tmpfs_inode_t *ino)
+{
+    return ino ? ino->ino : 0;
+}
+
+uint32_t tmpfs_inode_uid(const tmpfs_inode_t *ino)
+{
+    return ino ? ino->uid : 0;
+}
+
+uint32_t tmpfs_inode_gid(const tmpfs_inode_t *ino)
+{
+    return ino ? ino->gid : 0;
+}
+
 void tmpfs_set_attrs(tmpfs_inode_t *ino, uint32_t mode, uint32_t uid,
                      uint32_t gid, uint64_t mtime)
 {
@@ -1213,4 +1252,31 @@ void tmpfs_set_attrs(tmpfs_inode_t *ino, uint32_t mode, uint32_t uid,
     ino->gid = gid;
     if (mtime != 0)
         ino->mtime = mtime;
+}
+
+int tmpfs_chmod_inode(tmpfs_inode_t *ino, uint32_t mode)
+{
+    unsigned long flags;
+    if (!ino)
+        return -EINVAL;
+    flags = spin_lock_irqsave(&ino->io_lock);
+    ino->mode = mode & TMPFS_MODE_MASK;
+    ino->ctime = tmpfs_now_sec();
+    spin_unlock_irqrestore(&ino->io_lock, flags);
+    return 0;
+}
+
+int tmpfs_chown_inode(tmpfs_inode_t *ino, uint32_t uid, uint32_t gid)
+{
+    unsigned long flags;
+    if (!ino)
+        return -EINVAL;
+    flags = spin_lock_irqsave(&ino->io_lock);
+    if (uid != (uint32_t)-1)
+        ino->uid = uid;
+    if (gid != (uint32_t)-1)
+        ino->gid = gid;
+    ino->ctime = tmpfs_now_sec();
+    spin_unlock_irqrestore(&ino->io_lock, flags);
+    return 0;
 }

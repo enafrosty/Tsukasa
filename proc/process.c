@@ -157,6 +157,9 @@ static void process_init_io_state(process_t *p, const process_t *parent)
         p->fds[i].file_desc = -1;
     }
     p->next_fd = 0;
+    p->umask = parent ? (parent->umask & 0777U) : 0022U;
+    p->fd_lock = SPINLOCK_INIT;
+    p->io_pad = 0;
     if (parent && parent->cwd[0]) {
         name_copy(p->cwd, parent->cwd, PROCESS_CWD_MAX);
     } else {

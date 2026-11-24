@@ -1,5 +1,5 @@
 /*
- * Project Tsukasa — AF_UNIX listener registry (guide 20)
+ * Project Tsukasa - AF_UNIX listener registry and dynamic stream ring buffers
  *
  * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
@@ -17,17 +17,33 @@
 #include "unix_socket.h"
 #include "../include/errno.h"
 #include "../include/spinlock.h"
+#include "../include/vfs_abi.h"
+#include "../mm/heap.h"
 #ifdef __x86_64__
-/* The accept wait queue is a wakeup hook for future blocking accept (SPEC-K01 poll integration). */
+#include "../proc/process.h"
 #include "../sys/wait_queue.h"
 #endif
 
+struct unix_ring {
+    uint8_t *data;
+    size_t capacity;
+    size_t read_pos;
+    size_t write_pos;
+    size_t size;
+    int readers;
+    int writers;
+    spinlock_t lock;
+#ifdef __x86_64__
+    wait_queue_head_t waitq;
+#endif
+};
+
 struct unix_listener {
-    int used;
     char path[TSK_UNIX_PATH_MAX];
     int owner_pid;
     int owner_fd;
     int listening;
+    int active;
     spinlock_t lock;
 #ifdef __x86_64__
     wait_queue_head_t accept_waitq;
@@ -35,10 +51,203 @@ struct unix_listener {
     unix_pending_conn_t pending[UNIX_BACKLOG];
     int pend_head;
     int pend_count;
+    struct unix_listener *next;
 };
 
-static struct unix_listener g_listeners[UNIX_MAX_LISTENERS];
+static struct unix_listener *g_listener_head = NULL;
 static spinlock_t g_registry_lock = SPINLOCK_INIT;
+
+unix_ring_t *unix_ring_create(void)
+{
+    unix_ring_t *r = (unix_ring_t *)kmalloc(sizeof(unix_ring_t));
+    if (!r)
+        return NULL;
+    r->data = (uint8_t *)kmalloc(UNIX_RING_CAPACITY);
+    if (!r->data) {
+        kfree(r);
+        return NULL;
+    }
+    r->capacity = UNIX_RING_CAPACITY;
+    r->read_pos = 0;
+    r->write_pos = 0;
+    r->size = 0;
+    r->readers = 1;
+    r->writers = 1;
+    r->lock = SPINLOCK_INIT;
+#ifdef __x86_64__
+    wait_queue_init(&r->waitq);
+#endif
+    return r;
+}
+
+void unix_ring_drop_claim(unix_ring_t *r, int drop_reader, int drop_writer)
+{
+    unsigned long flags;
+    int empty_claims;
+    if (!r)
+        return;
+
+    flags = spin_lock_irqsave(&r->lock);
+    if (drop_reader && r->readers > 0)
+        r->readers--;
+    if (drop_writer && r->writers > 0)
+        r->writers--;
+    empty_claims = (r->readers == 0 && r->writers == 0);
+    spin_unlock_irqrestore(&r->lock, flags);
+
+#ifdef __x86_64__
+    wait_queue_wake_all(&r->waitq);
+#endif
+    if (empty_claims) {
+        if (r->data)
+            kfree(r->data);
+        kfree(r);
+    }
+}
+
+size_t unix_ring_read(unix_ring_t *r, void *buf, size_t count, int nonblock, int *err_out)
+{
+    uint8_t *dst = (uint8_t *)buf;
+    if (err_out)
+        *err_out = 0;
+    if (!r || !dst || count == 0)
+        return 0;
+
+    for (;;) {
+        unsigned long flags = spin_lock_irqsave(&r->lock);
+        if (r->size > 0) {
+            size_t got = 0;
+            while (got < count && r->size > 0) {
+                dst[got++] = r->data[r->read_pos];
+                r->read_pos = (r->read_pos + 1U) % r->capacity;
+                r->size--;
+            }
+            spin_unlock_irqrestore(&r->lock, flags);
+#ifdef __x86_64__
+            if (got > 0)
+                wait_queue_wake_all(&r->waitq);
+#endif
+            return got;
+        }
+        if (r->writers == 0) {
+            spin_unlock_irqrestore(&r->lock, flags);
+            return 0;
+        }
+        if (nonblock) {
+            spin_unlock_irqrestore(&r->lock, flags);
+            if (err_out)
+                *err_out = -EAGAIN;
+            return 0;
+        }
+#ifdef __x86_64__
+        process_t *proc = process_current();
+        if (!proc) {
+            spin_unlock_irqrestore(&r->lock, flags);
+            return 0;
+        }
+        wait_queue_entry_t wqe;
+        wqe.proc = proc;
+        wqe.next = NULL;
+        wait_queue_prepare_to_wait(&r->waitq, &wqe);
+        spin_unlock_irqrestore(&r->lock, flags);
+        process_yield();
+        wait_queue_finish_wait(&r->waitq, &wqe);
+#else
+        spin_unlock_irqrestore(&r->lock, flags);
+        return 0;
+#endif
+    }
+}
+
+size_t unix_ring_write(unix_ring_t *r, const void *buf, size_t count, int nonblock, int *err_out)
+{
+    const uint8_t *src = (const uint8_t *)buf;
+    if (err_out)
+        *err_out = 0;
+    if (!r || !src || count == 0)
+        return 0;
+
+    for (;;) {
+        unsigned long flags = spin_lock_irqsave(&r->lock);
+        if (r->readers == 0) {
+            spin_unlock_irqrestore(&r->lock, flags);
+            if (err_out)
+                *err_out = -EPIPE;
+            return 0;
+        }
+        if (r->size < r->capacity) {
+            size_t wr = 0;
+            while (wr < count && r->size < r->capacity) {
+                r->data[r->write_pos] = src[wr++];
+                r->write_pos = (r->write_pos + 1U) % r->capacity;
+                r->size++;
+            }
+            spin_unlock_irqrestore(&r->lock, flags);
+#ifdef __x86_64__
+            if (wr > 0)
+                wait_queue_wake_all(&r->waitq);
+#endif
+            return wr;
+        }
+        if (nonblock) {
+            spin_unlock_irqrestore(&r->lock, flags);
+            if (err_out)
+                *err_out = -EAGAIN;
+            return 0;
+        }
+#ifdef __x86_64__
+        process_t *proc = process_current();
+        if (!proc) {
+            spin_unlock_irqrestore(&r->lock, flags);
+            return 0;
+        }
+        wait_queue_entry_t wqe;
+        wqe.proc = proc;
+        wqe.next = NULL;
+        wait_queue_prepare_to_wait(&r->waitq, &wqe);
+        spin_unlock_irqrestore(&r->lock, flags);
+        process_yield();
+        wait_queue_finish_wait(&r->waitq, &wqe);
+#else
+        spin_unlock_irqrestore(&r->lock, flags);
+        return 0;
+#endif
+    }
+}
+
+size_t unix_ring_avail(unix_ring_t *r)
+{
+    unsigned long flags;
+    size_t sz;
+    if (!r)
+        return 0;
+    flags = spin_lock_irqsave(&r->lock);
+    sz = r->size;
+    spin_unlock_irqrestore(&r->lock, flags);
+    return sz;
+}
+
+int unix_ring_poll_mask(unix_ring_t *rx, unix_ring_t *tx)
+{
+    int mask = 0;
+    if (rx) {
+        unsigned long flags = spin_lock_irqsave(&rx->lock);
+        if (rx->size > 0)
+            mask |= VFS_POLLIN;
+        if (rx->writers == 0)
+            mask |= VFS_POLLHUP;
+        spin_unlock_irqrestore(&rx->lock, flags);
+    }
+    if (tx) {
+        unsigned long flags = spin_lock_irqsave(&tx->lock);
+        if (tx->readers == 0)
+            mask |= VFS_POLLERR | VFS_POLLHUP;
+        else if (tx->size < tx->capacity)
+            mask |= VFS_POLLOUT;
+        spin_unlock_irqrestore(&tx->lock, flags);
+    }
+    return mask;
+}
 
 static int upath_len(const char *s)
 {
@@ -58,52 +267,51 @@ static int upath_eq(const char *a, const char *b)
     return a[i] == '\0' && b[i] == '\0';
 }
 
-/* Registry-lock-only path search (caller holds g_registry_lock). */
 static struct unix_listener *find_locked(const char *path)
 {
-    for (int i = 0; i < UNIX_MAX_LISTENERS; i++) {
-        if (g_listeners[i].used && upath_eq(g_listeners[i].path, path))
-            return &g_listeners[i];
+    struct unix_listener *curr = g_listener_head;
+    while (curr) {
+        if (curr->active && upath_eq(curr->path, path))
+            return curr;
+        curr = curr->next;
     }
-    return (struct unix_listener *)0;
+    return NULL;
 }
 
 int unix_register_listener(const char *path, int owner_pid, int owner_fd)
 {
     unsigned long flags;
-    struct unix_listener *l = (struct unix_listener *)0;
+    struct unix_listener *l;
     int len = upath_len(path);
 
     if (!path || len == 0 || len >= TSK_UNIX_PATH_MAX)
         return -EINVAL;
 
-    flags = spin_lock_irqsave(&g_registry_lock);
-    if (find_locked(path)) {
-        spin_unlock_irqrestore(&g_registry_lock, flags);
-        return -EADDRINUSE;
-    }
-    for (int i = 0; i < UNIX_MAX_LISTENERS; i++) {
-        if (!g_listeners[i].used) {
-            l = &g_listeners[i];
-            break;
-        }
-    }
-    if (!l) {
-        spin_unlock_irqrestore(&g_registry_lock, flags);
-        return -ENOSPC;
-    }
-    l->used = 1;
+    l = (struct unix_listener *)kmalloc(sizeof(struct unix_listener));
+    if (!l)
+        return -ENOMEM;
+
     for (int i = 0; i < TSK_UNIX_PATH_MAX; i++)
         l->path[i] = (i < len) ? path[i] : '\0';
     l->owner_pid = owner_pid;
     l->owner_fd = owner_fd;
     l->listening = 0;
+    l->active = 1;
     l->lock = SPINLOCK_INIT;
 #ifdef __x86_64__
     wait_queue_init(&l->accept_waitq);
 #endif
     l->pend_head = 0;
     l->pend_count = 0;
+
+    flags = spin_lock_irqsave(&g_registry_lock);
+    if (find_locked(path)) {
+        spin_unlock_irqrestore(&g_registry_lock, flags);
+        kfree(l);
+        return -EADDRINUSE;
+    }
+    l->next = g_listener_head;
+    g_listener_head = l;
     spin_unlock_irqrestore(&g_registry_lock, flags);
     return 0;
 }
@@ -111,24 +319,32 @@ int unix_register_listener(const char *path, int owner_pid, int owner_fd)
 int unix_unregister_listener(const char *path)
 {
     unsigned long flags;
-    struct unix_listener *l;
+    struct unix_listener *prev = NULL;
+    struct unix_listener *curr;
 
     if (!path)
         return -EINVAL;
     flags = spin_lock_irqsave(&g_registry_lock);
-    l = find_locked(path);
-    if (!l) {
-        spin_unlock_irqrestore(&g_registry_lock, flags);
-        return -ENOENT;
+    curr = g_listener_head;
+    while (curr) {
+        if (curr->active && upath_eq(curr->path, path)) {
+            if (prev)
+                prev->next = curr->next;
+            else
+                g_listener_head = curr->next;
+            curr->active = 0;
+            curr->listening = 0;
+            curr->pend_head = 0;
+            curr->pend_count = 0;
+            spin_unlock_irqrestore(&g_registry_lock, flags);
+            kfree(curr);
+            return 0;
+        }
+        prev = curr;
+        curr = curr->next;
     }
-    /* The owner dequeues pendings before unregistering (fs/vfs.c drops the pipe claims); anything left is... */
-    l->used = 0;
-    l->path[0] = '\0';
-    l->listening = 0;
-    l->pend_head = 0;
-    l->pend_count = 0;
     spin_unlock_irqrestore(&g_registry_lock, flags);
-    return 0;
+    return -ENOENT;
 }
 
 unix_listener_t *unix_find_listener(const char *path)
@@ -137,7 +353,7 @@ unix_listener_t *unix_find_listener(const char *path)
     struct unix_listener *l;
 
     if (!path)
-        return (unix_listener_t *)0;
+        return NULL;
     flags = spin_lock_irqsave(&g_registry_lock);
     l = find_locked(path);
     spin_unlock_irqrestore(&g_registry_lock, flags);
@@ -163,7 +379,7 @@ int unix_enqueue_pending(unix_listener_t *lst, const unix_pending_conn_t *pc)
     if (!lst || !pc)
         return -1;
     flags = spin_lock_irqsave(&lst->lock);
-    if (!lst->used || lst->pend_count >= UNIX_BACKLOG) {
+    if (!lst->active || lst->pend_count >= UNIX_BACKLOG) {
         spin_unlock_irqrestore(&lst->lock, flags);
         return -1;
     }
@@ -213,6 +429,11 @@ wait_queue_head_t *unix_listener_get_accept_waitq(unix_listener_t *lst)
 {
     return lst ? &lst->accept_waitq : NULL;
 }
+
+wait_queue_head_t *unix_ring_get_waitq(unix_ring_t *r)
+{
+    return r ? &r->waitq : NULL;
+}
 #endif
 
 void unix_socket_run_selftests(void)
@@ -223,15 +444,12 @@ void unix_socket_run_selftests(void)
     unix_pending_conn_t out_conn;
     int rc;
 
-    /* Clean slate */
     unix_unregister_listener(test_path);
 
     rc = unix_register_listener(test_path, 1, 3);
-    if (rc != 0) {
+    if (rc != 0)
         return;
-    }
 
-    /* Duplicate registration must fail */
     if (unix_register_listener(test_path, 2, 4) != -EADDRINUSE) {
         unix_unregister_listener(test_path);
         return;
@@ -254,8 +472,8 @@ void unix_socket_run_selftests(void)
         return;
     }
 
-    in_conn.pipe1 = (void *)0x1000;
-    in_conn.pipe2 = (void *)0x2000;
+    in_conn.pipe1 = (unix_ring_t *)0x1000;
+    in_conn.pipe2 = (unix_ring_t *)0x2000;
     in_conn.client_pid = 42;
     in_conn.client_fd = 5;
 

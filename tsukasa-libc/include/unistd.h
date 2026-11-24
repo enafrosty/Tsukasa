@@ -27,6 +27,11 @@
 #define SEEK_CUR 1
 #define SEEK_END 2
 
+#define F_OK 0
+#define X_OK 1
+#define W_OK 2
+#define R_OK 4
+
 extern char **environ;
 
 ssize_t read(int fd, void *buf, size_t count);
@@ -41,6 +46,13 @@ char *getcwd(char *buf, size_t size);
 int chdir(const char *path);
 int unlink(const char *pathname);
 int rmdir(const char *pathname);
+int access(const char *pathname, int mode);
+int chown(const char *pathname, uid_t owner, gid_t group);
+int fchown(int fd, uid_t owner, gid_t group);
+int truncate(const char *path, off_t length);
+int ftruncate(int fd, off_t length);
+int symlink(const char *target, const char *linkpath);
+ssize_t readlink(const char *pathname, char *buf, size_t bufsiz);
 int list_dir(const char *dir, char names[][64], int max);
 int isatty(int fd);
 

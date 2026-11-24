@@ -39,7 +39,7 @@ LIMINE_REPO = https://github.com/limine-bootloader/limine.git
 LIMINE_BRANCH = v8.x-binary
 
 COMMON_OBJS = vga.o \
-    mm/pmm.o mm/heap.o mm/slab.o mm/tlsf.o mm/vmm_x64.o mm/vm_space.o \
+    mm/pmm.o mm/heap.o mm/slab.o mm/tlsf.o mm/vmm_x64.o mm/vm_space.o mm/pagecache.o \
     drv/fb.o drv/pic.o drv/pit.o drv/ps2kbd.o drv/irq.o drv/ps2mouse.o \
     drv/serial.o drv/ata.o drv/blockdev.o drv/diskmgr.o drv/rtc.o \
     drv/input_dev.o \
