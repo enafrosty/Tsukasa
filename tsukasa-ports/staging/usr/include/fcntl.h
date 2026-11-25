@@ -29,9 +29,15 @@
 #define O_EXCL      0x0040
 #define O_NOFOLLOW  0x0080
 #define O_DIRECTORY 0x0100
+#define O_CLOEXEC   0x0200
 
-#define F_GETFL 1
-#define F_SETFL 2
+#define F_DUPFD         0
+#define F_GETFL         1
+#define F_SETFL         2
+#define F_GETFD         3
+#define F_SETFD         4
+#define F_DUPFD_CLOEXEC 1030
+#define FD_CLOEXEC      1
 
 int open(const char *pathname, int flags, ...);
 int fcntl(int fd, int cmd, ...);

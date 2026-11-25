@@ -240,10 +240,6 @@ unsigned long long strtoull(const char *nptr, char **endptr, int base)
     return v;
 }
 
-static char g_env_home[] = "/";
-static char g_env_path[] = "/bin:/usr/bin:/sbin";
-static char g_env_term[] = "xterm";
-
 static char *g_default_environ[] = {
     "HOME=/",
     "PATH=/bin:/usr/bin:/sbin",
@@ -251,29 +247,133 @@ static char *g_default_environ[] = {
     NULL
 };
 char **environ = g_default_environ;
+static int g_environ_allocated = 0;
+
+static size_t env_key_len(const char *name)
+{
+    size_t len = 0;
+    if (!name || !name[0])
+        return 0;
+    while (name[len]) {
+        if (name[len] == '=')
+            return 0;
+        len++;
+    }
+    return len;
+}
+
+static int env_match_entry(const char *entry, const char *name, size_t nlen)
+{
+    if (!entry || !name || nlen == 0)
+        return 0;
+    for (size_t i = 0; i < nlen; i++) {
+        if (entry[i] != name[i])
+            return 0;
+    }
+    return entry[nlen] == '=';
+}
 
 char *getenv(const char *name)
 {
-    if (!name)
+    size_t nlen = env_key_len(name);
+    if (nlen == 0 || !environ)
         return NULL;
-    if (name[0] == 'H' && name[1] == 'O' && name[2] == 'M' && name[3] == 'E' && name[4] == '\0')
-        return g_env_home;
-    if (name[0] == 'P' && name[1] == 'A' && name[2] == 'T' && name[3] == 'H' && name[4] == '\0')
-        return g_env_path;
-    if (name[0] == 'T' && name[1] == 'E' && name[2] == 'R' && name[3] == 'M' && name[4] == '\0')
-        return g_env_term;
+    for (size_t i = 0; environ[i]; i++) {
+        if (env_match_entry(environ[i], name, nlen))
+            return environ[i] + nlen + 1;
+    }
     return NULL;
 }
 
 int setenv(const char *name, const char *value, int overwrite)
 {
-    (void)name; (void)value; (void)overwrite;
+    size_t nlen = env_key_len(name);
+    if (nlen == 0 || !value)
+        return -1;
+
+    size_t count = 0;
+    size_t found_idx = (size_t)-1;
+    if (environ) {
+        while (environ[count]) {
+            if (found_idx == (size_t)-1 && env_match_entry(environ[count], name, nlen))
+                found_idx = count;
+            count++;
+        }
+    }
+
+    if (found_idx != (size_t)-1 && !overwrite)
+        return 0;
+
+    size_t vlen = strlen(value);
+    char *kv = (char *)malloc(nlen + 1 + vlen + 1);
+    if (!kv)
+        return -1;
+    memcpy(kv, name, nlen);
+    kv[nlen] = '=';
+    memcpy(kv + nlen + 1, value, vlen + 1);
+
+    if (found_idx != (size_t)-1) {
+        if (!g_environ_allocated) {
+            char **copy = (char **)malloc((count + 1) * sizeof(char *));
+            if (!copy) {
+                free(kv);
+                return -1;
+            }
+            for (size_t i = 0; i < count; i++)
+                copy[i] = environ[i];
+            copy[count] = NULL;
+            environ = copy;
+            g_environ_allocated = 1;
+        }
+        environ[found_idx] = kv;
+        return 0;
+    }
+
+    char **new_env = (char **)malloc((count + 2) * sizeof(char *));
+    if (!new_env) {
+        free(kv);
+        return -1;
+    }
+    for (size_t i = 0; i < count; i++)
+        new_env[i] = environ[i];
+    new_env[count] = kv;
+    new_env[count + 1] = NULL;
+    if (g_environ_allocated)
+        free(environ);
+    environ = new_env;
+    g_environ_allocated = 1;
     return 0;
 }
 
 int unsetenv(const char *name)
 {
-    (void)name;
+    size_t nlen = env_key_len(name);
+    if (nlen == 0)
+        return -1;
+    if (!environ)
+        return 0;
+
+    size_t count = 0;
+    while (environ[count])
+        count++;
+
+    if (!g_environ_allocated) {
+        char **copy = (char **)malloc((count + 1) * sizeof(char *));
+        if (!copy)
+            return -1;
+        for (size_t i = 0; i <= count; i++)
+            copy[i] = environ[i];
+        environ = copy;
+        g_environ_allocated = 1;
+    }
+
+    size_t w = 0;
+    for (size_t r = 0; r < count; r++) {
+        if (env_match_entry(environ[r], name, nlen))
+            continue;
+        environ[w++] = environ[r];
+    }
+    environ[w] = NULL;
     return 0;
 }
 

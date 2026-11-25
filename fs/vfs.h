@@ -41,9 +41,15 @@
 #define VFS_O_EXCL      0x0040
 #define VFS_O_NOFOLLOW  0x0080
 #define VFS_O_DIRECTORY 0x0100
+#define VFS_O_CLOEXEC   0x0200
 
-#define VFS_F_GETFL 1
-#define VFS_F_SETFL 2
+#define VFS_F_DUPFD         0
+#define VFS_F_GETFL         1
+#define VFS_F_SETFL         2
+#define VFS_F_GETFD         3
+#define VFS_F_SETFD         4
+#define VFS_F_DUPFD_CLOEXEC 1030
+#define VFS_FD_CLOEXEC      1
 
 /* The poll bits, mmap prot and map flags, fb ioctls plus their screeninfo structs, and the KD console mode... */
 
@@ -214,6 +220,8 @@ int vfs_process_dup2(struct process *dst,
                      int dst_fd,
                      const struct process *src,
                      int src_fd);
+void vfs_process_close_cloexec(struct process *proc);
+int  vfs_path_nosuid(const char *path);
 void vfs_process_cleanup(struct process *proc);
 
 #endif /* VFS_H */

@@ -35,6 +35,7 @@
 #include <time.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "../../scripts/test/tsk_test.h"
 
@@ -174,7 +175,7 @@ static int real_main(int argc, char **argv, char **envp)
         return run_worker_mprotect_segv();
 
     int passed = 0;
-    int total = 23;
+    int total = 29;
 
     /* Test 1: Stack frame alignment (rsp % 16 == 8 on function entry). */
     if ((s_entry_rsp & 0xF) != 8) {
@@ -1255,6 +1256,312 @@ static int real_main(int argc, char **argv, char **envp)
             return 78;
         }
         TSK_TEST_PASS("syscalls", "mmap_msync_negative");
+        passed++;
+    }
+
+    /* Test 24: COW fork parent/child isolation across stack, heap, anon mmap, and file mmap. */
+    {
+        int ok = 1;
+        volatile uint32_t *heap_buf = (volatile uint32_t *)malloc(8192);
+        volatile uint8_t *anon = (volatile uint8_t *)mmap(
+            NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        const char *cpath = "/tmp/cow_priv.dat";
+        int pfd = open(cpath, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        volatile char *pmap = MAP_FAILED;
+        if (!heap_buf || (void *)anon == MAP_FAILED || pfd < 0 ||
+            write(pfd, "ORIG_COW_PAGE_01", 16) != 16) {
+            ok = 0;
+        } else {
+            pmap = (volatile char *)mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, pfd, 0);
+            close(pfd);
+            pfd = -1;
+            if ((void *)pmap == MAP_FAILED)
+                ok = 0;
+        }
+        if (pfd >= 0)
+            close(pfd);
+
+        volatile uint64_t stack_var = 0x1111222233334444ULL;
+        if (ok) {
+            heap_buf[0] = 0xA1B2C3D4u;
+            heap_buf[1024] = 0x55667788u;
+            anon[0] = 0x33u;
+            anon[4096] = 0x33u;
+            pmap[0] = 'X';
+
+            pid_t cpid = fork();
+            if (cpid < 0) {
+                ok = 0;
+            } else if (cpid == 0) {
+                if (heap_buf[0] != 0xA1B2C3D4u || heap_buf[1024] != 0x55667788u ||
+                    anon[0] != 0x33u || anon[4096] != 0x33u ||
+                    pmap[0] != 'X' || pmap[1] != 'R' ||
+                    stack_var != 0x1111222233334444ULL) {
+                    _exit(2);
+                }
+                heap_buf[0] = 0xDEADBEEFu;
+                heap_buf[1024] = 0x0BADF00Du;
+                anon[0] = 0x77u;
+                anon[4096] = 0x88u;
+                pmap[0] = 'Y';
+                stack_var = 0x9999AAAABBBBCCCCULL;
+                if (heap_buf[0] != 0xDEADBEEFu || anon[4096] != 0x88u || pmap[0] != 'Y' ||
+                    stack_var != 0x9999AAAABBBBCCCCULL) {
+                    _exit(3);
+                }
+                _exit(19);
+            } else {
+                int wst = 0;
+                if (waitpid(cpid, &wst, 0) != cpid || !WIFEXITED(wst) || WEXITSTATUS(wst) != 19)
+                    ok = 0;
+                if (heap_buf[0] != 0xA1B2C3D4u || heap_buf[1024] != 0x55667788u ||
+                    anon[0] != 0x33u || anon[4096] != 0x33u ||
+                    pmap[0] != 'X' || pmap[1] != 'R' ||
+                    stack_var != 0x1111222233334444ULL) {
+                    ok = 0;
+                }
+            }
+        }
+        if ((void *)pmap != MAP_FAILED)
+            munmap((void *)(uintptr_t)pmap, 4096);
+        if ((void *)anon != MAP_FAILED)
+            munmap((void *)(uintptr_t)anon, 8192);
+        if (heap_buf)
+            free((void *)(uintptr_t)heap_buf);
+        unlink(cpath);
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "fork_cow_isolation", "COW fork isolation check failed");
+            return 79;
+        }
+        TSK_TEST_PASS("syscalls", "fork_cow_isolation");
+        passed++;
+    }
+
+    /* Test 25: fork preserves SHM attachments RW without COW splitting. */
+    {
+        int ok = 1;
+        int sid = shm_create(4096);
+        volatile uint32_t *shm_ptr = (sid >= 0) ? (volatile uint32_t *)shm_attach(sid) : NULL;
+        if (!shm_ptr) {
+            ok = 0;
+        } else {
+            *shm_ptr = 0x12340001u;
+            pid_t cpid = fork();
+            if (cpid < 0) {
+                ok = 0;
+            } else if (cpid == 0) {
+                if (*shm_ptr != 0x12340001u)
+                    _exit(2);
+                *shm_ptr = 0xABCD9876u;
+                _exit(0);
+            } else {
+                int wst = 0;
+                if (waitpid(cpid, &wst, 0) != cpid || !WIFEXITED(wst) || WEXITSTATUS(wst) != 0)
+                    ok = 0;
+                if (*shm_ptr != 0xABCD9876u)
+                    ok = 0;
+            }
+            shm_detach((void *)(uintptr_t)shm_ptr);
+        }
+        if (sid >= 0)
+            shm_destroy(sid);
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "fork_shm_shared", "SHM state across fork was not shared");
+            return 80;
+        }
+        TSK_TEST_PASS("syscalls", "fork_shm_shared");
+        passed++;
+    }
+
+    /* Test 26: POSIX execve argv, envp, auxv, O_CLOEXEC, F_DUPFD_CLOEXEC, F_GETFD/F_SETFD. */
+    {
+        int ok = 1;
+        int fail_stage = 0;
+        int fail_val = 0;
+        const char *fpath = "/tmp/exec_fd.txt";
+        int fd = open(fpath, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        int keep_fd = -1, clo_fd = -1, dup_clo_fd = -1;
+        if (fd < 0 || write(fd, "KEEP_ME", 7) != 7) {
+            ok = 0;
+            fail_stage = 1;
+        } else {
+            close(fd);
+            keep_fd = open(fpath, O_RDONLY);
+            clo_fd = open(fpath, O_RDONLY | O_CLOEXEC);
+            dup_clo_fd = (keep_fd >= 0) ? fcntl(keep_fd, F_DUPFD_CLOEXEC, 20) : -1;
+            if (keep_fd < 0 || clo_fd < 0 || dup_clo_fd < 20) {
+                ok = 0;
+                fail_stage = 2;
+            }
+            if (ok && (fcntl(keep_fd, F_GETFD, 0) != 0 ||
+                       fcntl(clo_fd, F_GETFD, 0) != FD_CLOEXEC ||
+                       fcntl(dup_clo_fd, F_GETFD, 0) != FD_CLOEXEC)) {
+                ok = 0;
+                fail_stage = 3;
+            }
+        }
+        if (ok) {
+            char kbuf[16], cbuf[16], dbuf[16];
+            sprintf(kbuf, "%d", keep_fd);
+            sprintf(cbuf, "%d", clo_fd);
+            sprintf(dbuf, "%d", dup_clo_fd);
+            pid_t cpid = fork();
+            if (cpid < 0) {
+                ok = 0;
+                fail_stage = 4;
+            } else if (cpid == 0) {
+                char *const ex_argv[] = {
+                    "/bin/exectest.elf", "--verify-exec", kbuf, cbuf, dbuf, NULL
+                };
+                char *const ex_envp[] = {
+                    "TSK_TEST_ENV=cow_exec_ok", "TSK_EXTRA=1", NULL
+                };
+                execve("/bin/exectest.elf", ex_argv, ex_envp);
+                _exit(99);
+            } else {
+                int wst = 0;
+                if (waitpid(cpid, &wst, 0) != cpid || !WIFEXITED(wst) || WEXITSTATUS(wst) != 33) {
+                    ok = 0;
+                    fail_stage = 5;
+                    fail_val = WIFEXITED(wst) ? WEXITSTATUS(wst) : -wst;
+                }
+            }
+        }
+        if (keep_fd >= 0) close(keep_fd);
+        if (clo_fd >= 0) close(clo_fd);
+        if (dup_clo_fd >= 0) close(dup_clo_fd);
+        unlink(fpath);
+        if (!ok) {
+            printf("[DBG] execve_argv_envp_auxv_cloexec stage=%d val=%d\n", fail_stage, fail_val);
+            TSK_TEST_FAIL("syscalls", "execve_argv_envp_auxv_cloexec", "execve argv/envp/auxv/cloexec failed");
+            return 81;
+        }
+        TSK_TEST_PASS("syscalls", "execve_argv_envp_auxv_cloexec");
+        passed++;
+    }
+
+    /* Test 27: Shebang script execution and -ELOOP depth limit. */
+    {
+        int ok = 1;
+        const char *sp = "/tmp/test_shebang.sh";
+        const char *lp = "/tmp/loop_shebang.sh";
+        int sfd = open(sp, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+        int lfd = open(lp, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+        const char *sc = "#!/bin/exectest.elf shebang_arg\necho ignored\n";
+        const char *lc = "#!/tmp/loop_shebang.sh\n";
+        if (sfd < 0 || write(sfd, sc, strlen(sc)) != (ssize_t)strlen(sc) ||
+            lfd < 0 || write(lfd, lc, strlen(lc)) != (ssize_t)strlen(lc)) {
+            ok = 0;
+        }
+        if (sfd >= 0) close(sfd);
+        if (lfd >= 0) close(lfd);
+
+        if (ok) {
+            pid_t cpid = fork();
+            if (cpid < 0) {
+                ok = 0;
+            } else if (cpid == 0) {
+                char *const sh_argv[] = { "/tmp/test_shebang.sh", "user_arg", NULL };
+                char *const sh_envp[] = { "TSK_SHEBANG_ENV=shebang_ok", NULL };
+                execve(sp, sh_argv, sh_envp);
+                _exit(99);
+            } else {
+                int wst = 0;
+                if (waitpid(cpid, &wst, 0) != cpid || !WIFEXITED(wst) || WEXITSTATUS(wst) != 55)
+                    ok = 0;
+            }
+        }
+        if (ok) {
+            char *const lp_argv[] = { "/tmp/loop_shebang.sh", NULL };
+            errno = 0;
+            if (execve(lp, lp_argv, NULL) != -1 || errno != ELOOP)
+                ok = 0;
+        }
+        unlink(sp);
+        unlink(lp);
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "execve_shebang", "shebang exec or ELOOP check failed");
+            return 82;
+        }
+        TSK_TEST_PASS("syscalls", "execve_shebang");
+        passed++;
+    }
+
+    /* Test 28: PIE ET_DYN and PT_INTERP dynamic-linker execution. */
+    {
+        int ok = 1;
+        pid_t c1 = fork();
+        if (c1 < 0) {
+            ok = 0;
+        } else if (c1 == 0) {
+            char *const argv1[] = { "/bin/pietest.elf", NULL };
+            execve("/bin/pietest.elf", argv1, NULL);
+            _exit(99);
+        } else {
+            int wst = 0;
+            if (waitpid(c1, &wst, 0) != c1 || !WIFEXITED(wst) || WEXITSTATUS(wst) != 42)
+                ok = 0;
+        }
+
+        if (ok) {
+            pid_t c2 = fork();
+            if (c2 < 0) {
+                ok = 0;
+            } else if (c2 == 0) {
+                char *const argv2[] = { "/bin/interptest.elf", NULL };
+                execve("/bin/interptest.elf", argv2, NULL);
+                _exit(99);
+            } else {
+                int wst = 0;
+                if (waitpid(c2, &wst, 0) != c2 || !WIFEXITED(wst) || WEXITSTATUS(wst) != 77)
+                    ok = 0;
+            }
+        }
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "execve_pie_interp", "PIE ET_DYN or PT_INTERP execution failed");
+            return 83;
+        }
+        TSK_TEST_PASS("syscalls", "execve_pie_interp");
+        passed++;
+    }
+
+    /* Test 29: Negative execve error paths leave caller intact. */
+    {
+        int ok = 1;
+        volatile uint64_t guard_val = 0x55AA123499887766ULL;
+        const char *npath = "/tmp/not_elf.bin";
+        int fd = open(npath, O_RDWR | O_CREAT | O_TRUNC, 0755);
+        if (fd < 0 || write(fd, "NOT_ELF_DATA", 12) != 12) {
+            ok = 0;
+        } else {
+            char *const bad_argv[] = { "bad", NULL };
+            errno = 0;
+            if (execve("/nonexistent_exec_target", bad_argv, NULL) != -1 || errno != ENOENT)
+                ok = 0;
+            errno = 0;
+            if (execve("/bin", bad_argv, NULL) != -1 || errno != EISDIR)
+                ok = 0;
+            errno = 0;
+            if (execve(npath, bad_argv, NULL) != -1 || errno != ENOEXEC)
+                ok = 0;
+            errno = 0;
+            if (execve((const char *)(uintptr_t)0x1234, bad_argv, NULL) != -1 || errno != EFAULT)
+                ok = 0;
+            char chk[16];
+            memset(chk, 0, sizeof(chk));
+            if (lseek(fd, 0, SEEK_SET) != 0 || read(fd, chk, 12) != 12 ||
+                memcmp(chk, "NOT_ELF_DATA", 12) != 0)
+                ok = 0;
+        }
+        if (fd >= 0) close(fd);
+        unlink(npath);
+        if (guard_val != 0x55AA123499887766ULL)
+            ok = 0;
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "execve_negative_intact", "negative execve error or caller state check failed");
+            return 84;
+        }
+        TSK_TEST_PASS("syscalls", "execve_negative_intact");
         passed++;
     }
 

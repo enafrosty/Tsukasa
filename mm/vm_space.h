@@ -102,6 +102,8 @@ typedef struct vm_space {
 int vm_space_init_kernel(vm_space_t *space);
 int vm_space_create(vm_space_t *space);
 int vm_space_clone(const vm_space_t *src, vm_space_t *dst);
+int vm_space_fork(vm_space_t *src, vm_space_t *dst);
+void vm_space_rebind_vmas(vm_space_t *space);
 void vm_space_destroy(vm_space_t *space);
 
 void vm_space_mmap_read_lock(vm_space_t *space);

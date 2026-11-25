@@ -30,6 +30,7 @@
 #include "../mm/vm_space.h"
 #include "../mm/vmm_x64.h"
 #include "../proc/process.h"
+#include "../loader/elf64.h"
 #include "../ipc/shm.h"
 #include "../sys/futex.h"
 #include "../sys/panic.h"
@@ -514,6 +515,53 @@ static long sys_wait4(long pid, long status, long options, long a4, long a5, lon
     (void)a4; (void)a5; (void)a6;
     if (status && !user_ok(status, (long)sizeof(int), 1)) return -EFAULT;
     return mux_sys(SYSTEM_CMD_WAITPID, pid, status, options);
+}
+
+static int validate_user_strv(long arr_ptr, int max_items)
+{
+    if (!arr_ptr)
+        return 1;
+    uintptr_t cur = (uintptr_t)arr_ptr;
+    for (int i = 0; i <= max_items; i++) {
+        if (!user_ok((long)cur, (long)sizeof(uintptr_t), 0))
+            return 0;
+        uintptr_t elem = *(const uintptr_t *)cur;
+        if (elem == 0)
+            return 1;
+        if (i == max_items)
+            return 0;
+        if (!user_str_ok_len((long)elem, 4096))
+            return 0;
+        cur += sizeof(uintptr_t);
+    }
+    return 0;
+}
+
+static long sys_fork(long a1, long a2, long a3, long a4, long a5, long a6)
+{
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    syscall_frame_t *sf = process_current_syscall_frame();
+    if (!sf)
+        return -ENOSYS;
+    return (long)process_fork_current(sf);
+}
+
+static long sys_execve(long path, long argv, long envp, long a4, long a5, long a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    if (!user_str_ok(path))
+        return -EFAULT;
+    if (!validate_user_strv(argv, 64))
+        return -EFAULT;
+    if (!validate_user_strv(envp, 64))
+        return -EFAULT;
+    syscall_frame_t *sf = process_current_syscall_frame();
+    if (!sf)
+        return -ENOSYS;
+    return (long)elf64_execve_current((const char *)(uintptr_t)path,
+                                      (char *const *)(uintptr_t)argv,
+                                      (char *const *)(uintptr_t)envp,
+                                      sf);
 }
 
 static long sys_kill(long pid, long sig, long a3, long a4, long a5, long a6)
@@ -1102,6 +1150,8 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [45] = sys_recvfrom,
     [49] = sys_bind,
     [50] = sys_listen,
+    [57] = sys_fork,
+    [59] = sys_execve,
     [60] = sys_exit,
     [61] = sys_wait4,
     [62] = sys_kill,

@@ -21,6 +21,7 @@
 #include <stdint.h>
 
 #include "../include/spinlock.h"
+#include "../include/syscall_frame.h"
 #include "../mm/vm_space.h"
 
 #define PROCESS_MAX_COUNT      256
@@ -144,6 +145,10 @@ struct process {
     uint32_t sid;
     uint32_t uid;
     uint32_t gid;
+    uint32_t euid;
+    uint32_t egid;
+    uint32_t suid;
+    uint32_t sgid;
     uint32_t cpu_id;
     uint32_t cpu_affinity;
 
@@ -235,6 +240,13 @@ process_t *process_spawn_idle_for_cpu(uint32_t cpu_id);
 
 /* Give the calling process a private user address space (own PML4, kernel higher-half shared). */
 int process_adopt_private_address_space(void);
+syscall_frame_t *process_current_syscall_frame(void);
+int process_fork_current(const syscall_frame_t *frame);
+int process_swap_vm_space(process_t *p, vm_space_t *new_space, vm_space_t *old_space_out);
+void process_execve_reset_state(process_t *p);
+void process_set_credentials(process_t *p,
+                             uint32_t uid, uint32_t euid, uint32_t suid,
+                             uint32_t gid, uint32_t egid, uint32_t sgid);
 int process_exec(int pid, process_entry_t entry, const char *name);
 int process_exit_current(int code);
 void process_exit(int code) __attribute__((noreturn));

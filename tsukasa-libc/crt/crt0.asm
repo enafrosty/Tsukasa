@@ -18,6 +18,7 @@ BITS 64
 global _start
 extern main
 extern exit
+extern environ
 
 section .text
 _start:
@@ -32,6 +33,7 @@ _start:
     mov rdi, [rsp]              ; arg1: argc
     lea rsi, [rsp + 8]          ; arg2: argv
     lea rdx, [rsp + rdi*8 + 16] ; arg3: envp = &argv[argc + 1]
+    mov [rel environ], rdx
 
     ; Align stack to 16-byte boundary before calling main
     and rsp, -16

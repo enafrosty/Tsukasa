@@ -296,6 +296,7 @@ struct input_event {
 /* mount(2) / umount2(2) flags */
 #ifndef MS_RDONLY
 #define MS_RDONLY       1
+#define MS_NOSUID       2
 #define MNT_FORCE       1
 #define MNT_DETACH      2
 #define MNT_EXPIRE      4
