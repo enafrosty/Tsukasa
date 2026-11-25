@@ -115,8 +115,8 @@ OBJS = arch/x86_64/boot/entry.o \
        arch/x86_64/kernel_main.o \
        arch/x86_64/cpu/gdt.o arch/x86_64/cpu/idt.o arch/x86_64/cpu/isr.o \
        arch/x86_64/cpu/syscall_entry.o arch/x86_64/cpu/syscall_init.o \
-       drv/acpi.o drv/ioapic.o drv/lapic.o sys/smp.o sys/wait_queue.o sys/work_queue.o \
-       sys/futex.o \
+       drv/acpi.o drv/hpet.o drv/ioapic.o drv/lapic.o sys/smp.o sys/time.o \
+       sys/wait_queue.o sys/work_queue.o sys/futex.o \
        sys/panic.o sys/kconsole.o \
        proc/process.o proc/scheduler.o proc/signal.o \
        tty/tty.o tty/termios.o tty/pty.o \

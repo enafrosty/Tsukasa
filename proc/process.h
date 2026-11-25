@@ -43,6 +43,22 @@
 #define PROCESS_WAIT_WUNTRACED  0x2
 #define PROCESS_WAIT_WCONTINUED 0x8
 
+#define PROCESS_CLONE_VM             0x00000100ULL
+#define PROCESS_CLONE_FS             0x00000200ULL
+#define PROCESS_CLONE_FILES          0x00000400ULL
+#define PROCESS_CLONE_SIGHAND        0x00000800ULL
+#define PROCESS_CLONE_THREAD         0x00010000ULL
+#define PROCESS_CLONE_SYSVSEM        0x00040000ULL
+#define PROCESS_CLONE_SETTLS         0x00080000ULL
+#define PROCESS_CLONE_PARENT_SETTID  0x00100000ULL
+#define PROCESS_CLONE_CHILD_CLEARTID 0x00200000ULL
+#define PROCESS_CLONE_CHILD_SETTID   0x01000000ULL
+
+#define PROCESS_ARCH_SET_GS          0x1001
+#define PROCESS_ARCH_SET_FS          0x1002
+#define PROCESS_ARCH_GET_FS          0x1003
+#define PROCESS_ARCH_GET_GS          0x1004
+
 #define PROCESS_SIG_DFL        ((uintptr_t)0)
 #define PROCESS_SIG_IGN        ((uintptr_t)1)
 
@@ -113,6 +129,18 @@ typedef enum thread_state {
 typedef struct process process_t;
 typedef struct thread thread_t;
 
+typedef struct mm_struct {
+    volatile int refcount;
+    vm_space_t space;
+} mm_struct_t;
+
+typedef struct files_struct {
+    volatile int refcount;
+    spinlock_t lock;
+    void *open_files[PROCESS_MAX_OPEN_FILES];
+    uint8_t fd_flags[PROCESS_MAX_OPEN_FILES];
+} files_struct_t;
+
 typedef struct fd_entry {
     int fd;
     int flags;
@@ -156,6 +184,7 @@ typedef struct process_snapshot {
 
 struct process {
     uint32_t pid;
+    uint32_t tgid;
     uint32_t ppid;
     uint32_t pgid;
     uint32_t sid;
@@ -170,6 +199,7 @@ struct process {
 
     process_state_t state;
     int is_idle;
+    int is_thread;
     int kill_pending;
 
     uint64_t kernel_rsp;
@@ -178,9 +208,13 @@ struct process {
     int kernel_stack_from_pmm;
     process_entry_t entry;
     thread_t main_thread;
+    mm_struct_t *mm;
+    files_struct_t *files;
     vm_space_t *va_space;
     void *user_stack;
     uint64_t user_entry;
+    uint64_t fs_base;
+    uint64_t clear_child_tid;
 
     int wait_status;
     int exit_code;
@@ -194,22 +228,19 @@ struct process {
     uintptr_t signal_handlers[PROCESS_MAX_SIGNALS];
     signal_action_s sig_actions[PROCESS_MAX_SIGNALS];
 
-    vm_space_t vm_space;
     uint32_t shm_attachment_count;
 
     int tty_id;
     char cwd[PROCESS_CWD_MAX];
     char cmdline[PROCESS_CMDLINE_MAX];
-    void *open_files[PROCESS_MAX_OPEN_FILES];
-    fd_entry_t fds[PROCESS_MAX_OPEN_FILES];
-    int next_fd;
     uint32_t umask;
-    spinlock_t fd_lock;
     uint32_t io_pad;
     int ctty_kind;
     int ctty_id;
     int wait_report_pending;
-    int ctty_pad;
+    int rq_cpu;
+    volatile int on_cpu;
+    volatile int wake_pending;
 
     int used;
     char name[PROCESS_NAME_MAX];
@@ -228,16 +259,23 @@ struct process {
     process_t *parent_next_child;
     process_t *children_head;
 
-    uint64_t sleep_deadline_ms;
+    uint64_t sleep_deadline_ns;
     process_t *sleep_next;
 
-    uint8_t fpu_state[512] __attribute__((aligned(16)));
+    uint8_t fpu_state[1024] __attribute__((aligned(64)));
     int fpu_initialized;
     int waiting_child;
     int sigreturn_pending_iretq;
     uint64_t sigreturn_stub_va;
     void *active_syscall_regs;
 };
+
+static inline vm_space_t *process_vm_space(const process_t *p)
+{
+    if (!p)
+        return NULL;
+    return p->mm ? &p->mm->space : p->va_space;
+}
 
 #define PROC_CREATED PROCESS_CREATED
 #define PROC_READY PROCESS_READY
@@ -266,6 +304,14 @@ process_t *process_spawn_idle_for_cpu(uint32_t cpu_id);
 int process_adopt_private_address_space(void);
 syscall_frame_t *process_current_syscall_frame(void);
 int process_fork_current(const syscall_frame_t *frame);
+int process_clone_current(const syscall_frame_t *frame,
+                          uint64_t flags,
+                          uint64_t child_stack,
+                          int *ptid,
+                          int *ctid,
+                          uint64_t tls);
+long process_arch_prctl(int code, uint64_t addr);
+long process_set_tid_address(int *tidptr);
 int process_swap_vm_space(process_t *p, vm_space_t *new_space, vm_space_t *old_space_out);
 void process_execve_reset_state(process_t *p);
 void process_set_credentials(process_t *p,
@@ -274,7 +320,24 @@ void process_set_credentials(process_t *p,
 int process_exec(int pid, process_entry_t entry, const char *name);
 int process_exit_current(int code);
 void process_exit(int code) __attribute__((noreturn));
+void process_exit_group(int code) __attribute__((noreturn));
 void process_terminate_current(int sig) __attribute__((noreturn));
+
+mm_struct_t *mm_create(void);
+mm_struct_t *mm_get(mm_struct_t *mm);
+void mm_put(mm_struct_t *mm);
+mm_struct_t *mm_kernel_shared(void);
+
+files_struct_t *files_create(void);
+files_struct_t *files_clone(files_struct_t *src);
+files_struct_t *files_get(files_struct_t *fs);
+void files_put(files_struct_t *fs);
+
+void fpu_init_cpu(void);
+int fpu_xsave_enabled(void);
+uint32_t fpu_save_size(void);
+void fpu_save_state(uint8_t *buf);
+void fpu_restore_state(const uint8_t *buf);
 
 int process_waitpid(int caller_pid, int target_pid, int options, int *status_out);
 int process_kill(int pid, int sig);
@@ -313,9 +376,12 @@ void signal_deliver_irq_exit(uint64_t *irq_frame);
 uint64_t process_schedule_tick(uint64_t current_rsp);
 uint64_t process_schedule_yield(uint64_t current_rsp);
 uint64_t process_schedule_ipi(uint64_t current_rsp);
+void process_finish_switch(void);
+void process_ap_idle_loop(void) __attribute__((noreturn));
 void process_idle_loop_note(void);
 void process_yield(void);
 int process_sleep_ms(uint64_t ms);
+void process_block_current_ns(uint64_t deadline_ns);
 int process_reparent(process_t *child, int parent_pid);
 uint64_t process_ticks(void);
 

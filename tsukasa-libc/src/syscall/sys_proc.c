@@ -248,6 +248,33 @@ pid_t getppid(void)
     return (pid_t)__syscall_check(__syscall0(SYS_getppid));
 }
 
+pid_t gettid(void)
+{
+    return (pid_t)__syscall_check(__syscall0(SYS_gettid));
+}
+
+int arch_prctl(int code, unsigned long addr)
+{
+    return (int)__syscall_check(__syscall2(SYS_arch_prctl, (int64_t)code, (int64_t)addr));
+}
+
+pid_t set_tid_address(int *tidptr)
+{
+    return (pid_t)__syscall_check(__syscall1(SYS_set_tid_address, (int64_t)(uintptr_t)tidptr));
+}
+
+long tsk_futex(volatile uint32_t *uaddr, int op, uint32_t val,
+               const struct timespec *timeout, volatile uint32_t *uaddr2, uint32_t val3)
+{
+    return __syscall_check(__syscall6(SYS_futex,
+                                      (int64_t)(uintptr_t)uaddr,
+                                      (int64_t)op,
+                                      (int64_t)val,
+                                      (int64_t)(uintptr_t)timeout,
+                                      (int64_t)(uintptr_t)uaddr2,
+                                      (int64_t)val3));
+}
+
 pid_t setsid(void)
 {
     return (pid_t)__syscall_check(__syscall0(SYS_setsid));
@@ -301,6 +328,13 @@ int atexit(void (*func)(void))
 void _exit(int status)
 {
     __syscall1(SYS_exit, status);
+    for (;;) {
+    }
+}
+
+void exit_group(int status)
+{
+    __syscall1(SYS_exit_group, status);
     for (;;) {
     }
 }

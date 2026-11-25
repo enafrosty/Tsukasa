@@ -26,6 +26,7 @@ extern idt_exception_handler_x64
 extern irq_handler_x64
 extern tlb_shootdown_ipi_handler
 extern process_entry_trampoline
+extern process_finish_switch
 extern syscall_dispatch
 extern signal_deliver_irq_exit
 
@@ -165,6 +166,10 @@ isr_irq_common:
     jz .keep_rsp
     mov rsp, rax
 .keep_rsp:
+    mov r15, rsp
+    and rsp, -16
+    call process_finish_switch
+    mov rsp, r15
     ; Ensure no latent NT/TF flag state can poison iretq task/trace semantics.
     pushfq
     pop rax

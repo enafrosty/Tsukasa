@@ -37,25 +37,170 @@
 #include "../mm/vmm_x64.h"
 #include "../net/network.h"
 #include "../sys/futex.h"
+#include "../sys/time.h"
 #include "../sys/work_queue.h"
 #include "../syscall/syscall.h"
 #include "../tty/tty.h"
 #include "../user/include/shell.h"
+#include "../arch/x86_64/cpu/idt.h"
 #include "../drv/pit.h"
+#include "../include/lapic.h"
 
 #define CPU_COUNT_MAX 32
 
-_Static_assert((offsetof(process_t, fpu_state) % 16) == 0,
-               "process_t fpu_state must be 16-byte aligned");
-_Static_assert((sizeof(process_t) % 16) == 0,
-               "process_t size must preserve 16-byte alignment in g_processes");
+_Static_assert((offsetof(process_t, fpu_state) % 64) == 0,
+               "process_t fpu_state must be 64-byte aligned for XSAVE");
+_Static_assert((sizeof(process_t) % 64) == 0,
+               "process_t size must preserve 64-byte alignment in g_processes");
+
+static volatile int g_fpu_probed;
+static int g_xsave_enabled;
+static uint32_t g_fpu_save_size = 512u;
+static uint64_t g_xsave_xcr0 = 0x3ULL;
+
+static inline uint64_t read_cr4_val(void)
+{
+    uint64_t cr4;
+    __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+    return cr4;
+}
+
+static inline void write_cr4_val(uint64_t cr4)
+{
+    __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4) : "memory");
+}
+
+static inline void write_xcr0(uint64_t val)
+{
+    uint32_t lo = (uint32_t)val;
+    uint32_t hi = (uint32_t)(val >> 32);
+    __asm__ volatile ("xsetbv" : : "c"(0u), "a"(lo), "d"(hi) : "memory");
+}
+
+void fpu_init_cpu(void)
+{
+    uint32_t max_leaf = 0u, l0_b = 0u, l0_c = 0u, l0_d = 0u;
+    __asm__ volatile ("cpuid" : "+a"(max_leaf), "=b"(l0_b), "+c"(l0_c), "=d"(l0_d) : : "memory");
+
+    uint32_t eax = 1u, ebx = 0u, ecx = 0u, edx = 0u;
+    if (max_leaf >= 1u)
+        __asm__ volatile ("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx) : : "memory");
+
+    int has_xsave = (max_leaf >= 0x0Du) && ((ecx & (1u << 26)) != 0);
+    int has_avx = (ecx & (1u << 28)) != 0;
+
+    if (!__atomic_load_n(&g_fpu_probed, __ATOMIC_ACQUIRE)) {
+        int use_xsave = 0;
+        uint32_t save_size = 512u;
+        uint64_t target_xcr0 = 0x3ULL;
+
+        if (has_xsave) {
+            uint64_t cr4 = read_cr4_val();
+            cr4 |= (1ULL << 18); /* CR4.OSXSAVE */
+            write_cr4_val(cr4);
+
+            uint64_t candidate_xcr0 = has_avx ? 0x7ULL : 0x3ULL;
+            uint32_t x_eax = 0x0Du, x_ebx = 0u, x_ecx = 0u, x_edx = 0u;
+            __asm__ volatile ("cpuid"
+                              : "+a"(x_eax), "=b"(x_ebx), "+c"(x_ecx), "=d"(x_edx)
+                              : : "memory");
+            uint64_t hw_mask = ((uint64_t)x_edx << 32) | (uint64_t)x_eax;
+            candidate_xcr0 &= hw_mask;
+            if ((candidate_xcr0 & 0x3ULL) == 0x3ULL) {
+                write_xcr0(candidate_xcr0);
+                x_eax = 0x0Du;
+                x_ecx = 0u;
+                __asm__ volatile ("cpuid"
+                                  : "+a"(x_eax), "=b"(x_ebx), "+c"(x_ecx), "=d"(x_edx)
+                                  : : "memory");
+                if (x_ebx >= 512u && x_ebx <= 1024u) {
+                    use_xsave = 1;
+                    save_size = x_ebx;
+                    target_xcr0 = candidate_xcr0;
+                } else if ((candidate_xcr0 & 0x4ULL) != 0ULL) {
+                    candidate_xcr0 = 0x3ULL;
+                    write_xcr0(candidate_xcr0);
+                    x_eax = 0x0Du;
+                    x_ecx = 0u;
+                    __asm__ volatile ("cpuid"
+                                      : "+a"(x_eax), "=b"(x_ebx), "+c"(x_ecx), "=d"(x_edx)
+                                      : : "memory");
+                    if (x_ebx >= 512u && x_ebx <= 1024u) {
+                        use_xsave = 1;
+                        save_size = x_ebx;
+                        target_xcr0 = candidate_xcr0;
+                    }
+                }
+            }
+            if (!use_xsave) {
+                cr4 &= ~(1ULL << 18);
+                write_cr4_val(cr4);
+            }
+        }
+
+        g_xsave_enabled = use_xsave;
+        g_fpu_save_size = save_size;
+        g_xsave_xcr0 = target_xcr0;
+        __atomic_store_n(&g_fpu_probed, 1, __ATOMIC_RELEASE);
+        kprintf("[fpu] mode=%s xcr0=0x%x save_size=%u\n",
+                g_xsave_enabled ? "xsave" : "fxsave",
+                (unsigned)g_xsave_xcr0,
+                (unsigned)g_fpu_save_size);
+        return;
+    }
+
+    if (g_xsave_enabled && has_xsave) {
+        uint64_t cr4 = read_cr4_val();
+        cr4 |= (1ULL << 18);
+        write_cr4_val(cr4);
+        write_xcr0(g_xsave_xcr0);
+    }
+}
+
+int fpu_xsave_enabled(void)
+{
+    return g_xsave_enabled;
+}
+
+uint32_t fpu_save_size(void)
+{
+    return g_fpu_save_size;
+}
 
 static void fpu_init_state(uint8_t *buf)
 {
-    for (size_t i = 0; i < 512; i++)
+    for (size_t i = 0; i < 1024u; i++)
         buf[i] = 0;
     *(uint16_t *)(buf + 0) = 0x037Fu;
     *(uint32_t *)(buf + 24) = 0x1F80u;
+    if (g_xsave_enabled)
+        *(uint64_t *)(buf + 512) = 0x3ULL;
+}
+
+void fpu_save_state(uint8_t *buf)
+{
+    if (!buf)
+        return;
+    if (g_xsave_enabled) {
+        uint32_t lo = (uint32_t)g_xsave_xcr0;
+        uint32_t hi = (uint32_t)(g_xsave_xcr0 >> 32);
+        __asm__ volatile ("xsave64 (%0)" : : "r"(buf), "a"(lo), "d"(hi) : "memory");
+    } else {
+        __asm__ volatile ("fxsave (%0)" : : "r"(buf) : "memory");
+    }
+}
+
+void fpu_restore_state(const uint8_t *buf)
+{
+    if (!buf)
+        return;
+    if (g_xsave_enabled) {
+        uint32_t lo = (uint32_t)g_xsave_xcr0;
+        uint32_t hi = (uint32_t)(g_xsave_xcr0 >> 32);
+        __asm__ volatile ("xrstor64 (%0)" : : "r"(buf), "a"(lo), "d"(hi) : "memory");
+    } else {
+        __asm__ volatile ("fxrstor (%0)" : : "r"(buf) : "memory");
+    }
 }
 #define WAIT_STATUS_EXIT(code)   (((code) & 0xFF) << 8)
 #define WAIT_STATUS_SIGNAL(sig)  ((sig) & 0x7F)
@@ -73,11 +218,19 @@ static void fpu_init_state(uint8_t *buf)
 #define PROCESS_CONTEXT_TOP_BIAS 24u
 #define PROCESS_CONTEXT_IRET_INDEX 19u
 
+typedef struct per_cpu_runq {
+    spinlock_t lock;
+    uint32_t nr_running;
+    process_t *head[PROCESS_PRIORITY_LEVELS];
+    process_t *tail[PROCESS_PRIORITY_LEVELS];
+    uint64_t pri_bitmap[4];
+} per_cpu_runq_t;
+
+static mm_struct_t g_kernel_mm;
 static process_t g_processes[PROCESS_MAX_COUNT];
 static process_t *g_current[CPU_COUNT_MAX + 1];
 static process_t *g_idle[CPU_COUNT_MAX + 1];
-static process_t *g_runq_head[PROCESS_PRIORITY_LEVELS];
-static process_t *g_runq_tail[PROCESS_PRIORITY_LEVELS];
+static per_cpu_runq_t g_cpu_rq[CPU_COUNT_MAX];
 static process_t *g_sleepq_head;
 
 static spinlock_t g_sched_lock = SPINLOCK_INIT;
@@ -92,6 +245,7 @@ static volatile uint64_t g_idle_seen_ticks[CPU_COUNT_MAX + 1];
 static volatile uint64_t g_idle_loop_ticks[CPU_COUNT_MAX + 1];
 
 static void process_ap_idle_entry(void);
+static void process_reap_dead_threads(void);
 
 static int g_inited;
 
@@ -150,20 +304,94 @@ static void name_copy(char *dst, const char *src, int cap)
     dst[i] = '\0';
 }
 
+mm_struct_t *mm_kernel_shared(void)
+{
+    return &g_kernel_mm;
+}
+
+mm_struct_t *mm_create(void)
+{
+    mm_struct_t *mm = (mm_struct_t *)kmalloc(sizeof(*mm));
+    if (!mm)
+        return NULL;
+    for (size_t i = 0; i < sizeof(*mm); i++)
+        ((uint8_t *)mm)[i] = 0;
+    mm->refcount = 1;
+    return mm;
+}
+
+mm_struct_t *mm_get(mm_struct_t *mm)
+{
+    if (!mm || mm == &g_kernel_mm)
+        return mm;
+    __atomic_fetch_add(&mm->refcount, 1, __ATOMIC_RELAXED);
+    return mm;
+}
+
+void mm_put(mm_struct_t *mm)
+{
+    if (!mm || mm == &g_kernel_mm)
+        return;
+    if (__atomic_sub_fetch(&mm->refcount, 1, __ATOMIC_ACQ_REL) == 0) {
+        vm_space_destroy(&mm->space);
+        kfree(mm);
+    }
+}
+
+files_struct_t *files_create(void)
+{
+    files_struct_t *fs = (files_struct_t *)kmalloc(sizeof(*fs));
+    if (!fs)
+        return NULL;
+    for (size_t i = 0; i < sizeof(*fs); i++)
+        ((uint8_t *)fs)[i] = 0;
+    fs->refcount = 1;
+    fs->lock = SPINLOCK_INIT;
+    return fs;
+}
+
+files_struct_t *files_get(files_struct_t *fs)
+{
+    if (!fs)
+        return NULL;
+    __atomic_fetch_add(&fs->refcount, 1, __ATOMIC_RELAXED);
+    return fs;
+}
+
+void files_put(files_struct_t *fs)
+{
+    if (!fs)
+        return;
+    if (__atomic_sub_fetch(&fs->refcount, 1, __ATOMIC_ACQ_REL) == 0) {
+        vfs_files_destroy(fs);
+        kfree(fs);
+    }
+}
+
+files_struct_t *files_clone(files_struct_t *src)
+{
+    files_struct_t *dst = files_create();
+    if (!dst)
+        return NULL;
+    if (!src)
+        return dst;
+
+    unsigned long irqf = spin_lock_irqsave(&src->lock);
+    for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
+        dst->open_files[i] = src->open_files[i];
+        dst->fd_flags[i] = src->fd_flags[i];
+        if (dst->open_files[i])
+            (void)vfs_file_ref((vfs_file_t *)dst->open_files[i]);
+    }
+    spin_unlock_irqrestore(&src->lock, irqf);
+    return dst;
+}
+
 static void process_init_io_state(process_t *p, const process_t *parent)
 {
     if (!p)
         return;
-    for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
-        p->open_files[i] = NULL;
-        p->fds[i].fd = -1;
-        p->fds[i].flags = 0;
-        p->fds[i].offset = 0;
-        p->fds[i].file_desc = -1;
-    }
-    p->next_fd = 0;
     p->umask = parent ? (parent->umask & 0777U) : 0022U;
-    p->fd_lock = SPINLOCK_INIT;
     p->io_pad = 0;
     if (parent && parent->cwd[0]) {
         name_copy(p->cwd, parent->cwd, PROCESS_CWD_MAX);
@@ -178,12 +406,19 @@ static void process_init_sched_state(process_t *p, process_t *parent)
     if (!p)
         return;
 
+    p->tgid = p->pid;
+    p->is_thread = 0;
     p->priority = parent ? parent->priority : PROCESS_DEFAULT_PRIORITY;
     p->time_slice = PROCESS_DEFAULT_TIMESLICE;
-    p->cpu_affinity = parent ? parent->cpu_affinity : sched_this_cpu();
-    if (p->cpu_affinity == PROCESS_CPU_AFFINITY_ANY || p->cpu_affinity >= g_cpu_count)
-        p->cpu_affinity = sched_this_cpu();
-    p->cpu_id = p->cpu_affinity;
+    p->cpu_affinity = PROCESS_CPU_AFFINITY_ANY;
+    p->cpu_id = sched_this_cpu();
+    if (p->cpu_id >= g_cpu_count)
+        p->cpu_id = 0;
+    p->rq_cpu = -1;
+    p->on_cpu = 0;
+    p->wake_pending = 0;
+    p->fs_base = 0;
+    p->clear_child_tid = 0;
     p->sched_ticks = 0;
     p->created_time = g_sched_ticks;
     p->next_queue = NULL;
@@ -229,111 +464,248 @@ static process_t *alloc_process_slot_locked(void)
     return NULL;
 }
 
-static void runq_push_locked(process_t *p)
+static inline uint32_t runq_clamp_pri(uint32_t pri)
 {
-    uint32_t pri;
-    if (!p)
-        return;
-    if (p->is_idle)
-        return;
-    pri = p->priority;
-    if (pri >= PROCESS_PRIORITY_LEVELS)
-        pri = PROCESS_PRIORITY_LEVELS - 1;
-    if (p->rq_next || p->prev_queue || g_runq_head[pri] == p || g_runq_tail[pri] == p)
-        return;
-    p->rq_next = NULL;
-    p->next_queue = NULL;
-    p->prev_queue = g_runq_tail[pri];
-    if (!g_runq_head[pri]) {
-        g_runq_head[pri] = p;
-        g_runq_tail[pri] = p;
-        return;
-    }
-    g_runq_tail[pri]->rq_next = p;
-    g_runq_tail[pri]->next_queue = p;
-    g_runq_tail[pri] = p;
+    return (pri < PROCESS_PRIORITY_LEVELS) ? pri : (PROCESS_PRIORITY_LEVELS - 1u);
 }
 
 static inline int runq_eligible_on_cpu_locked(const process_t *p, uint32_t cpu)
 {
-    if (process_is_current_on_other_cpu_locked(p, cpu))
+    if (!p || p->on_cpu || process_is_current_on_other_cpu_locked(p, cpu))
         return 0;
     return p->cpu_affinity == PROCESS_CPU_AFFINITY_ANY || p->cpu_affinity == cpu;
 }
 
+static uint32_t runq_pick_target_cpu_locked(const process_t *p)
+{
+    uint32_t this_cpu = sched_this_cpu();
+    if (p->cpu_affinity != PROCESS_CPU_AFFINITY_ANY && p->cpu_affinity < g_cpu_count)
+        return p->cpu_affinity;
+
+    for (uint32_t i = 0; i < g_cpu_count; i++) {
+        uint32_t c = (this_cpu + i) % g_cpu_count;
+        const cpu_state_t *cs = smp_get_cpu(c);
+        if (cs && !cs->online)
+            continue;
+        const process_t *cur = g_current[c];
+        if (cur && cur->is_idle && g_cpu_rq[c].nr_running == 0)
+            return c;
+    }
+
+    uint32_t best_cpu = (this_cpu < g_cpu_count) ? this_cpu : 0;
+    uint32_t best_load = g_cpu_rq[best_cpu].nr_running;
+    for (uint32_t c = 0; c < g_cpu_count; c++) {
+        const cpu_state_t *cs = smp_get_cpu(c);
+        if (cs && !cs->online)
+            continue;
+        if (g_cpu_rq[c].nr_running < best_load) {
+            best_load = g_cpu_rq[c].nr_running;
+            best_cpu = c;
+        }
+    }
+    return best_cpu;
+}
+
+static void runq_maybe_ipi_locked(uint32_t target_cpu, uint32_t pri)
+{
+    uint32_t this_cpu = sched_this_cpu();
+    if (target_cpu == this_cpu || target_cpu >= g_cpu_count)
+        return;
+    cpu_state_t *cs = smp_get_cpu(target_cpu);
+    if (!cs || !cs->online)
+        return;
+    process_t *remote_cur = g_current[target_cpu];
+    if (!remote_cur || remote_cur->is_idle || pri < remote_cur->priority)
+        lapic_send_ipi(cs->lapic_id, IDT_VEC_RESCHEDULE);
+}
+
+static void runq_push_locked(process_t *p)
+{
+    uint32_t pri;
+    uint32_t target_cpu;
+    per_cpu_runq_t *rq;
+
+    if (!p || p->is_idle || !p->used)
+        return;
+    if (p->on_cpu) {
+        p->wake_pending = 1;
+        return;
+    }
+    if (p->rq_cpu >= 0)
+        return;
+
+    pri = runq_clamp_pri(p->priority);
+    target_cpu = runq_pick_target_cpu_locked(p);
+    rq = &g_cpu_rq[target_cpu];
+
+    spin_lock(&rq->lock);
+    p->rq_next = NULL;
+    p->next_queue = NULL;
+    p->prev_queue = rq->tail[pri];
+    if (!rq->head[pri]) {
+        rq->head[pri] = p;
+        rq->tail[pri] = p;
+    } else {
+        rq->tail[pri]->rq_next = p;
+        rq->tail[pri]->next_queue = p;
+        rq->tail[pri] = p;
+    }
+    rq->nr_running++;
+    rq->pri_bitmap[pri >> 6] |= (1ULL << (pri & 63u));
+    p->rq_cpu = (int)target_cpu;
+    spin_unlock(&rq->lock);
+
+    runq_maybe_ipi_locked(target_cpu, pri);
+}
+
+static process_t *runq_pop_from_cpu_locked(uint32_t rq_cpu, uint32_t for_cpu, int use_trylock)
+{
+    per_cpu_runq_t *rq = &g_cpu_rq[rq_cpu];
+    if (use_trylock) {
+        if (!spin_trylock(&rq->lock))
+            return NULL;
+    } else {
+        spin_lock(&rq->lock);
+    }
+
+    for (uint32_t word = 0; word < 4u; word++) {
+        uint64_t bm = rq->pri_bitmap[word];
+        while (bm) {
+            uint32_t bit = (uint32_t)__builtin_ctzll(bm);
+            uint32_t pri = (word << 6) | bit;
+            bm &= (bm - 1ULL);
+
+            process_t *prev = NULL;
+            process_t *p = rq->head[pri];
+            while (p && !runq_eligible_on_cpu_locked(p, for_cpu)) {
+                prev = p;
+                p = p->rq_next;
+            }
+            if (!p)
+                continue;
+
+            if (prev)
+                prev->rq_next = p->rq_next;
+            else
+                rq->head[pri] = p->rq_next;
+            if (rq->tail[pri] == p)
+                rq->tail[pri] = prev;
+            if (p->rq_next)
+                p->rq_next->prev_queue = prev;
+            if (prev)
+                prev->next_queue = p->rq_next;
+
+            if (!rq->head[pri])
+                rq->pri_bitmap[word] &= ~(1ULL << bit);
+            if (rq->nr_running > 0)
+                rq->nr_running--;
+
+            p->rq_next = NULL;
+            p->next_queue = NULL;
+            p->prev_queue = NULL;
+            p->rq_cpu = -1;
+            spin_unlock(&rq->lock);
+            return p;
+        }
+    }
+
+    spin_unlock(&rq->lock);
+    return NULL;
+}
+
 static process_t *runq_pop_locked(uint32_t cpu)
 {
-    for (uint32_t pri = 0; pri < PROCESS_PRIORITY_LEVELS; pri++) {
-        process_t *prev = NULL;
-        process_t *p = g_runq_head[pri];
-        while (p && !runq_eligible_on_cpu_locked(p, cpu)) {
-            prev = p;
-            p = p->rq_next;
-        }
-        if (!p)
-            continue;
-        if (prev)
-            prev->rq_next = p->rq_next;
-        else
-            g_runq_head[pri] = p->rq_next;
-        if (g_runq_tail[pri] == p)
-            g_runq_tail[pri] = prev;
-        if (p->rq_next)
-            p->rq_next->prev_queue = prev;
-        if (prev)
-            prev->next_queue = p->rq_next;
-        p->rq_next = NULL;
-        p->next_queue = NULL;
-        p->prev_queue = NULL;
+    if (cpu >= g_cpu_count)
+        return NULL;
+
+    process_t *p = runq_pop_from_cpu_locked(cpu, cpu, 0);
+    if (p)
         return p;
+
+    for (uint32_t i = 1; i < g_cpu_count; i++) {
+        uint32_t victim = (cpu + i) % g_cpu_count;
+        if (g_cpu_rq[victim].nr_running == 0)
+            continue;
+        p = runq_pop_from_cpu_locked(victim, cpu, 1);
+        if (p)
+            return p;
     }
     return NULL;
 }
 
 static int runq_best_priority_locked(uint32_t cpu)
 {
-    for (uint32_t pri = 0; pri < PROCESS_PRIORITY_LEVELS; pri++) {
-        for (const process_t *p = g_runq_head[pri]; p; p = p->rq_next) {
-            if (runq_eligible_on_cpu_locked(p, cpu))
-                return (int)pri;
+    if (cpu >= g_cpu_count)
+        return -1;
+    per_cpu_runq_t *rq = &g_cpu_rq[cpu];
+    spin_lock(&rq->lock);
+    for (uint32_t word = 0; word < 4u; word++) {
+        uint64_t bm = rq->pri_bitmap[word];
+        while (bm) {
+            uint32_t bit = (uint32_t)__builtin_ctzll(bm);
+            uint32_t pri = (word << 6) | bit;
+            bm &= (bm - 1ULL);
+            for (const process_t *p = rq->head[pri]; p; p = p->rq_next) {
+                if (runq_eligible_on_cpu_locked(p, cpu)) {
+                    spin_unlock(&rq->lock);
+                    return (int)pri;
+                }
+            }
         }
     }
+    spin_unlock(&rq->lock);
     return -1;
 }
 
 static void runq_remove_locked(process_t *target)
 {
     uint32_t pri;
+    int cpu;
+    per_cpu_runq_t *rq;
     process_t *prev = NULL;
     process_t *cur;
 
-    if (!target)
+    if (!target || target->rq_cpu < 0 || target->rq_cpu >= (int)g_cpu_count)
         return;
-    pri = target->priority;
-    if (pri >= PROCESS_PRIORITY_LEVELS)
-        pri = PROCESS_PRIORITY_LEVELS - 1;
 
-    cur = g_runq_head[pri];
+    cpu = target->rq_cpu;
+    rq = &g_cpu_rq[cpu];
+    pri = runq_clamp_pri(target->priority);
+
+    spin_lock(&rq->lock);
+    if (target->rq_cpu != cpu) {
+        spin_unlock(&rq->lock);
+        return;
+    }
+
+    cur = rq->head[pri];
     while (cur) {
         if (cur == target) {
             if (prev)
                 prev->rq_next = cur->rq_next;
             else
-                g_runq_head[pri] = cur->rq_next;
-            if (g_runq_tail[pri] == cur)
-                g_runq_tail[pri] = prev;
+                rq->head[pri] = cur->rq_next;
+            if (rq->tail[pri] == cur)
+                rq->tail[pri] = prev;
             if (cur->rq_next)
                 cur->rq_next->prev_queue = prev;
             if (prev)
                 prev->next_queue = cur->rq_next;
+            if (!rq->head[pri])
+                rq->pri_bitmap[pri >> 6] &= ~(1ULL << (pri & 63u));
+            if (rq->nr_running > 0)
+                rq->nr_running--;
             cur->rq_next = NULL;
             cur->next_queue = NULL;
             cur->prev_queue = NULL;
+            cur->rq_cpu = -1;
+            spin_unlock(&rq->lock);
             return;
         }
         prev = cur;
         cur = cur->rq_next;
     }
+    spin_unlock(&rq->lock);
 }
 
 static void sleepq_remove_locked(process_t *target)
@@ -351,14 +723,14 @@ static void sleepq_remove_locked(process_t *target)
             else
                 g_sleepq_head = cur->sleep_next;
             cur->sleep_next = NULL;
-            cur->sleep_deadline_ms = 0;
+            cur->sleep_deadline_ns = 0;
             return;
         }
         prev = cur;
         cur = cur->sleep_next;
     }
     target->sleep_next = NULL;
-    target->sleep_deadline_ms = 0;
+    target->sleep_deadline_ns = 0;
 }
 
 static void sleepq_insert_locked(process_t *p)
@@ -370,12 +742,12 @@ static void sleepq_insert_locked(process_t *p)
     if (!p)
         return;
 
-    dl = p->sleep_deadline_ms;
+    dl = p->sleep_deadline_ns;
     sleepq_remove_locked(p);
-    p->sleep_deadline_ms = dl;
+    p->sleep_deadline_ns = dl;
 
     cur = g_sleepq_head;
-    while (cur && cur->sleep_deadline_ms <= dl) {
+    while (cur && cur->sleep_deadline_ns <= dl) {
         prev = cur;
         cur = cur->sleep_next;
     }
@@ -386,13 +758,13 @@ static void sleepq_insert_locked(process_t *p)
         g_sleepq_head = p;
 }
 
-static void sleepq_wake_expired_locked(uint64_t now_ms)
+static void sleepq_wake_expired_locked(uint64_t now_ns)
 {
-    while (g_sleepq_head && now_ms >= g_sleepq_head->sleep_deadline_ms) {
+    while (g_sleepq_head && now_ns >= g_sleepq_head->sleep_deadline_ns) {
         process_t *p = g_sleepq_head;
         g_sleepq_head = p->sleep_next;
         p->sleep_next = NULL;
-        p->sleep_deadline_ms = 0;
+        p->sleep_deadline_ns = 0;
         if (p->used && !p->is_idle && p->state == PROCESS_SLEEPING) {
             p->state = PROCESS_READY;
             p->main_thread.state = THREAD_READY;
@@ -446,44 +818,41 @@ static void parent_unlink_child_locked(process_t *parent, process_t *child)
     }
 }
 
+static void proc_release_resources_unlocked(process_t *p, mm_struct_t *mm, files_struct_t *fs)
+{
+    if (fs)
+        files_put(fs);
+    if (mm && mm != &g_kernel_mm) {
+        if (__atomic_load_n(&mm->refcount, __ATOMIC_ACQUIRE) == 1 && p)
+            shm_process_cleanup(p);
+        mm_put(mm);
+    }
+}
+
+static void free_process_stack_locked(process_t *p)
+{
+    if (!p || !p->kernel_stack)
+        return;
+    if (p->kernel_stack_from_pmm) {
+        if (p->kernel_stack_phys)
+            pmm_free_pages(p->kernel_stack_phys, PROCESS_STACK_PAGES);
+    } else {
+        kfree(p->kernel_stack);
+    }
+    p->kernel_stack = NULL;
+    p->kernel_stack_phys = 0;
+    p->kernel_stack_from_pmm = 0;
+}
+
 static void free_process_resources_locked(process_t *p)
 {
     if (!p)
         return;
 
-    vfs_process_cleanup(p);
-    shm_process_cleanup(p);
-    vm_space_destroy(&p->vm_space);
-
-    if (p->kernel_stack) {
-        if (p->kernel_stack_from_pmm) {
-            if (p->kernel_stack_phys)
-                pmm_free_pages(p->kernel_stack_phys, PROCESS_STACK_PAGES);
-        } else {
-            kfree(p->kernel_stack);
-        }
-        p->kernel_stack = NULL;
-        p->kernel_stack_phys = 0;
-        p->kernel_stack_from_pmm = 0;
-    }
-}
-
-static void reset_process_slot_locked(process_t *p)
-{
-    if (!p)
-        return;
-    sleepq_remove_locked(p);
-    free_process_resources_locked(p);
-    p->used = 0;
-    p->state = PROCESS_DEAD;
-    p->shm_attachment_count = 0;
-    p->rq_next = NULL;
-    p->next_queue = NULL;
-    p->prev_queue = NULL;
-    p->parent = NULL;
-    p->child_count = 0;
-    p->children_head = NULL;
-    p->parent_next_child = NULL;
+    p->mm = NULL;
+    p->files = NULL;
+    p->va_space = NULL;
+    free_process_stack_locked(p);
 }
 
 /* Initial context matches the x64 IRQ epilogue: [rax..r15][vector][rip][cs][rflags][rsp][ss] with rsp... */
@@ -616,7 +985,7 @@ uint64_t process_stack_top_aligned(const process_t *p)
 static void wake_parent_if_waiting_locked(process_t *child)
 {
     process_t *parent;
-    if (!child || child->ppid == 0)
+    if (!child || child->ppid == 0 || child->is_thread)
         return;
     parent = find_by_pid_locked((int)child->ppid);
     if (!parent)
@@ -714,25 +1083,44 @@ int process_poll_was_woken(void)
     return woken;
 }
 
-void process_block_current(void)
+void process_block_current_ns(uint64_t mono_deadline_ns)
 {
     unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
     process_t *self = g_current[sched_this_cpu()];
-    if (self && !self->is_idle) {
+    if (self && !self->is_idle &&
+        self->state != PROCESS_ZOMBIE && self->state != PROCESS_DEAD && !self->kill_pending) {
         runq_remove_locked(self);
-        self->state = PROCESS_BLOCKED;
-        self->main_thread.state = THREAD_BLOCKED;
+        self->wake_pending = 0;
+        if (mono_deadline_ns != 0ULL) {
+            self->sleep_deadline_ns = mono_deadline_ns;
+            self->state = PROCESS_SLEEPING;
+            self->main_thread.state = THREAD_SLEEPING;
+            sleepq_insert_locked(self);
+        } else {
+            sleepq_remove_locked(self);
+            self->state = PROCESS_BLOCKED;
+            self->main_thread.state = THREAD_BLOCKED;
+        }
     }
     spin_unlock_irqrestore(&g_sched_lock, irqf);
+}
+
+void process_block_current(void)
+{
+    process_block_current_ns(0ULL);
 }
 
 void process_finish_wait_current(void)
 {
     unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
     process_t *self = g_current[sched_this_cpu()];
-    if (self && !self->is_idle) {
+    if (self && !self->is_idle &&
+        self->state != PROCESS_ZOMBIE && self->state != PROCESS_DEAD && !self->kill_pending) {
         runq_remove_locked(self);
-        if (self->state == PROCESS_BLOCKED || self->state == PROCESS_READY) {
+        sleepq_remove_locked(self);
+        self->wake_pending = 0;
+        if (self->state == PROCESS_BLOCKED || self->state == PROCESS_SLEEPING ||
+            self->state == PROCESS_READY) {
             self->state = PROCESS_RUNNING;
             self->main_thread.state = THREAD_RUNNING;
         }
@@ -744,8 +1132,10 @@ void process_set_poll_blocked(uint64_t deadline_ms)
 {
     unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
     process_t *self = g_current[sched_this_cpu()];
-    if (self && !self->is_idle) {
+    if (self && !self->is_idle &&
+        self->state != PROCESS_ZOMBIE && self->state != PROCESS_DEAD && !self->kill_pending) {
         runq_remove_locked(self);
+        self->wake_pending = 0;
         self->poll_deadline_ms = deadline_ms;
         self->state = PROCESS_BLOCKED;
         self->main_thread.state = THREAD_BLOCKED;
@@ -757,8 +1147,9 @@ void process_clear_poll_deadline(void)
 {
     unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
     process_t *self = g_current[sched_this_cpu()];
-    if (self) {
+    if (self && self->state != PROCESS_ZOMBIE && self->state != PROCESS_DEAD && !self->kill_pending) {
         self->poll_deadline_ms = 0;
+        self->wake_pending = 0;
         runq_remove_locked(self);
         if (self->state == PROCESS_BLOCKED || self->state == PROCESS_READY) {
             self->state = PROCESS_RUNNING;
@@ -787,7 +1178,10 @@ int process_wake_blocked(process_t *p)
         p->poll_deadline_ms = 0;
         p->state = PROCESS_READY;
         p->main_thread.state = THREAD_READY;
-        runq_push_locked(p);
+        if (p->on_cpu)
+            p->wake_pending = 1;
+        else
+            runq_push_locked(p);
         woke = 1;
     }
     spin_unlock_irqrestore(&g_sched_lock, irqf);
@@ -796,14 +1190,16 @@ int process_wake_blocked(process_t *p)
 
 int process_sleep_ms(uint64_t ms)
 {
-    uint64_t start_ms;
-    uint64_t deadline;
+    uint64_t start_ns;
+    uint64_t delta_ns;
+    uint64_t deadline_ns;
 
     if (ms == 0)
         return 0;
 
-    start_ms = pit_ticks_ms();
-    deadline = (ms > UINT64_MAX - start_ms) ? UINT64_MAX : (start_ms + ms);
+    start_ns = time_monotonic_ns();
+    delta_ns = (ms > UINT64_MAX / 1000000ULL) ? UINT64_MAX : (ms * 1000000ULL);
+    deadline_ns = (delta_ns > UINT64_MAX - start_ns) ? UINT64_MAX : (start_ns + delta_ns);
 
     for (;;) {
         uint64_t flags = irq_save_disable();
@@ -814,26 +1210,33 @@ int process_sleep_ms(uint64_t ms)
             irq_restore(flags);
             return 0;
         }
+        if (self->state == PROCESS_ZOMBIE || self->state == PROCESS_DEAD || self->kill_pending) {
+            sleepq_remove_locked(self);
+            spin_unlock(&g_sched_lock);
+            irq_restore(flags);
+            return -EINTR;
+        }
         if (signal_deliverable_mask_locked(self) != 0) {
             sleepq_remove_locked(self);
             spin_unlock(&g_sched_lock);
             irq_restore(flags);
             return -EINTR;
         }
-        if (pit_ticks_ms() >= deadline) {
+        if (time_monotonic_ns() >= deadline_ns) {
             sleepq_remove_locked(self);
             spin_unlock(&g_sched_lock);
             irq_restore(flags);
             return 0;
         }
         runq_remove_locked(self);
-        self->sleep_deadline_ms = deadline;
+        self->wake_pending = 0;
+        self->sleep_deadline_ns = deadline_ns;
         self->state = PROCESS_SLEEPING;
         self->main_thread.state = THREAD_SLEEPING;
         sleepq_insert_locked(self);
         spin_unlock(&g_sched_lock);
 
-        /* Yield with IF=0 so PIT IRQ0 cannot fire before this task deschedules. */
+        /* Yield with IF=0 so timer IRQ cannot fire before this task deschedules. */
         process_yield();
         irq_restore(flags);
     }
@@ -935,7 +1338,15 @@ static void signal_post_locked(process_t *p, int sig)
         return;
 
     if (sig == PROCESS_SIGKILL) {
+        uint32_t target_cpu = p->cpu_id;
+        int remote_on_cpu = (p->on_cpu && target_cpu < g_cpu_count &&
+                             target_cpu != sched_this_cpu()) ? 1 : 0;
         mark_zombie_locked(p, WAIT_STATUS_SIGNAL(sig));
+        if (remote_on_cpu) {
+            cpu_state_t *cs = smp_get_cpu(target_cpu);
+            if (cs && cs->online)
+                lapic_send_ipi(cs->lapic_id, IDT_VEC_RESCHEDULE);
+        }
         return;
     }
 
@@ -958,13 +1369,18 @@ static void signal_post_locked(process_t *p, int sig)
         return;
 
     p->signal_pending |= bit;
-    if (!(p->signal_mask & bit) &&
-        (p->state == PROCESS_BLOCKED || p->state == PROCESS_SLEEPING)) {
-        sleepq_remove_locked(p);
-        p->poll_deadline_ms = 0;
-        p->state = PROCESS_READY;
-        p->main_thread.state = THREAD_READY;
-        runq_push_locked(p);
+    if (!(p->signal_mask & bit)) {
+        if (p->state == PROCESS_BLOCKED || p->state == PROCESS_SLEEPING) {
+            sleepq_remove_locked(p);
+            p->poll_deadline_ms = 0;
+            p->state = PROCESS_READY;
+            p->main_thread.state = THREAD_READY;
+            runq_push_locked(p);
+        } else if (p->on_cpu && p->cpu_id < g_cpu_count && p->cpu_id != sched_this_cpu()) {
+            cpu_state_t *cs = smp_get_cpu(p->cpu_id);
+            if (cs && cs->online)
+                lapic_send_ipi(cs->lapic_id, IDT_VEC_RESCHEDULE);
+        }
     }
 }
 
@@ -975,29 +1391,31 @@ static void mark_zombie_locked(process_t *p, int wait_status)
     if (p->state == PROCESS_ZOMBIE || p->state == PROCESS_DEAD)
         return;
 
-    /* Reparent orphaned children to PID 1 (init). */
-    process_t *init_proc = find_by_pid_locked(1);
-    process_t *child = p->children_head;
-    while (child) {
-        process_t *next_child = child->parent_next_child;
-        child->parent_next_child = NULL;
-        child->parent = NULL;
-        if (init_proc && init_proc != p) {
-            child->ppid = 1;
-            parent_link_child_locked(init_proc, child);
-            if (child->state == PROCESS_ZOMBIE) {
-                signal_post_locked(init_proc, PROCESS_SIGCHLD);
-                wake_parent_if_waiting_locked(child);
+    if (!p->is_thread) {
+        /* Reparent orphaned children to PID 1 (init). */
+        process_t *init_proc = find_by_pid_locked(1);
+        process_t *child = p->children_head;
+        while (child) {
+            process_t *next_child = child->parent_next_child;
+            child->parent_next_child = NULL;
+            child->parent = NULL;
+            if (init_proc && init_proc != p) {
+                child->ppid = 1;
+                parent_link_child_locked(init_proc, child);
+                if (child->state == PROCESS_ZOMBIE && !child->is_thread) {
+                    signal_post_locked(init_proc, PROCESS_SIGCHLD);
+                    wake_parent_if_waiting_locked(child);
+                }
+            } else {
+                child->ppid = 0;
             }
-        } else {
-            child->ppid = 0;
+            child = next_child;
         }
-        child = next_child;
+        p->children_head = NULL;
+        for (uint32_t i = 0; i < PROCESS_MAX_CHILDREN; i++)
+            p->children[i] = NULL;
+        p->child_count = 0;
     }
-    p->children_head = NULL;
-    for (uint32_t i = 0; i < PROCESS_MAX_CHILDREN; i++)
-        p->children[i] = NULL;
-    p->child_count = 0;
 
     p->wait_status = wait_status;
     p->exit_code = WAIT_EXIT_CODE(wait_status);
@@ -1006,15 +1424,16 @@ static void mark_zombie_locked(process_t *p, int wait_status)
     p->state = PROCESS_ZOMBIE;
     p->main_thread.state = THREAD_ZOMBIE;
     p->kill_pending = 0;
+    p->wake_pending = 0;
     sleepq_remove_locked(p);
     runq_remove_locked(p);
 
-    if (p->ppid > 0) {
+    if (!p->is_thread && p->ppid > 0) {
         process_t *parent = find_by_pid_locked((int)p->ppid);
         if (parent)
             signal_post_locked(parent, PROCESS_SIGCHLD);
+        wake_parent_if_waiting_locked(p);
     }
-    wake_parent_if_waiting_locked(p);
 }
 
 static int signal_pick_lowest(uint64_t mask)
@@ -1031,12 +1450,13 @@ static int prepare_signal_action_locked(process_t *p, uintptr_t *handler_out, in
     uint64_t pending;
     int sig;
     uintptr_t handler;
+    vm_space_t *vs = process_vm_space(p);
 
     if (!p || p->state == PROCESS_ZOMBIE || p->state == PROCESS_DEAD)
         return 0;
 
     /* Ring-3 processes deliver signals on return to user space, not inside the scheduler. */
-    if (p->vm_space.owns_pml4)
+    if (vs && vs->owns_pml4)
         return 0;
 
     pending = p->signal_pending & ~p->signal_mask;
@@ -1102,6 +1522,8 @@ static process_t *create_kernel_process_locked(const char *name, process_entry_t
 
     p->used = 1;
     p->pid = g_next_pid++;
+    p->tgid = p->pid;
+    p->is_thread = 0;
     p->ppid = parent ? parent->pid : 0;
     p->pgid = p->pid;
     p->sid = parent ? parent->sid : p->pid;
@@ -1121,27 +1543,46 @@ static process_t *create_kernel_process_locked(const char *name, process_entry_t
     p->shm_attachment_count = 0;
     process_init_sched_state(p, parent);
     process_init_io_state(p, parent);
-    if (parent)
-        vfs_process_inherit(p, parent);
+    p->files = (parent && parent->files) ? files_clone(parent->files) : files_create();
+    if (!p->files) {
+        p->used = 0;
+        return NULL;
+    }
     name_copy(p->name, name ? name : "proc", PROCESS_NAME_MAX);
 
-    if (vm_space_init_kernel(&p->vm_space) == 0) {
+    mm_struct_t *mm = mm_create();
+    if (!mm) {
+        files_put(p->files);
+        p->files = NULL;
+        p->used = 0;
+        return NULL;
+    }
+    if (vm_space_init_kernel(&mm->space) == 0) {
         uint64_t kernel_pml4 = vmm_get_kernel_pml4();
+        vm_space_t *bvs = g_current[0] ? process_vm_space(g_current[0]) : NULL;
         if (kernel_pml4)
-            p->vm_space.pml4_phys = kernel_pml4;
-        else if (g_current[0] && !g_current[0]->vm_space.owns_pml4 && g_current[0]->vm_space.pml4_phys)
-            p->vm_space.pml4_phys = g_current[0]->vm_space.pml4_phys;
-        p->vm_space.shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE + (((uintptr_t)p->pid % 64) * 0x01000000ULL);
-    } else if (vm_space_create(&p->vm_space) != 0) {
+            mm->space.pml4_phys = kernel_pml4;
+        else if (bvs && !bvs->owns_pml4 && bvs->pml4_phys)
+            mm->space.pml4_phys = bvs->pml4_phys;
+        mm->space.shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE + (((uintptr_t)p->pid % 64) * 0x01000000ULL);
+    } else if (vm_space_create(&mm->space) != 0) {
+        mm_put(mm);
+        files_put(p->files);
+        p->files = NULL;
         p->used = 0;
         kprintf("[proc] WARN: vm_space init failed for '%s' (pid=%u)\n",
                 p->name, (unsigned)p->pid);
         return NULL;
     }
-    p->va_space = &p->vm_space;
+    p->mm = mm;
+    p->va_space = &mm->space;
 
     if (alloc_process_stack_locked(p) != 0) {
-        vm_space_destroy(&p->vm_space);
+        mm_put(p->mm);
+        p->mm = NULL;
+        p->va_space = NULL;
+        files_put(p->files);
+        p->files = NULL;
         p->used = 0;
         kprintf("[proc] WARN: stack alloc failed for '%s' (pid=%u)\n",
                 p->name, (unsigned)p->pid);
@@ -1149,7 +1590,12 @@ static process_t *create_kernel_process_locked(const char *name, process_entry_t
     }
 
     if (setup_initial_context_locked(p) != 0) {
-        free_process_resources_locked(p);
+        free_process_stack_locked(p);
+        mm_put(p->mm);
+        p->mm = NULL;
+        p->va_space = NULL;
+        files_put(p->files);
+        p->files = NULL;
         p->used = 0;
         return NULL;
     }
@@ -1181,14 +1627,27 @@ void process_init(void)
     flags = irq_save_disable();
     spin_lock(&g_sched_lock);
 
+    for (size_t k = 0; k < sizeof(g_kernel_mm); k++)
+        ((uint8_t *)&g_kernel_mm)[k] = 0;
+    g_kernel_mm.refcount = 1;
+    (void)vm_space_init_kernel(&g_kernel_mm.space);
+    if (vmm_get_kernel_pml4())
+        g_kernel_mm.space.pml4_phys = vmm_get_kernel_pml4();
+
     for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
         for (size_t j = 0; j < sizeof(g_processes[i]); j++)
             ((uint8_t *)&g_processes[i])[j] = 0;
     }
 
-    for (uint32_t pri = 0; pri < PROCESS_PRIORITY_LEVELS; pri++) {
-        g_runq_head[pri] = NULL;
-        g_runq_tail[pri] = NULL;
+    for (uint32_t c = 0; c < CPU_COUNT_MAX; c++) {
+        g_cpu_rq[c].lock = SPINLOCK_INIT;
+        g_cpu_rq[c].nr_running = 0;
+        for (uint32_t w = 0; w < 4u; w++)
+            g_cpu_rq[c].pri_bitmap[w] = 0ULL;
+        for (uint32_t pri = 0; pri < PROCESS_PRIORITY_LEVELS; pri++) {
+            g_cpu_rq[c].head[pri] = NULL;
+            g_cpu_rq[c].tail[pri] = NULL;
+        }
     }
     g_sleepq_head = NULL;
     g_sched_ticks = 0;
@@ -1203,6 +1662,7 @@ void process_init(void)
 
     bootstrap->used = 1;
     bootstrap->pid = 0;
+    bootstrap->tgid = 0;
     bootstrap->ppid = 0;
     bootstrap->pgid = 0;
     bootstrap->sid = 0;
@@ -1214,23 +1674,24 @@ void process_init(void)
     bootstrap->shm_attachment_count = 0;
     bootstrap->entry = NULL;
     process_init_sched_state(bootstrap, NULL);
+    bootstrap->cpu_affinity = 0;
+    bootstrap->on_cpu = 1;
     bootstrap->main_thread.state = THREAD_BLOCKED;
     process_init_io_state(bootstrap, NULL);
+    bootstrap->files = files_create();
     name_copy(bootstrap->name, "swapper", PROCESS_NAME_MAX);
-    if (vm_space_init_kernel(&bootstrap->vm_space) != 0) {
-        spin_unlock(&g_sched_lock);
-        irq_restore(flags);
-        return;
-    }
-    bootstrap->va_space = &bootstrap->vm_space;
+    bootstrap->mm = mm_kernel_shared();
+    bootstrap->va_space = &bootstrap->mm->space;
     g_current[0] = bootstrap;
 
     idle = create_kernel_process_locked("idle0", NULL, NULL);
     if (idle) {
         idle->is_idle = 1;
         idle->pid = 0;
+        idle->tgid = 0;
         idle->pgid = 0;
         idle->sid = 0;
+        idle->cpu_affinity = 0;
         g_idle[0] = idle;
         runq_remove_locked(idle);
     }
@@ -1273,31 +1734,38 @@ int process_get_pgid(int pid)
 int process_adopt_private_address_space(void)
 {
     process_t *p;
-    vm_space_t priv;
+    mm_struct_t *mm = mm_create();
     uint64_t flags;
 
-    if (vm_space_create(&priv) != 0)
+    if (!mm)
         return -1;
+    if (vm_space_create(&mm->space) != 0) {
+        mm_put(mm);
+        return -1;
+    }
 
     flags = irq_save_disable();
     spin_lock(&g_sched_lock);
     p = g_current[sched_this_cpu()];
-    if (!p || p->vm_space.owns_pml4) {
+    vm_space_t *cur_vs = process_vm_space(p);
+    if (!p || (cur_vs && cur_vs->owns_pml4)) {
         spin_unlock(&g_sched_lock);
         irq_restore(flags);
-        vm_space_destroy(&priv);
+        mm_put(mm);
         return p ? 0 : -1;
     }
+    mm_struct_t *old_mm = p->mm;
     uint32_t cpu = sched_this_cpu();
-    p->vm_space = priv;
-    p->vm_space.mmap_rwsem.lock = SPINLOCK_INIT;
-    wait_queue_init(&p->vm_space.mmap_rwsem.waitq);
-    p->va_space = &p->vm_space;
+    p->mm = mm;
+    p->va_space = &mm->space;
     if (cpu < 64u)
-        __atomic_or_fetch(&p->vm_space.active_cpus, (1ULL << cpu), __ATOMIC_SEQ_CST);
-    vmm_switch_pml4(priv.pml4_phys);
+        __atomic_or_fetch(&mm->space.active_cpus, (1ULL << cpu), __ATOMIC_SEQ_CST);
+    vmm_switch_pml4(mm->space.pml4_phys);
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
+
+    if (old_mm && old_mm != &g_kernel_mm)
+        mm_put(old_mm);
     return 0;
 }
 
@@ -1319,26 +1787,48 @@ int process_swap_vm_space(process_t *p, vm_space_t *new_space, vm_space_t *old_s
 {
     uint64_t flags;
     uint32_t cpu;
+    mm_struct_t *new_mm;
+    mm_struct_t *old_mm;
 
     if (!p || !new_space || !new_space->owns_pml4 || !new_space->pml4_phys)
         return -EINVAL;
 
+    new_mm = mm_create();
+    if (!new_mm)
+        return -ENOMEM;
+    new_mm->space = *new_space;
+    new_mm->space.mmap_rwsem.lock = SPINLOCK_INIT;
+    wait_queue_init(&new_mm->space.mmap_rwsem.waitq);
+    vm_space_rebind_vmas(&new_mm->space);
+
     flags = irq_save_disable();
     spin_lock(&g_sched_lock);
     cpu = sched_this_cpu();
-    if (old_space_out) {
-        *old_space_out = p->vm_space;
-        if (cpu < 64u && old_space_out->owns_pml4)
-            __atomic_and_fetch(&old_space_out->active_cpus, ~(1ULL << cpu), __ATOMIC_SEQ_CST);
-    }
-    p->vm_space = *new_space;
-    p->va_space = &p->vm_space;
-    vm_space_rebind_vmas(&p->vm_space);
+    old_mm = p->mm;
+    if (old_mm && old_mm->space.owns_pml4 && cpu < 64u)
+        __atomic_and_fetch(&old_mm->space.active_cpus, ~(1ULL << cpu), __ATOMIC_SEQ_CST);
+    p->mm = new_mm;
+    p->va_space = &new_mm->space;
     if (cpu < 64u)
-        __atomic_or_fetch(&p->vm_space.active_cpus, (1ULL << cpu), __ATOMIC_SEQ_CST);
-    vmm_switch_pml4(p->vm_space.pml4_phys);
+        __atomic_or_fetch(&new_mm->space.active_cpus, (1ULL << cpu), __ATOMIC_SEQ_CST);
+    vmm_switch_pml4(new_mm->space.pml4_phys);
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
+
+    if (old_space_out) {
+        if (old_mm && old_mm != &g_kernel_mm &&
+            __atomic_load_n(&old_mm->refcount, __ATOMIC_ACQUIRE) == 1) {
+            *old_space_out = old_mm->space;
+            vm_space_rebind_vmas(old_space_out);
+            kfree(old_mm);
+            old_mm = NULL;
+        } else {
+            for (size_t i = 0; i < sizeof(*old_space_out); i++)
+                ((uint8_t *)old_space_out)[i] = 0;
+        }
+    }
+    if (old_mm && old_mm != &g_kernel_mm)
+        mm_put(old_mm);
     return 0;
 }
 
@@ -1362,10 +1852,16 @@ void process_execve_reset_state(process_t *p)
         }
     }
     p->sigreturn_stub_va = 0;
+    p->fs_base = 0;
+    p->clear_child_tid = 0;
+    p->tgid = p->pid;
+    p->is_thread = 0;
     fpu_init_state(p->fpu_state);
     p->fpu_initialized = 1;
-    if (p == g_current[sched_this_cpu()])
-        __asm__ volatile("fxrstor (%0)" : : "r"(p->fpu_state) : "memory");
+    if (p == g_current[sched_this_cpu()]) {
+        fpu_restore_state(p->fpu_state);
+        wrmsr(MSR_FS_BASE, 0ULL);
+    }
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
 }
@@ -1389,29 +1885,127 @@ void process_set_credentials(process_t *p,
     irq_restore(flags);
 }
 
-int process_fork_current(const syscall_frame_t *frame)
+static void process_reap_dead_threads(void)
 {
-    uint64_t flags;
+    for (;;) {
+        process_t *dead_t = NULL;
+        mm_struct_t *mm = NULL;
+        files_struct_t *fs = NULL;
+        uint64_t flags = irq_save_disable();
+
+        spin_lock(&g_sched_lock);
+        for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
+            process_t *p = &g_processes[i];
+            if (p->used && p->is_thread &&
+                p->state == PROCESS_ZOMBIE &&
+                !p->on_cpu &&
+                !process_is_current_anywhere_locked(p)) {
+                dead_t = p;
+                sleepq_remove_locked(p);
+                runq_remove_locked(p);
+                mm = p->mm;
+                fs = p->files;
+                p->mm = NULL;
+                p->files = NULL;
+                p->va_space = NULL;
+                p->state = PROCESS_DEAD;
+                break;
+            }
+        }
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+
+        if (!dead_t)
+            break;
+
+        proc_release_resources_unlocked(dead_t, mm, fs);
+
+        flags = irq_save_disable();
+        spin_lock(&g_sched_lock);
+        free_process_stack_locked(dead_t);
+        dead_t->used = 0;
+        dead_t->shm_attachment_count = 0;
+        dead_t->rq_next = NULL;
+        dead_t->next_queue = NULL;
+        dead_t->prev_queue = NULL;
+        dead_t->rq_cpu = -1;
+        dead_t->on_cpu = 0;
+        dead_t->wake_pending = 0;
+        dead_t->parent = NULL;
+        dead_t->child_count = 0;
+        dead_t->children_head = NULL;
+        dead_t->parent_next_child = NULL;
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+    }
+}
+
+static int clone_internal(const syscall_frame_t *frame,
+                          uint64_t clone_flags,
+                          uint64_t child_stack,
+                          int *ptid,
+                          int *ctid,
+                          uint64_t tls)
+{
+    uint64_t irq_flags;
     process_t *cur;
     process_t *child;
+    mm_struct_t *parent_mm = NULL;
+    mm_struct_t *child_mm = NULL;
+    files_struct_t *parent_files = NULL;
+    files_struct_t *child_files = NULL;
     uint32_t child_pid;
+    int is_thread = (clone_flags & PROCESS_CLONE_THREAD) ? 1 : 0;
 
     if (!frame)
         return -EINVAL;
 
-    flags = irq_save_disable();
+    if (is_thread) {
+        if ((clone_flags & (PROCESS_CLONE_VM | PROCESS_CLONE_SIGHAND)) !=
+            (PROCESS_CLONE_VM | PROCESS_CLONE_SIGHAND))
+            return -EINVAL;
+        if (child_stack == 0)
+            return -EINVAL;
+    }
+
+    if (child_stack != 0 &&
+        (child_stack < PAGING_USER_VA_MIN || child_stack >= PAGING_USER_VA_MAX))
+        return -EFAULT;
+    if ((clone_flags & PROCESS_CLONE_PARENT_SETTID) &&
+        (!ptid || !vmm_validate_user_ptr(ptid, sizeof(int), 1)))
+        return -EFAULT;
+    if ((clone_flags & (PROCESS_CLONE_CHILD_CLEARTID | PROCESS_CLONE_CHILD_SETTID)) &&
+        (!ctid || !vmm_validate_user_ptr(ctid, sizeof(int), 1)))
+        return -EFAULT;
+    if ((clone_flags & PROCESS_CLONE_SETTLS) && tls >= 0x0000800000000000ULL)
+        return -EINVAL;
+
+    process_reap_dead_threads();
+
+    if (!(clone_flags & PROCESS_CLONE_VM)) {
+        child_mm = mm_create();
+        if (!child_mm)
+            return -ENOMEM;
+    }
+
+    irq_flags = irq_save_disable();
     spin_lock(&g_sched_lock);
     cur = g_current[sched_this_cpu()];
-    if (!cur || cur->is_idle || !cur->vm_space.owns_pml4) {
+    vm_space_t *cur_vs = process_vm_space(cur);
+    if (!cur || cur->is_idle || !cur_vs || !cur_vs->owns_pml4) {
         spin_unlock(&g_sched_lock);
-        irq_restore(flags);
+        irq_restore(irq_flags);
+        if (child_mm)
+            kfree(child_mm);
         return -EINVAL;
     }
 
     child = alloc_process_slot_locked();
     if (!child) {
         spin_unlock(&g_sched_lock);
-        irq_restore(flags);
+        irq_restore(irq_flags);
+        if (child_mm)
+            kfree(child_mm);
         return -EAGAIN;
     }
 
@@ -1421,7 +2015,9 @@ int process_fork_current(const syscall_frame_t *frame)
     child->used = 1;
     child->pid = g_next_pid++;
     child_pid = child->pid;
-    child->ppid = cur->pid;
+    child->tgid = is_thread ? cur->tgid : child_pid;
+    child->is_thread = is_thread;
+    child->ppid = is_thread ? cur->ppid : cur->pid;
     child->pgid = cur->pgid;
     child->sid = cur->sid;
     child->uid = cur->uid;
@@ -1450,7 +2046,13 @@ int process_fork_current(const syscall_frame_t *frame)
         child->sig_actions[i] = cur->sig_actions[i];
     }
 
-    process_init_sched_state(child, cur);
+    process_init_sched_state(child, is_thread ? cur->parent : cur);
+    child->tgid = is_thread ? cur->tgid : child_pid;
+    child->is_thread = is_thread;
+    child->fs_base = (clone_flags & PROCESS_CLONE_SETTLS) ? tls : cur->fs_base;
+    child->clear_child_tid = (clone_flags & PROCESS_CLONE_CHILD_CLEARTID)
+                                 ? (uint64_t)(uintptr_t)ctid
+                                 : 0ULL;
     process_init_io_state(child, cur);
     name_copy(child->name, cur->name, PROCESS_NAME_MAX);
     name_copy(child->cmdline, cur->cmdline, PROCESS_CMDLINE_MAX);
@@ -1459,12 +2061,14 @@ int process_fork_current(const syscall_frame_t *frame)
         child->used = 0;
         child->state = PROCESS_DEAD;
         spin_unlock(&g_sched_lock);
-        irq_restore(flags);
+        irq_restore(irq_flags);
+        if (child_mm)
+            kfree(child_mm);
         return -ENOMEM;
     }
 
-    /* Capture parent's live FPU/SSE registers so child resumes with identical state. */
-    __asm__ volatile("fxsave (%0)" : : "r"(cur->fpu_state) : "memory");
+    /* Capture caller's live FPU/SSE/AVX registers for the child. */
+    fpu_save_state(cur->fpu_state);
     cur->fpu_initialized = 1;
     for (size_t i = 0; i < sizeof(child->fpu_state); i++)
         child->fpu_state[i] = cur->fpu_state[i];
@@ -1474,6 +2078,8 @@ int process_fork_current(const syscall_frame_t *frame)
     syscall_frame_t *child_sf =
         (syscall_frame_t *)(uintptr_t)(child_top - sizeof(syscall_frame_t));
     *child_sf = *frame;
+    if (child_stack != 0)
+        child_sf->rsp = child_stack;
 
     uint64_t *ctx = (uint64_t *)(uintptr_t)((uintptr_t)child_sf -
                                             PROCESS_CONTEXT_TOTAL_QWORDS * sizeof(uint64_t));
@@ -1489,38 +2095,155 @@ int process_fork_current(const syscall_frame_t *frame)
     child->kernel_rsp = (uint64_t)(uintptr_t)ctx;
     child->main_thread.kernel_rsp = child->kernel_rsp;
     child->main_thread.kernel_stack = child->kernel_stack;
-    child->va_space = &child->vm_space;
+
+    parent_mm = mm_get(cur->mm);
+    parent_files = files_get(cur->files);
+    if (clone_flags & PROCESS_CLONE_VM) {
+        child->mm = parent_mm;
+        child->va_space = child->mm ? &child->mm->space : NULL;
+    }
+    if (clone_flags & PROCESS_CLONE_FILES)
+        child->files = parent_files;
 
     spin_unlock(&g_sched_lock);
-    irq_restore(flags);
+    irq_restore(irq_flags);
 
-    if (vm_space_fork(&cur->vm_space, &child->vm_space) != 0 ||
-        shm_process_fork(cur, child) != 0 ||
-        vfs_process_inherit(child, cur) != 0) {
-        vfs_process_cleanup(child);
-        shm_process_cleanup(child);
-        vm_space_destroy(&child->vm_space);
+    if (!(clone_flags & PROCESS_CLONE_VM)) {
+        if (!parent_mm) {
+            mm_put(child_mm);
+            files_put(parent_files);
+            irq_flags = irq_save_disable();
+            spin_lock(&g_sched_lock);
+            free_process_resources_locked(child);
+            child->used = 0;
+            child->state = PROCESS_DEAD;
+            spin_unlock(&g_sched_lock);
+            irq_restore(irq_flags);
+            return -ENOMEM;
+        }
+        child->mm = child_mm;
+        child->va_space = &child_mm->space;
+        if (vm_space_fork(&parent_mm->space, &child_mm->space) != 0 ||
+            shm_process_fork(cur, child) != 0) {
+            shm_process_cleanup(child);
+            child->mm = NULL;
+            child->va_space = NULL;
+            mm_put(child_mm);
+            mm_put(parent_mm);
+            if (!(clone_flags & PROCESS_CLONE_FILES))
+                files_put(parent_files);
+            else
+                files_put(child->files);
 
-        flags = irq_save_disable();
-        spin_lock(&g_sched_lock);
-        free_process_resources_locked(child);
-        child->used = 0;
-        child->state = PROCESS_DEAD;
-        spin_unlock(&g_sched_lock);
-        irq_restore(flags);
-        return -ENOMEM;
+            irq_flags = irq_save_disable();
+            spin_lock(&g_sched_lock);
+            free_process_resources_locked(child);
+            child->used = 0;
+            child->state = PROCESS_DEAD;
+            spin_unlock(&g_sched_lock);
+            irq_restore(irq_flags);
+            return -ENOMEM;
+        }
+        mm_put(parent_mm);
     }
 
-    flags = irq_save_disable();
+    if (!(clone_flags & PROCESS_CLONE_FILES)) {
+        child_files = files_clone(parent_files);
+        files_put(parent_files);
+        if (!child_files) {
+            proc_release_resources_unlocked(child, child->mm, NULL);
+
+            irq_flags = irq_save_disable();
+            spin_lock(&g_sched_lock);
+            free_process_resources_locked(child);
+            child->used = 0;
+            child->state = PROCESS_DEAD;
+            spin_unlock(&g_sched_lock);
+            irq_restore(irq_flags);
+            return -ENOMEM;
+        }
+        child->files = child_files;
+    }
+
+    if ((clone_flags & PROCESS_CLONE_PARENT_SETTID) && ptid)
+        *ptid = (int)child_pid;
+    if ((clone_flags & PROCESS_CLONE_CHILD_SETTID) && ctid &&
+        (clone_flags & PROCESS_CLONE_VM))
+        *ctid = (int)child_pid;
+
+    irq_flags = irq_save_disable();
     spin_lock(&g_sched_lock);
-    parent_link_child_locked(cur, child);
+    if (!is_thread)
+        parent_link_child_locked(cur, child);
     child->state = PROCESS_READY;
     child->main_thread.state = THREAD_READY;
     runq_push_locked(child);
     spin_unlock(&g_sched_lock);
-    irq_restore(flags);
+    irq_restore(irq_flags);
 
     return (int)child_pid;
+}
+
+int process_fork_current(const syscall_frame_t *frame)
+{
+    return clone_internal(frame, 0ULL, 0ULL, NULL, NULL, 0ULL);
+}
+
+int process_clone_current(const syscall_frame_t *frame,
+                          uint64_t flags,
+                          uint64_t child_stack,
+                          int *ptid,
+                          int *ctid,
+                          uint64_t tls)
+{
+    return clone_internal(frame, flags, child_stack, ptid, ctid, tls);
+}
+
+long process_arch_prctl(int code, uint64_t addr)
+{
+    process_t *cur = process_current();
+    if (!cur)
+        return -EINVAL;
+
+    if (code == PROCESS_ARCH_SET_FS) {
+        if (addr >= 0x0000800000000000ULL)
+            return -EINVAL;
+        uint64_t flags = irq_save_disable();
+        spin_lock(&g_sched_lock);
+        cur->fs_base = addr;
+        wrmsr(MSR_FS_BASE, addr);
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return 0;
+    }
+
+    if (code == PROCESS_ARCH_GET_FS) {
+        if (!addr || !vmm_validate_user_ptr((void *)(uintptr_t)addr, sizeof(uint64_t), 1))
+            return -EFAULT;
+        uint64_t flags = irq_save_disable();
+        spin_lock(&g_sched_lock);
+        uint64_t fs = cur->fs_base;
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        *(uint64_t *)(uintptr_t)addr = fs;
+        return 0;
+    }
+
+    return -EINVAL;
+}
+
+long process_set_tid_address(int *tidptr)
+{
+    process_t *cur = process_current();
+    if (!cur)
+        return -EINVAL;
+    uint64_t flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    cur->clear_child_tid = (uint64_t)(uintptr_t)tidptr;
+    long tid = (long)cur->pid;
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    return tid;
 }
 
 process_t *process_spawn_kernel(const char *name, process_entry_t entry)
@@ -1629,6 +2352,7 @@ process_t *process_spawn_idle_for_cpu(uint32_t cpu_id)
 
     p->used = 1;
     p->pid = 0;
+    p->tgid = 0;
     p->ppid = 0;
     p->pgid = 0;
     p->sid = 0;
@@ -1642,7 +2366,9 @@ process_t *process_spawn_idle_for_cpu(uint32_t cpu_id)
     p->shm_attachment_count = 0;
     process_init_sched_state(p, NULL);
     p->cpu_affinity = cpu_id;
+    p->on_cpu = 1;
     process_init_io_state(p, NULL);
+    p->files = files_create();
     name_copy(p->name, idle_name, PROCESS_NAME_MAX);
 
     p->kernel_stack = (void *)(uintptr_t)(cs->kernel_stack - PROCESS_STACK_SIZE);
@@ -1654,23 +2380,8 @@ process_t *process_spawn_idle_for_cpu(uint32_t cpu_id)
     p->main_thread.cpu_id = cpu_id;
     p->main_thread.state = THREAD_RUNNING;
 
-    if (g_current[0] && g_current[0]->vm_space.pml4_phys) {
-        /* Share the boot kernel address space, exactly like other kernel processes spawned without a parent... */
-        p->vm_space.pml4_phys = g_current[0]->vm_space.pml4_phys;
-        p->vm_space.user_min = g_current[0]->vm_space.user_min;
-        p->vm_space.user_max = g_current[0]->vm_space.user_max;
-        p->vm_space.shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE + (((uintptr_t)p->pid % 64) * 0x01000000ULL);
-        p->vm_space.mapped_pages = 0;
-        p->vm_space.shm_pages = 0;
-        p->vm_space.owns_pml4 = 0;
-    } else if (vm_space_init_kernel(&p->vm_space) != 0) {
-        p->used = 0;
-        spin_unlock(&g_sched_lock);
-        irq_restore(flags);
-        kprintf("[guide06] WARN: vm_space init failed for %s\n", idle_name);
-        return NULL;
-    }
-    p->va_space = &p->vm_space;
+    p->mm = mm_kernel_shared();
+    p->va_space = &p->mm->space;
 
     g_idle[cpu_id] = p;
     g_current[cpu_id] = p;
@@ -1687,6 +2398,7 @@ int process_exec(int pid, process_entry_t entry, const char *name)
 {
     process_t *p;
     uint64_t flags;
+    vm_space_t *vs;
     if (!entry || pid <= 0)
         return -1;
 
@@ -1702,12 +2414,17 @@ int process_exec(int pid, process_entry_t entry, const char *name)
     }
 
     shm_process_cleanup(p);
-    p->vm_space.shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE + (((uintptr_t)p->pid % 64) * 0x01000000ULL);
-    p->vm_space.mapped_pages = 0;
-    p->vm_space.shm_pages = 0;
+    vs = process_vm_space(p);
+    if (vs) {
+        vs->shm_cursor = (uintptr_t)VM_SPACE_SHM_BASE + (((uintptr_t)p->pid % 64) * 0x01000000ULL);
+        vs->mapped_pages = 0;
+        vs->shm_pages = 0;
+    }
     p->shm_attachment_count = 0;
 
     p->entry = entry;
+    p->fs_base = 0;
+    p->clear_child_tid = 0;
     p->fpu_initialized = 0;
     p->waiting_child = 0;
     p->sigreturn_pending_iretq = 0;
@@ -1738,10 +2455,32 @@ int process_exec(int pid, process_entry_t entry, const char *name)
     return 0;
 }
 
+static void clear_child_tid_and_wake(process_t *cur)
+{
+    uint64_t tid_va;
+    if (!cur)
+        return;
+    tid_va = cur->clear_child_tid;
+    if (!tid_va)
+        return;
+    cur->clear_child_tid = 0;
+    if (vmm_validate_user_ptr((void *)(uintptr_t)tid_va, sizeof(uint32_t), 1)) {
+        volatile uint32_t *uaddr = (volatile uint32_t *)(uintptr_t)tid_va;
+        __atomic_store_n(uaddr, 0u, __ATOMIC_RELEASE);
+        (void)kernel_futex_wake(uaddr, 1);
+    }
+}
+
 int process_exit_current(int code)
 {
-    process_t *cur;
-    uint64_t flags = irq_save_disable();
+    process_t *cur = process_current();
+    uint64_t flags;
+    if (!cur)
+        return -1;
+
+    clear_child_tid_and_wake(cur);
+
+    flags = irq_save_disable();
     spin_lock(&g_sched_lock);
     cur = g_current[sched_this_cpu()];
     if (!cur) {
@@ -1763,11 +2502,53 @@ void process_exit(int code)
         __asm__ volatile ("hlt");
 }
 
-/* Terminate the current process because it took a fatal fault (e.g. */
+void process_exit_group(int code)
+{
+    process_t *cur = process_current();
+    uint64_t flags;
+    uint32_t tgid;
+
+    if (cur)
+        clear_child_tid_and_wake(cur);
+
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    cur = g_current[sched_this_cpu()];
+    if (cur) {
+        tgid = cur->tgid;
+        for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
+            process_t *p = &g_processes[i];
+            if (!p->used || p->tgid != tgid || p == cur)
+                continue;
+            if (p->state != PROCESS_ZOMBIE && p->state != PROCESS_DEAD) {
+                uint32_t target_cpu = p->cpu_id;
+                mark_zombie_locked(p, WAIT_STATUS_EXIT(code));
+                if (p->on_cpu && target_cpu < g_cpu_count && target_cpu != sched_this_cpu()) {
+                    cpu_state_t *cs = smp_get_cpu(target_cpu);
+                    if (cs && cs->online)
+                        lapic_send_ipi(cs->lapic_id, IDT_VEC_RESCHEDULE);
+                }
+            }
+        }
+        mark_zombie_locked(cur, WAIT_STATUS_EXIT(code));
+    }
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+
+    process_yield();
+    for (;;)
+        __asm__ volatile ("hlt");
+}
+
+/* Terminate the current process because it took a fatal fault. */
 void process_terminate_current(int sig)
 {
-    process_t *cur;
-    uint64_t flags = irq_save_disable();
+    process_t *cur = process_current();
+    uint64_t flags;
+    if (cur)
+        clear_child_tid_and_wake(cur);
+
+    flags = irq_save_disable();
     spin_lock(&g_sched_lock);
     cur = g_current[sched_this_cpu()];
     if (cur)
@@ -1794,12 +2575,15 @@ static int wait_match_child(process_t *caller, process_t *child, int target_pid)
 
 int process_waitpid(int caller_pid, int target_pid, int options, int *status_out)
 {
+    process_reap_dead_threads();
+
     for (;;) {
         process_t *caller;
         process_t *child;
         process_t *self;
         int found_match = 0;
         int found_any_child = 0;
+        int zombie_busy = 0;
         uint64_t flags = irq_save_disable();
 
         spin_lock(&g_sched_lock);
@@ -1815,40 +2599,41 @@ int process_waitpid(int caller_pid, int target_pid, int options, int *status_out
             found_any_child = 1;
             if (wait_match_child(caller, child, target_pid)) {
                 found_match = 1;
-                if (child->state == PROCESS_ZOMBIE &&
-                    !process_is_current_anywhere_locked(child)) {
+                if (child->state == PROCESS_ZOMBIE) {
+                    if (child->on_cpu || process_is_current_anywhere_locked(child)) {
+                        zombie_busy = 1;
+                        child = child->parent_next_child;
+                        continue;
+                    }
                     int pid = (int)child->pid;
+                    mm_struct_t *c_mm = child->mm;
+                    files_struct_t *c_fs = child->files;
                     if (status_out)
                         *status_out = child->wait_status;
                     parent_unlink_child_locked(caller, child);
                     sleepq_remove_locked(child);
+                    runq_remove_locked(child);
+                    child->mm = NULL;
+                    child->files = NULL;
+                    child->va_space = NULL;
                     child->state = PROCESS_DEAD;
                     spin_unlock(&g_sched_lock);
                     irq_restore(flags);
 
                     /* Release VFS files, SHM, and VM space outside g_sched_lock so dirty MAP_SHARED writeback can sleep. */
-                    vfs_process_cleanup(child);
-                    shm_process_cleanup(child);
-                    vm_space_destroy(&child->vm_space);
+                    proc_release_resources_unlocked(child, c_mm, c_fs);
 
                     flags = irq_save_disable();
                     spin_lock(&g_sched_lock);
-                    if (child->kernel_stack) {
-                        if (child->kernel_stack_from_pmm) {
-                            if (child->kernel_stack_phys)
-                                pmm_free_pages(child->kernel_stack_phys, PROCESS_STACK_PAGES);
-                        } else {
-                            kfree(child->kernel_stack);
-                        }
-                        child->kernel_stack = NULL;
-                        child->kernel_stack_phys = 0;
-                        child->kernel_stack_from_pmm = 0;
-                    }
+                    free_process_stack_locked(child);
                     child->used = 0;
                     child->shm_attachment_count = 0;
                     child->rq_next = NULL;
                     child->next_queue = NULL;
                     child->prev_queue = NULL;
+                    child->rq_cpu = -1;
+                    child->on_cpu = 0;
+                    child->wake_pending = 0;
                     child->parent = NULL;
                     child->child_count = 0;
                     child->children_head = NULL;
@@ -1896,6 +2681,13 @@ int process_waitpid(int caller_pid, int target_pid, int options, int *status_out
             spin_unlock(&g_sched_lock);
             irq_restore(flags);
             return 0;
+        }
+
+        if (zombie_busy) {
+            spin_unlock(&g_sched_lock);
+            process_yield();
+            irq_restore(flags);
+            continue;
         }
 
         if (signal_deliverable_mask_locked(caller) != 0) {
@@ -2502,7 +3294,8 @@ static uint64_t ensure_sigreturn_stub(process_t *p)
         0x0F, 0x05,                               /* syscall */
         0x0F, 0x0B                                /* ud2 */
     };
-    if (!p || !p->vm_space.owns_pml4)
+    vm_space_t *vs = process_vm_space(p);
+    if (!p || !vs || !vs->owns_pml4)
         return 0;
     if (p->sigreturn_stub_va)
         return p->sigreturn_stub_va;
@@ -2517,31 +3310,31 @@ static uint64_t ensure_sigreturn_stub(process_t *p)
     sig_memset(kva, 0, VMM_X64_PAGE_SIZE);
     sig_memcpy(kva, stub_code, sizeof(stub_code));
 
-    vm_space_mmap_write_lock(&p->vm_space);
-    uintptr_t va = vma_find_unmapped_area(&p->vm_space,
+    vm_space_mmap_write_lock(vs);
+    uintptr_t va = vma_find_unmapped_area(vs,
                                           (uintptr_t)VM_SPACE_ANON_BASE,
                                           (uintptr_t)VM_SPACE_ANON_LIMIT,
                                           VMM_X64_PAGE_SIZE);
-    if (!va || !vma_insert(&p->vm_space, va, va + VMM_X64_PAGE_SIZE,
+    if (!va || !vma_insert(vs, va, va + VMM_X64_PAGE_SIZE,
                            VMA_PROT_READ | VMA_PROT_EXEC,
                            VMA_FLAG_ANON | VMA_FLAG_PRIVATE)) {
-        vm_space_mmap_write_unlock(&p->vm_space);
+        vm_space_mmap_write_unlock(vs);
         pmm_free_pages(phys, 1);
         return 0;
     }
-    vm_space_mmap_write_unlock(&p->vm_space);
+    vm_space_mmap_write_unlock(vs);
 
-    if (vm_space_map_user_pages(&p->vm_space, va, phys, 1,
+    if (vm_space_map_user_pages(vs, va, phys, 1,
                                 PAGING_MAP_READ | PAGING_MAP_EXEC |
                                 PAGING_MAP_USER) != 0) {
-        vm_space_mmap_write_lock(&p->vm_space);
-        vma_unmap_range(&p->vm_space, va, VMM_X64_PAGE_SIZE);
-        vm_space_mmap_write_unlock(&p->vm_space);
+        vm_space_mmap_write_lock(vs);
+        vma_unmap_range(vs, va, VMM_X64_PAGE_SIZE);
+        vm_space_mmap_write_unlock(vs);
         pmm_free_pages(phys, 1);
         return 0;
     }
 
-    __atomic_fetch_add(&p->vm_space.anon_pages, 1u, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&vs->anon_pages, 1u, __ATOMIC_RELAXED);
     p->sigreturn_stub_va = (uint64_t)va;
     return p->sigreturn_stub_va;
 }
@@ -2609,8 +3402,9 @@ static void deliver_user_signal_common(process_t *cur, int is_irq,
     uint8_t saved_fpu[512] __attribute__((aligned(16)));
     uint8_t clean_fpu[512] __attribute__((aligned(16)));
     int fpu_captured = 0;
+    vm_space_t *cur_vs = process_vm_space(cur);
 
-    if (!cur || cur->is_idle || !cur->vm_space.owns_pml4) {
+    if (!cur || cur->is_idle || !cur_vs || !cur_vs->owns_pml4) {
         irq_restore(entry_flags);
         return;
     }
@@ -2738,7 +3532,10 @@ static void deliver_user_signal_common(process_t *cur, int is_irq,
         uint64_t uc_va = sigframe_va + (uint64_t)offsetof(tsk_sigframe_t, uc);
 
         __asm__ volatile ("cli" : : : "memory");
-        fpu_init_state(clean_fpu);
+        for (size_t i = 0; i < 512u; i++)
+            clean_fpu[i] = 0;
+        *(uint16_t *)(clean_fpu + 0) = 0x037Fu;
+        *(uint32_t *)(clean_fpu + 24) = 0x1F80u;
         __asm__ volatile ("fxrstor (%0)" : : "r"(clean_fpu) : "memory");
         cur->fpu_initialized = 1;
 
@@ -2776,6 +3573,10 @@ void signal_deliver_syscall_exit(syscall_regs_t *regs, int *is_iretq)
     process_t *cur = process_current();
     if (!regs || !is_iretq || !cur)
         return;
+    if (cur->state == PROCESS_ZOMBIE || cur->kill_pending) {
+        process_yield();
+        return;
+    }
     if (!(cur->signal_pending & ~cur->signal_mask))
         return;
     deliver_user_signal_common(cur, 0, regs, is_iretq, NULL);
@@ -2786,6 +3587,10 @@ void signal_deliver_irq_exit(uint64_t *irq_frame)
     process_t *cur = process_current();
     if (!irq_frame || !cur)
         return;
+    if (cur->state == PROCESS_ZOMBIE || cur->kill_pending) {
+        process_yield();
+        return;
+    }
     if (!(cur->signal_pending & ~cur->signal_mask))
         return;
     deliver_user_signal_common(cur, 1, NULL, NULL, irq_frame);
@@ -2802,7 +3607,8 @@ long process_rt_sigreturn(syscall_regs_t *regs)
     uint64_t safe_rflags;
     uint64_t irq_flags;
 
-    if (!cur || !cur->vm_space.owns_pml4 || !regs)
+    vm_space_t *cur_vs = process_vm_space(cur);
+    if (!cur || !cur_vs || !cur_vs->owns_pml4 || !regs)
         return -EFAULT;
 
     uc_va = regs->rsp;
@@ -2867,7 +3673,10 @@ static uint64_t process_schedule_core(uint64_t current_rsp, int is_timer_tick)
     uintptr_t signal_handler = 0;
     int delivered_sig = 0;
     uint64_t next_rsp;
+    uint64_t now_ns = 0;
+    int prev_requeue = 0;
     uint32_t cpu;
+    cpu_state_t *cs;
     uint64_t flags = irq_save_disable();
 
     cpu = sched_this_cpu();
@@ -2875,13 +3684,19 @@ static uint64_t process_schedule_core(uint64_t current_rsp, int is_timer_tick)
         irq_restore(flags);
         return current_rsp;
     }
+    cs = smp_get_cpu(cpu);
+
+    if (is_timer_tick && cpu == 0) {
+        now_ns = time_monotonic_ns();
+        vfs_timerfd_tick(now_ns);
+    }
 
     spin_lock(&g_sched_lock);
     if (is_timer_tick) {
         if (cpu == 0) {
             g_sched_ticks++;
-            uint64_t now_ms = pit_ticks_ms();
-            sleepq_wake_expired_locked(now_ms);
+            sleepq_wake_expired_locked(now_ns);
+            uint64_t now_ms = now_ns / 1000000ULL;
             for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
                 process_t *p = &g_processes[i];
                 if (p->used && !p->is_idle && p->state == PROCESS_BLOCKED && p->poll_deadline_ms != 0) {
@@ -2911,7 +3726,8 @@ static uint64_t process_schedule_core(uint64_t current_rsp, int is_timer_tick)
 
         if (cur->state == PROCESS_RUNNING &&
             prepare_signal_action_locked(cur, &signal_handler, &delivered_sig)) {
-            if (!cur->vm_space.owns_pml4 && signal_handler >= 0xFFFFFFFF80000000ULL) {
+            vm_space_t *cur_vs = process_vm_space(cur);
+            if ((!cur_vs || !cur_vs->owns_pml4) && signal_handler >= 0xFFFFFFFF80000000ULL) {
                 process_signal_handler_t fn = (process_signal_handler_t)(uintptr_t)signal_handler;
                 spin_unlock(&g_sched_lock);
                 fn(delivered_sig);
@@ -2932,6 +3748,12 @@ static uint64_t process_schedule_core(uint64_t current_rsp, int is_timer_tick)
                 if (!cur->is_idle &&
                     cur->time_slice > 0 &&
                     (best_pri < 0 || cur->priority <= (uint32_t)best_pri)) {
+                    cur->on_cpu = 1;
+                    cur->wake_pending = 0;
+                    if (cs) {
+                        cs->prev_proc = NULL;
+                        cs->prev_requeue = 0;
+                    }
                     next_rsp = cur->kernel_rsp ? cur->kernel_rsp : current_rsp;
                     spin_unlock(&g_sched_lock);
                     irq_restore(flags);
@@ -2946,42 +3768,55 @@ static uint64_t process_schedule_core(uint64_t current_rsp, int is_timer_tick)
                 cur->main_thread.state = THREAD_READY;
                 cur->time_slice = PROCESS_DEFAULT_TIMESLICE;
                 cur->main_thread.time_slice = cur->time_slice;
-                runq_push_locked(cur);
+                prev_requeue = 1;
             }
+        } else if (cur && !cur->is_idle &&
+                   cur->state == PROCESS_READY && cur->wake_pending) {
+            cur->wake_pending = 0;
+            prev_requeue = 1;
         }
     }
 
     next = runq_pop_locked(cpu);
+    if (!next && prev_requeue && cur && cur->used && !cur->is_idle && cur->state == PROCESS_READY) {
+        next = cur;
+        prev_requeue = 0;
+    }
     if (!next)
         next = g_idle[cpu];
     if (!next)
         next = cur;
+
+    if (next && next != cur && next->kernel_stack) {
+        if (validate_or_repair_context_locked(next) != 0) {
+            process_t *fallback = (prev_requeue && cur) ? cur : g_idle[cpu];
+            if (fallback) {
+                next = fallback;
+                if (next == cur)
+                    prev_requeue = 0;
+            }
+        }
+    }
 
     if (next) {
         next->state = PROCESS_RUNNING;
         next->main_thread.state = THREAD_RUNNING;
         next->cpu_id = cpu;
         next->main_thread.cpu_id = cpu;
-    }
-    g_current[cpu] = next;
-    if (next && next->kernel_stack) {
-        if (validate_or_repair_context_locked(next) != 0) {
-            process_t *fallback = cur ? cur : g_idle[cpu];
-            if (fallback) {
-                next = fallback;
-                next->state = PROCESS_RUNNING;
-                next->main_thread.state = THREAD_RUNNING;
-                next->cpu_id = cpu;
-                next->main_thread.cpu_id = cpu;
-                g_current[cpu] = next;
-            }
-        }
-        if (next && next->kernel_stack)
+        next->on_cpu = 1;
+        next->wake_pending = 0;
+        if (next->kernel_stack)
             tss_set_rsp0_x64(process_stack_top_aligned(next));
     }
-    {
-        vm_space_t *prev_vs = (cur && cur->va_space) ? cur->va_space : (cur ? &cur->vm_space : NULL);
-        vm_space_t *next_vs = (next && next->va_space) ? next->va_space : (next ? &next->vm_space : NULL);
+    g_current[cpu] = next;
+
+    if (next && next != cur) {
+        if (cs) {
+            cs->prev_proc = cur;
+            cs->prev_requeue = prev_requeue;
+        }
+        vm_space_t *prev_vs = process_vm_space(cur);
+        vm_space_t *next_vs = process_vm_space(next);
         if (next_vs && next_vs->owns_pml4 && next_vs->pml4_phys) {
             if (cpu < 64u)
                 __atomic_or_fetch(&next_vs->active_cpus, (1ULL << cpu), __ATOMIC_SEQ_CST);
@@ -2991,18 +3826,20 @@ static uint64_t process_schedule_core(uint64_t current_rsp, int is_timer_tick)
         }
         if (prev_vs && prev_vs != next_vs && prev_vs->owns_pml4 && cpu < 64u)
             __atomic_and_fetch(&prev_vs->active_cpus, ~(1ULL << cpu), __ATOMIC_SEQ_CST);
-    }
 
-    if (next && next != cur) {
         if (cur) {
-            __asm__ volatile("fxsave (%0)" : : "r"(cur->fpu_state) : "memory");
+            fpu_save_state(cur->fpu_state);
             cur->fpu_initialized = 1;
         }
         if (!next->fpu_initialized) {
             fpu_init_state(next->fpu_state);
             next->fpu_initialized = 1;
         }
-        __asm__ volatile("fxrstor (%0)" : : "r"(next->fpu_state) : "memory");
+        fpu_restore_state(next->fpu_state);
+        wrmsr(MSR_FS_BASE, next->fs_base);
+    } else if (cs) {
+        cs->prev_proc = NULL;
+        cs->prev_requeue = 0;
     }
 
     next_rsp = next ? next->kernel_rsp : current_rsp;
@@ -3010,6 +3847,34 @@ static uint64_t process_schedule_core(uint64_t current_rsp, int is_timer_tick)
     irq_restore(flags);
 
     return next_rsp ? next_rsp : current_rsp;
+}
+
+void process_finish_switch(void)
+{
+    uint32_t cpu = sched_this_cpu();
+    cpu_state_t *cs = smp_get_cpu(cpu);
+    if (!cs)
+        return;
+
+    process_t *prev = cs->prev_proc;
+    int requeue = cs->prev_requeue;
+    if (!prev)
+        return;
+    cs->prev_proc = NULL;
+    cs->prev_requeue = 0;
+
+    unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
+    prev->on_cpu = 0;
+    if ((requeue || prev->wake_pending) &&
+        prev->used && !prev->is_idle && prev->state == PROCESS_READY) {
+        prev->wake_pending = 0;
+        runq_push_locked(prev);
+    } else {
+        prev->wake_pending = 0;
+    }
+    if (prev->state == PROCESS_ZOMBIE)
+        wake_parent_if_waiting_locked(prev);
+    spin_unlock_irqrestore(&g_sched_lock, irqf);
 }
 
 uint64_t process_schedule_tick(uint64_t current_rsp)
@@ -3025,7 +3890,7 @@ uint64_t process_schedule_yield(uint64_t current_rsp)
 uint64_t process_schedule_ipi(uint64_t current_rsp)
 {
     g_ipi_ticks[sched_this_cpu()]++;
-    return process_schedule_core(current_rsp, 1);
+    return process_schedule_core(current_rsp, 0);
 }
 
 void process_idle_loop_note(void)
@@ -3033,9 +3898,19 @@ void process_idle_loop_note(void)
     g_idle_loop_ticks[sched_this_cpu()]++;
 }
 
+void process_ap_idle_loop(void)
+{
+    for (;;) {
+        if (work_queue_drain_one())
+            continue;
+        process_idle_loop_note();
+        __asm__ volatile ("sti; hlt");
+    }
+}
+
 static void process_ap_idle_entry(void)
 {
-    work_queue_drain_loop();
+    process_ap_idle_loop();
 }
 
 void process_yield(void)
@@ -3170,16 +4045,20 @@ void process_get_memory_breakdown(process_mem_breakdown_t *out)
     spin_lock(&g_sched_lock);
     for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
         process_t *p = &g_processes[i];
+        vm_space_t *vs;
         if (!p->used || p->state == PROCESS_DEAD)
             continue;
         b.proc_count++;
-        b.mapped_pages += p->vm_space.mapped_pages;
-        b.shm_pages += p->vm_space.shm_pages;
+        vs = process_vm_space(p);
+        if (vs && !p->is_thread) {
+            b.mapped_pages += vs->mapped_pages;
+            b.shm_pages += vs->shm_pages;
+            b.anon_pages += vs->anon_pages;
+            b.file_pages += vs->file_pages;
+            b.stack_pages += vs->stack_pages;
+            b.heap_pages += vs->heap_pages;
+        }
         b.shm_attachments += p->shm_attachment_count;
-        b.anon_pages += p->vm_space.anon_pages;
-        b.file_pages += p->vm_space.file_pages;
-        b.stack_pages += p->vm_space.stack_pages;
-        b.heap_pages += p->vm_space.heap_pages;
         if (p->kernel_stack && p->kernel_stack_from_pmm)
             b.kernel_stack_pages += PROCESS_STACK_PAGES;
     }
@@ -3206,11 +4085,15 @@ void process_get_memory_totals(size_t *proc_count_out,
     spin_lock(&g_sched_lock);
     for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
         process_t *p = &g_processes[i];
+        vm_space_t *vs;
         if (!p->used || p->state == PROCESS_DEAD)
             continue;
         proc_count++;
-        mapped_pages += p->vm_space.mapped_pages;
-        shm_pages += p->vm_space.shm_pages;
+        vs = process_vm_space(p);
+        if (vs && !p->is_thread) {
+            mapped_pages += vs->mapped_pages;
+            shm_pages += vs->shm_pages;
+        }
         shm_attachments += p->shm_attachment_count;
     }
     spin_unlock(&g_sched_lock);
@@ -3233,9 +4116,11 @@ void process_dump_memory_state(void)
     kprintf("[mem][proc] pid ppid state maps shm_pages shm_att pml4\n");
     for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
         process_t *p = &g_processes[i];
+        vm_space_t *vs;
         const char *state = "unknown";
         if (!p->used || p->state == PROCESS_DEAD)
             continue;
+        vs = process_vm_space(p);
         if (p->state == PROCESS_CREATED) state = "created";
         else if (p->state == PROCESS_READY) state = "ready";
         else if (p->state == PROCESS_RUNNING) state = "running";
@@ -3247,11 +4132,11 @@ void process_dump_memory_state(void)
                 (unsigned)p->pid,
                 (unsigned)p->ppid,
                 state,
-                (unsigned)p->vm_space.mapped_pages,
-                (unsigned)p->vm_space.shm_pages,
+                vs ? (unsigned)vs->mapped_pages : 0u,
+                vs ? (unsigned)vs->shm_pages : 0u,
                 (unsigned)p->shm_attachment_count,
-                (uint32_t)(p->vm_space.pml4_phys >> 32),
-                (uint32_t)(p->vm_space.pml4_phys & 0xFFFFFFFFu));
+                vs ? (uint32_t)(vs->pml4_phys >> 32) : 0u,
+                vs ? (uint32_t)(vs->pml4_phys & 0xFFFFFFFFu) : 0u);
     }
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
@@ -3413,7 +4298,7 @@ static void phase2_selftest_entry(void)
                  cur->priority < PROCESS_PRIORITY_LEVELS &&
                  cur->time_slice <= PROCESS_DEFAULT_TIMESLICE &&
                  cur->time_slice > 0 &&
-                 cur->va_space == &cur->vm_space &&
+                 cur->va_space == process_vm_space(cur) &&
                  cur->main_thread.process == cur &&
                  cur->main_thread.tid == cur->pid &&
                  cur->main_thread.priority == cur->priority;
@@ -3780,25 +4665,26 @@ static void phase3_exit_leak_task(void)
 static int phase3_mapping_api_test(void)
 {
     process_t *cur = process_current();
+    vm_space_t *vs = process_vm_space(cur);
     uintptr_t phys;
     uintptr_t va;
     volatile uint32_t *probe;
     int rc = 0;
 
-    if (!cur)
+    if (!cur || !vs)
         return -1;
 
     phys = pmm_alloc_pages(1);
     if (!phys)
         return -1;
 
-    va = vm_space_reserve_shm_range(&cur->vm_space, 1);
+    va = vm_space_reserve_shm_range(vs, 1);
     if (!va) {
         pmm_free_pages(phys, 1);
         return -1;
     }
 
-    if (vm_space_map_user_pages(&cur->vm_space,
+    if (vm_space_map_user_pages(vs,
                                 va,
                                 phys,
                                 1,
@@ -3813,7 +4699,7 @@ static int phase3_mapping_api_test(void)
     if (*probe != 0xDEADBEEFu)
         rc = -1;
 
-    if (vm_space_protect_user_pages(&cur->vm_space,
+    if (vm_space_protect_user_pages(vs,
                                     va,
                                     1,
                                     PAGING_MAP_READ | PAGING_MAP_EXEC |
@@ -3821,10 +4707,10 @@ static int phase3_mapping_api_test(void)
         rc = -1;
     }
 
-    if (vm_space_unmap_user_pages(&cur->vm_space, va, 1) != 0)
+    if (vm_space_unmap_user_pages(vs, va, 1) != 0)
         rc = -1;
 
-    if (vm_space_map_user_pages(&cur->vm_space,
+    if (vm_space_map_user_pages(vs,
                                 va + 7,
                                 phys,
                                 1,
@@ -3833,7 +4719,7 @@ static int phase3_mapping_api_test(void)
         rc = -1;
     }
 
-    if (vm_space_map_user_pages(&cur->vm_space,
+    if (vm_space_map_user_pages(vs,
                                 (uintptr_t)PAGING_KERNEL_VA_MIN,
                                 phys,
                                 1,

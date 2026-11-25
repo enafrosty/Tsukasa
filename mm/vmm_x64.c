@@ -1729,13 +1729,14 @@ int vmm_validate_user_ptr(const void *ptr, size_t len, int need_write)
             uint64_t rflags = 0;
             __asm__ volatile ("pushfq\n\tpopq %0" : "=r"(rflags) : : "memory");
             process_t *cur = process_current();
-            if ((rflags & (1ULL << 9)) && cur && cur->vm_space.owns_pml4 &&
-                cur->vm_space.pml4_phys == pml4) {
+            vm_space_t *vs = process_vm_space(cur);
+            if ((rflags & (1ULL << 9)) && vs && vs->owns_pml4 &&
+                vs->pml4_phys == pml4) {
                 uint64_t err = (ok && (flags & VMM_X64_PTE_PRESENT)) ? 1ULL : 0ULL;
                 err |= 0x4ULL;
                 if (need_write)
                     err |= 0x2ULL;
-                if (vm_space_handle_page_fault(&cur->vm_space, va, err) == 0 &&
+                if (vm_space_handle_page_fault(vs, va, err) == 0 &&
                     vmm_query_page(pml4, va, &phys, &flags) == 0) {
                     ok = 1;
                 } else {

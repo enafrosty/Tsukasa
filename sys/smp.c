@@ -27,6 +27,7 @@
 #include "mm/vmm_x64.h"
 #include "mm/pmm.h"
 #include "mm/heap.h"
+#include "proc/process.h"
 
 _Static_assert(offsetof(cpu_state_t, syscall_rsp) == X64_CPU_SYSCALL_RSP_OFF,
                "cpu_state_t syscall_rsp offset mismatch");
@@ -37,6 +38,7 @@ static cpu_state_t *cpu_states = NULL;
 static uint32_t total_cpus = 0;
 static uint32_t bsp_lapic_id = 0;
 static cpu_state_t bsp_cpu_state = {0};
+static volatile int g_smp_sched_ready = 0;
 
 static uint32_t read_lapic_id(void)
 {
@@ -112,6 +114,7 @@ static void ap_entry(struct limine_smp_info *info)
     wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)(uintptr_t)&cpu_states[my_id]);
 
     pmm_pcp_init_cpu(my_id);
+    fpu_init_cpu();
 
     syscall_init_x64();
     cpu_states[my_id].efer_msr = rdmsr(MSR_IA32_EFER);
@@ -119,11 +122,15 @@ static void ap_entry(struct limine_smp_info *info)
 
     kprintf("[boot:x64] AP %u online\n", my_id);
 
-    /* Move onto this core's own kernel stack before entering the drain loop: the drain loop is registered as... */
+    /* Wait until BSP finishes timer calibration and process_init, then start local timer and enter scheduler idle loop. */
+    while (!__atomic_load_n(&g_smp_sched_ready, __ATOMIC_ACQUIRE))
+        __asm__ volatile ("pause");
+
+    lapic_timer_start_cpu();
     __asm__ volatile (
         "movq %0, %%rsp\n"
         "xorl %%ebp, %%ebp\n"
-        "call work_queue_drain_loop\n"
+        "call process_ap_idle_loop\n"
         : : "r"(cpu_states[my_id].kernel_stack) : "memory");
     __builtin_unreachable();
 }
@@ -158,9 +165,15 @@ void smp_init_bsp(void)
     wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)(uintptr_t)&bsp_cpu_state);
 
     pmm_pcp_init_cpu(0);
+    fpu_init_cpu();
 
     syscall_init_x64();
     bsp_cpu_state.efer_msr = rdmsr(MSR_IA32_EFER);
+}
+
+void smp_release_ap_schedulers(void)
+{
+    __atomic_store_n(&g_smp_sched_ready, 1, __ATOMIC_RELEASE);
 }
 
 uint32_t smp_init(struct limine_smp_response *smp_resp)

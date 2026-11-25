@@ -1,5 +1,5 @@
 /*
- * Project Tsukasa — futex: address-keyed block/wake primitive (guide 10)
+ * Project Tsukasa — futex: physical-address-keyed block/wake primitive
  *
  * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
@@ -21,12 +21,15 @@
 #include "../include/errno.h"
 #include "../include/spinlock.h"
 #include "../mm/heap.h"
+#include "../mm/vmm_x64.h"
 #include "../proc/process.h"
+#include "../sys/time.h"
 
-#define FUTEX_BUCKETS 64
+#define FUTEX_BUCKETS 128
 
 typedef struct futex_waiter {
-    volatile uint32_t *uaddr;
+    uint64_t phys_key;
+    uint32_t bitset;
     process_t *proc;
     struct futex_waiter *next;
 } futex_waiter_t;
@@ -36,94 +39,159 @@ typedef struct futex_bucket {
     spinlock_t lock;
 } futex_bucket_t;
 
-/* Zero-BSS is the fully initialized state (head == NULL, lock == SPINLOCK_INIT == 0), so — like the guide-09... */
 static futex_bucket_t g_futex_buckets[FUTEX_BUCKETS];
 
-static futex_bucket_t *futex_bucket(const volatile uint32_t *uaddr)
+static int futex_phys_key(const volatile uint32_t *uaddr, uint64_t *key_out)
 {
-    uintptr_t key = (uintptr_t)uaddr >> 2;
-    return &g_futex_buckets[key & (FUTEX_BUCKETS - 1)];
+    uintptr_t va = (uintptr_t)uaddr;
+    if (!uaddr || !key_out)
+        return -EINVAL;
+    if (va >= 0xFFFF800000000000ULL) {
+        uint64_t pa = vmm_virt_to_phys(va);
+        *key_out = pa ? pa : (uint64_t)va;
+        return 0;
+    }
+
+    process_t *cur = process_current();
+    vm_space_t *vs = process_vm_space(cur);
+    if (vs && vs->pml4_phys) {
+        uint64_t pg_phys = 0;
+        uint64_t pte_flags = 0;
+        uintptr_t pg_va = va & ~(uintptr_t)(VMM_X64_PAGE_SIZE - 1ULL);
+        if (vmm_query_page(vs->pml4_phys, pg_va, &pg_phys, &pte_flags) != 0 ||
+            !(pte_flags & VMM_X64_PTE_PRESENT)) {
+            (void)*uaddr;
+            if (vmm_query_page(vs->pml4_phys, pg_va, &pg_phys, &pte_flags) != 0 ||
+                !(pte_flags & VMM_X64_PTE_PRESENT)) {
+                return -EFAULT;
+            }
+        }
+        *key_out = pg_phys + (uint64_t)(va & (VMM_X64_PAGE_SIZE - 1ULL));
+        return 0;
+    }
+
+    *key_out = (uint64_t)va;
+    return 0;
 }
 
-long kernel_futex_wait(volatile uint32_t *uaddr, uint32_t expected)
+static futex_bucket_t *futex_bucket_for_key(uint64_t key)
+{
+    uint64_t h = (key >> 2) ^ (key >> 12);
+    return &g_futex_buckets[h & (FUTEX_BUCKETS - 1)];
+}
+
+long kernel_futex_wait_ex(volatile uint32_t *uaddr,
+                          uint32_t expected,
+                          int has_timeout,
+                          uint64_t mono_deadline_ns,
+                          uint32_t bitset)
 {
     futex_bucket_t *b;
     futex_waiter_t *node;
     futex_waiter_t **pp;
     unsigned long irqf;
+    uint64_t phys_key = 0;
     process_t *self = process_current();
 
-    if (!uaddr || !self)
+    if (!uaddr || !self || bitset == 0u)
         return -EINVAL;
+    if (futex_phys_key(uaddr, &phys_key) != 0)
+        return -EFAULT;
 
-    /* Allocate BEFORE taking the bucket lock (adaptation note 3): the allocator takes its own locks (slab ->... */
-    node = kmalloc(sizeof(*node));
+    node = (futex_waiter_t *)kmalloc(sizeof(*node));
     if (!node)
         return -ENOMEM;
-    node->uaddr = uaddr;
+    node->phys_key = phys_key;
+    node->bitset = bitset;
     node->proc = self;
     node->next = NULL;
 
-    b = futex_bucket(uaddr);
+    b = futex_bucket_for_key(phys_key);
     irqf = spin_lock_irqsave(&b->lock);
 
-    /* The race-closing check: a waker publishes the new value BEFORE calling wake, and wake takes this same... */
     if (*uaddr != expected) {
         spin_unlock_irqrestore(&b->lock, irqf);
         kfree(node);
         return -EAGAIN;
     }
 
+    if (has_timeout && time_monotonic_ns() >= mono_deadline_ns) {
+        spin_unlock_irqrestore(&b->lock, irqf);
+        kfree(node);
+        return -ETIMEDOUT;
+    }
+
     node->next = b->head;
     b->head = node;
-
-    /* Mark ourselves BLOCKED (both state fields, nested g_sched_lock) while STILL holding the bucket lock: a... */
-    process_block_current();
-
+    process_block_current_ns(has_timeout ? mono_deadline_ns : 0ULL);
     spin_unlock_irqrestore(&b->lock, irqf);
 
-    /* Deschedule. */
-    process_yield();
+    for (;;) {
+        process_yield();
 
-    /* Resumed. Ownership protocol (adaptation note 4): if the waker unlinked our node, the waker frees it —... */
-    irqf = spin_lock_irqsave(&b->lock);
-    for (pp = &b->head; *pp; pp = &(*pp)->next) {
-        if (*pp == node && (*pp)->proc == self) {
+        irqf = spin_lock_irqsave(&b->lock);
+        int still_queued = 0;
+        for (pp = &b->head; *pp; pp = &(*pp)->next) {
+            if (*pp == node && (*pp)->proc == self) {
+                still_queued = 1;
+                break;
+            }
+        }
+        if (!still_queued) {
+            spin_unlock_irqrestore(&b->lock, irqf);
+            return 0;
+        }
+
+        if (process_has_deliverable_signal(self)) {
             *pp = node->next;
             spin_unlock_irqrestore(&b->lock, irqf);
             kfree(node);
-            return 0;
+            return -EINTR;
         }
+        if (has_timeout && time_monotonic_ns() >= mono_deadline_ns) {
+            *pp = node->next;
+            spin_unlock_irqrestore(&b->lock, irqf);
+            kfree(node);
+            return -ETIMEDOUT;
+        }
+
+        process_block_current_ns(has_timeout ? mono_deadline_ns : 0ULL);
+        spin_unlock_irqrestore(&b->lock, irqf);
     }
-    spin_unlock_irqrestore(&b->lock, irqf);
-    return 0;
 }
 
-long kernel_futex_wake(volatile uint32_t *uaddr, int count)
+long kernel_futex_wait(volatile uint32_t *uaddr, uint32_t expected)
+{
+    return kernel_futex_wait_ex(uaddr, expected, 0, 0ULL, FUTEX_BITSET_MATCH_ANY);
+}
+
+long kernel_futex_wake_ex(volatile uint32_t *uaddr, int count, uint32_t bitset)
 {
     futex_bucket_t *b;
     futex_waiter_t *collected = NULL;
     futex_waiter_t **pp;
     futex_waiter_t *n;
     unsigned long irqf;
+    uint64_t phys_key = 0;
     long woken = 0;
 
-    if (!uaddr)
+    if (!uaddr || bitset == 0u)
         return -EINVAL;
     if (count <= 0)
         return 0;
+    if (futex_phys_key(uaddr, &phys_key) != 0)
+        return -EFAULT;
 
-    b = futex_bucket(uaddr);
+    b = futex_bucket_for_key(phys_key);
     irqf = spin_lock_irqsave(&b->lock);
 
     pp = &b->head;
     while (*pp && woken < count) {
         n = *pp;
-        if (n->uaddr != uaddr) {
+        if (n->phys_key != phys_key || (n->bitset & bitset) == 0u) {
             pp = &n->next;
             continue;
         }
-        /* Unlink, then wake under the nested g_sched_lock (lock order bucket -> sched, identical to the wait side). */
         *pp = n->next;
         if (process_wake_blocked(n->proc))
             woken++;
@@ -141,20 +209,26 @@ long kernel_futex_wake(volatile uint32_t *uaddr, int count)
     return woken;
 }
 
+long kernel_futex_wake(volatile uint32_t *uaddr, int count)
+{
+    return kernel_futex_wake_ex(uaddr, count, FUTEX_BITSET_MATCH_ANY);
+}
+
 int futex_pending_waiters(const volatile uint32_t *uaddr)
 {
     futex_bucket_t *b;
     futex_waiter_t *n;
     unsigned long irqf;
+    uint64_t phys_key = 0;
     int cnt = 0;
 
-    if (!uaddr)
+    if (!uaddr || futex_phys_key(uaddr, &phys_key) != 0)
         return 0;
 
-    b = futex_bucket(uaddr);
+    b = futex_bucket_for_key(phys_key);
     irqf = spin_lock_irqsave(&b->lock);
     for (n = b->head; n; n = n->next) {
-        if (n->uaddr == uaddr)
+        if (n->phys_key == phys_key)
             cnt++;
     }
     spin_unlock_irqrestore(&b->lock, irqf);

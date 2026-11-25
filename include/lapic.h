@@ -26,4 +26,11 @@ uint32_t lapic_read_id(void);
 void lapic_send_ipi_all(void);
 void lapic_send_ipi(uint32_t lapic_id, uint8_t vector);
 
+int lapic_timer_calibrate(uint32_t hz);
+void lapic_timer_start_cpu(void);
+void lapic_timer_stop_cpu(void);
+int lapic_timer_active(void);
+void lapic_timer_note_tick(uint32_t cpu_id);
+uint64_t lapic_timer_ticks_cpu(uint32_t cpu_id);
+
 #endif /* LAPIC_H */

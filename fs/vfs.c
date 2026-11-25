@@ -49,6 +49,7 @@
 #include "../mm/pagecache.h"
 #include "../proc/process.h"
 #include "../tty/tty.h"
+#include "../sys/time.h"
 #include "../sys/wait_queue.h"
 #include "../drv/pit.h"
 #ifdef __x86_64__
@@ -103,6 +104,17 @@ typedef struct vfs_pipe {
     spinlock_t lock;
     wait_queue_head_t waitq;
 } vfs_pipe_t;
+
+typedef struct vfs_timerfd {
+    spinlock_t lock;
+    wait_queue_head_t waitq;
+    int clockid;
+    int armed;
+    uint64_t next_expire_ns;
+    uint64_t interval_ns;
+    uint64_t expirations;
+    struct vfs_timerfd *list_next;
+} vfs_timerfd_t;
 
 typedef struct vfs_file {
     int refcount;
@@ -163,6 +175,9 @@ typedef struct vfs_file {
             epoll_item_t *items;
             int count;
         } epoll;
+        struct {
+            vfs_timerfd_t *tfd;
+        } timerfd;
     } u;
 } vfs_file_t;
 
@@ -198,7 +213,6 @@ static vfs_mount_t g_mounts[VFS_MAX_MOUNTS];
 static uint64_t g_next_mount_id = 1;
 static spinlock_t g_mounts_lock = SPINLOCK_INIT;
 static spinlock_t g_vfs_alloc_lock = SPINLOCK_INIT;
-static spinlock_t g_fd_lock = SPINLOCK_INIT;
 static spinlock_t g_dcache_lock = SPINLOCK_INIT;
 static spinlock_t g_pc_inode_lock = SPINLOCK_INIT;
 
@@ -229,6 +243,8 @@ static size_t g_dcache_count;
 static uint64_t g_dcache_next_id = 2;
 
 static vfs_flock_inode_t *g_flock_buckets[VFS_FLOCK_BUCKETS];
+static spinlock_t g_timerfd_list_lock = SPINLOCK_INIT;
+static vfs_timerfd_t *g_timerfd_list;
 
 static inline unsigned long vfs_irq_save_disable(void)
 {
@@ -251,7 +267,10 @@ static inline void vfs_irq_restore(unsigned long flags)
 #endif
 }
 
-static void *g_kernel_open_files[PROCESS_MAX_OPEN_FILES];
+static files_struct_t g_kernel_files = {
+    .refcount = 1,
+    .lock = SPINLOCK_INIT
+};
 static char g_kernel_cwd[VFS_PATH_MAX] = "/";
 static uint32_t g_kernel_umask = 0022U;
 
@@ -332,11 +351,11 @@ static int path_copy_join(char *out, int cap, const char *base, const char *extr
     return (extra && extra[i]) ? -1 : 0;
 }
 
-static void **fd_table_for_process(process_t *proc)
+static files_struct_t *vfs_files_for_process(process_t *proc)
 {
-    if (proc)
-        return proc->open_files;
-    return g_kernel_open_files;
+    if (proc && proc->files)
+        return proc->files;
+    return &g_kernel_files;
 }
 
 static char *cwd_for_process(process_t *proc)
@@ -1004,12 +1023,14 @@ static void vfs_flock_release_file(vfs_file_t *f)
 
 static void file_pool_reset(void)
 {
-    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
-    for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++)
-        g_kernel_open_files[i] = NULL;
+    unsigned long flags = spin_lock_irqsave(&g_kernel_files.lock);
+    for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
+        g_kernel_files.open_files[i] = NULL;
+        g_kernel_files.fd_flags[i] = 0;
+    }
     kstrncpy(g_kernel_cwd, "/", VFS_PATH_MAX);
     g_kernel_umask = 0022U;
-    spin_unlock_irqrestore(&g_fd_lock, flags);
+    spin_unlock_irqrestore(&g_kernel_files.lock, flags);
 }
 
 static vfs_file_t *file_alloc(void)
@@ -1189,9 +1210,27 @@ static void file_release(vfs_file_t *f)
     if (f->backend != VFS_BACKEND_FAT32 && f->backend != VFS_BACKEND_FAT32VOL &&
         f->backend != VFS_BACKEND_EXT4 && f->backend != VFS_BACKEND_TMPFS &&
         f->backend != VFS_BACKEND_PIPE && f->backend != VFS_BACKEND_UNIXSOCK &&
-        f->backend != VFS_BACKEND_DEVFS && f->backend != VFS_BACKEND_EPOLL) {
+        f->backend != VFS_BACKEND_DEVFS && f->backend != VFS_BACKEND_EPOLL &&
+        f->backend != VFS_BACKEND_TIMERFD) {
         if (f->u.regular.owns_buf && f->u.regular.buf)
             kfree(f->u.regular.buf);
+    }
+
+    if (f->backend == VFS_BACKEND_TIMERFD && f->u.timerfd.tfd) {
+        vfs_timerfd_t *tfd = f->u.timerfd.tfd;
+        f->u.timerfd.tfd = NULL;
+        unsigned long tlflags = spin_lock_irqsave(&g_timerfd_list_lock);
+        vfs_timerfd_t **pp = &g_timerfd_list;
+        while (*pp) {
+            if (*pp == tfd) {
+                *pp = tfd->list_next;
+                tfd->list_next = NULL;
+                break;
+            }
+            pp = &(*pp)->list_next;
+        }
+        spin_unlock_irqrestore(&g_timerfd_list_lock, tlflags);
+        kfree(tfd);
     }
 
     if (f->backend == VFS_BACKEND_EPOLL) {
@@ -1621,36 +1660,37 @@ int vfs_file_sync_range(vfs_file_t *f, uint64_t start_page, uint64_t end_page, i
 
 static vfs_file_t *fd_lookup_ref(process_t *proc, int fd)
 {
-    void **tbl = fd_table_for_process(proc);
+    files_struct_t *fs = vfs_files_for_process(proc);
     vfs_file_t *f = NULL;
     if (!fd_valid(fd))
         return NULL;
-    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
-    f = (vfs_file_t *)tbl[fd];
+    unsigned long flags = spin_lock_irqsave(&fs->lock);
+    f = (vfs_file_t *)fs->open_files[fd];
     if (f == (vfs_file_t *)(uintptr_t)1)
         f = NULL;
     if (f)
         file_ref(f);
-    spin_unlock_irqrestore(&g_fd_lock, flags);
+    spin_unlock_irqrestore(&fs->lock, flags);
     return f;
 }
 
-static void fd_close_on_table(void **tbl, int fd)
+static void fd_close_on_table(files_struct_t *fs, int fd)
 {
     vfs_file_t *f;
-    if (!tbl || !fd_valid(fd))
+    if (!fs || !fd_valid(fd))
         return;
 
-    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
-    f = (vfs_file_t *)tbl[fd];
+    unsigned long flags = spin_lock_irqsave(&fs->lock);
+    f = (vfs_file_t *)fs->open_files[fd];
     if (!f || f == (vfs_file_t *)(uintptr_t)1) {
-        tbl[fd] = NULL;
-        spin_unlock_irqrestore(&g_fd_lock, flags);
+        fs->open_files[fd] = NULL;
+        fs->fd_flags[fd] = 0;
+        spin_unlock_irqrestore(&fs->lock, flags);
         return;
     }
 
     for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
-        vfs_file_t *ef = (vfs_file_t *)tbl[i];
+        vfs_file_t *ef = (vfs_file_t *)fs->open_files[i];
         if (ef && ef != (vfs_file_t *)(uintptr_t)1 && ef->backend == VFS_BACKEND_EPOLL) {
             unsigned long eflags = spin_lock_irqsave(&ef->lock);
             epoll_item_t *prev = NULL;
@@ -1672,12 +1712,9 @@ static void fd_close_on_table(void **tbl, int fd)
         }
     }
 
-    tbl[fd] = NULL;
-    if (tbl != g_kernel_open_files) {
-        process_t *owner = (process_t *)((uintptr_t)tbl - offsetof(process_t, open_files));
-        owner->fds[fd].flags = 0;
-    }
-    spin_unlock_irqrestore(&g_fd_lock, flags);
+    fs->open_files[fd] = NULL;
+    fs->fd_flags[fd] = 0;
+    spin_unlock_irqrestore(&fs->lock, flags);
     file_release(f);
 }
 
@@ -2763,18 +2800,17 @@ static int open_ext4_file(const vfs_mount_t *m, vfs_file_t *f,
 
 static int vfs_install_fd(process_t *proc, vfs_file_t *f)
 {
-    void **tbl = fd_table_for_process(proc);
-    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
+    files_struct_t *fs = vfs_files_for_process(proc);
+    unsigned long flags = spin_lock_irqsave(&fs->lock);
     for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
-        if (!tbl[i]) {
-            tbl[i] = f;
-            if (proc)
-                proc->fds[i].flags = 0;
-            spin_unlock_irqrestore(&g_fd_lock, flags);
+        if (!fs->open_files[i]) {
+            fs->open_files[i] = f;
+            fs->fd_flags[i] = 0;
+            spin_unlock_irqrestore(&fs->lock, flags);
             return i;
         }
     }
-    spin_unlock_irqrestore(&g_fd_lock, flags);
+    spin_unlock_irqrestore(&fs->lock, flags);
     return -EMFILE;
 }
 
@@ -3096,8 +3132,12 @@ int vfs_open_flags_mode(const char *path, int flags, int mode)
         file_release(f);
         return fd;
     }
-    if (proc && (flags & VFS_O_CLOEXEC))
-        proc->fds[fd].flags = VFS_FD_CLOEXEC;
+    if (flags & VFS_O_CLOEXEC) {
+        files_struct_t *fs = vfs_files_for_process(proc);
+        unsigned long fdflags = spin_lock_irqsave(&fs->lock);
+        fs->fd_flags[fd] = VFS_FD_CLOEXEC;
+        spin_unlock_irqrestore(&fs->lock, fdflags);
+    }
     return fd;
 }
 
@@ -3931,8 +3971,8 @@ int vfs_umount2(const char *target, int flags)
 void vfs_close(int fd)
 {
     process_t *proc = vfs_current_process();
-    void **tbl = fd_table_for_process(proc);
-    fd_close_on_table(tbl, fd);
+    files_struct_t *fs = vfs_files_for_process(proc);
+    fd_close_on_table(fs, fd);
 }
 
 /* Read/write/seek */
@@ -3945,6 +3985,23 @@ int vfs_fd_has_mode(int fd, int mode)
     if (f)
         file_release(f);
     return ok;
+}
+
+static int timerfd_refresh_locked(vfs_timerfd_t *tfd, uint64_t now_ns)
+{
+    if (!tfd->armed || now_ns < tfd->next_expire_ns)
+        return 0;
+    if (tfd->interval_ns > 0) {
+        uint64_t delta = now_ns - tfd->next_expire_ns;
+        uint64_t ticks = 1ULL + (delta / tfd->interval_ns);
+        tfd->expirations += ticks;
+        tfd->next_expire_ns += ticks * tfd->interval_ns;
+    } else {
+        tfd->expirations++;
+        tfd->armed = 0;
+        tfd->next_expire_ns = 0;
+    }
+    return 1;
 }
 
 size_t vfs_read(int fd, void *buf, size_t count)
@@ -4108,6 +4165,55 @@ size_t vfs_read(int fd, void *buf, size_t count)
                                     (f->flags & VFS_O_NONBLOCK) ? 1 : 0, &err);
         file_release(f);
         return (err < 0) ? (size_t)err : got;
+    }
+
+    if (f->backend == VFS_BACKEND_TIMERFD) {
+        vfs_timerfd_t *tfd = f->u.timerfd.tfd;
+        if (!tfd || count < sizeof(uint64_t)) {
+            file_release(f);
+            return (size_t)-EINVAL;
+        }
+        for (;;) {
+            unsigned long irqf = vfs_irq_save_disable();
+            spin_lock(&tfd->lock);
+            (void)timerfd_refresh_locked(tfd, time_monotonic_ns());
+            if (tfd->expirations > 0) {
+                uint64_t exp = tfd->expirations;
+                tfd->expirations = 0;
+                spin_unlock(&tfd->lock);
+                vfs_irq_restore(irqf);
+                *(uint64_t *)buf = exp;
+                file_release(f);
+                return sizeof(uint64_t);
+            }
+            if (f->flags & VFS_O_NONBLOCK) {
+                spin_unlock(&tfd->lock);
+                vfs_irq_restore(irqf);
+                file_release(f);
+                return (size_t)-EAGAIN;
+            }
+            process_t *curp = vfs_current_process();
+            if (!curp) {
+                spin_unlock(&tfd->lock);
+                vfs_irq_restore(irqf);
+                file_release(f);
+                return (size_t)-EAGAIN;
+            }
+            if (process_has_deliverable_signal(curp)) {
+                spin_unlock(&tfd->lock);
+                vfs_irq_restore(irqf);
+                file_release(f);
+                return (size_t)-EINTR;
+            }
+            wait_queue_entry_t wqe;
+            wqe.proc = curp;
+            wqe.next = NULL;
+            wait_queue_prepare_to_wait(&tfd->waitq, &wqe);
+            spin_unlock(&tfd->lock);
+            process_yield();
+            vfs_irq_restore(irqf);
+            wait_queue_finish_wait(&tfd->waitq, &wqe);
+        }
     }
 
     if (f->backend == VFS_BACKEND_DEVFS) {
@@ -4484,7 +4590,6 @@ size_t vfs_size(int fd)
 int vfs_dup(int oldfd)
 {
     process_t *proc = vfs_current_process();
-    void **tbl = fd_table_for_process(proc);
     vfs_file_t *f = fd_lookup_ref(proc, oldfd);
     if (!f)
         return -EBADF;
@@ -4493,14 +4598,13 @@ int vfs_dup(int oldfd)
         file_release(f);
         return newfd;
     }
-    (void)tbl;
     return newfd;
 }
 
 int vfs_dup2(int oldfd, int newfd)
 {
     process_t *proc = vfs_current_process();
-    void **tbl = fd_table_for_process(proc);
+    files_struct_t *fs = vfs_files_for_process(proc);
     if (!fd_valid(newfd))
         return -EBADF;
     vfs_file_t *f = fd_lookup_ref(proc, oldfd);
@@ -4510,13 +4614,12 @@ int vfs_dup2(int oldfd, int newfd)
         file_release(f);
         return newfd;
     }
-    fd_close_on_table(tbl, newfd);
-    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
-    vfs_file_t *existing = (vfs_file_t *)tbl[newfd];
-    tbl[newfd] = f;
-    if (proc)
-        proc->fds[newfd].flags = 0;
-    spin_unlock_irqrestore(&g_fd_lock, flags);
+    fd_close_on_table(fs, newfd);
+    unsigned long flags = spin_lock_irqsave(&fs->lock);
+    vfs_file_t *existing = (vfs_file_t *)fs->open_files[newfd];
+    fs->open_files[newfd] = f;
+    fs->fd_flags[newfd] = 0;
+    spin_unlock_irqrestore(&fs->lock, flags);
     if (existing && existing != (vfs_file_t *)(uintptr_t)1)
         file_release(existing);
     return newfd;
@@ -4525,7 +4628,7 @@ int vfs_dup2(int oldfd, int newfd)
 int vfs_pipe(int pipefd[2])
 {
     process_t *proc = vfs_current_process();
-    void **tbl = fd_table_for_process(proc);
+    files_struct_t *fs = vfs_files_for_process(proc);
     int fd_r = -1;
     int fd_w = -1;
     vfs_pipe_t *p;
@@ -4535,26 +4638,26 @@ int vfs_pipe(int pipefd[2])
     if (!pipefd)
         return -EINVAL;
 
-    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
+    unsigned long flags = spin_lock_irqsave(&fs->lock);
     for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
-        if (!tbl[i]) {
+        if (!fs->open_files[i]) {
             if (fd_r < 0) {
                 fd_r = i;
-                tbl[i] = (void *)1;
+                fs->open_files[i] = (void *)1;
             } else {
                 fd_w = i;
-                tbl[i] = (void *)1;
+                fs->open_files[i] = (void *)1;
                 break;
             }
         }
     }
     if (fd_r < 0 || fd_w < 0) {
         if (fd_r >= 0)
-            tbl[fd_r] = NULL;
-        spin_unlock_irqrestore(&g_fd_lock, flags);
+            fs->open_files[fd_r] = NULL;
+        spin_unlock_irqrestore(&fs->lock, flags);
         return -EMFILE;
     }
-    spin_unlock_irqrestore(&g_fd_lock, flags);
+    spin_unlock_irqrestore(&fs->lock, flags);
 
     p = pipe_alloc();
     fr = file_alloc();
@@ -4566,10 +4669,10 @@ int vfs_pipe(int pipefd[2])
             file_release(fw);
         if (p)
             pipe_free_slot(p);
-        flags = spin_lock_irqsave(&g_fd_lock);
-        tbl[fd_r] = NULL;
-        tbl[fd_w] = NULL;
-        spin_unlock_irqrestore(&g_fd_lock, flags);
+        flags = spin_lock_irqsave(&fs->lock);
+        fs->open_files[fd_r] = NULL;
+        fs->open_files[fd_w] = NULL;
+        spin_unlock_irqrestore(&fs->lock, flags);
         return -ENOMEM;
     }
 
@@ -4594,10 +4697,12 @@ int vfs_pipe(int pipefd[2])
     p->readers = 1;
     p->writers = 1;
 
-    flags = spin_lock_irqsave(&g_fd_lock);
-    tbl[fd_r] = fr;
-    tbl[fd_w] = fw;
-    spin_unlock_irqrestore(&g_fd_lock, flags);
+    flags = spin_lock_irqsave(&fs->lock);
+    fs->open_files[fd_r] = fr;
+    fs->open_files[fd_w] = fw;
+    fs->fd_flags[fd_r] = 0;
+    fs->fd_flags[fd_w] = 0;
+    spin_unlock_irqrestore(&fs->lock, flags);
 
     pipefd[0] = fd_r;
     pipefd[1] = fd_w;
@@ -4830,24 +4935,18 @@ int vfs_fcntl(int fd, int cmd, int arg)
     if (!f)
         return -EBADF;
     if (cmd == VFS_F_GETFD) {
-        if (!proc) {
-            file_release(f);
-            return -EBADF;
-        }
-        unsigned long fd_flags = spin_lock_irqsave(&g_fd_lock);
-        rc = proc->fds[fd].flags & VFS_FD_CLOEXEC;
-        spin_unlock_irqrestore(&g_fd_lock, fd_flags);
+        files_struct_t *fs = vfs_files_for_process(proc);
+        unsigned long fd_flags = spin_lock_irqsave(&fs->lock);
+        rc = fs->fd_flags[fd] & VFS_FD_CLOEXEC;
+        spin_unlock_irqrestore(&fs->lock, fd_flags);
         file_release(f);
         return rc;
     }
     if (cmd == VFS_F_SETFD) {
-        if (!proc) {
-            file_release(f);
-            return -EBADF;
-        }
-        unsigned long fd_flags = spin_lock_irqsave(&g_fd_lock);
-        proc->fds[fd].flags = (arg & VFS_FD_CLOEXEC) ? VFS_FD_CLOEXEC : 0;
-        spin_unlock_irqrestore(&g_fd_lock, fd_flags);
+        files_struct_t *fs = vfs_files_for_process(proc);
+        unsigned long fd_flags = spin_lock_irqsave(&fs->lock);
+        fs->fd_flags[fd] = (arg & VFS_FD_CLOEXEC) ? VFS_FD_CLOEXEC : 0;
+        spin_unlock_irqrestore(&fs->lock, fd_flags);
         file_release(f);
         return 0;
     }
@@ -4856,21 +4955,19 @@ int vfs_fcntl(int fd, int cmd, int arg)
             file_release(f);
             return -EINVAL;
         }
-        void **tbl = fd_table_for_process(proc);
+        files_struct_t *fs = vfs_files_for_process(proc);
         int newfd = -EMFILE;
-        unsigned long fd_flags = spin_lock_irqsave(&g_fd_lock);
+        unsigned long fd_flags = spin_lock_irqsave(&fs->lock);
         for (int i = arg; i < PROCESS_MAX_OPEN_FILES; i++) {
-            if (!tbl[i]) {
+            if (!fs->open_files[i]) {
                 file_ref(f);
-                tbl[i] = f;
-                if (proc) {
-                    proc->fds[i].flags = (cmd == VFS_F_DUPFD_CLOEXEC) ? VFS_FD_CLOEXEC : 0;
-                }
+                fs->open_files[i] = f;
+                fs->fd_flags[i] = (cmd == VFS_F_DUPFD_CLOEXEC) ? VFS_FD_CLOEXEC : 0;
                 newfd = i;
                 break;
             }
         }
-        spin_unlock_irqrestore(&g_fd_lock, fd_flags);
+        spin_unlock_irqrestore(&fs->lock, fd_flags);
         file_release(f);
         return newfd;
     }
@@ -5261,7 +5358,8 @@ void vfs_vma_fork_pin_shared_page(const vm_area_t *vma, uintptr_t va)
 void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t offset)
 {
     process_t *proc = vfs_current_process();
-    if (!proc || !proc->vm_space.owns_pml4 || length == 0)
+    vm_space_t *vs = process_vm_space(proc);
+    if (!proc || !vs || !vs->owns_pml4 || length == 0)
         return (void *)(intptr_t)-EINVAL;
 
     if ((prot & ~(VFS_PROT_READ | VFS_PROT_WRITE | VFS_PROT_EXEC)) != 0)
@@ -5293,38 +5391,38 @@ void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t of
             return (void *)(intptr_t)-EBADF;
 
         uintptr_t target_va = 0;
-        vm_space_mmap_write_lock(&proc->vm_space);
+        vm_space_mmap_write_lock(vs);
 
         if (flags & VFS_MAP_FIXED) {
             uintptr_t req_va = (uintptr_t)addr;
             if (!req_va || !paging_is_page_aligned_uintptr(req_va)) {
-                vm_space_mmap_write_unlock(&proc->vm_space);
+                vm_space_mmap_write_unlock(vs);
                 return (void *)(intptr_t)-EINVAL;
             }
             if (!paging_range_is_user(req_va, span)) {
-                vm_space_mmap_write_unlock(&proc->vm_space);
+                vm_space_mmap_write_unlock(vs);
                 return (void *)(intptr_t)-ENOMEM;
             }
-            (void)vma_unmap_range(&proc->vm_space, req_va, span);
+            (void)vma_unmap_range(vs, req_va, span);
             target_va = req_va;
         } else {
             if (addr != NULL && paging_is_page_aligned_uintptr((uintptr_t)addr) &&
                 paging_range_is_user((uintptr_t)addr, span)) {
                 uintptr_t hint = (uintptr_t)addr;
-                target_va = vma_find_unmapped_area(&proc->vm_space, hint, hint + span, span);
+                target_va = vma_find_unmapped_area(vs, hint, hint + span, span);
             }
             if (!target_va)
-                target_va = vm_space_reserve_anon_range(&proc->vm_space, page_count);
+                target_va = vm_space_reserve_anon_range(vs, page_count);
             if (!target_va) {
-                vm_space_mmap_write_unlock(&proc->vm_space);
+                vm_space_mmap_write_unlock(vs);
                 return (void *)(intptr_t)-ENOMEM;
             }
         }
 
         uint32_t vma_flags = VMA_FLAG_ANON | (is_shared ? VMA_FLAG_SHARED : VMA_FLAG_PRIVATE);
-        vm_area_t *vma = vma_insert(&proc->vm_space, target_va, target_va + span,
+        vm_area_t *vma = vma_insert(vs, target_va, target_va + span,
                                     vma_prot, vma_flags);
-        vm_space_mmap_write_unlock(&proc->vm_space);
+        vm_space_mmap_write_unlock(vs);
         if (!vma)
             return (void *)(intptr_t)-ENOMEM;
 
@@ -5348,9 +5446,9 @@ void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t of
                 uintptr_t dev_va = (uintptr_t)res & ~page_mask;
                 size_t dev_off_in_pg = (size_t)((uintptr_t)res & page_mask);
                 size_t dev_span = (length + dev_off_in_pg + (size_t)page_mask) & ~(size_t)page_mask;
-                vm_space_mmap_write_lock(&proc->vm_space);
-                if (!vma_find(&proc->vm_space, dev_va)) {
-                    vm_area_t *dvma = vma_insert(&proc->vm_space, dev_va, dev_va + dev_span,
+                vm_space_mmap_write_lock(vs);
+                if (!vma_find(vs, dev_va)) {
+                    vm_area_t *dvma = vma_insert(vs, dev_va, dev_va + dev_span,
                                                  vma_prot, VMA_FLAG_DEVICE | VMA_FLAG_SHARED);
                     if (dvma) {
                         dvma->file = vfs_file_ref(f);
@@ -5359,7 +5457,7 @@ void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t of
                         dvma->close_cb = vfs_mmap_vma_close;
                     }
                 }
-                vm_space_mmap_write_unlock(&proc->vm_space);
+                vm_space_mmap_write_unlock(vs);
             }
         }
         file_release(f);
@@ -5386,41 +5484,41 @@ void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t of
     uint64_t fsize = vfs_file_size_bytes(f);
     uintptr_t target_va = 0;
 
-    vm_space_mmap_write_lock(&proc->vm_space);
+    vm_space_mmap_write_lock(vs);
     if (flags & VFS_MAP_FIXED) {
         uintptr_t req_va = (uintptr_t)addr;
         if (!req_va || !paging_is_page_aligned_uintptr(req_va)) {
-            vm_space_mmap_write_unlock(&proc->vm_space);
+            vm_space_mmap_write_unlock(vs);
             file_release(f);
             return (void *)(intptr_t)-EINVAL;
         }
         if (!paging_range_is_user(req_va, span)) {
-            vm_space_mmap_write_unlock(&proc->vm_space);
+            vm_space_mmap_write_unlock(vs);
             file_release(f);
             return (void *)(intptr_t)-ENOMEM;
         }
-        (void)vma_unmap_range(&proc->vm_space, req_va, span);
+        (void)vma_unmap_range(vs, req_va, span);
         target_va = req_va;
     } else {
         if (addr != NULL && paging_is_page_aligned_uintptr((uintptr_t)addr) &&
             paging_range_is_user((uintptr_t)addr, span)) {
             uintptr_t hint = (uintptr_t)addr;
-            target_va = vma_find_unmapped_area(&proc->vm_space, hint, hint + span, span);
+            target_va = vma_find_unmapped_area(vs, hint, hint + span, span);
         }
         if (!target_va)
-            target_va = vm_space_reserve_anon_range(&proc->vm_space, page_count);
+            target_va = vm_space_reserve_anon_range(vs, page_count);
         if (!target_va) {
-            vm_space_mmap_write_unlock(&proc->vm_space);
+            vm_space_mmap_write_unlock(vs);
             file_release(f);
             return (void *)(intptr_t)-ENOMEM;
         }
     }
 
     uint32_t vma_flags = VMA_FLAG_FILE | (is_shared ? VMA_FLAG_SHARED : VMA_FLAG_PRIVATE);
-    vm_area_t *vma = vma_insert(&proc->vm_space, target_va, target_va + span,
+    vm_area_t *vma = vma_insert(vs, target_va, target_va + span,
                                 vma_prot, vma_flags);
     if (!vma) {
-        vm_space_mmap_write_unlock(&proc->vm_space);
+        vm_space_mmap_write_unlock(vs);
         file_release(f);
         return (void *)(intptr_t)-ENOMEM;
     }
@@ -5432,7 +5530,7 @@ void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t of
     vma->close_cb = vfs_mmap_vma_close;
     vma->unmap_cb = vfs_mmap_vma_unmap;
     vma->fault_cb = vfs_mmap_vma_fault;
-    vm_space_mmap_write_unlock(&proc->vm_space);
+    vm_space_mmap_write_unlock(vs);
 
     file_release(f);
     return (void *)target_va;
@@ -5444,7 +5542,8 @@ int vfs_munmap(void *addr, size_t length)
         return -EINVAL;
 
     process_t *proc = vfs_current_process();
-    if (!proc || !proc->vm_space.owns_pml4)
+    vm_space_t *vs = process_vm_space(proc);
+    if (!proc || !vs || !vs->owns_pml4)
         return -EINVAL;
 
     uintptr_t p = (uintptr_t)addr;
@@ -5463,10 +5562,10 @@ int vfs_munmap(void *addr, size_t length)
     if (!paging_range_is_user(base, span))
         return -EINVAL;
 
-    vm_space_mmap_write_lock(&proc->vm_space);
-    int has_vma = (vma_find(&proc->vm_space, base) != NULL);
-    int rc = vma_unmap_range(&proc->vm_space, base, span);
-    vm_space_mmap_write_unlock(&proc->vm_space);
+    vm_space_mmap_write_lock(vs);
+    int has_vma = (vma_find(vs, base) != NULL);
+    int rc = vma_unmap_range(vs, base, span);
+    vm_space_mmap_write_unlock(vs);
 
     if (!has_vma) {
         size_t fb_sz = fb_byte_size();
@@ -5492,7 +5591,8 @@ int vfs_msync(void *addr, size_t length, int flags)
         return -EINVAL;
 
     process_t *proc = vfs_current_process();
-    if (!proc || !proc->vm_space.owns_pml4)
+    vm_space_t *vs = process_vm_space(proc);
+    if (!proc || !vs || !vs->owns_pml4)
         return -ENOMEM;
 
     if (length == 0)
@@ -5507,14 +5607,14 @@ int vfs_msync(void *addr, size_t length, int flags)
     if (end <= p || !paging_range_is_user(p, (size_t)(end - p)))
         return -ENOMEM;
 
-    vm_space_mmap_read_lock(&proc->vm_space);
+    vm_space_mmap_read_lock(vs);
 
     /* Ensure the entire requested range is covered by VMAs with no holes. */
     uintptr_t pos = p;
     while (pos < end) {
-        vm_area_t *check = vma_find(&proc->vm_space, pos);
+        vm_area_t *check = vma_find(vs, pos);
         if (!check || check->start > pos) {
-            vm_space_mmap_read_unlock(&proc->vm_space);
+            vm_space_mmap_read_unlock(vs);
             return -ENOMEM;
         }
         pos = check->end;
@@ -5524,9 +5624,9 @@ int vfs_msync(void *addr, size_t length, int flags)
     uintptr_t zero_phys = pmm_zero_page_phys();
     pos = p;
     while (pos < end) {
-        vm_area_t *vma = vma_find(&proc->vm_space, pos);
+        vm_area_t *vma = vma_find(vs, pos);
         if (!vma) {
-            vm_space_mmap_read_unlock(&proc->vm_space);
+            vm_space_mmap_read_unlock(vs);
             return -ENOMEM;
         }
         uintptr_t u_start = (vma->start > pos) ? vma->start : pos;
@@ -5540,7 +5640,7 @@ int vfs_msync(void *addr, size_t length, int flags)
 
             for (uintptr_t va = u_start; va < u_end; va += PAGE_SIZE) {
                 uint64_t q_phys = 0, q_flags = 0;
-                if (vmm_query_page(proc->vm_space.pml4_phys, va, &q_phys, &q_flags) != 0 ||
+                if (vmm_query_page(vs->pml4_phys, va, &q_phys, &q_flags) != 0 ||
                     !(q_flags & VMM_X64_PTE_PRESENT)) {
                     continue;
                 }
@@ -5555,8 +5655,8 @@ int vfs_msync(void *addr, size_t length, int flags)
                         pagecache_put_page(pg);
                     }
                     /* Clear WRITABLE so subsequent writes after msync fault and re-dirty. */
-                    if (vmm_protect_present_pages(proc->vm_space.pml4_phys, va, 1, ro_flags) == 0)
-                        vmm_tlb_shootdown(&proc->vm_space, va, 1);
+                    if (vmm_protect_present_pages(vs->pml4_phys, va, 1, ro_flags) == 0)
+                        vmm_tlb_shootdown(vs, va, 1);
                 }
             }
 
@@ -5572,7 +5672,7 @@ int vfs_msync(void *addr, size_t length, int flags)
         pos = u_end;
     }
 
-    vm_space_mmap_read_unlock(&proc->vm_space);
+    vm_space_mmap_read_unlock(vs);
     return first_err;
 }
 
@@ -5619,6 +5719,18 @@ static int vfs_file_poll_mask(vfs_file_t *f)
             return f->u.device.ops->poll(f->u.device.priv, VFS_POLLIN | VFS_POLLOUT);
         if (f->mode & VFS_MODE_WRITE)
             mask |= VFS_POLLOUT;
+        return mask;
+    }
+
+    if (f->backend == VFS_BACKEND_TIMERFD) {
+        vfs_timerfd_t *tfd = f->u.timerfd.tfd;
+        if (!tfd)
+            return VFS_POLLERR;
+        unsigned long tflags = spin_lock_irqsave(&tfd->lock);
+        (void)timerfd_refresh_locked(tfd, time_monotonic_ns());
+        if (tfd->expirations > 0)
+            mask |= VFS_POLLIN;
+        spin_unlock_irqrestore(&tfd->lock, tflags);
         return mask;
     }
 
@@ -5731,6 +5843,13 @@ static void vfs_poll_register_file(vfs_file_t *f, poll_table_t *pt, int16_t even
             if (wq)
                 poll_wtable_queue(wq, pt);
         }
+        return;
+    }
+
+    if (f->backend == VFS_BACKEND_TIMERFD) {
+        vfs_timerfd_t *tfd = f->u.timerfd.tfd;
+        if (tfd)
+            poll_wtable_queue(&tfd->waitq, pt);
         return;
     }
 
@@ -6048,6 +6167,175 @@ int vfs_epoll_wait(int epfd, epoll_event_t *events, int maxevents, int timeout_m
         kfree(pfds);
     file_release(epf);
     return num_ready;
+}
+
+static uint64_t timespec_to_ns_safe(const struct tsk_timespec *ts)
+{
+    uint64_t sec = (uint64_t)ts->tv_sec;
+    uint64_t nsec = (uint64_t)ts->tv_nsec;
+    if (sec > (UINT64_MAX - nsec) / 1000000000ULL)
+        return UINT64_MAX;
+    return sec * 1000000000ULL + nsec;
+}
+
+static void ns_to_timespec(uint64_t ns, struct tsk_timespec *out)
+{
+    out->tv_sec = (int64_t)(ns / 1000000000ULL);
+    out->tv_nsec = (int64_t)(ns % 1000000000ULL);
+}
+
+int vfs_timerfd_create(int clockid, int flags)
+{
+    if (clockid != TSK_CLOCK_REALTIME && clockid != TSK_CLOCK_MONOTONIC)
+        return -EINVAL;
+    if (flags & ~(TSK_TFD_CLOEXEC | TSK_TFD_NONBLOCK))
+        return -EINVAL;
+
+    process_t *proc = vfs_current_process();
+    vfs_file_t *f = file_alloc();
+    vfs_timerfd_t *tfd = (vfs_timerfd_t *)kmalloc(sizeof(vfs_timerfd_t));
+    if (!f || !tfd) {
+        if (f)
+            kfree(f);
+        if (tfd)
+            kfree(tfd);
+        return -ENOMEM;
+    }
+
+    tfd->lock = SPINLOCK_INIT;
+    wait_queue_init(&tfd->waitq);
+    tfd->clockid = clockid;
+    tfd->armed = 0;
+    tfd->next_expire_ns = 0;
+    tfd->interval_ns = 0;
+    tfd->expirations = 0;
+
+    f->backend = VFS_BACKEND_TIMERFD;
+    f->mode = VFS_MODE_READ;
+    f->flags = VFS_O_RDONLY | ((flags & TSK_TFD_NONBLOCK) ? VFS_O_NONBLOCK : 0);
+    f->inode_dev = 0x54494D45ULL;
+    f->inode_ino = (uint64_t)(uintptr_t)tfd;
+    f->u.timerfd.tfd = tfd;
+
+    unsigned long tlflags = spin_lock_irqsave(&g_timerfd_list_lock);
+    tfd->list_next = g_timerfd_list;
+    g_timerfd_list = tfd;
+    spin_unlock_irqrestore(&g_timerfd_list_lock, tlflags);
+
+    int fd = vfs_install_fd(proc, f);
+    if (fd < 0) {
+        file_release(f);
+        return -EMFILE;
+    }
+    if (flags & TSK_TFD_CLOEXEC) {
+        files_struct_t *fs = vfs_files_for_process(proc);
+        unsigned long fdflags = spin_lock_irqsave(&fs->lock);
+        fs->fd_flags[fd] |= VFS_FD_CLOEXEC;
+        spin_unlock_irqrestore(&fs->lock, fdflags);
+    }
+    return fd;
+}
+
+int vfs_timerfd_settime(int fd, int flags,
+                        const struct tsk_itimerspec *new_val,
+                        struct tsk_itimerspec *old_val)
+{
+    if (!new_val)
+        return -EINVAL;
+    if (flags & ~TSK_TFD_TIMER_ABSTIME)
+        return -EINVAL;
+    if (new_val->it_value.tv_sec < 0 || new_val->it_value.tv_nsec < 0 ||
+        new_val->it_value.tv_nsec >= 1000000000L ||
+        new_val->it_interval.tv_sec < 0 || new_val->it_interval.tv_nsec < 0 ||
+        new_val->it_interval.tv_nsec >= 1000000000L)
+        return -EINVAL;
+
+    process_t *proc = vfs_current_process();
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    if (!f)
+        return -EBADF;
+    if (f->backend != VFS_BACKEND_TIMERFD || !f->u.timerfd.tfd) {
+        file_release(f);
+        return -EINVAL;
+    }
+    vfs_timerfd_t *tfd = f->u.timerfd.tfd;
+    uint64_t now_ns = time_monotonic_ns();
+    uint64_t val_ns = timespec_to_ns_safe(&new_val->it_value);
+    uint64_t int_ns = timespec_to_ns_safe(&new_val->it_interval);
+
+    unsigned long tflags = spin_lock_irqsave(&tfd->lock);
+    (void)timerfd_refresh_locked(tfd, now_ns);
+    if (old_val) {
+        uint64_t rem_ns = 0;
+        if (tfd->armed && tfd->next_expire_ns > now_ns)
+            rem_ns = tfd->next_expire_ns - now_ns;
+        ns_to_timespec(rem_ns, &old_val->it_value);
+        ns_to_timespec(tfd->interval_ns, &old_val->it_interval);
+    }
+
+    tfd->expirations = 0;
+    tfd->interval_ns = int_ns;
+    if (val_ns == 0) {
+        tfd->armed = 0;
+        tfd->next_expire_ns = 0;
+    } else {
+        uint64_t target_ns = now_ns + val_ns;
+        if (flags & TSK_TFD_TIMER_ABSTIME) {
+            if (tfd->clockid == TSK_CLOCK_REALTIME) {
+                int64_t rt_now = time_realtime_ns();
+                int64_t diff = (int64_t)val_ns - rt_now;
+                target_ns = (diff > 0) ? (now_ns + (uint64_t)diff) : now_ns;
+            } else {
+                target_ns = val_ns;
+            }
+        }
+        tfd->armed = 1;
+        tfd->next_expire_ns = target_ns;
+        if (timerfd_refresh_locked(tfd, now_ns))
+            wait_queue_wake_all(&tfd->waitq);
+    }
+    spin_unlock_irqrestore(&tfd->lock, tflags);
+    file_release(f);
+    return 0;
+}
+
+int vfs_timerfd_gettime(int fd, struct tsk_itimerspec *cur_val)
+{
+    if (!cur_val)
+        return -EINVAL;
+    process_t *proc = vfs_current_process();
+    vfs_file_t *f = fd_lookup_ref(proc, fd);
+    if (!f)
+        return -EBADF;
+    if (f->backend != VFS_BACKEND_TIMERFD || !f->u.timerfd.tfd) {
+        file_release(f);
+        return -EINVAL;
+    }
+    vfs_timerfd_t *tfd = f->u.timerfd.tfd;
+    uint64_t now_ns = time_monotonic_ns();
+    unsigned long tflags = spin_lock_irqsave(&tfd->lock);
+    (void)timerfd_refresh_locked(tfd, now_ns);
+    uint64_t rem_ns = 0;
+    if (tfd->armed && tfd->next_expire_ns > now_ns)
+        rem_ns = tfd->next_expire_ns - now_ns;
+    ns_to_timespec(rem_ns, &cur_val->it_value);
+    ns_to_timespec(tfd->interval_ns, &cur_val->it_interval);
+    spin_unlock_irqrestore(&tfd->lock, tflags);
+    file_release(f);
+    return 0;
+}
+
+void vfs_timerfd_tick(uint64_t now_ns)
+{
+    unsigned long tlflags = spin_lock_irqsave(&g_timerfd_list_lock);
+    for (vfs_timerfd_t *tfd = g_timerfd_list; tfd; tfd = tfd->list_next) {
+        unsigned long tflags = spin_lock_irqsave(&tfd->lock);
+        int fired = timerfd_refresh_locked(tfd, now_ns);
+        spin_unlock_irqrestore(&tfd->lock, tflags);
+        if (fired)
+            wait_queue_wake_all(&tfd->waitq);
+    }
+    spin_unlock_irqrestore(&g_timerfd_list_lock, tlflags);
 }
 
 /* stat/lstat/fstat/cwd/list/getdents64 */
@@ -6438,44 +6726,60 @@ long vfs_getdents64(int fd, void *dirp, size_t count)
 
 int vfs_process_inherit(struct process *dst, const struct process *src)
 {
-    void **dst_tbl;
-    void **src_tbl;
+    files_struct_t *dst_fs;
+    files_struct_t *src_fs;
     if (!dst)
         return -1;
 
-    dst_tbl = fd_table_for_process((process_t *)dst);
-    src_tbl = fd_table_for_process((process_t *)src);
+    dst_fs = vfs_files_for_process((process_t *)dst);
+    src_fs = vfs_files_for_process((process_t *)src);
+    if (dst_fs == src_fs)
+        return 0;
+
     for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++)
-        fd_close_on_table(dst_tbl, i);
+        fd_close_on_table(dst_fs, i);
 
     if (!src)
         return 0;
 
-    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
+    unsigned long flags1, flags2;
+    if ((uintptr_t)src_fs < (uintptr_t)dst_fs) {
+        flags1 = spin_lock_irqsave(&src_fs->lock);
+        flags2 = spin_lock_irqsave(&dst_fs->lock);
+    } else {
+        flags1 = spin_lock_irqsave(&dst_fs->lock);
+        flags2 = spin_lock_irqsave(&src_fs->lock);
+    }
     for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
-        vfs_file_t *f = (vfs_file_t *)src_tbl[i];
+        vfs_file_t *f = (vfs_file_t *)src_fs->open_files[i];
         if (!f || f == (vfs_file_t *)(uintptr_t)1)
             continue;
         file_ref(f);
-        dst_tbl[i] = f;
-        ((process_t *)dst)->fds[i].flags = ((const process_t *)src)->fds[i].flags;
+        dst_fs->open_files[i] = f;
+        dst_fs->fd_flags[i] = src_fs->fd_flags[i];
     }
-    spin_unlock_irqrestore(&g_fd_lock, flags);
+    if ((uintptr_t)src_fs < (uintptr_t)dst_fs) {
+        spin_unlock_irqrestore(&dst_fs->lock, flags2);
+        spin_unlock_irqrestore(&src_fs->lock, flags1);
+    } else {
+        spin_unlock_irqrestore(&src_fs->lock, flags2);
+        spin_unlock_irqrestore(&dst_fs->lock, flags1);
+    }
     return 0;
 }
 
 void vfs_process_close_cloexec(struct process *proc)
 {
-    void **tbl;
+    files_struct_t *fs;
     if (!proc)
         return;
-    tbl = fd_table_for_process(proc);
+    fs = vfs_files_for_process(proc);
     for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
-        unsigned long flags = spin_lock_irqsave(&g_fd_lock);
-        int close_it = (tbl[i] != NULL && (proc->fds[i].flags & VFS_FD_CLOEXEC)) ? 1 : 0;
-        spin_unlock_irqrestore(&g_fd_lock, flags);
+        unsigned long flags = spin_lock_irqsave(&fs->lock);
+        int close_it = (fs->open_files[i] != NULL && (fs->fd_flags[i] & VFS_FD_CLOEXEC)) ? 1 : 0;
+        spin_unlock_irqrestore(&fs->lock, flags);
         if (close_it)
-            fd_close_on_table(tbl, i);
+            fd_close_on_table(fs, i);
     }
 }
 
@@ -6484,46 +6788,58 @@ int vfs_process_dup2(struct process *dst,
                      const struct process *src,
                      int src_fd)
 {
-    void **dst_tbl;
-    void **src_tbl;
+    files_struct_t *dst_fs;
+    files_struct_t *src_fs;
     vfs_file_t *f;
     if (!dst || !src || !fd_valid(dst_fd) || !fd_valid(src_fd))
         return -1;
 
-    dst_tbl = fd_table_for_process((process_t *)dst);
-    src_tbl = fd_table_for_process((process_t *)src);
+    dst_fs = vfs_files_for_process((process_t *)dst);
+    src_fs = vfs_files_for_process((process_t *)src);
 
-    unsigned long flags = spin_lock_irqsave(&g_fd_lock);
-    f = (vfs_file_t *)src_tbl[src_fd];
+    unsigned long flags = spin_lock_irqsave(&src_fs->lock);
+    f = (vfs_file_t *)src_fs->open_files[src_fd];
     if (!f || f == (vfs_file_t *)(uintptr_t)1) {
-        spin_unlock_irqrestore(&g_fd_lock, flags);
+        spin_unlock_irqrestore(&src_fs->lock, flags);
         return -1;
     }
     file_ref(f);
-    spin_unlock_irqrestore(&g_fd_lock, flags);
+    spin_unlock_irqrestore(&src_fs->lock, flags);
 
-    fd_close_on_table(dst_tbl, dst_fd);
+    fd_close_on_table(dst_fs, dst_fd);
 
-    flags = spin_lock_irqsave(&g_fd_lock);
-    vfs_file_t *old = (vfs_file_t *)dst_tbl[dst_fd];
-    dst_tbl[dst_fd] = f;
-    spin_unlock_irqrestore(&g_fd_lock, flags);
+    flags = spin_lock_irqsave(&dst_fs->lock);
+    vfs_file_t *old = (vfs_file_t *)dst_fs->open_files[dst_fd];
+    dst_fs->open_files[dst_fd] = f;
+    dst_fs->fd_flags[dst_fd] = 0;
+    spin_unlock_irqrestore(&dst_fs->lock, flags);
     if (old && old != (vfs_file_t *)(uintptr_t)1)
         file_release(old);
     return 0;
+}
+
+void vfs_files_destroy(struct files_struct *fs)
+{
+    if (!fs || fs == &g_kernel_files)
+        return;
+    for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++)
+        fd_close_on_table(fs, i);
+    kfree(fs);
 }
 
 /* Process teardown hook */
 
 void vfs_process_cleanup(struct process *proc)
 {
-    void **tbl;
+    files_struct_t *fs;
     process_t *p = (process_t *)proc;
     if (!p)
         return;
-    tbl = fd_table_for_process(p);
-    for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++)
-        fd_close_on_table(tbl, i);
+    fs = p->files;
+    if (fs) {
+        for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++)
+            fd_close_on_table(fs, i);
+    }
     if (!p->cwd[0])
         kstrncpy(p->cwd, "/", PROCESS_CWD_MAX);
 }

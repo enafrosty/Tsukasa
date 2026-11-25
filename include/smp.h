@@ -20,6 +20,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+struct process;
+
 typedef struct cpu_state {
     struct cpu_state *self;
     uint32_t cpu_id;
@@ -32,6 +34,8 @@ typedef struct cpu_state {
     uint64_t user_rsp;
     uint64_t pat_msr;
     uint64_t efer_msr;
+    struct process *prev_proc;
+    int prev_requeue;
 } cpu_state_t;
 
 /* Fixed %gs offsets used by arch/x86_64/cpu/syscall_entry.asm. */
@@ -42,6 +46,7 @@ typedef struct cpu_state {
 
 #define MSR_IA32_PAT        0x00000277u
 #define MSR_IA32_EFER       0xC0000080u
+#define MSR_FS_BASE         0xC0000100
 #define MSR_GS_BASE         0xC0000101
 #define MSR_KERNEL_GS_BASE  0xC0000102
 
@@ -67,5 +72,6 @@ uint32_t smp_this_cpu_id(void);
 uint32_t smp_cpu_count(void);
 cpu_state_t *smp_get_cpu(uint32_t cpu_id);
 uint32_t smp_get_lapic_id(uint32_t cpu_id);
+void smp_release_ap_schedulers(void);
 
 #endif /* SMP_H */

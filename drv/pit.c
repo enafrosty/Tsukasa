@@ -16,6 +16,7 @@
 
 #include "pit.h"
 #include "ps2.h"
+#include "../sys/time.h"
 
 static volatile uint64_t g_pit_ticks;
 static volatile uint32_t g_pit_hz;
@@ -53,6 +54,8 @@ uint64_t pit_ticks(void)
 
 uint64_t pit_ticks_ms(void)
 {
+    if (time_is_ready())
+        return time_monotonic_ms();
     uint32_t hz = g_pit_hz;
     if (hz == 0)
         hz = 100;

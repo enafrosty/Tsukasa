@@ -138,7 +138,7 @@ static int run_client(const char *sock_path)
         if (got < 0)
             break;
         if (got == 0) {
-            sched_yield();
+            usleep(1000);
             continue;
         }
         if (ev.type == VANILLA_EVENT_THEME_CHANGED)
@@ -171,7 +171,7 @@ static int run_server_loop(vanilla_server_t *srv)
     for (int spin = 0; spin < 500 && client_idx < 0; spin++) {
         client_idx = vanilla_server_accept(srv);
         if (client_idx < 0)
-            sched_yield();
+            usleep(2000);
     }
 
     if (client_idx < 0) {

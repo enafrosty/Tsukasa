@@ -40,6 +40,11 @@ struct timespec {
     long   tv_nsec;
 };
 
+struct itimerspec {
+    struct timespec it_interval;
+    struct timespec it_value;
+};
+
 time_t time(time_t *out);
 clock_t clock(void);
 time_t mktime(struct tm *tm);
@@ -53,10 +58,14 @@ struct tm *localtime_r(const time_t *timer, struct tm *result);
 struct tm *localtime(const time_t *timer);
 size_t strftime(char *s, size_t max, const char *fmt, const struct tm *tm);
 
-#define CLOCK_REALTIME  0
-#define CLOCK_MONOTONIC 1
+#define CLOCK_REALTIME      0
+#define CLOCK_MONOTONIC     1
+#define CLOCK_MONOTONIC_RAW 4
+#define CLOCK_BOOTTIME      7
 
 int clock_gettime(int clk_id, struct timespec *tp);
+int clock_getres(int clk_id, struct timespec *res);
+int clock_settime(int clk_id, const struct timespec *tp);
 
 int nanosleep(const struct timespec *req, struct timespec *rem);
 unsigned int sleep(unsigned int seconds);

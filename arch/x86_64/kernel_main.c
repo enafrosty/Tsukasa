@@ -28,6 +28,8 @@
 #include "include/smp.h"
 #include "include/lapic.h"
 #include "mm/pmm.h"
+#include "mm/pagecache.h"
+#include "mm/slab.h"
 #include "mm/heap.h"
 #include "mm/vmm_x64.h"
 
@@ -48,6 +50,7 @@
 #include "loader/exec.h"
 #include "loader/elf64.h"
 #include "proc/process.h"
+#include "sys/time.h"
 #include "tty/tty.h"
 #include "user/apps/registry.h"
 #include "include/io.h"
@@ -300,10 +303,13 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     }
 
     rtc_init();
+    time_init();
 
     pic_init();
     ioapic_init();
     pit_init(100);
+    if (lapic_timer_calibrate(100) != 0)
+        kprintf("[boot:x64] WARN: LAPIC timer calibration failed, keeping PIT IRQ0\n");
     pci_init();
     network_init();
     kprintf("[boot:x64] network stack init deferred until scheduler start\n");
@@ -323,6 +329,13 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     tty_init();
     user_apps_register_all();
     kprintf("[boot:x64] userspace app registry ready\n");
+
+    int selftest_req = is_selftest_requested(boot_info);
+    if (selftest_req) {
+        pmm_run_selftests();
+        pagecache_run_selftests();
+        slab_run_selftests();
+    }
 
     int init_pid = -1;
     int test_mode = is_test_requested(boot_info);
@@ -375,7 +388,7 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
             process_reparent(net_proc, init_pid);
     }
 
-    if (is_selftest_requested(boot_info)) {
+    if (selftest_req) {
         kprintf("[boot:x64] automated selftest mode enabled\n");
         syscall_table_run_selftests();
     }
@@ -393,6 +406,14 @@ void kernel_main_x64(const struct tsukasa_boot_info *boot_info)
     kprintf("[boot:x64] phase8 selftests spawn...\n");
     process_run_phase8_selftests();
     */
+
+    lapic_timer_start_cpu();
+    if (lapic_timer_active()) {
+        if (ioapic_active())
+            (void)ioapic_mask_gsi(acpi_irq_to_gsi(0));
+        pic_mask_irq(0);
+    }
+    smp_release_ap_schedulers();
 
     __asm__ volatile ("sti");
     kprintf("[boot:x64] interrupts enabled, preemptive scheduler active\n");
