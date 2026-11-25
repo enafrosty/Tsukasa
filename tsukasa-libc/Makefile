@@ -63,8 +63,9 @@ STDIO_OBJS   = src/stdio/printf.o \
                src/stdio/sscanf.o
 
 SETJMP_OBJS  = src/setjmp/setjmp.o
+TERMIOS_OBJS = src/termios/termios.o
 
-LIBC_OBJS    = $(SYSCALL_OBJS) $(STRING_OBJS) $(STDLIB_OBJS) $(STDIO_OBJS) $(SETJMP_OBJS)
+LIBC_OBJS    = $(SYSCALL_OBJS) $(STRING_OBJS) $(STDLIB_OBJS) $(STDIO_OBJS) $(SETJMP_OBJS) $(TERMIOS_OBJS)
 MATH_OBJS    = src/math/math.o
 
 LIBC_A       = lib/libc.a

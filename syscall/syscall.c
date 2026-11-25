@@ -302,7 +302,7 @@ static uintptr_t handle_system(uintptr_t cmd,
     }
 
     case SYSTEM_CMD_KILL:
-        return (uintptr_t)process_kill((int)arg2, (int)arg3);
+        return (uintptr_t)process_kill_posix((int)arg2, (int)arg3);
 
     case SYSTEM_CMD_SIGACTION:
     {

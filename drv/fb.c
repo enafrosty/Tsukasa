@@ -24,6 +24,8 @@
 #include "../mm/vmm_x64.h"
 #include "../mm/vm_space.h"
 #include "../proc/process.h"
+#include "../sys/kconsole.h"
+#include "../tty/tty.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -180,6 +182,15 @@ int fb_ioctl(unsigned long request, void *arg)
         if (mode != VFS_KD_TEXT && mode != VFS_KD_GRAPHICS)
             return -EINVAL;
         g_kd_mode = mode;
+        kconsole_set_active(mode == VFS_KD_TEXT);
+        (void)tty_set_kd_mode(tty_get_active(), mode);
+        return 0;
+    }
+
+    if (request == VFS_KDGETMODE) {
+        if (!arg || !vmm_validate_user_ptr(arg, sizeof(int), 1))
+            return -EFAULT;
+        *(int *)arg = g_kd_mode;
         return 0;
     }
 

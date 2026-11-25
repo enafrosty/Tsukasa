@@ -39,7 +39,9 @@
 #define PROCESS_DEFAULT_TIMESLICE 4
 #define PROCESS_CPU_AFFINITY_ANY UINT32_MAX
 
-#define PROCESS_WAIT_WNOHANG   0x1
+#define PROCESS_WAIT_WNOHANG    0x1
+#define PROCESS_WAIT_WUNTRACED  0x2
+#define PROCESS_WAIT_WCONTINUED 0x8
 
 #define PROCESS_SIG_DFL        ((uintptr_t)0)
 #define PROCESS_SIG_IGN        ((uintptr_t)1)
@@ -204,6 +206,10 @@ struct process {
     uint32_t umask;
     spinlock_t fd_lock;
     uint32_t io_pad;
+    int ctty_kind;
+    int ctty_id;
+    int wait_report_pending;
+    int ctty_pad;
 
     int used;
     char name[PROCESS_NAME_MAX];
@@ -275,6 +281,13 @@ int process_kill(int pid, int sig);
 int process_kill_pgid(int pgid, int sig);
 
 int process_set_tty(int pid, int tty_id);
+int process_set_ctty(int pid, int kind, int id);
+int process_setsid(void);
+int process_getsid(int pid);
+int process_setpgid(int pid, int pgid);
+int process_getpgid_posix(int pid);
+int process_getpgrp(void);
+int process_kill_posix(int pid, int sig);
 int process_set_priority(int pid, uint32_t priority);
 int process_set_cmdline(int pid, const char *cmdline);
 int process_get_cmdline(int pid, char *buf, size_t size);

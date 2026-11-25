@@ -45,10 +45,125 @@
 #define VFS_FBIOGET_VSCREENINFO 0x4600
 #define VFS_FBIOGET_FSCREENINFO 0x4602
 
-/* KD console mode ioctl (Linux KDSETMODE) */
+/* KD console mode ioctls (Linux KDSETMODE / KDGETMODE) */
 #define VFS_KDSETMODE   0x4B3A
+#define VFS_KDGETMODE   0x4B3B
 #define VFS_KD_TEXT     0x00
 #define VFS_KD_GRAPHICS 0x01
+
+/* VT console ioctls (Linux VT_*) */
+#define VFS_VT_GETSTATE   0x5603
+#define VFS_VT_ACTIVATE   0x5606
+#define VFS_VT_WAITACTIVE 0x5607
+
+struct vfs_vt_stat {
+    uint16_t v_active;
+    uint16_t v_signal;
+    uint16_t v_state;
+};
+
+/* TTY / PTY ioctls (Linux x86_64 compatible) */
+#define VFS_TCGETS     0x5401UL
+#define VFS_TCSETS     0x5402UL
+#define VFS_TCSETSW    0x5403UL
+#define VFS_TCSETSF    0x5404UL
+#define VFS_TIOCSCTTY  0x540EUL
+#define VFS_TIOCGPGRP  0x540FUL
+#define VFS_TIOCSPGRP  0x5410UL
+#define VFS_TIOCGWINSZ 0x5413UL
+#define VFS_TIOCSWINSZ 0x5414UL
+#define VFS_FIONREAD   0x541BUL
+#define VFS_TIOCGPTN   0x80045430UL
+#define VFS_TIOCSPTLCK 0x40045431UL
+
+#define VFS_NCCS 32
+
+typedef uint32_t vfs_tcflag_t;
+typedef uint8_t  vfs_cc_t;
+typedef uint32_t vfs_speed_t;
+
+struct tsk_winsize {
+    uint16_t ws_row;
+    uint16_t ws_col;
+    uint16_t ws_xpixel;
+    uint16_t ws_ypixel;
+};
+
+struct tsk_termios {
+    vfs_tcflag_t c_iflag;
+    vfs_tcflag_t c_oflag;
+    vfs_tcflag_t c_cflag;
+    vfs_tcflag_t c_lflag;
+    vfs_cc_t     c_line;
+    vfs_cc_t     c_cc[VFS_NCCS];
+    vfs_speed_t  c_ispeed;
+    vfs_speed_t  c_ospeed;
+};
+
+/* c_cc indices */
+#define VFS_VINTR    0
+#define VFS_VQUIT    1
+#define VFS_VERASE   2
+#define VFS_VKILL    3
+#define VFS_VEOF     4
+#define VFS_VTIME    5
+#define VFS_VMIN     6
+#define VFS_VSWTC    7
+#define VFS_VSTART   8
+#define VFS_VSTOP    9
+#define VFS_VSUSP    10
+#define VFS_VEOL     11
+#define VFS_VREPRINT 12
+#define VFS_VDISCARD 13
+#define VFS_VWERASE  14
+#define VFS_VLNEXT   15
+#define VFS_VEOL2    16
+
+/* c_iflag bits */
+#define VFS_IGNBRK  0000001U
+#define VFS_BRKINT  0000002U
+#define VFS_IGNPAR  0000004U
+#define VFS_PARMRK  0000010U
+#define VFS_INPCK   0000020U
+#define VFS_ISTRIP  0000040U
+#define VFS_INLCR   0000100U
+#define VFS_IGNCR   0000200U
+#define VFS_ICRNL   0000400U
+#define VFS_IXON    0002000U
+#define VFS_IXANY   0004000U
+#define VFS_IXOFF   0010000U
+#define VFS_IUTF8   0040000U
+
+/* c_oflag bits */
+#define VFS_OPOST   0000001U
+#define VFS_OLCUC   0000002U
+#define VFS_ONLCR   0000004U
+#define VFS_OCRNL   0000010U
+#define VFS_ONOCR   0000020U
+#define VFS_ONLRET  0000040U
+
+/* c_cflag bits */
+#define VFS_CSIZE   0000060U
+#define VFS_CS8     0000060U
+#define VFS_CREAD   0000200U
+#define VFS_HUPCL   0002000U
+#define VFS_CLOCAL  0004000U
+#define VFS_B0      0000000U
+#define VFS_B9600   0000015U
+#define VFS_B38400  0000017U
+#define VFS_B115200 0010002U
+
+/* c_lflag bits */
+#define VFS_ISIG    0000001U
+#define VFS_ICANON  0000002U
+#define VFS_ECHO    0000010U
+#define VFS_ECHOE   0000020U
+#define VFS_ECHOK   0000040U
+#define VFS_ECHONL  0000100U
+#define VFS_NOFLSH  0000200U
+#define VFS_TOSTOP  0000400U
+#define VFS_ECHOCTL 0001000U
+#define VFS_IEXTEN  0100000U
 
 /* Block device ioctls (Linux-compatible) */
 #define BLKRRPART    0x125F

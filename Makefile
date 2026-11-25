@@ -119,7 +119,7 @@ OBJS = arch/x86_64/boot/entry.o \
        sys/futex.o \
        sys/panic.o sys/kconsole.o \
        proc/process.o proc/scheduler.o proc/signal.o \
-       tty/tty.o \
+       tty/tty.o tty/termios.o tty/pty.o \
        syscall/syscall.o syscall/syscall_table.o \
        ipc/shm.o ipc/unix_socket.o \
        $(USER_LIB_OBJS) $(USER_APP_OBJS) \
@@ -324,7 +324,7 @@ USER_TEST_BINS = $(INITRD_BIN)/hello.elf $(INITRD_BIN)/hello_sc.elf $(INITRD_BIN
                  $(INITRD_BIN)/interpld.elf $(INITRD_BIN)/interptest.elf
 
 COREUTILS_NAMES = ls cat mkdir rm cp mv grep ps free sysfetch kill date poweroff reboot \
-                  head tail wc sort uniq cut uname touch net ping telnet fetch tsh
+                  head tail wc sort uniq cut uname touch net ping telnet fetch tsh vterm
 
 apps: $(USER_TEST_BINS) vanilla coreutils disktools ports libc-tests
 
@@ -356,6 +356,8 @@ $(INITRD_IMG): apps limine-artifacts bootblob.bin $(LZ4PACK)
 	done
 	ln -sf tsh $(INITRD_BIN)/tsh.elf
 	ln -sf tsh $(INITRD_BIN)/TSH.ELF
+	ln -sf vterm $(INITRD_BIN)/vterm.elf
+	ln -sf vterm $(INITRD_BIN)/VTERM.ELF
 	cp vanilla/bin/vanilla_srv.elf $(INITRD_BIN)/vsrv
 	ln -sf vsrv $(INITRD_BIN)/vsrv.elf
 	ln -sf vsrv $(INITRD_BIN)/VSRV.ELF

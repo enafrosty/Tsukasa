@@ -3012,11 +3012,25 @@ int vfs_open_flags_mode(const char *path, int flags, int mode)
         f->u.device.ops = ops;
         f->u.device.priv = priv;
         f->pos = 0;
-        if (ops && ops->open) {
-            if (ops->open(priv, flags) != 0) {
+        if (ops && ops->open_instance) {
+            void *inst_priv = priv;
+            int orc = ops->open_instance(priv, flags, &inst_priv);
+            if (orc != 0) {
+                f->u.device.ops = NULL;
+                f->u.device.priv = NULL;
                 mount_unref(m);
                 file_release(f);
-                return -EIO;
+                return (orc < 0) ? orc : -EIO;
+            }
+            f->u.device.priv = inst_priv;
+        } else if (ops && ops->open) {
+            int orc = ops->open(priv, flags);
+            if (orc != 0) {
+                f->u.device.ops = NULL;
+                f->u.device.priv = NULL;
+                mount_unref(m);
+                file_release(f);
+                return (orc < 0) ? orc : -EIO;
             }
         }
         break;
@@ -4103,9 +4117,11 @@ size_t vfs_read(int fd, void *buf, size_t count)
             size_t pos = f->pos;
             spin_unlock_irqrestore(&f->lock, fflags);
             n = f->u.device.ops->read(f->u.device.priv, pos, buf, count, f->flags);
-            fflags = spin_lock_irqsave(&f->lock);
-            f->pos = pos + n;
-            spin_unlock_irqrestore(&f->lock, fflags);
+            if ((long)n > 0) {
+                fflags = spin_lock_irqsave(&f->lock);
+                f->pos = pos + n;
+                spin_unlock_irqrestore(&f->lock, fflags);
+            }
         }
         file_release(f);
         return n;
@@ -4307,14 +4323,19 @@ size_t vfs_write(int fd, const void *buf, size_t count)
 
     if (f->backend == VFS_BACKEND_DEVFS) {
         size_t n = 0;
-        if (f->u.device.ops && f->u.device.ops->write) {
+        if (f->u.device.ops && (f->u.device.ops->write_flags || f->u.device.ops->write)) {
             unsigned long fflags = spin_lock_irqsave(&f->lock);
             size_t pos = f->pos;
             spin_unlock_irqrestore(&f->lock, fflags);
-            n = f->u.device.ops->write(f->u.device.priv, pos, buf, count);
-            fflags = spin_lock_irqsave(&f->lock);
-            f->pos = pos + n;
-            spin_unlock_irqrestore(&f->lock, fflags);
+            if (f->u.device.ops->write_flags)
+                n = f->u.device.ops->write_flags(f->u.device.priv, pos, buf, count, f->flags);
+            else
+                n = f->u.device.ops->write(f->u.device.priv, pos, buf, count);
+            if ((long)n > 0) {
+                fflags = spin_lock_irqsave(&f->lock);
+                f->pos = pos + n;
+                spin_unlock_irqrestore(&f->lock, fflags);
+            }
         }
         file_release(f);
         return n;
@@ -4875,9 +4896,6 @@ int vfs_fcntl(int fd, int cmd, int arg)
 int vfs_ioctl(int fd, unsigned long request, void *arg)
 {
     process_t *proc = vfs_current_process();
-    if (request == VFS_KDSETMODE)
-        return fb_ioctl(request, arg);
-
     vfs_file_t *f = fd_lookup_ref(proc, fd);
     if (!f)
         return -EBADF;
@@ -5697,15 +5715,18 @@ static void vfs_poll_register_file(vfs_file_t *f, poll_table_t *pt, int16_t even
     }
 
     if (f->backend == VFS_BACKEND_DEVFS) {
+        if (f->u.device.ops && f->u.device.ops->get_waitq) {
+            wait_queue_head_t *wq = f->u.device.ops->get_waitq(f->u.device.priv, events);
+            if (wq)
+                poll_wtable_queue(wq, pt);
+            return;
+        }
         const char *sub = f->path;
         while (*sub == '/')
             sub++;
         if ((events & VFS_POLLIN) &&
             (kstreq(sub, "input/events") || kstreq(sub, "events") ||
-             kstreq(sub, "keyboard") || kstreq(sub, "mouse") ||
-             kstreq(sub, "tty") ||
-             (sub[0] == 't' && sub[1] == 't' && sub[2] == 'y' &&
-              sub[3] >= '0' && sub[3] <= '9' && sub[4] == '\0'))) {
+             kstreq(sub, "keyboard") || kstreq(sub, "mouse"))) {
             wait_queue_head_t *wq = input_dev_get_events_waitq();
             if (wq)
                 poll_wtable_queue(wq, pt);

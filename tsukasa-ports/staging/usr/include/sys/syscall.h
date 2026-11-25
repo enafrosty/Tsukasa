@@ -81,7 +81,12 @@
 #define SYS_chown          92
 #define SYS_fchown         93
 #define SYS_umask          95
+#define SYS_setpgid        109
 #define SYS_getppid        110
+#define SYS_getpgrp        111
+#define SYS_setsid         112
+#define SYS_getpgid        121
+#define SYS_getsid         124
 #define SYS_rt_sigpending  127
 #define SYS_sync           162
 #define SYS_mount          165

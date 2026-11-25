@@ -19,6 +19,8 @@
 #include <sys/poll.h>
 #include <sys/select.h>
 #include <sys/epoll.h>
+#include <termios.h>
+#include <unistd.h>
 
 int ioctl(int fd, unsigned long request, ...)
 {
@@ -77,5 +79,25 @@ int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
 
 int isatty(int fd)
 {
-    return (fd >= 0 && fd <= 2) ? 1 : 0;
+    struct termios t;
+    int saved_errno = errno;
+    if (ioctl(fd, TCGETS, &t) == 0) {
+        errno = saved_errno;
+        return 1;
+    }
+    return 0;
+}
+
+pid_t tcgetpgrp(int fd)
+{
+    int pgid = -1;
+    if (ioctl(fd, TIOCGPGRP, &pgid) < 0)
+        return -1;
+    return (pid_t)pgid;
+}
+
+int tcsetpgrp(int fd, pid_t pgrp)
+{
+    int pg = (int)pgrp;
+    return ioctl(fd, TIOCSPGRP, &pg);
 }
