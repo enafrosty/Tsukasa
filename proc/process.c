@@ -59,6 +59,8 @@ static void fpu_init_state(uint8_t *buf)
 }
 #define WAIT_STATUS_EXIT(code)   (((code) & 0xFF) << 8)
 #define WAIT_STATUS_SIGNAL(sig)  ((sig) & 0x7F)
+#define WAIT_STATUS_STOPPED(sig) ((((sig) & 0xFF) << 8) | 0x7F)
+#define WAIT_STATUS_CONTINUED    0xFFFF
 #define WAIT_EXIT_CODE(st)       (((st) >> 8) & 0xFF)
 #define WAIT_TERM_SIGNAL(st)     ((st) & 0x7F)
 
@@ -870,6 +872,54 @@ int process_reparent(process_t *child, int parent_pid)
     return 0;
 }
 
+static int is_default_ignore_sig(int sig)
+{
+    return (sig == PROCESS_SIGCHLD || sig == PROCESS_SIGCONT ||
+            sig == PROCESS_SIGWINCH || sig == PROCESS_SIGURG);
+}
+
+static int is_default_stop_sig(int sig)
+{
+    return (sig == PROCESS_SIGSTOP || sig == PROCESS_SIGTSTP ||
+            sig == PROCESS_SIGTTIN || sig == PROCESS_SIGTTOU);
+}
+
+static void stop_process_locked(process_t *p, int sig)
+{
+    if (!p || p->pid == 1 || p->is_idle ||
+        p->state == PROCESS_ZOMBIE || p->state == PROCESS_DEAD)
+        return;
+
+    sleepq_remove_locked(p);
+    runq_remove_locked(p);
+    p->poll_deadline_ms = 0;
+    p->state = PROCESS_STOPPED;
+    p->main_thread.state = THREAD_STOPPED;
+    p->wait_status = WAIT_STATUS_STOPPED(sig);
+    p->wait_report_pending = 1;
+    wake_parent_if_waiting_locked(p);
+}
+
+static void continue_process_locked(process_t *p)
+{
+    if (!p || p->is_idle || p->state == PROCESS_ZOMBIE || p->state == PROCESS_DEAD)
+        return;
+
+    p->signal_pending &= ~((1ULL << PROCESS_SIGSTOP) |
+                           (1ULL << PROCESS_SIGTSTP) |
+                           (1ULL << PROCESS_SIGTTIN) |
+                           (1ULL << PROCESS_SIGTTOU));
+
+    if (p->state == PROCESS_STOPPED) {
+        p->state = PROCESS_READY;
+        p->main_thread.state = THREAD_READY;
+        p->wait_status = WAIT_STATUS_CONTINUED;
+        p->wait_report_pending = 1;
+        runq_push_locked(p);
+        wake_parent_if_waiting_locked(p);
+    }
+}
+
 static void mark_zombie_locked(process_t *p, int wait_status);
 
 static void signal_post_locked(process_t *p, int sig)
@@ -890,26 +940,20 @@ static void signal_post_locked(process_t *p, int sig)
     }
 
     if (sig == PROCESS_SIGCONT) {
-        p->signal_pending &= ~((1ULL << PROCESS_SIGSTOP) |
-                               (1ULL << PROCESS_SIGTSTP) |
-                               (1ULL << PROCESS_SIGTTIN) |
-                               (1ULL << PROCESS_SIGTTOU));
-        if (p->state == PROCESS_STOPPED) {
-            p->state = PROCESS_READY;
-            p->main_thread.state = THREAD_READY;
-            runq_push_locked(p);
-        }
+        continue_process_locked(p);
         if (p->signal_handlers[sig] == PROCESS_SIG_DFL ||
             p->signal_handlers[sig] == PROCESS_SIG_IGN)
             return;
     }
 
-    if (sig == PROCESS_SIGSTOP || sig == PROCESS_SIGTSTP ||
-        sig == PROCESS_SIGTTIN || sig == PROCESS_SIGTTOU) {
-        p->signal_pending &= ~(1ULL << PROCESS_SIGCONT);
+    uint64_t bit = 1ULL << (uint32_t)sig;
+    uintptr_t handler = p->signal_handlers[sig];
+    if (sig == PROCESS_SIGSTOP ||
+        (is_default_stop_sig(sig) && handler == PROCESS_SIG_DFL && !(p->signal_mask & bit))) {
+        stop_process_locked(p, sig);
+        return;
     }
 
-    uint64_t bit = 1ULL << (uint32_t)sig;
     if (!(p->signal_mask & bit) && signal_is_ignored_locked(p, sig))
         return;
 
@@ -1006,7 +1050,21 @@ static int prepare_signal_action_locked(process_t *p, uintptr_t *handler_out, in
     p->signal_pending &= ~(1ULL << (uint32_t)sig);
     handler = p->signal_handlers[sig];
 
-    if (handler == PROCESS_SIG_IGN)
+    if (sig == PROCESS_SIGKILL) {
+        if (p->pid == 1)
+            return 0;
+        mark_zombie_locked(p, WAIT_STATUS_SIGNAL(sig));
+        return 0;
+    }
+
+    if (sig == PROCESS_SIGSTOP ||
+        (handler == PROCESS_SIG_DFL && is_default_stop_sig(sig))) {
+        stop_process_locked(p, sig);
+        return 0;
+    }
+
+    if (handler == PROCESS_SIG_IGN ||
+        (handler == PROCESS_SIG_DFL && is_default_ignore_sig(sig)))
         return 0;
 
     if (handler == PROCESS_SIG_DFL) {
@@ -1016,9 +1074,7 @@ static int prepare_signal_action_locked(process_t *p, uintptr_t *handler_out, in
         if (p->pid == 1)
             return 0;
         if (kind == SIG_DFL_STOP) {
-            p->state = PROCESS_STOPPED;
-            p->main_thread.state = THREAD_STOPPED;
-            runq_remove_locked(p);
+            stop_process_locked(p, sig);
             return 0;
         }
         mark_zombie_locked(p, WAIT_STATUS_SIGNAL(sig));
@@ -1059,6 +1115,9 @@ static process_t *create_kernel_process_locked(const char *name, process_entry_t
     p->state = PROCESS_READY;
     p->entry = entry;
     p->tty_id = parent ? parent->tty_id : 0;
+    p->ctty_kind = parent ? parent->ctty_kind : 0;
+    p->ctty_id = parent ? parent->ctty_id : -1;
+    p->wait_report_pending = 0;
     p->shm_attachment_count = 0;
     process_init_sched_state(p, parent);
     process_init_io_state(p, parent);
@@ -1375,6 +1434,9 @@ int process_fork_current(const syscall_frame_t *frame)
     child->entry = NULL;
     child->user_entry = cur->user_entry;
     child->tty_id = cur->tty_id;
+    child->ctty_kind = cur->ctty_kind;
+    child->ctty_id = cur->ctty_id;
+    child->wait_report_pending = 0;
     child->shm_attachment_count = 0;
 
     child->signal_mask = cur->signal_mask;
@@ -1795,6 +1857,31 @@ int process_waitpid(int caller_pid, int target_pid, int options, int *status_out
                     irq_restore(flags);
                     return pid;
                 }
+                if ((options & PROCESS_WAIT_WUNTRACED) &&
+                    child->state == PROCESS_STOPPED &&
+                    child->wait_report_pending) {
+                    int pid = (int)child->pid;
+                    if (status_out)
+                        *status_out = child->wait_status;
+                    child->wait_report_pending = 0;
+                    spin_unlock(&g_sched_lock);
+                    irq_restore(flags);
+                    return pid;
+                }
+                if ((options & PROCESS_WAIT_WCONTINUED) &&
+                    child->state != PROCESS_STOPPED &&
+                    child->state != PROCESS_ZOMBIE &&
+                    child->state != PROCESS_DEAD &&
+                    child->wait_report_pending &&
+                    child->wait_status == WAIT_STATUS_CONTINUED) {
+                    int pid = (int)child->pid;
+                    if (status_out)
+                        *status_out = WAIT_STATUS_CONTINUED;
+                    child->wait_report_pending = 0;
+                    spin_unlock(&g_sched_lock);
+                    irq_restore(flags);
+                    return pid;
+                }
             }
             child = child->parent_next_child;
         }
@@ -1818,6 +1905,11 @@ int process_waitpid(int caller_pid, int target_pid, int options, int *status_out
         }
 
         self = g_current[sched_this_cpu()];
+        if (self && (self->signal_pending & ~self->signal_mask)) {
+            spin_unlock(&g_sched_lock);
+            irq_restore(flags);
+            return -EINTR;
+        }
         if (self && self->pid == caller->pid) {
             self->waiting_child = 1;
             self->state = PROCESS_BLOCKED;
@@ -1843,6 +1935,7 @@ int process_kill(int pid, int sig)
 {
     process_t *p;
     uint64_t flags;
+    int self_stopped = 0;
     if (pid == 0) {
         process_t *cur = process_current();
         if (!cur || cur->pgid == 0)
@@ -1883,9 +1976,13 @@ int process_kill(int pid, int sig)
     }
 
     signal_post_locked(p, sig);
+    if (p == g_current[sched_this_cpu()] && p->state == PROCESS_STOPPED)
+        self_stopped = 1;
 
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
+    if (self_stopped)
+        process_yield();
     return 0;
 }
 
@@ -1893,11 +1990,13 @@ int process_kill_pgid(int pgid, int sig)
 {
     int count = 0;
     uint64_t flags;
+    int self_stopped = 0;
     if (pgid <= 0 || sig < 0 || sig >= PROCESS_MAX_SIGNALS)
         return -EINVAL;
 
     flags = irq_save_disable();
     spin_lock(&g_sched_lock);
+    process_t *cur = g_current[sched_this_cpu()];
     for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
         process_t *p = &g_processes[i];
         if (!p->used || p->state == PROCESS_DEAD || p->state == PROCESS_ZOMBIE)
@@ -1906,13 +2005,214 @@ int process_kill_pgid(int pgid, int sig)
             continue;
         if (p->pid == 1 && (sig == PROCESS_SIGKILL || sig == PROCESS_SIGSTOP || sig == PROCESS_SIGTERM))
             continue;
-        if (sig > 0)
+        if (sig > 0) {
             signal_post_locked(p, sig);
+            if (p == cur && p->state == PROCESS_STOPPED)
+                self_stopped = 1;
+        }
         count++;
     }
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
+    if (self_stopped)
+        process_yield();
     return count;
+}
+
+int process_kill_posix(int pid, int sig)
+{
+    if (sig < 0 || sig >= PROCESS_MAX_SIGNALS)
+        return -EINVAL;
+
+    if (pid > 0)
+        return (process_kill(pid, sig) == 0) ? 0 : -ESRCH;
+
+    if (pid == 0) {
+        process_t *cur = process_current();
+        int pgid = cur ? (int)cur->pgid : 0;
+        if (pgid <= 0)
+            return -ESRCH;
+        int rc = process_kill_pgid(pgid, sig);
+        return (rc > 0) ? 0 : -ESRCH;
+    }
+
+    if (pid < -1) {
+        int rc = process_kill_pgid(-pid, sig);
+        return (rc > 0) ? 0 : -ESRCH;
+    }
+
+    /* pid == -1: signal all eligible processes except init and kernel idle/swapper */
+    uint64_t flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    int count = 0;
+    int self_stopped = 0;
+    process_t *cur = g_current[sched_this_cpu()];
+    for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
+        process_t *p = &g_processes[i];
+        if (!p->used || p->is_idle || p->pid <= 1 ||
+            p->state == PROCESS_DEAD || p->state == PROCESS_ZOMBIE)
+            continue;
+        if (sig > 0) {
+            signal_post_locked(p, sig);
+            if (p == cur && p->state == PROCESS_STOPPED)
+                self_stopped = 1;
+        }
+        count++;
+    }
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    if (self_stopped)
+        process_yield();
+    return (count > 0) ? 0 : -ESRCH;
+}
+
+int process_set_ctty(int pid, int kind, int id)
+{
+    process_t *p;
+    uint64_t flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    p = find_by_pid_locked(pid);
+    if (!p) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -1;
+    }
+    p->ctty_kind = kind;
+    p->ctty_id = id;
+    if (kind == 1)
+        p->tty_id = id;
+    else if (kind == 0)
+        p->tty_id = -1;
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    return 0;
+}
+
+int process_setsid(void)
+{
+    uint64_t flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    process_t *cur = g_current[sched_this_cpu()];
+    if (!cur || !cur->used || cur->pid == 0) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -EPERM;
+    }
+    if (cur->sid == cur->pid) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -EPERM;
+    }
+    for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
+        process_t *q = &g_processes[i];
+        if (!q->used || q == cur || q->state == PROCESS_DEAD)
+            continue;
+        if (q->pgid == cur->pid || q->sid == cur->pid) {
+            spin_unlock(&g_sched_lock);
+            irq_restore(flags);
+            return -EPERM;
+        }
+    }
+    cur->sid = cur->pid;
+    cur->pgid = cur->pid;
+    cur->ctty_kind = 0;
+    cur->ctty_id = -1;
+    cur->tty_id = -1;
+    int sid = (int)cur->sid;
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    return sid;
+}
+
+int process_getsid(int pid)
+{
+    if (pid < 0)
+        return -EINVAL;
+    uint64_t flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    process_t *p = (pid == 0) ? g_current[sched_this_cpu()] : find_by_pid_locked(pid);
+    int sid = (p && p->used && p->state != PROCESS_DEAD) ? (int)p->sid : -ESRCH;
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    return sid;
+}
+
+int process_setpgid(int pid, int pgid)
+{
+    if (pid < 0 || pgid < 0)
+        return -EINVAL;
+
+    uint64_t flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    process_t *cur = g_current[sched_this_cpu()];
+    if (!cur) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -ESRCH;
+    }
+    process_t *target = (pid == 0) ? cur : find_by_pid_locked(pid);
+    if (!target || !target->used || target->state == PROCESS_DEAD) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -ESRCH;
+    }
+    if (target != cur && target->ppid != cur->pid) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -ESRCH;
+    }
+    if (target->pid == target->sid) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -EPERM;
+    }
+    if (target != cur && target->sid != cur->sid) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -EPERM;
+    }
+
+    uint32_t new_pgid = (pgid == 0) ? target->pid : (uint32_t)pgid;
+    if (new_pgid != target->pid) {
+        int found_pg = 0;
+        for (int i = 0; i < PROCESS_MAX_COUNT; i++) {
+            process_t *q = &g_processes[i];
+            if (!q->used || q->state == PROCESS_DEAD || q->state == PROCESS_ZOMBIE)
+                continue;
+            if (q->pgid == new_pgid && q->sid == cur->sid) {
+                found_pg = 1;
+                break;
+            }
+        }
+        if (!found_pg) {
+            spin_unlock(&g_sched_lock);
+            irq_restore(flags);
+            return -EPERM;
+        }
+    }
+
+    target->pgid = new_pgid;
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    return 0;
+}
+
+int process_getpgid_posix(int pid)
+{
+    if (pid < 0)
+        return -EINVAL;
+    uint64_t flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    process_t *p = (pid == 0) ? g_current[sched_this_cpu()] : find_by_pid_locked(pid);
+    int pg = (p && p->used && p->state != PROCESS_DEAD) ? (int)p->pgid : -ESRCH;
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    return pg;
+}
+
+int process_getpgrp(void)
+{
+    return process_getpgid_posix(0);
 }
 
 int process_set_tty(int pid, int tty_id)

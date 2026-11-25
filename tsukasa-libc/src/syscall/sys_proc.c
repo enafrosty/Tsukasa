@@ -248,6 +248,31 @@ pid_t getppid(void)
     return (pid_t)__syscall_check(__syscall0(SYS_getppid));
 }
 
+pid_t setsid(void)
+{
+    return (pid_t)__syscall_check(__syscall0(SYS_setsid));
+}
+
+pid_t getsid(pid_t pid)
+{
+    return (pid_t)__syscall_check(__syscall1(SYS_getsid, (int64_t)pid));
+}
+
+int setpgid(pid_t pid, pid_t pgid)
+{
+    return (int)__syscall_check(__syscall2(SYS_setpgid, (int64_t)pid, (int64_t)pgid));
+}
+
+pid_t getpgid(pid_t pid)
+{
+    return (pid_t)__syscall_check(__syscall1(SYS_getpgid, (int64_t)pid));
+}
+
+pid_t getpgrp(void)
+{
+    return (pid_t)__syscall_check(__syscall0(SYS_getpgrp));
+}
+
 int sched_yield(void)
 {
     return (int)__syscall_check(__syscall0(SYS_sched_yield));

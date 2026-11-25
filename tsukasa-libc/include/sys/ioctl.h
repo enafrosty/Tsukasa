@@ -23,8 +23,40 @@
 #define FBIOGET_FSCREENINFO 0x4602
 
 #define KDSETMODE   0x4B3A
+#define KDGETMODE   0x4B3B
 #define KD_TEXT     0x00
 #define KD_GRAPHICS 0x01
+
+#define VT_GETSTATE   0x5603
+#define VT_ACTIVATE   0x5606
+#define VT_WAITACTIVE 0x5607
+
+struct vt_stat {
+    uint16_t v_active;
+    uint16_t v_signal;
+    uint16_t v_state;
+};
+
+/* TTY / PTY ioctls (Linux x86_64 compatible) */
+#define TCGETS     0x5401UL
+#define TCSETS     0x5402UL
+#define TCSETSW    0x5403UL
+#define TCSETSF    0x5404UL
+#define TIOCSCTTY  0x540EUL
+#define TIOCGPGRP  0x540FUL
+#define TIOCSPGRP  0x5410UL
+#define TIOCGWINSZ 0x5413UL
+#define TIOCSWINSZ 0x5414UL
+#define FIONREAD   0x541BUL
+#define TIOCGPTN   0x80045430UL
+#define TIOCSPTLCK 0x40045431UL
+
+struct winsize {
+    uint16_t ws_row;
+    uint16_t ws_col;
+    uint16_t ws_xpixel;
+    uint16_t ws_ypixel;
+};
 
 /* Block device ioctls (Linux-compatible) */
 #define BLKRRPART    0x125F

@@ -20,6 +20,8 @@
 #include "../drv/pit.h"
 #include "../drv/serial.h"
 #include "../tty/tty.h"
+#include "../tty/pty.h"
+#include "../proc/process.h"
 #include "../include/errno.h"
 #include "../include/spinlock.h"
 #include "../include/vfs_abi.h"
@@ -305,22 +307,15 @@ static const devfs_ops_t g_urandom_ops = {
 static size_t dev_tty_read(void *priv, size_t pos, void *buf, size_t count, int flags)
 {
     (void)pos;
-    (void)flags;
     if (!buf || count == 0)
         return 0;
 #ifdef __x86_64__
     int index = (int)(intptr_t)priv;
-    int active = tty_get_active();
-    if (index >= 0 && index != active)
-        return 0;
-
-    size_t got = input_dev_tty_read(buf, count);
-    uint8_t *dst = (uint8_t *)buf;
-    while (got < count && serial_has_rx_port(COM1_BASE))
-        dst[got++] = (uint8_t)serial_getc_port(COM1_BASE);
-    return got;
+    long r = tty_read(index, buf, count, flags);
+    return (size_t)r;
 #else
     (void)priv;
+    (void)flags;
     return 0;
 #endif
 }
@@ -339,32 +334,135 @@ static size_t dev_tty_write(void *priv, size_t pos, const void *buf, size_t coun
 #endif
 }
 
-static int dev_tty_poll(void *priv, int events)
+static int dev_tty_ioctl(void *priv, unsigned long request, void *arg)
 {
-    int revents = events & VFS_POLLOUT;
 #ifdef __x86_64__
     int index = (int)(intptr_t)priv;
-    int active = tty_get_active();
-    if ((index < 0 || index == active) &&
-        (input_dev_tty_poll_readable() || serial_has_rx_port(COM1_BASE))) {
-        revents |= (events & VFS_POLLIN);
-    }
+    return tty_ioctl(index, request, arg);
 #else
     (void)priv;
+    (void)request;
+    (void)arg;
+    return -ENOTTY;
 #endif
-    return revents;
+}
+
+static int dev_tty_poll(void *priv, int events)
+{
+#ifdef __x86_64__
+    int index = (int)(intptr_t)priv;
+    return tty_poll(index, events);
+#else
+    (void)priv;
+    return events & VFS_POLLOUT;
+#endif
+}
+
+static wait_queue_head_t *dev_tty_get_waitq(void *priv, int events)
+{
+#ifdef __x86_64__
+    int index = (int)(intptr_t)priv;
+    return tty_get_waitq(index, events);
+#else
+    (void)priv;
+    (void)events;
+    return NULL;
+#endif
 }
 
 static const devfs_ops_t g_tty_ops = {
     .open = NULL,
+    .open_instance = NULL,
     .close = NULL,
     .read = dev_tty_read,
     .write = dev_tty_write,
-    .ioctl = NULL,
+    .write_flags = NULL,
+    .ioctl = dev_tty_ioctl,
     .mmap = NULL,
     .munmap = NULL,
     .poll = dev_tty_poll,
     .size = NULL,
+    .get_waitq = dev_tty_get_waitq,
+};
+
+/* /dev/tty controlling terminal alias */
+static const devfs_ops_t g_ctty_ops;
+
+static int dev_ctty_open_instance(void *priv, int flags, void **priv_out)
+{
+    (void)priv;
+#ifdef __x86_64__
+    process_t *cur = process_current();
+    if (cur && cur->ctty_kind == 2 && cur->ctty_id >= 0) {
+        void *pty = pty_lookup_by_id(cur->ctty_id);
+        if (pty && pty_slave_open_existing(pty, flags) == 0) {
+            *priv_out = pty;
+            return 0;
+        }
+    }
+#endif
+    (void)flags;
+    *priv_out = NULL;
+    return 0;
+}
+
+static void dev_ctty_close(void *priv)
+{
+    if (priv) {
+        const devfs_ops_t *sops = pty_get_slave_ops();
+        if (sops && sops->close)
+            sops->close(priv);
+    }
+}
+
+static size_t dev_ctty_read(void *priv, size_t pos, void *buf, size_t count, int flags)
+{
+    if (priv)
+        return pty_get_slave_ops()->read(priv, pos, buf, count, flags);
+    return dev_tty_read((void *)(intptr_t)-1, pos, buf, count, flags);
+}
+
+static size_t dev_ctty_write_flags(void *priv, size_t pos, const void *buf, size_t count, int flags)
+{
+    if (priv)
+        return pty_get_slave_ops()->write_flags(priv, pos, buf, count, flags);
+    return dev_tty_write((void *)(intptr_t)-1, pos, buf, count);
+}
+
+static int dev_ctty_ioctl(void *priv, unsigned long request, void *arg)
+{
+    if (priv)
+        return pty_get_slave_ops()->ioctl(priv, request, arg);
+    return dev_tty_ioctl((void *)(intptr_t)-1, request, arg);
+}
+
+static int dev_ctty_poll(void *priv, int events)
+{
+    if (priv)
+        return pty_get_slave_ops()->poll(priv, events);
+    return dev_tty_poll((void *)(intptr_t)-1, events);
+}
+
+static wait_queue_head_t *dev_ctty_get_waitq(void *priv, int events)
+{
+    if (priv)
+        return pty_get_slave_ops()->get_waitq(priv, events);
+    return dev_tty_get_waitq((void *)(intptr_t)-1, events);
+}
+
+static const devfs_ops_t g_ctty_ops = {
+    .open = NULL,
+    .open_instance = dev_ctty_open_instance,
+    .close = dev_ctty_close,
+    .read = dev_ctty_read,
+    .write = NULL,
+    .write_flags = dev_ctty_write_flags,
+    .ioctl = dev_ctty_ioctl,
+    .mmap = NULL,
+    .munmap = NULL,
+    .poll = dev_ctty_poll,
+    .size = NULL,
+    .get_waitq = dev_ctty_get_waitq,
 };
 
 /* /dev/keyboard operations */
@@ -556,6 +654,7 @@ int devfs_unregister_device(const char *name)
 void devfs_init(void)
 {
     input_dev_init();
+    pty_init();
 
     for (size_t i = 0; i < DEVFS_MAX_DEVICES; i++)
         g_dev_nodes[i].used = 0;
@@ -564,7 +663,8 @@ void devfs_init(void)
     devfs_register_device("null", VFS_TYPE_CHAR, &g_null_ops, NULL);
     devfs_register_device("zero", VFS_TYPE_CHAR, &g_zero_ops, NULL);
     devfs_register_device("urandom", VFS_TYPE_CHAR, &g_urandom_ops, NULL);
-    devfs_register_device("tty", VFS_TYPE_CHAR, &g_tty_ops, (void *)(intptr_t)-1);
+    devfs_register_device("tty", VFS_TYPE_CHAR, &g_ctty_ops, (void *)(intptr_t)-1);
+    devfs_register_device("ptmx", VFS_TYPE_CHAR, pty_get_ptmx_ops(), NULL);
 
     char tty_name[8];
     for (int i = 0; i <= 9; i++) {
@@ -621,12 +721,17 @@ int devfs_stat(const char *subpath, vfs_stat_t *out)
     while (*p == '/')
         p++;
 
-    if (dev_streq(p, "") || dev_streq(p, "input")) {
+    if (dev_streq(p, "") || dev_streq(p, "input") || dev_streq(p, "pts")) {
         out->size = 0;
         out->blocks = 0;
         out->type = VFS_TYPE_DIR;
         out->mode = VFS_MODE_READ;
-        out->st_ino = dev_streq(p, "") ? 1ULL : 2ULL;
+        if (dev_streq(p, ""))
+            out->st_ino = 1ULL;
+        else if (dev_streq(p, "input"))
+            out->st_ino = 2ULL;
+        else
+            out->st_ino = 3ULL;
         out->st_mode = VFS_S_IFDIR | 0555U;
         out->st_nlink = 2U;
         out->st_blksize = 4096U;
@@ -669,14 +774,20 @@ int devfs_list(const char *subpath, char names[][VFS_NAME_MAX], int max)
     if (*subpath == '\0') {
         unsigned long flags = spin_lock_irqsave(&g_devfs_lock);
         for (size_t i = 0; i < DEVFS_MAX_DEVICES && count < max; i++) {
-            if (g_dev_nodes[i].used && !dev_streq(g_dev_nodes[i].name, "input/events")) {
-                dev_strncpy(names[count], g_dev_nodes[i].name, VFS_NAME_MAX);
+            const char *n = g_dev_nodes[i].name;
+            int is_pts = (n[0] == 'p' && n[1] == 't' && n[2] == 's' && n[3] == '/');
+            if (g_dev_nodes[i].used && !dev_streq(n, "input/events") && !is_pts) {
+                dev_strncpy(names[count], n, VFS_NAME_MAX);
                 count++;
             }
         }
         spin_unlock_irqrestore(&g_devfs_lock, flags);
         if (count < max) {
             dev_strncpy(names[count], "input", VFS_NAME_MAX);
+            count++;
+        }
+        if (count < max) {
+            dev_strncpy(names[count], "pts", VFS_NAME_MAX);
             count++;
         }
         return count;
@@ -687,6 +798,20 @@ int devfs_list(const char *subpath, char names[][VFS_NAME_MAX], int max)
             dev_strncpy(names[count], "events", VFS_NAME_MAX);
             count++;
         }
+        return count;
+    }
+
+    if (dev_streq(subpath, "pts")) {
+        unsigned long flags = spin_lock_irqsave(&g_devfs_lock);
+        for (size_t i = 0; i < DEVFS_MAX_DEVICES && count < max; i++) {
+            const char *n = g_dev_nodes[i].name;
+            if (g_dev_nodes[i].used &&
+                n[0] == 'p' && n[1] == 't' && n[2] == 's' && n[3] == '/') {
+                dev_strncpy(names[count], n + 4, VFS_NAME_MAX);
+                count++;
+            }
+        }
+        spin_unlock_irqrestore(&g_devfs_lock, flags);
         return count;
     }
 

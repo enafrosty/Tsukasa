@@ -450,6 +450,47 @@ static long sys_ioctl(long fd, long req, long arg, long a4, long a5, long a6)
         if (!user_ok(arg, (long)sizeof(uint64_t), 1))
             return -EFAULT;
         break;
+    case VFS_TCGETS:
+        if (!user_ok(arg, (long)sizeof(struct tsk_termios), 1))
+            return -EFAULT;
+        break;
+    case VFS_TCSETS:
+    case VFS_TCSETSW:
+    case VFS_TCSETSF:
+        if (!user_ok(arg, (long)sizeof(struct tsk_termios), 0))
+            return -EFAULT;
+        break;
+    case VFS_TIOCGPGRP:
+    case VFS_FIONREAD:
+    case VFS_KDGETMODE:
+        if (!user_ok(arg, (long)sizeof(int), 1))
+            return -EFAULT;
+        break;
+    case VFS_TIOCSPGRP:
+    case VFS_TIOCSPTLCK:
+        if (!user_ok(arg, (long)sizeof(int), 0))
+            return -EFAULT;
+        break;
+    case VFS_KDSETMODE:
+        if ((uintptr_t)arg > 0xFFFFu && !user_ok(arg, (long)sizeof(int), 0))
+            return -EFAULT;
+        break;
+    case VFS_TIOCGWINSZ:
+        if (!user_ok(arg, (long)sizeof(struct tsk_winsize), 1))
+            return -EFAULT;
+        break;
+    case VFS_TIOCSWINSZ:
+        if (!user_ok(arg, (long)sizeof(struct tsk_winsize), 0))
+            return -EFAULT;
+        break;
+    case VFS_TIOCGPTN:
+        if (!user_ok(arg, (long)sizeof(unsigned int), 1))
+            return -EFAULT;
+        break;
+    case VFS_VT_GETSTATE:
+        if (!user_ok(arg, (long)sizeof(struct vfs_vt_stat), 1))
+            return -EFAULT;
+        break;
     default:
         break;
     }
@@ -570,7 +611,37 @@ static long sys_execve(long path, long argv, long envp, long a4, long a5, long a
 static long sys_kill(long pid, long sig, long a3, long a4, long a5, long a6)
 {
     (void)a3; (void)a4; (void)a5; (void)a6;
-    return (long)process_kill((int)pid, (int)sig);
+    return (long)process_kill_posix((int)pid, (int)sig);
+}
+
+static long sys_setpgid(long pid, long pgid, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    return (long)process_setpgid((int)pid, (int)pgid);
+}
+
+static long sys_getpgrp(long a1, long a2, long a3, long a4, long a5, long a6)
+{
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    return (long)process_getpgrp();
+}
+
+static long sys_setsid(long a1, long a2, long a3, long a4, long a5, long a6)
+{
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    return (long)process_setsid();
+}
+
+static long sys_getpgid(long pid, long a2, long a3, long a4, long a5, long a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    return (long)process_getpgid_posix((int)pid);
+}
+
+static long sys_getsid(long pid, long a2, long a3, long a4, long a5, long a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    return (long)process_getsid((int)pid);
 }
 
 static long sys_fcntl(long fd, long cmd, long arg, long a4, long a5, long a6)
@@ -1208,7 +1279,12 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [92] = sys_chown,
     [93] = sys_fchown,
     [95] = sys_umask,
+    [109] = sys_setpgid,
     [110] = sys_getppid,
+    [111] = sys_getpgrp,
+    [112] = sys_setsid,
+    [121] = sys_getpgid,
+    [124] = sys_getsid,
     [127] = sys_rt_sigpending,
     [162] = sys_sync,
     [165] = sys_mount,

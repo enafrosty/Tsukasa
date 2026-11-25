@@ -29,6 +29,7 @@
 #define WTERMSIG(status)     ((status) & 0x7f)
 #define WIFSTOPPED(status)   (((status) & 0xff) == 0x7f)
 #define WSTOPSIG(status)     (((status) >> 8) & 0xff)
+#define WIFCONTINUED(status) ((status) == 0xffff)
 
 pid_t wait(int *wstatus);
 pid_t waitpid(pid_t pid, int *wstatus, int options);

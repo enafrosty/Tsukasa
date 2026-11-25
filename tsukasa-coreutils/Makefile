@@ -45,7 +45,7 @@ TSH_OBJS = src/tsh/main.o \
 
 UTILS = ls cat mkdir rm cp mv touch head tail wc grep sort uniq cut \
         sysfetch ps kill free uname date poweroff reboot \
-        net ping telnet fetch
+        net ping telnet fetch vterm
 BIN_DIR = bin
 TSH_BIN = $(BIN_DIR)/tsh.elf
 UTIL_BINS = $(patsubst %,$(BIN_DIR)/%.elf,$(UTILS))
@@ -100,6 +100,7 @@ check: all
 	@echo "     - bin/ping.elf"
 	@echo "     - bin/telnet.elf"
 	@echo "     - bin/fetch.elf"
+	@echo "     - bin/vterm.elf"
 
 clean:
 	rm -rf src/*/*.o $(BIN_DIR)

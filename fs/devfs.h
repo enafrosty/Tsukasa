@@ -20,17 +20,21 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "vfs.h"
+#include "../sys/wait_queue.h"
 
 typedef struct devfs_ops {
     int    (*open)(void *priv, int flags);
+    int    (*open_instance)(void *priv, int flags, void **priv_out);
     void   (*close)(void *priv);
     size_t (*read)(void *priv, size_t pos, void *buf, size_t count, int flags);
     size_t (*write)(void *priv, size_t pos, const void *buf, size_t count);
+    size_t (*write_flags)(void *priv, size_t pos, const void *buf, size_t count, int flags);
     int    (*ioctl)(void *priv, unsigned long request, void *arg);
     void  *(*mmap)(void *priv, void *addr, size_t length, int prot, int flags, size_t offset);
     int    (*munmap)(void *priv, void *addr, size_t length);
     int    (*poll)(void *priv, int events);
     size_t (*size)(void *priv);
+    wait_queue_head_t *(*get_waitq)(void *priv, int events);
 } devfs_ops_t;
 
 void devfs_init(void);

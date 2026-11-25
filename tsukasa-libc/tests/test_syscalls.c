@@ -31,6 +31,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <termios.h>
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
@@ -307,6 +308,46 @@ static int stack_autogrow_probe(int depth, uint8_t expected)
     return 0;
 }
 
+static int run_worker_pty_job(const char *pts_path)
+{
+    if (setsid() != getpid())
+        return 1;
+    errno = 0;
+    if (setsid() != -1 || errno != EPERM)
+        return 2;
+    if (getsid(0) != getpid() || getpgrp() != getpid() || getpgid(0) != getpid())
+        return 3;
+
+    int sfd = open(pts_path, O_RDWR);
+    if (sfd < 0)
+        return 4;
+    if (ioctl(sfd, TIOCSCTTY, 0) != 0) {
+        close(sfd);
+        return 5;
+    }
+    if (tcgetpgrp(sfd) != getpid()) {
+        close(sfd);
+        return 6;
+    }
+
+    if (write(sfd, "READY\n", 6) != 6) {
+        close(sfd);
+        return 7;
+    }
+
+    for (int i = 0; i < 600; i++) {
+        usleep(10000);
+        char c = 0;
+        struct pollfd pfd = { .fd = sfd, .events = POLLIN, .revents = 0 };
+        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+            if (read(sfd, &c, 1) == 1 && c == 'P')
+                (void)write(sfd, "ALIVE\n", 6);
+        }
+    }
+    close(sfd);
+    return 0;
+}
+
 static int real_main(int argc, char **argv, char **envp)
 {
     (void)envp;
@@ -329,9 +370,11 @@ static int real_main(int argc, char **argv, char **envp)
         return run_worker_delayed_write();
     if (argc >= 2 && strcmp(argv[1], "--worker-sigpipe-dfl") == 0)
         return run_worker_sigpipe_dfl();
+    if (argc >= 3 && strcmp(argv[1], "--worker-pty-job") == 0)
+        return run_worker_pty_job(argv[2]);
 
     int passed = 0;
-    int total = 32;
+    int total = 36;
 
     /* Test 1: Stack frame alignment (rsp % 16 == 8 on function entry). */
     if ((s_entry_rsp & 0xF) != 8) {
@@ -2105,6 +2148,380 @@ static int real_main(int argc, char **argv, char **envp)
             return 81;
         }
         TSK_TEST_PASS("syscalls", "blocking_pipes_sigpipe_poll");
+        passed++;
+    }
+
+    /* Test 33: PTY master/slave round-trip, TIOCGPTN, TIOCSPTLCK, TIOCSWINSZ, POLLHUP. */
+    {
+        int ok = 1;
+        int mfd = open("/dev/ptmx", O_RDWR | O_NONBLOCK);
+        if (mfd < 0) {
+            ok = 0;
+        } else {
+            unsigned int ptn = 9999;
+            char pts_path[32];
+            if (ioctl(mfd, TIOCGPTN, &ptn) != 0 || ptn >= 32)
+                ok = 0;
+            snprintf(pts_path, sizeof(pts_path), "/dev/pts/%u", ptn);
+
+            struct stat pst;
+            if (ok && stat(pts_path, &pst) != 0)
+                ok = 0;
+
+            /* Slave must reject open while locked. */
+            if (ok && open(pts_path, O_RDWR) >= 0)
+                ok = 0;
+
+            int unlock = 0;
+            if (ok && ioctl(mfd, TIOCSPTLCK, &unlock) != 0)
+                ok = 0;
+
+            int sfd = ok ? open(pts_path, O_RDWR | O_NONBLOCK) : -1;
+            if (sfd < 0)
+                ok = 0;
+
+            int nfd = open("/dev/null", O_RDONLY);
+            if (ok && (isatty(sfd) != 1 || (nfd >= 0 && isatty(nfd) != 0)))
+                ok = 0;
+            if (nfd >= 0)
+                close(nfd);
+
+            struct winsize ws_set = { .ws_row = 40, .ws_col = 120, .ws_xpixel = 960, .ws_ypixel = 480 };
+            struct winsize ws_get;
+            memset(&ws_get, 0, sizeof(ws_get));
+            if (ok && (ioctl(mfd, TIOCSWINSZ, &ws_set) != 0 ||
+                       ioctl(sfd, TIOCGWINSZ, &ws_get) != 0 ||
+                       ws_get.ws_row != 40 || ws_get.ws_col != 120)) {
+                ok = 0;
+            }
+
+            if (ok) {
+                struct pollfd pfds[2] = {
+                    { .fd = sfd, .events = POLLIN, .revents = 0 },
+                    { .fd = mfd, .events = POLLIN, .revents = 0 },
+                };
+                if (poll(pfds, 2, 0) != 0)
+                    ok = 0;
+                if (write(mfd, "ping\n", 5) != 5)
+                    ok = 0;
+                if (poll(pfds, 2, 50) < 1 || !(pfds[0].revents & POLLIN))
+                    ok = 0;
+                char sbuf[32];
+                memset(sbuf, 0, sizeof(sbuf));
+                if (read(sfd, sbuf, sizeof(sbuf)) != 5 || memcmp(sbuf, "ping\n", 5) != 0)
+                    ok = 0;
+
+                if (write(sfd, "pong\n", 5) != 5)
+                    ok = 0;
+                char mbuf[64];
+                memset(mbuf, 0, sizeof(mbuf));
+                ssize_t mr = read(mfd, mbuf, sizeof(mbuf));
+                if (mr <= 0)
+                    ok = 0;
+                mbuf[mr] = '\0';
+                if (!strstr(mbuf, "pong\r\n"))
+                    ok = 0;
+            }
+
+            if (sfd >= 0) {
+                close(sfd);
+                struct pollfd hpfd = { .fd = mfd, .events = POLLIN, .revents = 0 };
+                if (poll(&hpfd, 1, 50) <= 0 || !(hpfd.revents & POLLHUP))
+                    ok = 0;
+                char ebuf[8];
+                if (read(mfd, ebuf, sizeof(ebuf)) != 0)
+                    ok = 0;
+            }
+
+            /* Invalid user pointers on ioctl must fail EFAULT. */
+            void *kptr = (void *)(uintptr_t)0xFFFFFFFF80000000ULL;
+            errno = 0;
+            if (ioctl(mfd, TIOCGPTN, kptr) != -1 || errno != EFAULT)
+                ok = 0;
+            errno = 0;
+            if (ioctl(mfd, TCGETS, kptr) != -1 || errno != EFAULT)
+                ok = 0;
+
+            close(mfd);
+        }
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "pty_master_slave", "PTY round-trip/ioctl check failed");
+            return 79;
+        }
+        TSK_TEST_PASS("syscalls", "pty_master_slave");
+        passed++;
+    }
+
+    /* Test 25: Kernel termios ICANON (VERASE/VKILL/VEOF), ECHO, OPOST/ONLCR, VMIN/VTIME, FIONREAD. */
+    {
+        int ok = 1;
+        int mfd = open("/dev/ptmx", O_RDWR | O_NONBLOCK);
+        unsigned int ptn = 0;
+        int unlock = 0;
+        char pts_path[32];
+        int sfd = -1;
+
+        if (mfd < 0 || ioctl(mfd, TIOCGPTN, &ptn) != 0 ||
+            ioctl(mfd, TIOCSPTLCK, &unlock) != 0) {
+            ok = 0;
+        } else {
+            snprintf(pts_path, sizeof(pts_path), "/dev/pts/%u", ptn);
+            sfd = open(pts_path, O_RDWR);
+            if (sfd < 0)
+                ok = 0;
+        }
+
+        struct termios t;
+        if (ok && tcgetattr(sfd, &t) != 0)
+            ok = 0;
+        if (ok && (!(t.c_lflag & ICANON) || !(t.c_lflag & ECHO) || !(t.c_oflag & ONLCR)))
+            ok = 0;
+
+        /* VERASE + FIONREAD + newline flush */
+        if (ok) {
+            char drain[128];
+            char erase_seq[5] = { 'a', 'b', 'c', (char)t.c_cc[VERASE], 'd' };
+            if (write(mfd, erase_seq, 5) != 5)
+                ok = 0;
+            int avail = -1;
+            if (ioctl(sfd, FIONREAD, &avail) != 0 || avail != 0)
+                ok = 0;
+            if (write(mfd, "\n", 1) != 1)
+                ok = 0;
+            if (ioctl(sfd, FIONREAD, &avail) != 0 || avail != 4)
+                ok = 0;
+            char rbuf[32];
+            if (read(sfd, rbuf, sizeof(rbuf)) != 4 || memcmp(rbuf, "abd\n", 4) != 0)
+                ok = 0;
+            while (read(mfd, drain, sizeof(drain)) > 0) {}
+        }
+
+        /* VKILL + VEOF partial and empty-line EOF */
+        if (ok) {
+            char kill_seq[8] = { 'x', 'y', 'z', (char)t.c_cc[VKILL], 'o', 'k', (char)t.c_cc[VEOF] };
+            if (write(mfd, kill_seq, 7) != 7)
+                ok = 0;
+            char rbuf[32];
+            if (read(sfd, rbuf, sizeof(rbuf)) != 2 || memcmp(rbuf, "ok", 2) != 0)
+                ok = 0;
+            char veof_ch = (char)t.c_cc[VEOF];
+            if (write(mfd, &veof_ch, 1) != 1)
+                ok = 0;
+            if (read(sfd, rbuf, sizeof(rbuf)) != 0)
+                ok = 0;
+        }
+
+        /* Raw mode + OPOST off + VMIN=0/VTIME=1 timeout + VMIN=3 */
+        if (ok) {
+            char drain[128];
+            while (read(mfd, drain, sizeof(drain)) > 0) {}
+
+            struct termios raw = t;
+            cfmakeraw(&raw);
+            raw.c_cc[VMIN] = 0;
+            raw.c_cc[VTIME] = 1;
+            if (tcsetattr(sfd, TCSANOW, &raw) != 0)
+                ok = 0;
+
+            if (write(sfd, "raw\n", 4) != 4)
+                ok = 0;
+            char mbuf[16];
+            if (read(mfd, mbuf, sizeof(mbuf)) != 4 || memcmp(mbuf, "raw\n", 4) != 0)
+                ok = 0;
+
+            char rbuf[16];
+            if (read(sfd, rbuf, sizeof(rbuf)) != 0)
+                ok = 0;
+
+            raw.c_cc[VMIN] = 3;
+            raw.c_cc[VTIME] = 0;
+            if (tcsetattr(sfd, TCSAFLUSH, &raw) != 0)
+                ok = 0;
+            if (write(mfd, "123", 3) != 3)
+                ok = 0;
+            if (read(sfd, rbuf, sizeof(rbuf)) != 3 || memcmp(rbuf, "123", 3) != 0)
+                ok = 0;
+        }
+
+        if (sfd >= 0) close(sfd);
+        if (mfd >= 0) close(mfd);
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "termios_ldisc", "termios line discipline check failed");
+            return 80;
+        }
+        TSK_TEST_PASS("syscalls", "termios_ldisc");
+        passed++;
+    }
+
+    /* Test 26: POSIX sessions, job control (Ctrl+C SIGINT, Ctrl+Z WIFSTOPPED, SIGCONT WIFCONTINUED). */
+    {
+        int ok = 1;
+
+        /* Part A: setsid + TIOCSCTTY + TIOCSWINSZ (SIGWINCH non-fatal) + Ctrl+C -> SIGINT */
+        {
+            int mfd = open("/dev/ptmx", O_RDWR);
+            unsigned int ptn = 0;
+            int unlock = 0;
+            char pts_path[32];
+            if (mfd < 0 || ioctl(mfd, TIOCGPTN, &ptn) != 0 ||
+                ioctl(mfd, TIOCSPTLCK, &unlock) != 0) {
+                ok = 0;
+            } else {
+                snprintf(pts_path, sizeof(pts_path), "/dev/pts/%u", ptn);
+                char *wargs[] = { "/bin/TSYSC.ELF", "--worker-pty-job", pts_path, NULL };
+                pid_t cpid = spawn("/bin/TSYSC.ELF", wargs, NULL);
+                if (cpid <= 0) {
+                    ok = 0;
+                } else {
+                    char rbuf[32];
+                    ssize_t n = read(mfd, rbuf, sizeof(rbuf) - 1);
+                    if (n <= 0 || (rbuf[n] = '\0', !strstr(rbuf, "READY")))
+                        ok = 0;
+
+                    struct winsize ws = { .ws_row = 30, .ws_col = 100, .ws_xpixel = 0, .ws_ypixel = 0 };
+                    if (ok && ioctl(mfd, TIOCSWINSZ, &ws) != 0)
+                        ok = 0;
+                    if (ok) {
+                        write(mfd, "P\n", 2);
+                        memset(rbuf, 0, sizeof(rbuf));
+                        int got_alive = 0;
+                        for (int tries = 0; tries < 20; tries++) {
+                            struct pollfd mp = { .fd = mfd, .events = POLLIN, .revents = 0 };
+                            if (poll(&mp, 1, 50) > 0 && (mp.revents & POLLIN)) {
+                                ssize_t rn = read(mfd, rbuf, sizeof(rbuf) - 1);
+                                if (rn > 0) {
+                                    rbuf[rn] = '\0';
+                                    if (strstr(rbuf, "ALIVE")) {
+                                        got_alive = 1;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (!got_alive)
+                            ok = 0;
+                    }
+
+                    char ctrl_c = 0x03;
+                    if (write(mfd, &ctrl_c, 1) != 1)
+                        ok = 0;
+                    int st = 0;
+                    if (waitpid(cpid, &st, 0) != cpid ||
+                        !WIFSIGNALED(st) || WTERMSIG(st) != SIGINT) {
+                        ok = 0;
+                    }
+                }
+            }
+            if (mfd >= 0)
+                close(mfd);
+        }
+
+        /* Part B: Ctrl+Z -> SIGTSTP (WIFSTOPPED) -> SIGCONT (WIFCONTINUED) -> SIGKILL */
+        if (ok) {
+            int mfd = open("/dev/ptmx", O_RDWR);
+            unsigned int ptn = 0;
+            int unlock = 0;
+            char pts_path[32];
+            if (mfd < 0 || ioctl(mfd, TIOCGPTN, &ptn) != 0 ||
+                ioctl(mfd, TIOCSPTLCK, &unlock) != 0) {
+                ok = 0;
+            } else {
+                snprintf(pts_path, sizeof(pts_path), "/dev/pts/%u", ptn);
+                char *wargs[] = { "/bin/TSYSC.ELF", "--worker-pty-job", pts_path, NULL };
+                pid_t cpid = spawn("/bin/TSYSC.ELF", wargs, NULL);
+                if (cpid <= 0) {
+                    ok = 0;
+                } else {
+                    char rbuf[32];
+                    ssize_t n = read(mfd, rbuf, sizeof(rbuf) - 1);
+                    if (n <= 0 || (rbuf[n] = '\0', !strstr(rbuf, "READY")))
+                        ok = 0;
+
+                    char ctrl_z = 0x1A;
+                    if (write(mfd, &ctrl_z, 1) != 1)
+                        ok = 0;
+
+                    int st = 0;
+                    if (waitpid(cpid, &st, WUNTRACED) != cpid ||
+                        !WIFSTOPPED(st) || WSTOPSIG(st) != SIGTSTP) {
+                        ok = 0;
+                    }
+                    if (ok && waitpid(cpid, &st, WNOHANG | WUNTRACED) != 0)
+                        ok = 0;
+
+                    if (ok && kill(cpid, SIGCONT) != 0)
+                        ok = 0;
+                    if (ok && (waitpid(cpid, &st, WCONTINUED) != cpid || !WIFCONTINUED(st)))
+                        ok = 0;
+
+                    kill(cpid, SIGKILL);
+                    waitpid(cpid, &st, 0);
+                }
+            }
+            if (mfd >= 0)
+                close(mfd);
+        }
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "pty_job_control", "session/job control/SIGTSTP/SIGCONT failed");
+            return 81;
+        }
+        TSK_TEST_PASS("syscalls", "pty_job_control");
+        passed++;
+    }
+
+    /* Test 27: Multi-VT ioctls (VT_GETSTATE/VT_ACTIVATE/KDSETMODE/KDGETMODE) and /bin/vterm. */
+    {
+        int ok = 1;
+        int tty_fd = open("/dev/tty0", O_RDWR);
+        int fb_fd = open("/dev/fb0", O_RDWR);
+        struct vt_stat vst_orig;
+        int orig_kd = KD_GRAPHICS;
+
+        if (tty_fd < 0 || fb_fd < 0 ||
+            ioctl(tty_fd, VT_GETSTATE, &vst_orig) != 0 ||
+            ioctl(fb_fd, KDGETMODE, &orig_kd) != 0) {
+            ok = 0;
+        } else {
+            if (ioctl(tty_fd, VT_ACTIVATE, (void *)(intptr_t)2) != 0)
+                ok = 0;
+            struct vt_stat vst_now;
+            if (ok && (ioctl(tty_fd, VT_GETSTATE, &vst_now) != 0 || vst_now.v_active != 2))
+                ok = 0;
+            if (ok && ioctl(tty_fd, VT_WAITACTIVE, (void *)(intptr_t)2) != 0)
+                ok = 0;
+
+            int tty2_fd = open("/dev/tty2", O_RDWR);
+            int kd2 = -1;
+            if (tty2_fd < 0 || ioctl(tty2_fd, KDGETMODE, &kd2) != 0 || kd2 != KD_TEXT)
+                ok = 0;
+            if (tty2_fd >= 0)
+                close(tty2_fd);
+
+            /* Restore original VT and KD mode cleanly. */
+            (void)ioctl(tty_fd, VT_ACTIVATE, (void *)(intptr_t)vst_orig.v_active);
+            (void)ioctl(fb_fd, KDSETMODE, (void *)(intptr_t)orig_kd);
+        }
+        if (tty_fd >= 0) close(tty_fd);
+        if (fb_fd >= 0) close(fb_fd);
+
+        struct stat vst_bin;
+        if (ok && stat("/bin/vterm", &vst_bin) != 0)
+            ok = 0;
+        if (ok) {
+            char *vt_args[] = { "/bin/vterm", "-c", "echo vterm_ok", NULL };
+            pid_t vpid = spawn("/bin/vterm", vt_args, NULL);
+            if (vpid <= 0 || wait_child_ok(vpid) != 0)
+                ok = 0;
+        }
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "vt_kd_vterm", "VT/KDGETMODE or /bin/vterm check failed");
+            return 82;
+        }
+        TSK_TEST_PASS("syscalls", "vt_kd_vterm");
         passed++;
     }
 
