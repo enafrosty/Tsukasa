@@ -1210,8 +1210,8 @@ int vm_space_brk(vm_space_t *space, uintptr_t new_brk, uintptr_t *cur_out)
         space->brk_start = (uintptr_t)0x10000000ULL;
         space->brk_current = space->brk_start;
     }
-    if (space->brk_limit == 0 || space->brk_limit > (uintptr_t)VM_SPACE_SHM_BASE)
-        space->brk_limit = (uintptr_t)VM_SPACE_SHM_BASE;
+    if (space->brk_limit == 0 || space->brk_limit > space->user_max)
+        space->brk_limit = space->user_max;
 
     if (new_brk == 0) {
         if (cur_out)
@@ -1335,6 +1335,103 @@ int vm_space_clone(const vm_space_t *src, vm_space_t *dst)
     dst->user_max = src->user_max;
     dst->owns_pml4 = 1;
     return 0;
+}
+
+extern void vfs_vma_fork_pin_shared_page(const vm_area_t *vma, uintptr_t va);
+
+int vm_space_fork(vm_space_t *src, vm_space_t *dst)
+{
+    if (!src || !dst)
+        return -EINVAL;
+    if (!src->owns_pml4 || !src->pml4_phys)
+        return vm_space_create(dst);
+
+    if (vm_space_create(dst) != 0)
+        return -ENOMEM;
+
+    vm_space_mmap_write_lock(src);
+
+    dst->user_min = src->user_min;
+    dst->user_max = src->user_max;
+    dst->shm_cursor = src->shm_cursor;
+    dst->anon_cursor = src->anon_cursor;
+    dst->brk_start = src->brk_start;
+    dst->brk_current = src->brk_current;
+    dst->brk_limit = src->brk_limit;
+
+    int rc = 0;
+    vm_area_t *vma = rb_min(src->vma_root);
+    while (vma) {
+        vm_area_t *dst_vma = vma_insert(dst, vma->start, vma->end, vma->prot, vma->flags);
+        if (!dst_vma) {
+            rc = -ENOMEM;
+            break;
+        }
+        dst_vma->file = vma->file;
+        dst_vma->file_offset = vma->file_offset;
+        dst_vma->file_size = vma->file_size;
+        dst_vma->fault_cb = vma->fault_cb;
+        dst_vma->open_cb = vma->open_cb;
+        dst_vma->close_cb = vma->close_cb;
+        dst_vma->unmap_cb = vma->unmap_cb;
+        if (dst_vma->open_cb)
+            dst_vma->open_cb(dst_vma);
+
+        int is_private = ((vma->flags & VMA_FLAG_PRIVATE) &&
+                          !(vma->flags & (VMA_FLAG_SHARED | VMA_FLAG_SHM | VMA_FLAG_DEVICE)))
+                             ? 1
+                             : 0;
+        int is_shared_file = ((vma->flags & (VMA_FLAG_FILE | VMA_FLAG_SHARED)) ==
+                              (VMA_FLAG_FILE | VMA_FLAG_SHARED))
+                                 ? 1
+                                 : 0;
+        int need_sd = 0;
+
+        for (uintptr_t va = vma->start; va < vma->end; va += PAGE_SIZE) {
+            int copied = 0;
+            uint64_t phys = 0;
+            if (vmm_fork_copy_pte(src->pml4_phys, dst->pml4_phys, va,
+                                  is_private, &copied, &phys, &need_sd) != 0) {
+                rc = -ENOMEM;
+                break;
+            }
+            if (!copied)
+                continue;
+
+            account_vma_page_delta(dst, dst_vma, 1);
+            if (!(vma->flags & (VMA_FLAG_SHM | VMA_FLAG_DEVICE)) && phys != 0) {
+                (void)pmm_page_get((uintptr_t)phys);
+                if (is_shared_file && phys != (uint64_t)pmm_zero_page_phys())
+                    vfs_vma_fork_pin_shared_page(dst_vma, va);
+            }
+        }
+        if (need_sd)
+            vmm_tlb_shootdown(src, vma->start, (size_t)((vma->end - vma->start) / PAGE_SIZE));
+        if (rc != 0)
+            break;
+
+        vma = rb_next(vma);
+    }
+
+    vm_space_mmap_write_unlock(src);
+
+    if (rc != 0) {
+        vm_space_destroy(dst);
+        return rc;
+    }
+    return 0;
+}
+
+void vm_space_rebind_vmas(vm_space_t *space)
+{
+    if (!space)
+        return;
+    rwsem_init(&space->mmap_rwsem);
+    vm_area_t *vma = rb_min(space->vma_root);
+    while (vma) {
+        vma->vm_space = space;
+        vma = rb_next(vma);
+    }
 }
 
 void vm_space_destroy(vm_space_t *space)

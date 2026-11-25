@@ -94,3 +94,27 @@ syscall_entry_x64:
     
     ; Return to Ring 3 (64-bit operand SYSRETQ)
     o64 sysret
+
+; Forked child resumes here via iretq from process_schedule_core with IF=0
+; and RSP pointing directly at its cloned syscall_frame_t.
+global fork_child_return_x64
+fork_child_return_x64:
+    cli
+    xor eax, eax
+    pop rdi
+    pop rsi
+    pop rdx
+    pop r8
+    pop r9
+    pop r10
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    pop rcx
+    pop r11
+    pop rsp
+    swapgs
+    o64 sysret

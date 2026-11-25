@@ -17,10 +17,18 @@
 #ifndef TSUKASA_ELF64_H
 #define TSUKASA_ELF64_H
 
-/* Spawn a ring-3 process from an ET_EXEC ELF64 at the given VFS path. Returns pid >= 0 on success, negative... */
+#include "../include/syscall_frame.h"
+
+/* Spawn a ring-3 process from an ELF64 executable at the given VFS path. */
 int elf64_spawn(const char *path, const char *name);
 
-/* Same, with a spawn cmdline that becomes the process's argv[] (tokenized with app_tokenize()-compatible... */
+/* Same, with a spawn cmdline tokenized into argv[]. */
 int elf64_spawn_cmdline(const char *path, const char *args, const char *name);
+
+/* Replace current process image with executable or shebang script at path. */
+int elf64_execve_current(const char *path,
+                         char *const argv[],
+                         char *const envp[],
+                         syscall_frame_t *frame);
 
 #endif

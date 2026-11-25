@@ -32,6 +32,7 @@
 #define VMM_X64_PTE_PAT           (1ULL << 7)   /* PAT bit for 4 KiB PTE */
 #define VMM_X64_PDE_PS            (1ULL << 7)   /* Page Size bit for 2 MiB/1 GiB entry */
 #define VMM_X64_PTE_GLOBAL        (1ULL << 8)
+#define VMM_X64_PTE_COW           (1ULL << 9)   /* OS-available bit for COW */
 #define VMM_X64_PTE_PROTNONE      (1ULL << 10) /* OS-available bit for PROT_NONE */
 #define VMM_X64_PDE_PAT           (1ULL << 12) /* PAT bit for 2 MiB/1 GiB entry */
 #define VMM_X64_PTE_NO_EXEC       (1ULL << 63)
@@ -98,6 +99,13 @@ int vmm_upgrade_user_page_write(uint64_t pml4_phys,
                                 uintptr_t virt_addr,
                                 uint64_t expected_phys,
                                 uint64_t map_flags);
+int vmm_fork_copy_pte(uint64_t src_pml4_phys,
+                      uint64_t dst_pml4_phys,
+                      uintptr_t virt_addr,
+                      int is_private,
+                      int *copied_out,
+                      uint64_t *phys_out,
+                      int *need_shootdown_out);
 void vmm_tlb_shootdown(struct vm_space *space, uintptr_t va, size_t page_count);
 void tlb_shootdown_ipi_handler(void);
 uint64_t vmm_tlb_shootdown_ipi_count(void);

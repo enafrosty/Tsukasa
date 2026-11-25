@@ -893,6 +893,10 @@ static process_t *create_kernel_process_locked(const char *name, process_entry_t
     p->sid = parent ? parent->sid : p->pid;
     p->uid = parent ? parent->uid : 0;
     p->gid = parent ? parent->gid : 0;
+    p->euid = parent ? parent->euid : p->uid;
+    p->egid = parent ? parent->egid : p->gid;
+    p->suid = parent ? parent->suid : p->uid;
+    p->sgid = parent ? parent->sgid : p->gid;
     p->cpu_id = 0;
     p->state = PROCESS_READY;
     p->entry = entry;
@@ -1078,6 +1082,216 @@ int process_adopt_private_address_space(void)
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
     return 0;
+}
+
+extern void fork_child_return_x64(void);
+
+syscall_frame_t *process_current_syscall_frame(void)
+{
+    process_t *cur = process_current();
+    if (!cur || !cur->kernel_stack)
+        return NULL;
+    return (syscall_frame_t *)(uintptr_t)(process_stack_top_aligned(cur) -
+                                          sizeof(syscall_frame_t));
+}
+
+int process_swap_vm_space(process_t *p, vm_space_t *new_space, vm_space_t *old_space_out)
+{
+    uint64_t flags;
+    uint32_t cpu;
+
+    if (!p || !new_space || !new_space->owns_pml4 || !new_space->pml4_phys)
+        return -EINVAL;
+
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    cpu = sched_this_cpu();
+    if (old_space_out) {
+        *old_space_out = p->vm_space;
+        if (cpu < 64u && old_space_out->owns_pml4)
+            __atomic_and_fetch(&old_space_out->active_cpus, ~(1ULL << cpu), __ATOMIC_SEQ_CST);
+    }
+    p->vm_space = *new_space;
+    p->va_space = &p->vm_space;
+    vm_space_rebind_vmas(&p->vm_space);
+    if (cpu < 64u)
+        __atomic_or_fetch(&p->vm_space.active_cpus, (1ULL << cpu), __ATOMIC_SEQ_CST);
+    vmm_switch_pml4(p->vm_space.pml4_phys);
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    return 0;
+}
+
+void process_execve_reset_state(process_t *p)
+{
+    uint64_t flags;
+    if (!p)
+        return;
+
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    for (int i = 0; i < PROCESS_MAX_SIGNALS; i++) {
+        if (p->signal_handlers[i] != PROCESS_SIG_DFL &&
+            p->signal_handlers[i] != PROCESS_SIG_IGN) {
+            p->signal_handlers[i] = PROCESS_SIG_DFL;
+            p->sig_actions[i].handler = 0;
+            p->sig_actions[i].mask = 0;
+            p->sig_actions[i].flags = 0;
+            p->sig_actions[i].action = SIGNAL_ACTION_DEFAULT;
+        }
+    }
+    fpu_init_state(p->fpu_state);
+    p->fpu_initialized = 1;
+    if (p == g_current[sched_this_cpu()])
+        __asm__ volatile("fxrstor (%0)" : : "r"(p->fpu_state) : "memory");
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+}
+
+void process_set_credentials(process_t *p,
+                             uint32_t uid, uint32_t euid, uint32_t suid,
+                             uint32_t gid, uint32_t egid, uint32_t sgid)
+{
+    uint64_t flags;
+    if (!p)
+        return;
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    p->uid = uid;
+    p->euid = euid;
+    p->suid = suid;
+    p->gid = gid;
+    p->egid = egid;
+    p->sgid = sgid;
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+}
+
+int process_fork_current(const syscall_frame_t *frame)
+{
+    uint64_t flags;
+    process_t *cur;
+    process_t *child;
+    uint32_t child_pid;
+
+    if (!frame)
+        return -EINVAL;
+
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    cur = g_current[sched_this_cpu()];
+    if (!cur || cur->is_idle || !cur->vm_space.owns_pml4) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -EINVAL;
+    }
+
+    child = alloc_process_slot_locked();
+    if (!child) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -EAGAIN;
+    }
+
+    for (size_t i = 0; i < sizeof(*child); i++)
+        ((uint8_t *)child)[i] = 0;
+
+    child->used = 1;
+    child->pid = g_next_pid++;
+    child_pid = child->pid;
+    child->ppid = cur->pid;
+    child->pgid = cur->pgid;
+    child->sid = cur->sid;
+    child->uid = cur->uid;
+    child->gid = cur->gid;
+    child->euid = cur->euid;
+    child->egid = cur->egid;
+    child->suid = cur->suid;
+    child->sgid = cur->sgid;
+    child->state = PROCESS_CREATED;
+    child->entry = NULL;
+    child->user_entry = cur->user_entry;
+    child->tty_id = cur->tty_id;
+    child->shm_attachment_count = 0;
+
+    child->signal_mask = cur->signal_mask;
+    child->signal_pending = 0;
+    for (int i = 0; i < PROCESS_MAX_SIGNALS; i++) {
+        child->signal_handlers[i] = cur->signal_handlers[i];
+        child->sig_actions[i] = cur->sig_actions[i];
+    }
+
+    process_init_sched_state(child, cur);
+    process_init_io_state(child, cur);
+    name_copy(child->name, cur->name, PROCESS_NAME_MAX);
+    name_copy(child->cmdline, cur->cmdline, PROCESS_CMDLINE_MAX);
+
+    if (alloc_process_stack_locked(child) != 0) {
+        child->used = 0;
+        child->state = PROCESS_DEAD;
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -ENOMEM;
+    }
+
+    /* Capture parent's live FPU/SSE registers so child resumes with identical state. */
+    __asm__ volatile("fxsave (%0)" : : "r"(cur->fpu_state) : "memory");
+    cur->fpu_initialized = 1;
+    for (size_t i = 0; i < sizeof(child->fpu_state); i++)
+        child->fpu_state[i] = cur->fpu_state[i];
+    child->fpu_initialized = 1;
+
+    uintptr_t child_top = process_stack_top_aligned(child);
+    syscall_frame_t *child_sf =
+        (syscall_frame_t *)(uintptr_t)(child_top - sizeof(syscall_frame_t));
+    *child_sf = *frame;
+
+    uint64_t *ctx = (uint64_t *)(uintptr_t)((uintptr_t)child_sf -
+                                            PROCESS_CONTEXT_TOTAL_QWORDS * sizeof(uint64_t));
+    for (int i = 0; i < 15; i++)
+        ctx[i] = 0;
+    ctx[15] = 0;
+    ctx[16] = (uint64_t)(uintptr_t)fork_child_return_x64;
+    ctx[17] = X64_GDT_KERNEL_CS;
+    ctx[18] = 0x002ULL; /* IF=0 until swapgs + sysret restores child R11 */
+    ctx[19] = (uint64_t)(uintptr_t)child_sf;
+    ctx[20] = X64_GDT_KERNEL_DS;
+
+    child->kernel_rsp = (uint64_t)(uintptr_t)ctx;
+    child->main_thread.kernel_rsp = child->kernel_rsp;
+    child->main_thread.kernel_stack = child->kernel_stack;
+    child->va_space = &child->vm_space;
+
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+
+    if (vm_space_fork(&cur->vm_space, &child->vm_space) != 0 ||
+        shm_process_fork(cur, child) != 0 ||
+        vfs_process_inherit(child, cur) != 0) {
+        vfs_process_cleanup(child);
+        shm_process_cleanup(child);
+        vm_space_destroy(&child->vm_space);
+
+        flags = irq_save_disable();
+        spin_lock(&g_sched_lock);
+        free_process_resources_locked(child);
+        child->used = 0;
+        child->state = PROCESS_DEAD;
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -ENOMEM;
+    }
+
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    parent_link_child_locked(cur, child);
+    child->state = PROCESS_READY;
+    child->main_thread.state = THREAD_READY;
+    runq_push_locked(child);
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+
+    return (int)child_pid;
 }
 
 process_t *process_spawn_kernel(const char *name, process_entry_t entry)

@@ -286,11 +286,42 @@ $(INITRD_BIN)/TESTDRV.ELF: user/cli/testdrv.c $(SDK_OBJS) user/crt/tsukasa_app.l
 	$(LD) -m elf_x86_64 -T user/crt/tsukasa_app.ld -nostdlib \
 	    -o $@ user/crt/crt0.o user/cli/testdrv.o user/crt/syscalls.o user/crt/stdio_lite.o
 
+$(INITRD_BIN)/exectest.elf: user/cli/exectest.c libc
+	@mkdir -p $(INITRD_BIN)
+	$(CC) -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
+	    -fno-pie -fstack-protector-strong -mstack-protector-guard=global -O2 \
+	    -Itsukasa-libc/include -c -o user/cli/exectest.o $<
+	$(LD) -m elf_x86_64 -T tsukasa-libc/tsukasa_app.ld -nostdlib \
+	    -o $@ tsukasa-libc/crt/crt0.o user/cli/exectest.o tsukasa-libc/lib/libc.a
+
+$(INITRD_BIN)/pietest.elf: user/cli/pietest.c
+	@mkdir -p $(INITRD_BIN)
+	$(CC) -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
+	    -fPIE -fno-stack-protector -O2 -c -o user/cli/pietest.o $<
+	$(LD) -m elf_x86_64 -pie --no-dynamic-linker -nostdlib -e _start \
+	    -o $@ user/cli/pietest.o
+
+$(INITRD_BIN)/interpld.elf: user/cli/interpld.c
+	@mkdir -p $(INITRD_BIN)
+	$(CC) -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
+	    -fPIE -fno-stack-protector -O2 -c -o user/cli/interpld.o $<
+	$(LD) -m elf_x86_64 -pie --no-dynamic-linker -nostdlib -e _start \
+	    -o $@ user/cli/interpld.o
+
+$(INITRD_BIN)/interptest.elf: user/cli/interptest.c
+	@mkdir -p $(INITRD_BIN)
+	$(CC) -Wall -Wextra -Werror -ffreestanding -mno-red-zone \
+	    -fPIE -fno-stack-protector -O2 -c -o user/cli/interptest.o $<
+	$(LD) -m elf_x86_64 -pie --dynamic-linker=/bin/interpld.elf -nostdlib -e _start \
+	    -o $@ user/cli/interptest.o
+
 USER_TEST_BINS = $(INITRD_BIN)/hello.elf $(INITRD_BIN)/hello_sc.elf $(INITRD_BIN)/fault.elf \
                  $(INITRD_BIN)/exit7.elf $(INITRD_BIN)/hellosdk.elf $(INITRD_BIN)/echo.elf \
                  $(INITRD_BIN)/cat.elf $(INITRD_BIN)/argvchk.elf $(INITRD_BIN)/futex10.elf \
                  $(INITRD_BIN)/usock20.elf $(INITRD_BIN)/wsrv15.elf $(INITRD_BIN)/wapp15.elf \
-                 $(INITRD_BIN)/wdemo16.elf $(INITRD_BIN)/mmapflt.elf $(INITRD_BIN)/TESTDRV.ELF
+                 $(INITRD_BIN)/wdemo16.elf $(INITRD_BIN)/mmapflt.elf $(INITRD_BIN)/TESTDRV.ELF \
+                 $(INITRD_BIN)/exectest.elf $(INITRD_BIN)/pietest.elf \
+                 $(INITRD_BIN)/interpld.elf $(INITRD_BIN)/interptest.elf
 
 COREUTILS_NAMES = ls cat mkdir rm cp mv grep ps free sysfetch kill date poweroff reboot \
                   head tail wc sort uniq cut uname touch net ping telnet fetch tsh

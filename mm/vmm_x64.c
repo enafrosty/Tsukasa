@@ -692,7 +692,7 @@ int vmm_destroy_address_space(uint64_t pml4_phys)
 
                     leaf_phys = leaf_entry & VMM_X64_ADDR_MASK;
                     if (leaf_phys)
-                        pmm_free_pages(leaf_phys, 1);
+                        (void)pmm_page_put(leaf_phys);
                 }
 
                 pmm_free_pages(pt_phys, 1);
@@ -1074,7 +1074,10 @@ int vmm_protect_present_pages(uint64_t pml4_phys,
         if ((entry & (VMM_X64_PTE_PRESENT | VMM_X64_PTE_PROTNONE)) == 0)
             continue;
 
-        pt->entries[pt_idx] = (entry & VMM_X64_ADDR_MASK) | pte_flags;
+        uint64_t updated_flags = pte_flags | (entry & VMM_X64_PTE_COW);
+        if (updated_flags & VMM_X64_PTE_COW)
+            updated_flags &= ~VMM_X64_PTE_WRITABLE;
+        pt->entries[pt_idx] = (entry & VMM_X64_ADDR_MASK) | updated_flags;
     }
     tlb_flush_range(pml4_phys, virt_addr, page_count);
     spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
@@ -1258,6 +1261,76 @@ int vmm_upgrade_user_page_write(uint64_t pml4_phys,
     (void)virt_addr;
     (void)expected_phys;
     (void)map_flags;
+    return -1;
+#endif
+}
+
+int vmm_fork_copy_pte(uint64_t src_pml4_phys,
+                      uint64_t dst_pml4_phys,
+                      uintptr_t virt_addr,
+                      int is_private,
+                      int *copied_out,
+                      uint64_t *phys_out,
+                      int *need_shootdown_out)
+{
+#ifdef __x86_64__
+    if (copied_out)
+        *copied_out = 0;
+    if (phys_out)
+        *phys_out = 0;
+    if (!src_pml4_phys || !dst_pml4_phys)
+        return -1;
+    if (!paging_range_is_user(virt_addr, PAGE_SIZE))
+        return -1;
+
+    uint64_t pt_idx = ((uint64_t)virt_addr >> 12) & 0x1FFULL;
+    page_table_t *src_pt = NULL;
+    page_table_t *dst_pt = NULL;
+
+    unsigned long irq_flags = spin_lock_irqsave(&g_vmm_lock);
+    if (walk_to_pt(src_pml4_phys, virt_addr, 0, 1, &src_pt) != 0) {
+        spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
+        return 0;
+    }
+
+    uint64_t entry = src_pt->entries[pt_idx];
+    if ((entry & (VMM_X64_PTE_PRESENT | VMM_X64_PTE_PROTNONE)) == 0 ||
+        (entry & VMM_X64_PTE_USER) == 0) {
+        spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
+        return 0;
+    }
+
+    if (walk_to_pt(dst_pml4_phys, virt_addr, 1, 1, &dst_pt) != 0) {
+        spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
+        return -1;
+    }
+
+    uint64_t child_entry = entry;
+    if (is_private && (entry & VMM_X64_PTE_PRESENT) && (entry & VMM_X64_PTE_WRITABLE)) {
+        uint64_t cow_entry = (entry & ~VMM_X64_PTE_WRITABLE) | VMM_X64_PTE_COW;
+        src_pt->entries[pt_idx] = cow_entry;
+        child_entry = cow_entry;
+        tlb_flush_range(src_pml4_phys, virt_addr, 1);
+        if (need_shootdown_out)
+            *need_shootdown_out = 1;
+    }
+
+    dst_pt->entries[pt_idx] = child_entry;
+    spin_unlock_irqrestore(&g_vmm_lock, irq_flags);
+
+    if (copied_out)
+        *copied_out = 1;
+    if (phys_out)
+        *phys_out = child_entry & VMM_X64_ADDR_MASK;
+    return 0;
+#else
+    (void)src_pml4_phys;
+    (void)dst_pml4_phys;
+    (void)virt_addr;
+    (void)is_private;
+    (void)copied_out;
+    (void)phys_out;
+    (void)need_shootdown_out;
     return -1;
 #endif
 }

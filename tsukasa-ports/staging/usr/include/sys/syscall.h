@@ -41,6 +41,7 @@
 #define SYS_pipe           22
 #define SYS_select         23
 #define SYS_sched_yield    24
+#define SYS_msync          26
 #define SYS_shm_create     29
 #define SYS_shm_attach     30
 #define SYS_shm_destroy    31

@@ -88,6 +88,7 @@ typedef struct vfs_mount {
     int path_len;
     vfs_backend_t backend;
     int read_only;
+    int nosuid;
     const char *name;
     void *fs_private;
 } vfs_mount_t;
@@ -473,6 +474,7 @@ static void mount_table_reset(void)
         g_mounts[i].path_len = 0;
         g_mounts[i].backend = VFS_BACKEND_NONE;
         g_mounts[i].read_only = 1;
+        g_mounts[i].nosuid = 0;
         g_mounts[i].name = "none";
         g_mounts[i].fs_private = NULL;
     }
@@ -505,6 +507,7 @@ static int mount_register_ctx(const char *path, vfs_backend_t backend,
             g_mounts[i].path_len = kstrlen(g_mounts[i].path);
             g_mounts[i].backend = backend;
             g_mounts[i].read_only = read_only ? 1 : 0;
+            g_mounts[i].nosuid = 0;
             g_mounts[i].name = name ? name : "unknown";
             g_mounts[i].fs_private = fs_private;
             spin_unlock_irqrestore(&g_mounts_lock, flags);
@@ -1670,6 +1673,10 @@ static void fd_close_on_table(void **tbl, int fd)
     }
 
     tbl[fd] = NULL;
+    if (tbl != g_kernel_open_files) {
+        process_t *owner = (process_t *)((uintptr_t)tbl - offsetof(process_t, open_files));
+        owner->fds[fd].flags = 0;
+    }
     spin_unlock_irqrestore(&g_fd_lock, flags);
     file_release(f);
 }
@@ -2761,6 +2768,8 @@ static int vfs_install_fd(process_t *proc, vfs_file_t *f)
     for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
         if (!tbl[i]) {
             tbl[i] = f;
+            if (proc)
+                proc->fds[i].flags = 0;
             spin_unlock_irqrestore(&g_fd_lock, flags);
             return i;
         }
@@ -3073,6 +3082,8 @@ int vfs_open_flags_mode(const char *path, int flags, int mode)
         file_release(f);
         return fd;
     }
+    if (proc && (flags & VFS_O_CLOEXEC))
+        proc->fds[fd].flags = VFS_FD_CLOEXEC;
     return fd;
 }
 
@@ -3738,6 +3749,13 @@ int vfs_mount(const char *source, const char *target, const char *fstype, unsign
             tmpfs_destroy(tfs);
             return rc;
         }
+        if (flags & MS_NOSUID) {
+            vfs_mount_t *nm = mount_lookup_ref(abs);
+            if (nm) {
+                nm->nosuid = 1;
+                mount_unref(nm);
+            }
+        }
         dcache_invalidate_path(abs);
         return 0;
     }
@@ -3760,6 +3778,13 @@ int vfs_mount(const char *source, const char *target, const char *fstype, unsign
         if (rc != 0) {
             (void)fat32_vol_umount(vol);
             return rc;
+        }
+        if (flags & MS_NOSUID) {
+            vfs_mount_t *nm = mount_lookup_ref(abs);
+            if (nm) {
+                nm->nosuid = 1;
+                mount_unref(nm);
+            }
         }
         dcache_invalidate_path(abs);
         return 0;
@@ -3785,11 +3810,35 @@ int vfs_mount(const char *source, const char *target, const char *fstype, unsign
             (void)ext4fs_umount(efs);
             return rc;
         }
+        if (flags & MS_NOSUID) {
+            vfs_mount_t *nm = mount_lookup_ref(abs);
+            if (nm) {
+                nm->nosuid = 1;
+                mount_unref(nm);
+            }
+        }
         dcache_invalidate_path(abs);
         return 0;
     }
 
     return -ENODEV;
+}
+
+int vfs_path_nosuid(const char *path)
+{
+    process_t *proc = vfs_current_process();
+    vfs_mount_t *m = NULL;
+    char abs[VFS_PATH_MAX];
+    char sub[VFS_PATH_MAX];
+    int exists = 0;
+    uint32_t type = VFS_TYPE_UNKNOWN;
+    if (!path || !path[0])
+        return 0;
+    if (vfs_resolve_path_ex(proc, path, 1, abs, &m, sub, &exists, &type) != 0 || !m)
+        return 0;
+    int nosuid = m->nosuid ? 1 : 0;
+    mount_unref(m);
+    return nosuid;
 }
 
 int vfs_umount2(const char *target, int flags)
@@ -4381,6 +4430,8 @@ int vfs_dup2(int oldfd, int newfd)
     unsigned long flags = spin_lock_irqsave(&g_fd_lock);
     vfs_file_t *existing = (vfs_file_t *)tbl[newfd];
     tbl[newfd] = f;
+    if (proc)
+        proc->fds[newfd].flags = 0;
     spin_unlock_irqrestore(&g_fd_lock, flags);
     if (existing && existing != (vfs_file_t *)(uintptr_t)1)
         file_release(existing);
@@ -4694,6 +4745,51 @@ int vfs_fcntl(int fd, int cmd, int arg)
     int rc = -EINVAL;
     if (!f)
         return -EBADF;
+    if (cmd == VFS_F_GETFD) {
+        if (!proc) {
+            file_release(f);
+            return -EBADF;
+        }
+        unsigned long fd_flags = spin_lock_irqsave(&g_fd_lock);
+        rc = proc->fds[fd].flags & VFS_FD_CLOEXEC;
+        spin_unlock_irqrestore(&g_fd_lock, fd_flags);
+        file_release(f);
+        return rc;
+    }
+    if (cmd == VFS_F_SETFD) {
+        if (!proc) {
+            file_release(f);
+            return -EBADF;
+        }
+        unsigned long fd_flags = spin_lock_irqsave(&g_fd_lock);
+        proc->fds[fd].flags = (arg & VFS_FD_CLOEXEC) ? VFS_FD_CLOEXEC : 0;
+        spin_unlock_irqrestore(&g_fd_lock, fd_flags);
+        file_release(f);
+        return 0;
+    }
+    if (cmd == VFS_F_DUPFD || cmd == VFS_F_DUPFD_CLOEXEC) {
+        if (arg < 0 || arg >= PROCESS_MAX_OPEN_FILES) {
+            file_release(f);
+            return -EINVAL;
+        }
+        void **tbl = fd_table_for_process(proc);
+        int newfd = -EMFILE;
+        unsigned long fd_flags = spin_lock_irqsave(&g_fd_lock);
+        for (int i = arg; i < PROCESS_MAX_OPEN_FILES; i++) {
+            if (!tbl[i]) {
+                file_ref(f);
+                tbl[i] = f;
+                if (proc) {
+                    proc->fds[i].flags = (cmd == VFS_F_DUPFD_CLOEXEC) ? VFS_FD_CLOEXEC : 0;
+                }
+                newfd = i;
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&g_fd_lock, fd_flags);
+        file_release(f);
+        return newfd;
+    }
     unsigned long flags = spin_lock_irqsave(&f->lock);
     switch (cmd) {
     case VFS_F_GETFL:
@@ -4867,7 +4963,9 @@ static int vfs_mmap_vma_fault(vm_area_t *vma, uintptr_t va, uint64_t error_code)
             uintptr_t new_phys = pmm_alloc_pages(1);
             if (!new_phys)
                 return -1;
-            k_memset((void *)vmm_phys_to_virt((uint64_t)new_phys), 0, PAGE_SIZE);
+            k_memcpy((void *)vmm_phys_to_virt((uint64_t)new_phys),
+                     (const void *)vmm_phys_to_virt(q_phys),
+                     PAGE_SIZE);
             page_t *npg = pmm_phys_to_page(new_phys);
             if (npg)
                 npg->flags |= PAGE_FLAG_ANON;
@@ -4895,6 +4993,43 @@ static int vfs_mmap_vma_fault(vm_area_t *vma, uintptr_t va, uint64_t error_code)
         }
         (void)pmm_page_put(phys);
         return (mrc == 1) ? 0 : -1;
+    }
+
+    if (!is_shared && is_write && is_present) {
+        uint64_t q_phys = 0, q_flags = 0;
+        if (vmm_query_page(space->pml4_phys, va, &q_phys, &q_flags) != 0 ||
+            !(q_flags & VMM_X64_PTE_PRESENT)) {
+            return -1;
+        }
+        if (q_flags & VMM_X64_PTE_WRITABLE)
+            return 0;
+        page_t *qpg = pmm_phys_to_page((uintptr_t)q_phys);
+        if (qpg && (qpg->flags & PAGE_FLAG_ANON)) {
+            uint64_t rw_flags = vfs_vma_map_flags(vma->prot, vma->flags, 1);
+            if (pmm_page_refcount((uintptr_t)q_phys) == 1u) {
+                int urc = vmm_upgrade_user_page_write(space->pml4_phys, va, q_phys, rw_flags);
+                if (urc == 0)
+                    vmm_tlb_shootdown(space, va, 1);
+                return (urc >= 0) ? 0 : -1;
+            }
+            uintptr_t new_phys = pmm_alloc_pages(1);
+            if (!new_phys)
+                return -1;
+            k_memcpy((void *)vmm_phys_to_virt((uint64_t)new_phys),
+                     (const void *)vmm_phys_to_virt(q_phys),
+                     PAGE_SIZE);
+            page_t *npg = pmm_phys_to_page(new_phys);
+            if (npg)
+                npg->flags |= PAGE_FLAG_ANON;
+            int crc = vmm_cow_replace_user_page(space->pml4_phys, va, q_phys, (uint64_t)new_phys, rw_flags);
+            if (crc == 0) {
+                vmm_tlb_shootdown(space, va, 1);
+                (void)pmm_page_put((uintptr_t)q_phys);
+                return 0;
+            }
+            (void)pmm_page_put(new_phys);
+            return (crc == 1) ? 0 : -1;
+        }
     }
 
     pagecache_page_t *pc_pg = vfs_file_get_page(f, page_idx);
@@ -5021,6 +5156,26 @@ static int vfs_mmap_vma_fault(vm_area_t *vma, uintptr_t va, uint64_t error_code)
     return (urc >= 0) ? 0 : -1;
 }
 #endif
+
+void vfs_vma_fork_pin_shared_page(const vm_area_t *vma, uintptr_t va)
+{
+#ifdef __x86_64__
+    if (!vma || !vma->file)
+        return;
+    if ((vma->flags & (VMA_FLAG_FILE | VMA_FLAG_SHARED)) != (VMA_FLAG_FILE | VMA_FLAG_SHARED))
+        return;
+    uint64_t obj_id = vfs_file_pc_obj_id((vfs_file_t *)vma->file);
+    if (!obj_id)
+        return;
+    uint64_t file_off = vma->file_offset + (uint64_t)(va - vma->start);
+    uint64_t pidx = file_off >> 12;
+    /* Match the pin acquired on demand fault so parent and child unmaps balance. */
+    (void)pagecache_lookup_page(obj_id, pidx);
+#else
+    (void)vma;
+    (void)va;
+#endif
+}
 
 void *vfs_mmap(void *addr, size_t length, int prot, int flags, int fd, size_t offset)
 {
@@ -6205,9 +6360,25 @@ int vfs_process_inherit(struct process *dst, const struct process *src)
             continue;
         file_ref(f);
         dst_tbl[i] = f;
+        ((process_t *)dst)->fds[i].flags = ((const process_t *)src)->fds[i].flags;
     }
     spin_unlock_irqrestore(&g_fd_lock, flags);
     return 0;
+}
+
+void vfs_process_close_cloexec(struct process *proc)
+{
+    void **tbl;
+    if (!proc)
+        return;
+    tbl = fd_table_for_process(proc);
+    for (int i = 0; i < PROCESS_MAX_OPEN_FILES; i++) {
+        unsigned long flags = spin_lock_irqsave(&g_fd_lock);
+        int close_it = (tbl[i] != NULL && (proc->fds[i].flags & VFS_FD_CLOEXEC)) ? 1 : 0;
+        spin_unlock_irqrestore(&g_fd_lock, flags);
+        if (close_it)
+            fd_close_on_table(tbl, i);
+    }
 }
 
 int vfs_process_dup2(struct process *dst,

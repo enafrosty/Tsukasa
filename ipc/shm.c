@@ -311,6 +311,69 @@ int shm_detach(void *addr)
     return unmap_rc;
 }
 
+int shm_process_fork(struct process *parent_proc, struct process *child_proc)
+{
+    process_t *parent = (process_t *)parent_proc;
+    process_t *child = (process_t *)child_proc;
+    struct shm_fork_item {
+        int shm_id;
+        uintptr_t virt_base;
+        uintptr_t phys_base;
+        size_t page_count;
+    } items[SHM_CLEANUP_BATCH];
+    size_t count = 0;
+    unsigned long flags;
+
+    if (!parent || !child)
+        return -1;
+
+    flags = spin_lock_irqsave(&g_shm_lock);
+    for (int i = 0; i < SHM_MAX_ATTACHMENTS && count < SHM_CLEANUP_BATCH; i++) {
+        struct shm_attachment *att = &g_attachments[i];
+        struct shm_region *r;
+        if (!att->in_use || att->pid != parent->pid)
+            continue;
+        r = shm_find_region_locked(att->shm_id);
+        if (!r || r->destroy_pending)
+            continue;
+
+        struct shm_attachment *catt = shm_alloc_attachment_locked();
+        if (!catt) {
+            spin_unlock_irqrestore(&g_shm_lock, flags);
+            shm_process_cleanup(child);
+            return -1;
+        }
+        catt->in_use = 1;
+        catt->pid = child->pid;
+        catt->shm_id = att->shm_id;
+        catt->virt_base = att->virt_base;
+        catt->page_count = att->page_count;
+        r->ref_count++;
+
+        items[count].shm_id = att->shm_id;
+        items[count].virt_base = att->virt_base;
+        items[count].phys_base = r->phys_base;
+        items[count].page_count = att->page_count;
+        count++;
+    }
+    spin_unlock_irqrestore(&g_shm_lock, flags);
+
+    for (size_t i = 0; i < count; i++) {
+        if (vm_space_map_user_pages(&child->vm_space,
+                                    items[i].virt_base,
+                                    items[i].phys_base,
+                                    items[i].page_count,
+                                    PAGING_MAP_READ | PAGING_MAP_WRITE |
+                                    PAGING_MAP_USER) != 0) {
+            shm_process_cleanup(child);
+            return -1;
+        }
+        vm_space_note_shm_attach(&child->vm_space, items[i].page_count);
+        child->shm_attachment_count++;
+    }
+    return 0;
+}
+
 void *shm_map(int shm_id)
 {
     return shm_attach(shm_id);

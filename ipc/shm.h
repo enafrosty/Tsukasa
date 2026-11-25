@@ -49,6 +49,9 @@ int shm_destroy(int shm_id);
 /* Cleanup SHM attachments owned by a process during exit/reap. @param proc Process to cleanup. */
 void shm_process_cleanup(struct process *proc);
 
+/* Duplicate parent SHM attachments into child across fork without COW. */
+int shm_process_fork(struct process *parent, struct process *child);
+
 /* Populate snapshot statistics for diagnostics. */
 void shm_get_stats(struct shm_stats *out);
 
