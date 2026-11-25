@@ -23,14 +23,17 @@
 #include "../include/paging.h"
 #include "../include/errno.h"
 #include "../include/kprintf.h"
+#include "../include/signal_abi.h"
 #include "../include/smp.h"
 #include "../include/spinlock.h"
+#include "../include/syscall_regs.h"
 #include "../fs/vfs.h"
 #include "../loader/exec.h"
 #include "../loader/elf64.h"
 #include "../ipc/shm.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
+#include "../mm/vm_space.h"
 #include "../mm/vmm_x64.h"
 #include "../net/network.h"
 #include "../sys/futex.h"
@@ -186,6 +189,10 @@ static void process_init_sched_state(process_t *p, process_t *parent)
     p->parent = parent;
     p->child_count = 0;
     p->fpu_initialized = 0;
+    p->waiting_child = 0;
+    p->sigreturn_pending_iretq = 0;
+    p->sigreturn_stub_va = 0;
+    p->active_syscall_regs = NULL;
 
     p->main_thread.tid = p->pid;
     p->main_thread.cpu_id = p->cpu_id;
@@ -612,11 +619,97 @@ static void wake_parent_if_waiting_locked(process_t *child)
     parent = find_by_pid_locked((int)child->ppid);
     if (!parent)
         return;
-    if (parent->state == PROCESS_BLOCKED) {
+    if (parent->state == PROCESS_BLOCKED && parent->waiting_child) {
         parent->state = PROCESS_READY;
         parent->main_thread.state = THREAD_READY;
         runq_push_locked(parent);
     }
+}
+
+typedef enum signal_default_kind {
+    SIG_DFL_TERM = 0,
+    SIG_DFL_IGN = 1,
+    SIG_DFL_STOP = 2,
+    SIG_DFL_CONT = 3,
+} signal_default_kind_t;
+
+static signal_default_kind_t signal_default_kind(int sig)
+{
+    switch (sig) {
+    case PROCESS_SIGCHLD:
+    case PROCESS_SIGURG:
+    case PROCESS_SIGWINCH:
+        return SIG_DFL_IGN;
+    case PROCESS_SIGCONT:
+        return SIG_DFL_CONT;
+    case PROCESS_SIGSTOP:
+    case PROCESS_SIGTSTP:
+    case PROCESS_SIGTTIN:
+    case PROCESS_SIGTTOU:
+        return SIG_DFL_STOP;
+    default:
+        return SIG_DFL_TERM;
+    }
+}
+
+static int signal_is_ignored_locked(const process_t *p, int sig)
+{
+    if (!p || sig <= 0 || sig >= PROCESS_MAX_SIGNALS)
+        return 1;
+    if (sig == PROCESS_SIGKILL || sig == PROCESS_SIGSTOP)
+        return 0;
+    if (p->signal_handlers[sig] == PROCESS_SIG_IGN)
+        return 1;
+    if (p->signal_handlers[sig] == PROCESS_SIG_DFL) {
+        signal_default_kind_t kind = signal_default_kind(sig);
+        if (kind == SIG_DFL_IGN)
+            return 1;
+        if (kind == SIG_DFL_CONT && p->state != PROCESS_STOPPED)
+            return 1;
+    }
+    return 0;
+}
+
+static uint64_t signal_deliverable_mask_locked(const process_t *p)
+{
+    uint64_t unmasked;
+    uint64_t res = 0;
+    if (!p)
+        return 0;
+    unmasked = p->signal_pending & ~p->signal_mask;
+    if (!unmasked)
+        return 0;
+    for (int sig = 1; sig < PROCESS_MAX_SIGNALS; sig++) {
+        uint64_t bit = 1ULL << (uint32_t)sig;
+        if (!(unmasked & bit))
+            continue;
+        if (!signal_is_ignored_locked(p, sig))
+            res |= bit;
+    }
+    return res;
+}
+
+int process_has_deliverable_signal(const process_t *p)
+{
+    uint64_t flags;
+    int has = 0;
+    if (!p)
+        return 0;
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    has = (signal_deliverable_mask_locked(p) != 0) ? 1 : 0;
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    return has;
+}
+
+int process_poll_was_woken(void)
+{
+    unsigned long irqf = spin_lock_irqsave(&g_sched_lock);
+    process_t *self = g_current[sched_this_cpu()];
+    int woken = (!self || self->state != PROCESS_BLOCKED) ? 1 : 0;
+    spin_unlock_irqrestore(&g_sched_lock, irqf);
+    return woken;
 }
 
 void process_block_current(void)
@@ -719,7 +812,7 @@ int process_sleep_ms(uint64_t ms)
             irq_restore(flags);
             return 0;
         }
-        if (self->signal_pending & ~self->signal_mask) {
+        if (signal_deliverable_mask_locked(self) != 0) {
             sleepq_remove_locked(self);
             spin_unlock(&g_sched_lock);
             irq_restore(flags);
@@ -777,6 +870,60 @@ int process_reparent(process_t *child, int parent_pid)
     return 0;
 }
 
+static void mark_zombie_locked(process_t *p, int wait_status);
+
+static void signal_post_locked(process_t *p, int sig)
+{
+    if (!p || !p->used || p->state == PROCESS_ZOMBIE || p->state == PROCESS_DEAD)
+        return;
+    if (sig <= 0 || sig >= PROCESS_MAX_SIGNALS)
+        return;
+
+    /* PID 1 (init) cannot be terminated or stopped by unhandled signals. */
+    if (p->pid == 1 && (sig == PROCESS_SIGKILL || sig == PROCESS_SIGSTOP ||
+                        sig == PROCESS_SIGTERM))
+        return;
+
+    if (sig == PROCESS_SIGKILL) {
+        mark_zombie_locked(p, WAIT_STATUS_SIGNAL(sig));
+        return;
+    }
+
+    if (sig == PROCESS_SIGCONT) {
+        p->signal_pending &= ~((1ULL << PROCESS_SIGSTOP) |
+                               (1ULL << PROCESS_SIGTSTP) |
+                               (1ULL << PROCESS_SIGTTIN) |
+                               (1ULL << PROCESS_SIGTTOU));
+        if (p->state == PROCESS_STOPPED) {
+            p->state = PROCESS_READY;
+            p->main_thread.state = THREAD_READY;
+            runq_push_locked(p);
+        }
+        if (p->signal_handlers[sig] == PROCESS_SIG_DFL ||
+            p->signal_handlers[sig] == PROCESS_SIG_IGN)
+            return;
+    }
+
+    if (sig == PROCESS_SIGSTOP || sig == PROCESS_SIGTSTP ||
+        sig == PROCESS_SIGTTIN || sig == PROCESS_SIGTTOU) {
+        p->signal_pending &= ~(1ULL << PROCESS_SIGCONT);
+    }
+
+    uint64_t bit = 1ULL << (uint32_t)sig;
+    if (!(p->signal_mask & bit) && signal_is_ignored_locked(p, sig))
+        return;
+
+    p->signal_pending |= bit;
+    if (!(p->signal_mask & bit) &&
+        (p->state == PROCESS_BLOCKED || p->state == PROCESS_SLEEPING)) {
+        sleepq_remove_locked(p);
+        p->poll_deadline_ms = 0;
+        p->state = PROCESS_READY;
+        p->main_thread.state = THREAD_READY;
+        runq_push_locked(p);
+    }
+}
+
 static void mark_zombie_locked(process_t *p, int wait_status)
 {
     if (!p)
@@ -784,23 +931,29 @@ static void mark_zombie_locked(process_t *p, int wait_status)
     if (p->state == PROCESS_ZOMBIE || p->state == PROCESS_DEAD)
         return;
 
-    /* Reparent orphaned children to PID 1 (init) */
+    /* Reparent orphaned children to PID 1 (init). */
     process_t *init_proc = find_by_pid_locked(1);
     process_t *child = p->children_head;
     while (child) {
         process_t *next_child = child->parent_next_child;
-        child->ppid = (init_proc && init_proc != p) ? 1 : 0;
+        child->parent_next_child = NULL;
+        child->parent = NULL;
         if (init_proc && init_proc != p) {
-            child->parent_next_child = init_proc->children_head;
-            init_proc->children_head = child;
-            if (child->state == PROCESS_ZOMBIE)
+            child->ppid = 1;
+            parent_link_child_locked(init_proc, child);
+            if (child->state == PROCESS_ZOMBIE) {
+                signal_post_locked(init_proc, PROCESS_SIGCHLD);
                 wake_parent_if_waiting_locked(child);
+            }
         } else {
-            child->parent_next_child = NULL;
+            child->ppid = 0;
         }
         child = next_child;
     }
     p->children_head = NULL;
+    for (uint32_t i = 0; i < PROCESS_MAX_CHILDREN; i++)
+        p->children[i] = NULL;
+    p->child_count = 0;
 
     p->wait_status = wait_status;
     p->exit_code = WAIT_EXIT_CODE(wait_status);
@@ -811,6 +964,12 @@ static void mark_zombie_locked(process_t *p, int wait_status)
     p->kill_pending = 0;
     sleepq_remove_locked(p);
     runq_remove_locked(p);
+
+    if (p->ppid > 0) {
+        process_t *parent = find_by_pid_locked((int)p->ppid);
+        if (parent)
+            signal_post_locked(parent, PROCESS_SIGCHLD);
+    }
     wake_parent_if_waiting_locked(p);
 }
 
@@ -823,8 +982,6 @@ static int signal_pick_lowest(uint64_t mask)
     return -1;
 }
 
-static int g_user_sig_drop_warned;
-
 static int prepare_signal_action_locked(process_t *p, uintptr_t *handler_out, int *sig_out)
 {
     uint64_t pending;
@@ -832,6 +989,10 @@ static int prepare_signal_action_locked(process_t *p, uintptr_t *handler_out, in
     uintptr_t handler;
 
     if (!p || p->state == PROCESS_ZOMBIE || p->state == PROCESS_DEAD)
+        return 0;
+
+    /* Ring-3 processes deliver signals on return to user space, not inside the scheduler. */
+    if (p->vm_space.owns_pml4)
         return 0;
 
     pending = p->signal_pending & ~p->signal_mask;
@@ -848,27 +1009,24 @@ static int prepare_signal_action_locked(process_t *p, uintptr_t *handler_out, in
     if (handler == PROCESS_SIG_IGN)
         return 0;
 
-    /* PID 1 (init) cannot be terminated by unhandled signals */
-    if (p->pid == 1 && (handler == PROCESS_SIG_DFL || sig == PROCESS_SIGKILL || sig == PROCESS_SIGINT))
-        return 0;
-
-    if (handler == PROCESS_SIG_DFL || sig == PROCESS_SIGKILL || sig == PROCESS_SIGINT) {
+    if (handler == PROCESS_SIG_DFL) {
+        signal_default_kind_t kind = signal_default_kind(sig);
+        if (kind == SIG_DFL_IGN || kind == SIG_DFL_CONT)
+            return 0;
+        if (p->pid == 1)
+            return 0;
+        if (kind == SIG_DFL_STOP) {
+            p->state = PROCESS_STOPPED;
+            p->main_thread.state = THREAD_STOPPED;
+            runq_remove_locked(p);
+            return 0;
+        }
         mark_zombie_locked(p, WAIT_STATUS_SIGNAL(sig));
         return 0;
     }
 
-    /* Without a user-mode sigreturn trampoline, never invoke a Ring-3 or lower-half handler in Ring 0. */
-    if (p->vm_space.owns_pml4 != 0 || handler < 0xFFFFFFFF80000000ULL) {
-        if (!g_user_sig_drop_warned) {
-            g_user_sig_drop_warned = 1;
-            kprintf("[proc] WARN: dropping user signal %d handler=0x%08x%08x for pid=%u (no user trampoline)\n",
-                    sig,
-                    (uint32_t)(handler >> 32),
-                    (uint32_t)(handler & 0xFFFFFFFFu),
-                    (unsigned)p->pid);
-        }
+    if (handler < 0xFFFFFFFF80000000ULL)
         return 0;
-    }
 
     if (handler_out)
         *handler_out = handler;
@@ -1089,10 +1247,13 @@ extern void fork_child_return_x64(void);
 syscall_frame_t *process_current_syscall_frame(void)
 {
     process_t *cur = process_current();
-    if (!cur || !cur->kernel_stack)
+    if (!cur || !cur->active_syscall_regs)
         return NULL;
-    return (syscall_frame_t *)(uintptr_t)(process_stack_top_aligned(cur) -
-                                          sizeof(syscall_frame_t));
+    syscall_regs_t *regs = (syscall_regs_t *)cur->active_syscall_regs;
+    _Static_assert(offsetof(syscall_regs_t, rsp) - offsetof(syscall_regs_t, rdi) ==
+                       sizeof(syscall_frame_t) - sizeof(uint64_t),
+                   "syscall_regs_t register tail must match syscall_frame_t");
+    return (syscall_frame_t *)(uintptr_t)&regs->rdi;
 }
 
 int process_swap_vm_space(process_t *p, vm_space_t *new_space, vm_space_t *old_space_out)
@@ -1137,9 +1298,11 @@ void process_execve_reset_state(process_t *p)
             p->sig_actions[i].handler = 0;
             p->sig_actions[i].mask = 0;
             p->sig_actions[i].flags = 0;
+            p->sig_actions[i].restorer = 0;
             p->sig_actions[i].action = SIGNAL_ACTION_DEFAULT;
         }
     }
+    p->sigreturn_stub_va = 0;
     fpu_init_state(p->fpu_state);
     p->fpu_initialized = 1;
     if (p == g_current[sched_this_cpu()])
@@ -1216,6 +1379,10 @@ int process_fork_current(const syscall_frame_t *frame)
 
     child->signal_mask = cur->signal_mask;
     child->signal_pending = 0;
+    child->waiting_child = 0;
+    child->sigreturn_pending_iretq = 0;
+    child->sigreturn_stub_va = cur->sigreturn_stub_va;
+    child->active_syscall_regs = NULL;
     for (int i = 0; i < PROCESS_MAX_SIGNALS; i++) {
         child->signal_handlers[i] = cur->signal_handlers[i];
         child->sig_actions[i] = cur->sig_actions[i];
@@ -1480,6 +1647,10 @@ int process_exec(int pid, process_entry_t entry, const char *name)
 
     p->entry = entry;
     p->fpu_initialized = 0;
+    p->waiting_child = 0;
+    p->sigreturn_pending_iretq = 0;
+    p->sigreturn_stub_va = 0;
+    p->active_syscall_regs = NULL;
     p->signal_pending = 0;
     p->signal_mask = 0;
     for (int i = 0; i < PROCESS_MAX_SIGNALS; i++)
@@ -1488,6 +1659,7 @@ int process_exec(int pid, process_entry_t entry, const char *name)
         p->sig_actions[i].handler = NULL;
         p->sig_actions[i].mask = 0;
         p->sig_actions[i].flags = 0;
+        p->sig_actions[i].restorer = 0;
         p->sig_actions[i].action = SIGNAL_ACTION_DEFAULT;
     }
     if (name && name[0])
@@ -1630,7 +1802,7 @@ int process_waitpid(int caller_pid, int target_pid, int options, int *status_out
         if (!found_any_child || !found_match) {
             spin_unlock(&g_sched_lock);
             irq_restore(flags);
-            return -1;
+            return -ECHILD;
         }
 
         if (options & PROCESS_WAIT_WNOHANG) {
@@ -1639,12 +1811,24 @@ int process_waitpid(int caller_pid, int target_pid, int options, int *status_out
             return 0;
         }
 
+        if (signal_deliverable_mask_locked(caller) != 0) {
+            spin_unlock(&g_sched_lock);
+            irq_restore(flags);
+            return -EINTR;
+        }
+
         self = g_current[sched_this_cpu()];
         if (self && self->pid == caller->pid) {
+            self->waiting_child = 1;
             self->state = PROCESS_BLOCKED;
             self->main_thread.state = THREAD_BLOCKED;
             spin_unlock(&g_sched_lock);
             process_yield();
+            irq_restore(flags);
+            flags = irq_save_disable();
+            spin_lock(&g_sched_lock);
+            self->waiting_child = 0;
+            spin_unlock(&g_sched_lock);
             irq_restore(flags);
             continue;
         }
@@ -1659,8 +1843,16 @@ int process_kill(int pid, int sig)
 {
     process_t *p;
     uint64_t flags;
+    if (pid == 0) {
+        process_t *cur = process_current();
+        if (!cur || cur->pgid == 0)
+            return -ESRCH;
+        return (process_kill_pgid((int)cur->pgid, sig) > 0) ? 0 : -ESRCH;
+    }
+    if (pid < -1)
+        return (process_kill_pgid(-pid, sig) > 0) ? 0 : -ESRCH;
     if (pid <= 0)
-        return -1;
+        return -ESRCH;
 
     flags = irq_save_disable();
     spin_lock(&g_sched_lock);
@@ -1668,7 +1860,7 @@ int process_kill(int pid, int sig)
     if (!p || p->state == PROCESS_DEAD) {
         spin_unlock(&g_sched_lock);
         irq_restore(flags);
-        return -1;
+        return -ESRCH;
     }
 
     if (sig == 0) {
@@ -1677,31 +1869,20 @@ int process_kill(int pid, int sig)
         return 0;
     }
 
-    if (sig <= 0 || sig >= PROCESS_MAX_SIGNALS) {
+    if (sig < 0 || sig >= PROCESS_MAX_SIGNALS) {
         spin_unlock(&g_sched_lock);
         irq_restore(flags);
-        return -1;
+        return -EINVAL;
     }
 
-    /* PID 1 (init) cannot be killed */
+    /* PID 1 (init) cannot be killed or stopped. */
     if (pid == 1 && (sig == PROCESS_SIGKILL || sig == PROCESS_SIGSTOP || sig == PROCESS_SIGTERM)) {
         spin_unlock(&g_sched_lock);
         irq_restore(flags);
-        return -1;
+        return -EPERM;
     }
 
-    if (sig == PROCESS_SIGKILL) {
-        mark_zombie_locked(p, WAIT_STATUS_SIGNAL(sig));
-    } else {
-        p->signal_pending |= (1ULL << (uint32_t)sig);
-        if (p->state == PROCESS_BLOCKED || p->state == PROCESS_SLEEPING) {
-            sleepq_remove_locked(p);
-            p->poll_deadline_ms = 0;
-            p->state = PROCESS_READY;
-            p->main_thread.state = THREAD_READY;
-            runq_push_locked(p);
-        }
-    }
+    signal_post_locked(p, sig);
 
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
@@ -1712,8 +1893,8 @@ int process_kill_pgid(int pgid, int sig)
 {
     int count = 0;
     uint64_t flags;
-    if (pgid <= 0 || sig <= 0 || sig >= PROCESS_MAX_SIGNALS)
-        return -1;
+    if (pgid <= 0 || sig < 0 || sig >= PROCESS_MAX_SIGNALS)
+        return -EINVAL;
 
     flags = irq_save_disable();
     spin_lock(&g_sched_lock);
@@ -1725,18 +1906,8 @@ int process_kill_pgid(int pgid, int sig)
             continue;
         if (p->pid == 1 && (sig == PROCESS_SIGKILL || sig == PROCESS_SIGSTOP || sig == PROCESS_SIGTERM))
             continue;
-        if (sig == PROCESS_SIGKILL)
-            mark_zombie_locked(p, WAIT_STATUS_SIGNAL(sig));
-        else {
-            p->signal_pending |= (1ULL << (uint32_t)sig);
-            if (p->state == PROCESS_BLOCKED || p->state == PROCESS_SLEEPING) {
-                sleepq_remove_locked(p);
-                p->poll_deadline_ms = 0;
-                p->state = PROCESS_READY;
-                p->main_thread.state = THREAD_READY;
-                runq_push_locked(p);
-            }
-        }
+        if (sig > 0)
+            signal_post_locked(p, sig);
         count++;
     }
     spin_unlock(&g_sched_lock);
@@ -1863,9 +2034,9 @@ int process_signal_register(int pid, int sig, process_signal_handler_t handler)
     uint64_t flags;
 
     if (sig <= 0 || sig >= PROCESS_MAX_SIGNALS)
-        return -1;
-    if (sig == PROCESS_SIGKILL && h != PROCESS_SIG_DFL)
-        return -1;
+        return -EINVAL;
+    if ((sig == PROCESS_SIGKILL || sig == PROCESS_SIGSTOP) && h != PROCESS_SIG_DFL)
+        return -EINVAL;
 
     flags = irq_save_disable();
     spin_lock(&g_sched_lock);
@@ -1873,13 +2044,66 @@ int process_signal_register(int pid, int sig, process_signal_handler_t handler)
     if (!p) {
         spin_unlock(&g_sched_lock);
         irq_restore(flags);
-        return -1;
+        return -ESRCH;
     }
     p->signal_handlers[sig] = h;
     p->sig_actions[sig].handler = (h > 1) ? handler : NULL;
+    p->sig_actions[sig].mask = 0;
+    p->sig_actions[sig].flags = 0;
+    p->sig_actions[sig].restorer = 0;
     p->sig_actions[sig].action = (h == PROCESS_SIG_IGN) ? SIGNAL_ACTION_IGNORE :
                                  ((h == PROCESS_SIG_DFL) ? SIGNAL_ACTION_DEFAULT :
                                   SIGNAL_ACTION_HANDLER);
+    if (signal_is_ignored_locked(p, sig))
+        p->signal_pending &= ~(1ULL << (uint32_t)sig);
+    spin_unlock(&g_sched_lock);
+    irq_restore(flags);
+    return 0;
+}
+
+int process_sigaction(int pid, int sig,
+                      const struct tsukasa_sigaction *act,
+                      struct tsukasa_sigaction *oldact)
+{
+    process_t *p;
+    uint64_t flags;
+
+    if (sig <= 0 || sig >= PROCESS_MAX_SIGNALS)
+        return -EINVAL;
+    if (act && (sig == PROCESS_SIGKILL || sig == PROCESS_SIGSTOP))
+        return -EINVAL;
+
+    flags = irq_save_disable();
+    spin_lock(&g_sched_lock);
+    p = find_by_pid_locked(pid);
+    if (!p) {
+        spin_unlock(&g_sched_lock);
+        irq_restore(flags);
+        return -ESRCH;
+    }
+
+    if (oldact) {
+        oldact->sa_handler = p->signal_handlers[sig];
+        oldact->sa_mask = p->sig_actions[sig].mask;
+        oldact->sa_flags = p->sig_actions[sig].flags;
+        oldact->sa_restorer = p->sig_actions[sig].restorer;
+    }
+
+    if (act) {
+        uintptr_t h = act->sa_handler;
+        p->signal_handlers[sig] = h;
+        p->sig_actions[sig].handler = (h > 1) ? (process_signal_handler_t)h : NULL;
+        p->sig_actions[sig].mask = act->sa_mask & ~((1ULL << PROCESS_SIGKILL) |
+                                                    (1ULL << PROCESS_SIGSTOP));
+        p->sig_actions[sig].flags = act->sa_flags;
+        p->sig_actions[sig].restorer = (act->sa_flags & TSK_SA_RESTORER) ? act->sa_restorer : 0;
+        p->sig_actions[sig].action = (h == PROCESS_SIG_IGN) ? SIGNAL_ACTION_IGNORE :
+                                     ((h == PROCESS_SIG_DFL) ? SIGNAL_ACTION_DEFAULT :
+                                      SIGNAL_ACTION_HANDLER);
+        if (signal_is_ignored_locked(p, sig))
+            p->signal_pending &= ~(1ULL << (uint32_t)sig);
+    }
+
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
     return 0;
@@ -1894,7 +2118,7 @@ int process_signal_mask(int pid, int how, uint64_t set, uint64_t *old_set)
     if (!p) {
         spin_unlock(&g_sched_lock);
         irq_restore(flags);
-        return -1;
+        return -ESRCH;
     }
     if (old_set)
         *old_set = p->signal_mask;
@@ -1907,9 +2131,9 @@ int process_signal_mask(int pid, int how, uint64_t set, uint64_t *old_set)
     else {
         spin_unlock(&g_sched_lock);
         irq_restore(flags);
-        return -1;
+        return -EINVAL;
     }
-    p->signal_mask &= ~(1ULL << PROCESS_SIGKILL);
+    p->signal_mask &= ~((1ULL << PROCESS_SIGKILL) | (1ULL << PROCESS_SIGSTOP));
     spin_unlock(&g_sched_lock);
     irq_restore(flags);
     return 0;
@@ -1920,14 +2144,14 @@ int process_signal_pending(int pid, uint64_t *pending_out)
     process_t *p;
     uint64_t flags;
     if (!pending_out)
-        return -1;
+        return -EFAULT;
     flags = irq_save_disable();
     spin_lock(&g_sched_lock);
     p = find_by_pid_locked(pid);
     if (!p) {
         spin_unlock(&g_sched_lock);
         irq_restore(flags);
-        return -1;
+        return -ESRCH;
     }
     *pending_out = p->signal_pending;
     spin_unlock(&g_sched_lock);
@@ -1938,6 +2162,402 @@ int process_signal_pending(int pid, uint64_t *pending_out)
 int process_signal_send(int pid, int sig)
 {
     return process_kill(pid, sig);
+}
+
+static void sig_memset(void *dst, uint8_t val, size_t n)
+{
+    uint8_t *d = (uint8_t *)dst;
+    for (size_t i = 0; i < n; i++)
+        d[i] = val;
+}
+
+static void sig_memcpy(void *dst, const void *src, size_t n)
+{
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    for (size_t i = 0; i < n; i++)
+        d[i] = s[i];
+}
+
+static uint32_t get_mxcsr_mask(void)
+{
+    static uint32_t cached_mask;
+    uint32_t mask = __atomic_load_n(&cached_mask, __ATOMIC_RELAXED);
+    if (mask)
+        return mask;
+    uint8_t tmp[512] __attribute__((aligned(16)));
+    sig_memset(tmp, 0, sizeof(tmp));
+    __asm__ volatile ("fxsave (%0)" : : "r"(tmp) : "memory");
+    mask = *(uint32_t *)(tmp + 28);
+    if (!mask)
+        mask = 0x0000FFBFu;
+    __atomic_store_n(&cached_mask, mask, __ATOMIC_RELAXED);
+    return mask;
+}
+
+static uint64_t ensure_sigreturn_stub(process_t *p)
+{
+    static const uint8_t stub_code[] = {
+        0x48, 0xC7, 0xC0, 0x0F, 0x00, 0x00, 0x00, /* mov rax, 15 (SYS_rt_sigreturn) */
+        0x0F, 0x05,                               /* syscall */
+        0x0F, 0x0B                                /* ud2 */
+    };
+    if (!p || !p->vm_space.owns_pml4)
+        return 0;
+    if (p->sigreturn_stub_va)
+        return p->sigreturn_stub_va;
+
+    uintptr_t phys = pmm_alloc_pages(1);
+    if (!phys)
+        return 0;
+    page_t *pg = pmm_phys_to_page(phys);
+    if (pg)
+        pg->flags |= PAGE_FLAG_ANON;
+    uint8_t *kva = (uint8_t *)vmm_phys_to_virt((uint64_t)phys);
+    sig_memset(kva, 0, VMM_X64_PAGE_SIZE);
+    sig_memcpy(kva, stub_code, sizeof(stub_code));
+
+    vm_space_mmap_write_lock(&p->vm_space);
+    uintptr_t va = vma_find_unmapped_area(&p->vm_space,
+                                          (uintptr_t)VM_SPACE_ANON_BASE,
+                                          (uintptr_t)VM_SPACE_ANON_LIMIT,
+                                          VMM_X64_PAGE_SIZE);
+    if (!va || !vma_insert(&p->vm_space, va, va + VMM_X64_PAGE_SIZE,
+                           VMA_PROT_READ | VMA_PROT_EXEC,
+                           VMA_FLAG_ANON | VMA_FLAG_PRIVATE)) {
+        vm_space_mmap_write_unlock(&p->vm_space);
+        pmm_free_pages(phys, 1);
+        return 0;
+    }
+    vm_space_mmap_write_unlock(&p->vm_space);
+
+    if (vm_space_map_user_pages(&p->vm_space, va, phys, 1,
+                                PAGING_MAP_READ | PAGING_MAP_EXEC |
+                                PAGING_MAP_USER) != 0) {
+        vm_space_mmap_write_lock(&p->vm_space);
+        vma_unmap_range(&p->vm_space, va, VMM_X64_PAGE_SIZE);
+        vm_space_mmap_write_unlock(&p->vm_space);
+        pmm_free_pages(phys, 1);
+        return 0;
+    }
+
+    __atomic_fetch_add(&p->vm_space.anon_pages, 1u, __ATOMIC_RELAXED);
+    p->sigreturn_stub_va = (uint64_t)va;
+    return p->sigreturn_stub_va;
+}
+
+static void save_regs_to_ucontext_syscall(const syscall_regs_t *regs, int is_iretq,
+                                          tsk_ucontext_t *uc)
+{
+    uc->uc_mcontext.gregs[TSK_REG_RAX] = regs->rax;
+    uc->uc_mcontext.gregs[TSK_REG_RDI] = regs->rdi;
+    uc->uc_mcontext.gregs[TSK_REG_RSI] = regs->rsi;
+    uc->uc_mcontext.gregs[TSK_REG_RDX] = regs->rdx;
+    uc->uc_mcontext.gregs[TSK_REG_R8]  = regs->r8;
+    uc->uc_mcontext.gregs[TSK_REG_R9]  = regs->r9;
+    uc->uc_mcontext.gregs[TSK_REG_R10] = regs->r10;
+    uc->uc_mcontext.gregs[TSK_REG_R15] = regs->r15;
+    uc->uc_mcontext.gregs[TSK_REG_R14] = regs->r14;
+    uc->uc_mcontext.gregs[TSK_REG_R13] = regs->r13;
+    uc->uc_mcontext.gregs[TSK_REG_R12] = regs->r12;
+    uc->uc_mcontext.gregs[TSK_REG_RBX] = regs->rbx;
+    uc->uc_mcontext.gregs[TSK_REG_RBP] = regs->rbp;
+    uc->uc_mcontext.gregs[TSK_REG_RCX] = regs->rcx;
+    uc->uc_mcontext.gregs[TSK_REG_R11] = regs->r11;
+    if (is_iretq) {
+        uc->uc_mcontext.gregs[TSK_REG_RIP] = regs->iret_rip;
+        uc->uc_mcontext.gregs[TSK_REG_EFL] = regs->iret_rflags;
+        uc->uc_mcontext.gregs[TSK_REG_RSP] = regs->iret_rsp;
+    } else {
+        uc->uc_mcontext.gregs[TSK_REG_RIP] = regs->rcx;
+        uc->uc_mcontext.gregs[TSK_REG_EFL] = regs->r11;
+        uc->uc_mcontext.gregs[TSK_REG_RSP] = regs->rsp;
+    }
+    uc->uc_mcontext.gregs[TSK_REG_CSGSFS] =
+        ((uint64_t)X64_GDT_USER_CS) | ((uint64_t)X64_GDT_USER_DS << 48);
+}
+
+static void save_regs_to_ucontext_irq(const uint64_t *frame, tsk_ucontext_t *uc)
+{
+    uc->uc_mcontext.gregs[TSK_REG_RAX] = frame[0];
+    uc->uc_mcontext.gregs[TSK_REG_RBX] = frame[1];
+    uc->uc_mcontext.gregs[TSK_REG_RCX] = frame[2];
+    uc->uc_mcontext.gregs[TSK_REG_RDX] = frame[3];
+    uc->uc_mcontext.gregs[TSK_REG_RSI] = frame[4];
+    uc->uc_mcontext.gregs[TSK_REG_RDI] = frame[5];
+    uc->uc_mcontext.gregs[TSK_REG_RBP] = frame[6];
+    uc->uc_mcontext.gregs[TSK_REG_R8]  = frame[7];
+    uc->uc_mcontext.gregs[TSK_REG_R9]  = frame[8];
+    uc->uc_mcontext.gregs[TSK_REG_R10] = frame[9];
+    uc->uc_mcontext.gregs[TSK_REG_R11] = frame[10];
+    uc->uc_mcontext.gregs[TSK_REG_R12] = frame[11];
+    uc->uc_mcontext.gregs[TSK_REG_R13] = frame[12];
+    uc->uc_mcontext.gregs[TSK_REG_R14] = frame[13];
+    uc->uc_mcontext.gregs[TSK_REG_R15] = frame[14];
+    uc->uc_mcontext.gregs[TSK_REG_RIP] = frame[16];
+    uc->uc_mcontext.gregs[TSK_REG_EFL] = frame[18];
+    uc->uc_mcontext.gregs[TSK_REG_RSP] = frame[19];
+    uc->uc_mcontext.gregs[TSK_REG_CSGSFS] =
+        (frame[17] & 0xFFFFu) | ((frame[20] & 0xFFFFu) << 48);
+}
+
+static void deliver_user_signal_common(process_t *cur, int is_irq,
+                                       syscall_regs_t *sc_regs, int *sc_is_iretq,
+                                       uint64_t *irq_frame)
+{
+    uint64_t entry_flags = irq_save_disable();
+    uint8_t saved_fpu[512] __attribute__((aligned(16)));
+    uint8_t clean_fpu[512] __attribute__((aligned(16)));
+    int fpu_captured = 0;
+
+    if (!cur || cur->is_idle || !cur->vm_space.owns_pml4) {
+        irq_restore(entry_flags);
+        return;
+    }
+
+    for (;;) {
+        spin_lock(&g_sched_lock);
+        uint64_t pending = cur->signal_pending & ~cur->signal_mask;
+        if (!pending) {
+            spin_unlock(&g_sched_lock);
+            irq_restore(entry_flags);
+            return;
+        }
+
+        if (!fpu_captured) {
+            __asm__ volatile ("fxsave (%0)" : : "r"(saved_fpu) : "memory");
+            fpu_captured = 1;
+        }
+
+        int sig = signal_pick_lowest(pending);
+        if (sig < 0) {
+            spin_unlock(&g_sched_lock);
+            irq_restore(entry_flags);
+            return;
+        }
+        cur->signal_pending &= ~(1ULL << (uint32_t)sig);
+
+        uintptr_t handler = cur->signal_handlers[sig];
+        if (handler == PROCESS_SIG_IGN) {
+            spin_unlock(&g_sched_lock);
+            continue;
+        }
+
+        if (handler == PROCESS_SIG_DFL) {
+            signal_default_kind_t kind = signal_default_kind(sig);
+            if (kind == SIG_DFL_IGN || kind == SIG_DFL_CONT) {
+                spin_unlock(&g_sched_lock);
+                continue;
+            }
+            if (cur->pid == 1) {
+                spin_unlock(&g_sched_lock);
+                continue;
+            }
+            if (kind == SIG_DFL_STOP) {
+                cur->state = PROCESS_STOPPED;
+                cur->main_thread.state = THREAD_STOPPED;
+                runq_remove_locked(cur);
+                spin_unlock(&g_sched_lock);
+                process_yield();
+                continue;
+            }
+            mark_zombie_locked(cur, WAIT_STATUS_SIGNAL(sig));
+            spin_unlock(&g_sched_lock);
+            process_yield();
+            for (;;)
+                __asm__ volatile ("hlt");
+        }
+
+        uint64_t old_mask = cur->signal_mask;
+        uint64_t sa_mask = cur->sig_actions[sig].mask;
+        int sa_flags = cur->sig_actions[sig].flags;
+        uintptr_t restorer = cur->sig_actions[sig].restorer;
+
+        cur->signal_mask |= sa_mask;
+        if (!(sa_flags & TSK_SA_NODEFER))
+            cur->signal_mask |= (1ULL << (uint32_t)sig);
+        cur->signal_mask &= ~((1ULL << PROCESS_SIGKILL) | (1ULL << PROCESS_SIGSTOP));
+
+        if (sa_flags & TSK_SA_RESETHAND) {
+            cur->signal_handlers[sig] = PROCESS_SIG_DFL;
+            cur->sig_actions[sig].handler = NULL;
+            cur->sig_actions[sig].flags = 0;
+            cur->sig_actions[sig].restorer = 0;
+            cur->sig_actions[sig].action = SIGNAL_ACTION_DEFAULT;
+        }
+        spin_unlock(&g_sched_lock);
+
+        /* Enable interrupts while validating/faulting the user stack frame. */
+        __asm__ volatile ("sti" : : : "memory");
+
+        if (handler < PAGING_USER_VA_MIN || handler >= PAGING_USER_VA_MAX) {
+            process_terminate_current(PROCESS_SIGSEGV);
+        }
+
+        uint64_t restorer_va = 0;
+        if ((sa_flags & TSK_SA_RESTORER) && restorer &&
+            vmm_validate_user_ptr((const void *)restorer, 1, 0)) {
+            restorer_va = (uint64_t)restorer;
+        } else {
+            restorer_va = ensure_sigreturn_stub(cur);
+        }
+        if (!restorer_va)
+            process_terminate_current(PROCESS_SIGSEGV);
+
+        uint64_t orig_rsp = is_irq ? irq_frame[19]
+                                   : ((*sc_is_iretq) ? sc_regs->iret_rsp : sc_regs->rsp);
+        if (orig_rsp < PAGING_USER_VA_MIN + 128ULL + sizeof(tsk_sigframe_t) ||
+            orig_rsp >= PAGING_USER_VA_MAX) {
+            process_terminate_current(PROCESS_SIGSEGV);
+        }
+
+        /* Skip mandatory 128-byte SysV Red Zone and align uc to 16 bytes with pretcode at (sigframe_va - 8). */
+        uint64_t frame_top = (orig_rsp - 128ULL) & ~0xFULL;
+        uint64_t frame_sz = ((uint64_t)sizeof(tsk_sigframe_t) + 15ULL) & ~0xFULL;
+        uint64_t sigframe_va = frame_top - frame_sz;
+        uint64_t entry_rsp = sigframe_va - 8ULL;
+
+        if (!vmm_validate_user_ptr((void *)(uintptr_t)entry_rsp, sizeof(tsk_sigframe_t) + 8ULL, 1))
+            process_terminate_current(PROCESS_SIGSEGV);
+
+        tsk_sigframe_t kframe;
+        sig_memset(&kframe, 0, sizeof(kframe));
+        kframe.info.si_signo = sig;
+        kframe.uc.uc_sigmask = old_mask;
+        kframe.uc.uc_mcontext.fpu_flags = 1ULL;
+        if (is_irq)
+            save_regs_to_ucontext_irq(irq_frame, &kframe.uc);
+        else
+            save_regs_to_ucontext_syscall(sc_regs, *sc_is_iretq, &kframe.uc);
+        sig_memcpy(kframe.uc.uc_mcontext.fpregs, saved_fpu, 512);
+
+        *(uint64_t *)(uintptr_t)entry_rsp = restorer_va;
+        sig_memcpy((void *)(uintptr_t)sigframe_va, &kframe, sizeof(kframe));
+
+        uint64_t info_va = sigframe_va + (uint64_t)offsetof(tsk_sigframe_t, info);
+        uint64_t uc_va = sigframe_va + (uint64_t)offsetof(tsk_sigframe_t, uc);
+
+        __asm__ volatile ("cli" : : : "memory");
+        fpu_init_state(clean_fpu);
+        __asm__ volatile ("fxrstor (%0)" : : "r"(clean_fpu) : "memory");
+        cur->fpu_initialized = 1;
+
+        if (is_irq) {
+            irq_frame[16] = (uint64_t)handler;
+            irq_frame[18] = 0x202ULL;
+            irq_frame[19] = entry_rsp;
+            irq_frame[5] = (uint64_t)sig; /* rdi */
+            irq_frame[4] = info_va;       /* rsi */
+            irq_frame[3] = uc_va;         /* rdx */
+        } else {
+            sc_regs->rdi = (uint64_t)sig;
+            sc_regs->rsi = info_va;
+            sc_regs->rdx = uc_va;
+            if (*sc_is_iretq) {
+                sc_regs->iret_rip = (uint64_t)handler;
+                sc_regs->iret_cs = X64_GDT_USER_CS;
+                sc_regs->iret_rflags = 0x202ULL;
+                sc_regs->iret_rsp = entry_rsp;
+                sc_regs->iret_ss = X64_GDT_USER_DS;
+            } else {
+                sc_regs->rcx = (uint64_t)handler;
+                sc_regs->r11 = 0x202ULL;
+                sc_regs->rsp = entry_rsp;
+            }
+        }
+
+        irq_restore(entry_flags);
+        return;
+    }
+}
+
+void signal_deliver_syscall_exit(syscall_regs_t *regs, int *is_iretq)
+{
+    process_t *cur = process_current();
+    if (!regs || !is_iretq || !cur)
+        return;
+    if (!(cur->signal_pending & ~cur->signal_mask))
+        return;
+    deliver_user_signal_common(cur, 0, regs, is_iretq, NULL);
+}
+
+void signal_deliver_irq_exit(uint64_t *irq_frame)
+{
+    process_t *cur = process_current();
+    if (!irq_frame || !cur)
+        return;
+    if (!(cur->signal_pending & ~cur->signal_mask))
+        return;
+    deliver_user_signal_common(cur, 1, NULL, NULL, irq_frame);
+}
+
+long process_rt_sigreturn(syscall_regs_t *regs)
+{
+    process_t *cur = process_current();
+    tsk_ucontext_t kuc;
+    uint64_t uc_va;
+    uint64_t target_rip;
+    uint64_t target_rsp;
+    uint64_t user_flags_mask;
+    uint64_t safe_rflags;
+    uint64_t irq_flags;
+
+    if (!cur || !cur->vm_space.owns_pml4 || !regs)
+        return -EFAULT;
+
+    uc_va = regs->rsp;
+    if (!vmm_validate_user_ptr((const void *)(uintptr_t)uc_va, sizeof(tsk_ucontext_t), 0))
+        return -EFAULT;
+
+    sig_memcpy(&kuc, (const void *)(uintptr_t)uc_va, sizeof(kuc));
+
+    target_rip = kuc.uc_mcontext.gregs[TSK_REG_RIP];
+    target_rsp = kuc.uc_mcontext.gregs[TSK_REG_RSP];
+    if (target_rip < PAGING_USER_VA_MIN || target_rip >= PAGING_USER_VA_MAX ||
+        target_rsp < PAGING_USER_VA_MIN || target_rsp >= PAGING_USER_VA_MAX)
+        return -EFAULT;
+
+    user_flags_mask = (1ULL << 0) | (1ULL << 2) | (1ULL << 4) | (1ULL << 6) |
+                      (1ULL << 7) | (1ULL << 10) | (1ULL << 11) | (1ULL << 21);
+    safe_rflags = (kuc.uc_mcontext.gregs[TSK_REG_EFL] & user_flags_mask) | 0x202ULL;
+
+    *(uint32_t *)(kuc.uc_mcontext.fpregs + 24) &= get_mxcsr_mask();
+
+    irq_flags = irq_save_disable();
+    __asm__ volatile ("fxrstor (%0)" : : "r"(kuc.uc_mcontext.fpregs) : "memory");
+    cur->fpu_initialized = 1;
+
+    spin_lock(&g_sched_lock);
+    cur->signal_mask = kuc.uc_sigmask & ~((1ULL << PROCESS_SIGKILL) |
+                                          (1ULL << PROCESS_SIGSTOP));
+    spin_unlock(&g_sched_lock);
+
+    regs->rax = kuc.uc_mcontext.gregs[TSK_REG_RAX];
+    regs->rdi = kuc.uc_mcontext.gregs[TSK_REG_RDI];
+    regs->rsi = kuc.uc_mcontext.gregs[TSK_REG_RSI];
+    regs->rdx = kuc.uc_mcontext.gregs[TSK_REG_RDX];
+    regs->r8  = kuc.uc_mcontext.gregs[TSK_REG_R8];
+    regs->r9  = kuc.uc_mcontext.gregs[TSK_REG_R9];
+    regs->r10 = kuc.uc_mcontext.gregs[TSK_REG_R10];
+    regs->r15 = kuc.uc_mcontext.gregs[TSK_REG_R15];
+    regs->r14 = kuc.uc_mcontext.gregs[TSK_REG_R14];
+    regs->r13 = kuc.uc_mcontext.gregs[TSK_REG_R13];
+    regs->r12 = kuc.uc_mcontext.gregs[TSK_REG_R12];
+    regs->rbx = kuc.uc_mcontext.gregs[TSK_REG_RBX];
+    regs->rbp = kuc.uc_mcontext.gregs[TSK_REG_RBP];
+    regs->rcx = kuc.uc_mcontext.gregs[TSK_REG_RCX];
+    regs->r11 = kuc.uc_mcontext.gregs[TSK_REG_R11];
+    regs->rsp = target_rsp;
+
+    regs->iret_rip = target_rip;
+    regs->iret_cs = X64_GDT_USER_CS;
+    regs->iret_rflags = safe_rflags;
+    regs->iret_rsp = target_rsp;
+    regs->iret_ss = X64_GDT_USER_DS;
+
+    cur->sigreturn_pending_iretq = 1;
+    irq_restore(irq_flags);
+    return (long)regs->rax;
 }
 
 static uint64_t process_schedule_core(uint64_t current_rsp, int is_timer_tick)

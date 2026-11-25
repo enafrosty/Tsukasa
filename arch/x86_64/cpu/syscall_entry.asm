@@ -16,19 +16,20 @@
 
 BITS 64
 global syscall_entry_x64
-extern syscall_dispatch
+extern syscall_entry_dispatch
 
 section .text
 
 syscall_entry_x64:
     ; Swap to kernel GS base
     swapgs
-    
+
     ; Save user RSP into GS scratch area (offset 48) and load kernel stack (offset 40)
     mov [gs:48], rsp
     mov rsp, [gs:40]
-    
-    ; Save user callee-saved registers, RIP, RFLAGS, RSP
+
+    ; Reserve optional iretq tail + 16-byte alignment padding (6 qwords), then push 16 GPR/RIP/RFLAGS/RSP qwords
+    sub rsp, 48
     push qword [gs:48]          ; User RSP
     push r11                    ; Saved RFLAGS (placed by SYSCALL)
     push rcx                    ; Saved RIP (placed by SYSCALL)
@@ -38,47 +39,30 @@ syscall_entry_x64:
     push r13
     push r14
     push r15
-    
-    ; Preserve user argument registers across C dispatch
     push r10
     push r9
     push r8
     push rdx
     push rsi
     push rdi
-    
-    ; Prepare arguments for syscall_dispatch(nr, a1, a2, a3, a4, a5, a6):
-    ; RAX = syscall number -> RDI
-    ; RDI = arg1 -> RSI
-    ; RSI = arg2 -> RDX
-    ; RDX = arg3 -> RCX
-    ; R10 = arg4 -> R8
-    ; R8  = arg5 -> R9
-    ; R9  = arg6 -> stack [rsp + 0]
-    
-    push r9                     ; 7th C argument (arg6), aligns stack to 16 bytes
-    mov r9, r8                  ; arg5
-    mov r8, r10                 ; arg4
-    mov rcx, rdx                ; arg3
-    mov rdx, rsi                ; arg2
-    mov rsi, rdi                ; arg1
-    mov rdi, rax                ; nr (syscall number)
-    
+    push rax
+
+    mov rdi, rsp
     cld
     sti
-    call syscall_dispatch
+    call syscall_entry_dispatch
     cli
-    add rsp, 8                  ; Pop 7th C argument
-    
-    ; Restore user argument registers (RAX preserved as return value)
+    test eax, eax
+    jnz .iretq_return
+
+    ; Fast return via SYSRET
+    pop rax
     pop rdi
     pop rsi
     pop rdx
     pop r8
     pop r9
     pop r10
-    
-    ; Restore callee-saved registers, RIP, RFLAGS, RSP
     pop r15
     pop r14
     pop r13
@@ -88,12 +72,30 @@ syscall_entry_x64:
     pop rcx                     ; Restore user RIP for SYSRET
     pop r11                     ; Restore user RFLAGS for SYSRET
     pop rsp                     ; Restore user RSP
-    
-    ; Swap back to user GS base
+
     swapgs
-    
-    ; Return to Ring 3 (64-bit operand SYSRETQ)
     o64 sysret
+
+.iretq_return:
+    ; Full register restore via IRETQ (preserves independent RCX/R11/RIP/RFLAGS)
+    pop rax
+    pop rdi
+    pop rsi
+    pop rdx
+    pop r8
+    pop r9
+    pop r10
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    pop rcx
+    pop r11
+    add rsp, 8                  ; Skip syscall-entry rsp slot; land on iret_rip
+    swapgs
+    iretq
 
 ; Forked child resumes here via iretq from process_schedule_core with IF=0
 ; and RSP pointing directly at its cloned syscall_frame_t.

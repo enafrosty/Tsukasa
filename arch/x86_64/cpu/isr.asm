@@ -27,6 +27,7 @@ extern irq_handler_x64
 extern tlb_shootdown_ipi_handler
 extern process_entry_trampoline
 extern syscall_dispatch
+extern signal_deliver_irq_exit
 
 %macro PUSH_GPRS 0
     push r15
@@ -170,6 +171,13 @@ isr_irq_common:
     and rax, ~((1 << 14) | (1 << 8))
     push rax
     popfq
+    test qword [rsp + 136], 3
+    jz .skip_swap
+    mov rdi, rsp
+    mov r15, rsp
+    and rsp, -16
+    call signal_deliver_irq_exit
+    mov rsp, r15
     test qword [rsp + 136], 3
     jz .skip_swap
     swapgs

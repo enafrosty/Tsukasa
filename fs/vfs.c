@@ -4015,38 +4015,66 @@ size_t vfs_read(int fd, void *buf, size_t count)
         }
 
         for (;;) {
+#ifdef __x86_64__
+            unsigned long irqf = vfs_irq_save_disable();
+            spin_lock(&p->lock);
+#else
             unsigned long pflags = spin_lock_irqsave(&p->lock);
+#endif
             if (p->size > 0) {
                 size_t got = pipe_ring_read(p, buf, count);
+#ifdef __x86_64__
+                spin_unlock(&p->lock);
+                vfs_irq_restore(irqf);
+#else
                 spin_unlock_irqrestore(&p->lock, pflags);
+#endif
                 if (got > 0)
                     wait_queue_wake_all(&p->waitq);
                 file_release(f);
                 return got;
             }
             if (p->writers == 0) {
+#ifdef __x86_64__
+                spin_unlock(&p->lock);
+                vfs_irq_restore(irqf);
+#else
                 spin_unlock_irqrestore(&p->lock, pflags);
+#endif
                 file_release(f);
                 return 0;
             }
             if (f->flags & VFS_O_NONBLOCK) {
+#ifdef __x86_64__
+                spin_unlock(&p->lock);
+                vfs_irq_restore(irqf);
+#else
                 spin_unlock_irqrestore(&p->lock, pflags);
+#endif
                 file_release(f);
                 return (size_t)-EAGAIN;
             }
 #ifdef __x86_64__
             process_t *curp = vfs_current_process();
             if (!curp) {
-                spin_unlock_irqrestore(&p->lock, pflags);
+                spin_unlock(&p->lock);
+                vfs_irq_restore(irqf);
                 file_release(f);
                 return 0;
+            }
+            if (process_has_deliverable_signal(curp)) {
+                spin_unlock(&p->lock);
+                vfs_irq_restore(irqf);
+                file_release(f);
+                return (size_t)-EINTR;
             }
             wait_queue_entry_t wqe;
             wqe.proc = curp;
             wqe.next = NULL;
             wait_queue_prepare_to_wait(&p->waitq, &wqe);
-            spin_unlock_irqrestore(&p->lock, pflags);
+            spin_unlock(&p->lock);
             process_yield();
+            vfs_irq_restore(irqf);
             wait_queue_finish_wait(&p->waitq, &wqe);
 #else
             spin_unlock_irqrestore(&p->lock, pflags);
@@ -4194,36 +4222,71 @@ size_t vfs_write(int fd, const void *buf, size_t count)
             return (size_t)-EPIPE;
         }
         for (;;) {
+#ifdef __x86_64__
+            unsigned long irqf = vfs_irq_save_disable();
+            spin_lock(&p->lock);
+#else
             unsigned long pflags = spin_lock_irqsave(&p->lock);
+#endif
             if (p->readers == 0) {
+#ifdef __x86_64__
+                process_t *curp = vfs_current_process();
+                spin_unlock(&p->lock);
+                vfs_irq_restore(irqf);
+                if (curp && !curp->is_idle)
+                    process_signal_send((int)curp->pid, PROCESS_SIGPIPE);
+#else
                 spin_unlock_irqrestore(&p->lock, pflags);
+#endif
                 file_release(f);
                 return (size_t)-EPIPE;
             }
             size_t wr = pipe_ring_write(p, buf, count);
-            spin_unlock_irqrestore(&p->lock, pflags);
             if (wr > 0) {
+#ifdef __x86_64__
+                spin_unlock(&p->lock);
+                vfs_irq_restore(irqf);
+#else
+                spin_unlock_irqrestore(&p->lock, pflags);
+#endif
                 wait_queue_wake_all(&p->waitq);
                 file_release(f);
                 return wr;
             }
             if (f->flags & VFS_O_NONBLOCK) {
+#ifdef __x86_64__
+                spin_unlock(&p->lock);
+                vfs_irq_restore(irqf);
+#else
+                spin_unlock_irqrestore(&p->lock, pflags);
+#endif
                 file_release(f);
                 return (size_t)-EAGAIN;
             }
 #ifdef __x86_64__
             process_t *curp = vfs_current_process();
             if (!curp) {
+                spin_unlock(&p->lock);
+                vfs_irq_restore(irqf);
                 file_release(f);
                 return 0;
+            }
+            if (process_has_deliverable_signal(curp)) {
+                spin_unlock(&p->lock);
+                vfs_irq_restore(irqf);
+                file_release(f);
+                return (size_t)-EINTR;
             }
             wait_queue_entry_t wqe;
             wqe.proc = curp;
             wqe.next = NULL;
             wait_queue_prepare_to_wait(&p->waitq, &wqe);
+            spin_unlock(&p->lock);
             process_yield();
+            vfs_irq_restore(irqf);
             wait_queue_finish_wait(&p->waitq, &wqe);
 #else
+            spin_unlock_irqrestore(&p->lock, pflags);
             file_release(f);
             return 0;
 #endif
@@ -5706,11 +5769,17 @@ int vfs_poll(vfs_pollfd_t *fds, size_t nfds, int timeout_ms)
             return process_sleep_ms((uint64_t)timeout_ms);
         for (;;) {
             unsigned long irqf = vfs_irq_save_disable();
-            if (proc && (proc->signal_pending & ~proc->signal_mask)) {
+            process_set_poll_blocked(0);
+            if (process_has_deliverable_signal(proc)) {
                 vfs_irq_restore(irqf);
+                process_clear_poll_deadline();
                 return -EINTR;
             }
-            process_set_poll_blocked(0);
+            if (process_poll_was_woken()) {
+                vfs_irq_restore(irqf);
+                process_clear_poll_deadline();
+                continue;
+            }
             process_yield();
             vfs_irq_restore(irqf);
             process_clear_poll_deadline();
@@ -5733,7 +5802,7 @@ int vfs_poll(vfs_pollfd_t *fds, size_t nfds, int timeout_ms)
     poll_wtable_init_with_capacity(&wt, proc, cap);
     vfs_poll_register(fds, nfds, &wt.pt);
 
-    /* Phase 3: sleep without lost-wakeup window across scan -> block -> yield */
+    /* Phase 3: arm BLOCKED before scan so concurrent wakeups cannot be lost. */
     uint64_t deadline = 0;
     if (timeout_ms > 0) {
         uint64_t now_ms = pit_ticks_ms();
@@ -5742,21 +5811,29 @@ int vfs_poll(vfs_pollfd_t *fds, size_t nfds, int timeout_ms)
     }
     for (;;) {
         unsigned long irqf = vfs_irq_save_disable();
+        process_set_poll_blocked(deadline);
         ready = vfs_poll_scan(fds, nfds);
         if (ready > 0) {
             vfs_irq_restore(irqf);
+            process_clear_poll_deadline();
             break;
         }
-        if (proc && (proc->signal_pending & ~proc->signal_mask)) {
+        if (process_has_deliverable_signal(proc)) {
             vfs_irq_restore(irqf);
+            process_clear_poll_deadline();
             poll_wtable_unregister_all(&wt);
             return -EINTR;
         }
         if (timeout_ms > 0 && pit_ticks_ms() >= deadline) {
             vfs_irq_restore(irqf);
+            process_clear_poll_deadline();
             break;
         }
-        process_set_poll_blocked(deadline);
+        if (process_poll_was_woken()) {
+            vfs_irq_restore(irqf);
+            process_clear_poll_deadline();
+            continue;
+        }
         process_yield();
         vfs_irq_restore(irqf);
         process_clear_poll_deadline();

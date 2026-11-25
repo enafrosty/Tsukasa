@@ -44,16 +44,29 @@
 #define PROCESS_SIG_DFL        ((uintptr_t)0)
 #define PROCESS_SIG_IGN        ((uintptr_t)1)
 
+#define PROCESS_SIGHUP         1
 #define PROCESS_SIGINT         2
+#define PROCESS_SIGQUIT        3
 #define PROCESS_SIGILL         4
 #define PROCESS_SIGTRAP        5
+#define PROCESS_SIGABRT        6
 #define PROCESS_SIGBUS         7
 #define PROCESS_SIGFPE         8
 #define PROCESS_SIGKILL        9
 #define PROCESS_SIGUSR1        10
 #define PROCESS_SIGSEGV        11
+#define PROCESS_SIGUSR2        12
+#define PROCESS_SIGPIPE        13
+#define PROCESS_SIGALRM        14
 #define PROCESS_SIGTERM        15
+#define PROCESS_SIGCHLD        17
+#define PROCESS_SIGCONT        18
 #define PROCESS_SIGSTOP        19
+#define PROCESS_SIGTSTP        20
+#define PROCESS_SIGTTIN        21
+#define PROCESS_SIGTTOU        22
+#define PROCESS_SIGURG         23
+#define PROCESS_SIGWINCH       28
 
 typedef enum process_state {
     PROCESS_CREATED = 0,
@@ -80,6 +93,7 @@ typedef struct signal_action_slot {
     signal_handler_t handler;
     uint64_t mask;
     int flags;
+    uintptr_t restorer;
     signal_action_t action;
 } signal_action_s;
 
@@ -213,6 +227,10 @@ struct process {
 
     uint8_t fpu_state[512] __attribute__((aligned(16)));
     int fpu_initialized;
+    int waiting_child;
+    int sigreturn_pending_iretq;
+    uint64_t sigreturn_stub_va;
+    void *active_syscall_regs;
 };
 
 #define PROC_CREATED PROCESS_CREATED
@@ -263,10 +281,21 @@ int process_get_cmdline(int pid, char *buf, size_t size);
 const char *process_current_cmdline(void);
 int process_clone_fd(int dst_pid, int dst_fd, int src_pid, int src_fd);
 
+struct tsukasa_sigaction;
+struct syscall_regs;
+
 int process_signal_register(int pid, int sig, process_signal_handler_t handler);
+int process_sigaction(int pid, int sig,
+                      const struct tsukasa_sigaction *act,
+                      struct tsukasa_sigaction *oldact);
 int process_signal_mask(int pid, int how, uint64_t set, uint64_t *old_set);
 int process_signal_pending(int pid, uint64_t *pending_out);
 int process_signal_send(int pid, int sig);
+int process_has_deliverable_signal(const process_t *p);
+int process_poll_was_woken(void);
+long process_rt_sigreturn(struct syscall_regs *regs);
+void signal_deliver_syscall_exit(struct syscall_regs *regs, int *is_iretq);
+void signal_deliver_irq_exit(uint64_t *irq_frame);
 
 uint64_t process_schedule_tick(uint64_t current_rsp);
 uint64_t process_schedule_yield(uint64_t current_rsp);
