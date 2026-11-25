@@ -22,6 +22,7 @@
 #ifdef __x86_64__
 
 #include "../fs/vfs.h"
+#include "../include/errno.h"
 #include "../drv/rtc.h"
 #include "../include/kprintf.h"
 #include "../ipc/shm.h"
@@ -309,25 +310,11 @@ static uintptr_t handle_system(uintptr_t cmd,
         const struct tsukasa_sigaction *act = (const struct tsukasa_sigaction *)(uintptr_t)arg3;
         struct tsukasa_sigaction *old = (struct tsukasa_sigaction *)(uintptr_t)arg4;
         int pid = process_current_pid();
-        if (old) {
-            if (!vmm_validate_user_ptr(old, sizeof(struct tsukasa_sigaction), 1))
-                return (uintptr_t)-1;
-            uint64_t pending = 0;
-            process_signal_pending(pid, &pending);
-            old->sa_handler = PROCESS_SIG_DFL;
-            old->sa_mask = pending;
-            old->sa_flags = 0;
-        }
-        if (act) {
-            if (!vmm_validate_user_ptr(act, sizeof(struct tsukasa_sigaction), 0))
-                return (uintptr_t)-1;
-            if (process_signal_register(pid, sig,
-                    (process_signal_handler_t)(uintptr_t)act->sa_handler) != 0)
-                return (uintptr_t)-1;
-            if (process_signal_mask(pid, SIG_SETMASK, act->sa_mask, NULL) != 0)
-                return (uintptr_t)-1;
-        }
-        return 0;
+        if (old && !vmm_validate_user_ptr(old, sizeof(struct tsukasa_sigaction), 1))
+            return (uintptr_t)-EFAULT;
+        if (act && !vmm_validate_user_ptr(act, sizeof(struct tsukasa_sigaction), 0))
+            return (uintptr_t)-EFAULT;
+        return (uintptr_t)process_sigaction(pid, sig, act, old);
     }
 
     case SYSTEM_CMD_SIGPROCMASK:

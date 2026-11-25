@@ -26,6 +26,7 @@ struct sigaction {
     sighandler_t sa_handler;
     sigset_t sa_mask;
     int sa_flags;
+    void (*sa_restorer)(void);
 };
 
 #define SIG_DFL ((sighandler_t)0)

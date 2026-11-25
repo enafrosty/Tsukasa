@@ -23,6 +23,8 @@
 #include "../fs/vfs.h"
 #include "../include/errno.h"
 #include "../include/kprintf.h"
+#include "../include/signal_abi.h"
+#include "../include/syscall_regs.h"
 #include "../include/vfs_abi.h"
 #include "../mm/pagecache.h"
 #include "../mm/pmm.h"
@@ -514,7 +516,8 @@ static long sys_wait4(long pid, long status, long options, long a4, long a5, lon
 {
     (void)a4; (void)a5; (void)a6;
     if (status && !user_ok(status, (long)sizeof(int), 1)) return -EFAULT;
-    return mux_sys(SYSTEM_CMD_WAITPID, pid, status, options);
+    return (long)process_waitpid(process_current_pid(), (int)pid, (int)options,
+                                 (int *)(uintptr_t)status);
 }
 
 static int validate_user_strv(long arr_ptr, int max_items)
@@ -567,7 +570,7 @@ static long sys_execve(long path, long argv, long envp, long a4, long a5, long a
 static long sys_kill(long pid, long sig, long a3, long a4, long a5, long a6)
 {
     (void)a3; (void)a4; (void)a5; (void)a6;
-    return mux_sys(SYSTEM_CMD_KILL, pid, sig, 0);
+    return (long)process_kill((int)pid, (int)sig);
 }
 
 static long sys_fcntl(long fd, long cmd, long arg, long a4, long a5, long a6)
@@ -788,32 +791,62 @@ static long sys_reboot(long magic1, long magic2, long cmd, long a4, long a5, lon
 
 
 
-static long sys_rt_sigaction(long sig, long act, long oldact, long a4, long a5, long a6)
+static long sys_rt_sigaction(long sig, long act, long oldact, long sigsetsize, long a5, long a6)
 {
-    (void)a4; (void)a5; (void)a6;
+    (void)a5; (void)a6;
+    if (sigsetsize != 0 && sigsetsize != (long)sizeof(uint64_t))
+        return -EINVAL;
     if (act && !user_ok(act, (long)sizeof(struct tsukasa_sigaction), 0))
         return -EFAULT;
     if (oldact && !user_ok(oldact, (long)sizeof(struct tsukasa_sigaction), 1))
         return -EFAULT;
-    return mux_sys(SYSTEM_CMD_SIGACTION, sig, act, oldact);
+    return (long)process_sigaction(process_current_pid(), (int)sig,
+                                   (const struct tsukasa_sigaction *)(uintptr_t)act,
+                                   (struct tsukasa_sigaction *)(uintptr_t)oldact);
 }
 
-static long sys_rt_sigprocmask(long how, long set, long oldset, long a4, long a5, long a6)
+static long sys_rt_sigprocmask(long how, long set, long oldset, long sigsetsize, long a5, long a6)
 {
-    (void)a4; (void)a5; (void)a6;
-    if (set && !user_ok(set, (long)sizeof(uint64_t), 0))
-        return -EFAULT;
+    uint64_t kset = 0;
+    (void)a5; (void)a6;
+    if (sigsetsize != 0 && sigsetsize != (long)sizeof(uint64_t))
+        return -EINVAL;
+    if (set) {
+        if (!user_ok(set, (long)sizeof(uint64_t), 0))
+            return -EFAULT;
+        kset = *(const uint64_t *)(uintptr_t)set;
+    }
     if (oldset && !user_ok(oldset, (long)sizeof(uint64_t), 1))
         return -EFAULT;
-    return mux_sys(SYSTEM_CMD_SIGPROCMASK, how, set, oldset);
+    if (!set) {
+        uint64_t cur_mask = 0;
+        int rc = process_signal_mask(process_current_pid(), 0 /* SIG_BLOCK */, 0, &cur_mask);
+        if (rc == 0 && oldset)
+            *(uint64_t *)(uintptr_t)oldset = cur_mask;
+        return (long)rc;
+    }
+    return (long)process_signal_mask(process_current_pid(), (int)how, kset,
+                                     (uint64_t *)(uintptr_t)oldset);
 }
 
-static long sys_rt_sigpending(long set, long a2, long a3, long a4, long a5, long a6)
+static long sys_rt_sigreturn(long a1, long a2, long a3, long a4, long a5, long a6)
 {
-    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    process_t *cur = process_current();
+    if (!cur || !cur->active_syscall_regs)
+        return -EFAULT;
+    return process_rt_sigreturn((syscall_regs_t *)cur->active_syscall_regs);
+}
+
+static long sys_rt_sigpending(long set, long sigsetsize, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (sigsetsize != 0 && sigsetsize != (long)sizeof(uint64_t))
+        return -EINVAL;
     if (!user_ok(set, (long)sizeof(uint64_t), 1))
         return -EFAULT;
-    return mux_sys(SYSTEM_CMD_SIGPENDING, set, 0, 0);
+    return (long)process_signal_pending(process_current_pid(),
+                                        (uint64_t *)(uintptr_t)set);
 }
 
 static long sys_list(long dir, long names, long max, long a4, long a5, long a6)
@@ -1130,6 +1163,7 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [12] = sys_brk,
     [13] = sys_rt_sigaction,
     [14] = sys_rt_sigprocmask,
+    [15] = sys_rt_sigreturn,
     [16] = sys_ioctl,
     [21] = sys_access,
     [22] = sys_pipe,
@@ -1217,6 +1251,34 @@ long syscall_dispatch(long nr, long a1, long a2, long a3, long a4, long a5, long
     if (nr < 0 || nr >= SYSCALL_TABLE_SIZE || !syscall_table[nr])
         return -ENOSYS;
     return syscall_table[nr](a1, a2, a3, a4, a5, a6);
+}
+
+int syscall_entry_dispatch(syscall_regs_t *regs)
+{
+    process_t *cur = process_current();
+    void *prev_regs = NULL;
+    int use_iretq = 0;
+    long ret;
+
+    if (cur) {
+        prev_regs = cur->active_syscall_regs;
+        cur->active_syscall_regs = regs;
+        cur->sigreturn_pending_iretq = 0;
+    }
+
+    ret = syscall_dispatch((long)regs->rax, (long)regs->rdi, (long)regs->rsi,
+                           (long)regs->rdx, (long)regs->r10, (long)regs->r8,
+                           (long)regs->r9);
+
+    if (cur) {
+        cur->active_syscall_regs = prev_regs;
+        use_iretq = cur->sigreturn_pending_iretq ? 1 : 0;
+        cur->sigreturn_pending_iretq = 0;
+    }
+
+    regs->rax = (uint64_t)ret;
+    signal_deliver_syscall_exit(regs, &use_iretq);
+    return use_iretq;
 }
 
 /* Called from isr_x64_syscall (int 0x80, DPL=3). */

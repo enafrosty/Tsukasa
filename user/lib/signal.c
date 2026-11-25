@@ -27,6 +27,7 @@ sighandler_t signal(int sig, sighandler_t handler)
     sa.sa_handler = handler;
     sa.sa_mask = 0;
     sa.sa_flags = 0;
+    sa.sa_restorer = 0;
     if (sigaction(sig, &sa, &old) != 0)
         return SIG_ERR;
     return old.sa_handler;

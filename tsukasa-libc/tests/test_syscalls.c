@@ -127,6 +127,150 @@ static int run_worker_vfs(const char *tag)
     return 0;
 }
 
+static volatile sig_atomic_t g_sigusr1_seen;
+static volatile sig_atomic_t g_sigusr1_signo;
+static volatile sig_atomic_t g_sigusr1_masked_in_handler;
+static volatile sig_atomic_t g_sigusr2_seen;
+static volatile sig_atomic_t g_sigint_seen;
+static volatile sig_atomic_t g_sigchld_seen;
+static volatile sig_atomic_t g_sigpipe_seen;
+
+static void sig_usr1_info_handler(int sig, siginfo_t *info, void *puc)
+{
+    sigset_t cur_mask = 0;
+    uint64_t stack_probe = 0;
+    uint64_t sp_val = (uint64_t)(uintptr_t)&stack_probe;
+    (void)sp_val;
+
+    /* Clobber all XMM registers inside the signal handler to test FXSAVE/FXRSTOR. */
+    __asm__ volatile (
+        "mov $0x1111222233334444, %%rax\n\t"
+        "movq %%rax, %%xmm0\n\t"
+        "movq %%rax, %%xmm1\n\t"
+        "movq %%rax, %%xmm2\n\t"
+        "movq %%rax, %%xmm3\n\t"
+        "movq %%rax, %%xmm4\n\t"
+        "movq %%rax, %%xmm5\n\t"
+        "movq %%rax, %%xmm6\n\t"
+        "movq %%rax, %%xmm7\n\t"
+        "movq %%rax, %%xmm8\n\t"
+        "movq %%rax, %%xmm9\n\t"
+        "movq %%rax, %%xmm10\n\t"
+        "movq %%rax, %%xmm11\n\t"
+        "movq %%rax, %%xmm12\n\t"
+        "movq %%rax, %%xmm13\n\t"
+        "movq %%rax, %%xmm14\n\t"
+        "movq %%rax, %%xmm15\n\t"
+        : : : "rax",
+              "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+              "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"
+    );
+
+    if (sigprocmask(SIG_BLOCK, NULL, &cur_mask) == 0 && sigismember(&cur_mask, SIGUSR1) == 1)
+        g_sigusr1_masked_in_handler = 1;
+    if (info && info->si_signo == sig && puc != NULL)
+        g_sigusr1_signo = sig;
+    g_sigusr1_seen++;
+}
+
+static void sig_usr2_handler(int sig)
+{
+    (void)sig;
+    g_sigusr2_seen++;
+    if (g_sigusr2_seen == 1)
+        raise(SIGUSR2); /* Allowed recursively under SA_NODEFER */
+}
+
+static void sig_int_handler(int sig)
+{
+    (void)sig;
+    g_sigint_seen++;
+}
+
+static void sig_chld_handler(int sig)
+{
+    (void)sig;
+    g_sigchld_seen++;
+}
+
+static void sig_pipe_handler(int sig)
+{
+    (void)sig;
+    g_sigpipe_seen++;
+}
+
+static int run_worker_exit0(void)
+{
+    return 0;
+}
+
+static int run_worker_block_sigkill(void)
+{
+    sigset_t m;
+    sigfillset(&m);
+    sigprocmask(SIG_SETMASK, &m, NULL);
+    for (int i = 0; i < 400; i++)
+        usleep(10000);
+    return 99;
+}
+
+static int run_worker_sig_ping(const char *pid_str)
+{
+    pid_t target = (pid_t)atoi(pid_str);
+    usleep(20000);
+    if (target > 0)
+        kill(target, SIGUSR1);
+    return 0;
+}
+
+static int run_worker_pipe_echo(void)
+{
+    for (int i = 3; i < 256; i++)
+        close(i);
+    char buf[64];
+    size_t total = 0;
+    for (;;) {
+        ssize_t n = read(0, buf + total, sizeof(buf) - total);
+        if (n < 0)
+            return 2;
+        if (n == 0)
+            break;
+        total += (size_t)n;
+        if (total == sizeof(buf))
+            break;
+    }
+    if (total == 0)
+        return 3;
+    if (write(1, buf, total) != (ssize_t)total)
+        return 4;
+    close(1);
+    return 0;
+}
+
+static int run_worker_delayed_write(void)
+{
+    for (int i = 3; i < 256; i++)
+        close(i);
+    usleep(30000);
+    if (write(1, "WAKE", 4) != 4)
+        return 2;
+    close(1);
+    return 0;
+}
+
+static int run_worker_sigpipe_dfl(void)
+{
+    for (int i = 3; i < 256; i++)
+        close(i);
+    int pfd[2];
+    if (pipe(pfd) != 0)
+        return 2;
+    close(pfd[0]);
+    write(pfd[1], "X", 1); /* Must terminate process with SIGPIPE */
+    close(pfd[1]);
+    return 3;
+}
+
 static int run_worker_mprotect_segv(void)
 {
     volatile uint32_t *p = (volatile uint32_t *)mmap(NULL, 4096,
@@ -173,9 +317,21 @@ static int real_main(int argc, char **argv, char **envp)
         return run_worker_vfs(argv[2]);
     if (argc >= 2 && strcmp(argv[1], "--worker-mprotect-segv") == 0)
         return run_worker_mprotect_segv();
+    if (argc >= 2 && strcmp(argv[1], "--worker-exit0") == 0)
+        return run_worker_exit0();
+    if (argc >= 2 && strcmp(argv[1], "--worker-block-sigkill") == 0)
+        return run_worker_block_sigkill();
+    if (argc >= 3 && strcmp(argv[1], "--worker-sig-ping") == 0)
+        return run_worker_sig_ping(argv[2]);
+    if (argc >= 2 && strcmp(argv[1], "--worker-pipe-echo") == 0)
+        return run_worker_pipe_echo();
+    if (argc >= 2 && strcmp(argv[1], "--worker-delayed-write") == 0)
+        return run_worker_delayed_write();
+    if (argc >= 2 && strcmp(argv[1], "--worker-sigpipe-dfl") == 0)
+        return run_worker_sigpipe_dfl();
 
     int passed = 0;
-    int total = 29;
+    int total = 32;
 
     /* Test 1: Stack frame alignment (rsp % 16 == 8 on function entry). */
     if ((s_entry_rsp & 0xF) != 8) {
@@ -1562,6 +1718,393 @@ static int real_main(int argc, char **argv, char **envp)
             return 84;
         }
         TSK_TEST_PASS("syscalls", "execve_negative_intact");
+        passed++;
+    }
+
+    /* Test 30: Real signal trampolines (rt_sigreturn), Red Zone, GPRs, XMM, and masks. */
+    {
+        int ok = 1;
+        g_sigusr1_seen = 0;
+        g_sigusr1_signo = 0;
+        g_sigusr1_masked_in_handler = 0;
+        g_sigusr2_seen = 0;
+        g_sigint_seen = 0;
+
+        struct sigaction act, oldact;
+        memset(&act, 0, sizeof(act));
+        act.sa_sigaction = sig_usr1_info_handler;
+        act.sa_flags = SA_SIGINFO;
+        sigemptyset(&act.sa_mask);
+        if (sigaction(SIGUSR1, &act, &oldact) != 0 || oldact.sa_handler != SIG_DFL)
+            ok = 0;
+
+        /* Preserve GPRs, XMM0/XMM1, and 128-byte Red Zone across syscall-exit delivery + rt_sigreturn. */
+        if (ok) {
+            uint64_t out_xmm0 = 0, out_xmm1 = 0, out_rz1 = 0, out_rz2 = 0;
+            uint64_t out_rbx = 0, out_r12 = 0;
+            uint64_t exp_xmm0 = 0x123456789ABCDEF0ULL;
+            uint64_t exp_xmm1 = 0x0FEDCBA987654321ULL;
+            uint64_t exp_rz1 = 0xAAAABBBBCCCCDDDDULL;
+            uint64_t exp_rz2 = 0x5555666677778888ULL;
+            pid_t self_pid = getpid();
+
+            __asm__ volatile (
+                "pushq %%rbx\n\t"
+                "pushq %%r12\n\t"
+                "movq %[in_rz1], -16(%%rsp)\n\t"
+                "movq %[in_rz2], -128(%%rsp)\n\t"
+                "movq %[in_x0], %%xmm0\n\t"
+                "movq %[in_x1], %%xmm1\n\t"
+                "movq $0xCAFEBABE11223344, %%rbx\n\t"
+                "movq $0x778899AABBCCDDEE, %%r12\n\t"
+                "movq $62, %%rax\n\t"
+                "movq %[pid], %%rdi\n\t"
+                "movq $10, %%rsi\n\t"
+                "syscall\n\t"
+                "movq %%rbx, %[out_rbx]\n\t"
+                "movq %%r12, %[out_r12]\n\t"
+                "movq -16(%%rsp), %[out_rz1]\n\t"
+                "movq -128(%%rsp), %[out_rz2]\n\t"
+                "popq %%r12\n\t"
+                "popq %%rbx\n\t"
+                "movq %%xmm0, %[out_x0]\n\t"
+                "movq %%xmm1, %[out_x1]\n\t"
+                : [out_x0] "=r"(out_xmm0),
+                  [out_x1] "=r"(out_xmm1),
+                  [out_rz1] "=r"(out_rz1),
+                  [out_rz2] "=r"(out_rz2),
+                  [out_rbx] "=r"(out_rbx),
+                  [out_r12] "=r"(out_r12)
+                : [in_x0] "r"(exp_xmm0),
+                  [in_x1] "r"(exp_xmm1),
+                  [in_rz1] "r"(exp_rz1),
+                  [in_rz2] "r"(exp_rz2),
+                  [pid] "r"((uint64_t)self_pid)
+                : "rax", "rcx", "rdi", "rsi", "r11", "xmm0", "xmm1", "memory"
+            );
+
+            if (g_sigusr1_seen != 1 || g_sigusr1_signo != SIGUSR1 ||
+                !g_sigusr1_masked_in_handler ||
+                out_xmm0 != exp_xmm0 || out_xmm1 != exp_xmm1 ||
+                out_rz1 != exp_rz1 || out_rz2 != exp_rz2 ||
+                out_rbx != 0xCAFEBABE11223344ULL ||
+                out_r12 != 0x778899AABBCCDDEEULL) {
+                ok = 0;
+            }
+        }
+
+        /* Async IRQ-exit signal delivery while spinning in userland loop with live XMM/RCX/R11. */
+        if (ok) {
+            char pidbuf[32];
+            snprintf(pidbuf, sizeof(pidbuf), "%d", (int)getpid());
+            char *pargs[] = { "/bin/TSYSC.ELF", "--worker-sig-ping", pidbuf, NULL };
+            pid_t pinger = spawn("/bin/TSYSC.ELF", pargs, NULL);
+            if (pinger < 0) {
+                ok = 0;
+            } else {
+                uint64_t loop_xmm2 = 0, loop_rcx = 0, loop_r11 = 0;
+                uint64_t exp_xmm2 = 0x13579BDF2468ACE0ULL;
+                uint64_t exp_rcx = 0x2222333344445555ULL;
+                uint64_t exp_r11 = 0x6666777788889999ULL;
+                volatile sig_atomic_t *flag_ptr = &g_sigusr1_seen;
+
+                __asm__ volatile (
+                    "movq %[in_x2], %%xmm2\n\t"
+                    "movq %[in_rcx], %%rcx\n\t"
+                    "movq %[in_r11], %%r11\n\t"
+                    "movl $0x2000000, %%edx\n\t"
+                    "1:\n\t"
+                    "cmpl $2, (%[fp])\n\t"
+                    "jge 2f\n\t"
+                    "pause\n\t"
+                    "decl %%edx\n\t"
+                    "jnz 1b\n\t"
+                    "2:\n\t"
+                    "movq %%xmm2, %[out_x2]\n\t"
+                    "movq %%rcx, %[out_rcx]\n\t"
+                    "movq %%r11, %[out_r11]\n\t"
+                    : [out_x2] "=r"(loop_xmm2),
+                      [out_rcx] "=r"(loop_rcx),
+                      [out_r11] "=r"(loop_r11)
+                    : [in_x2] "r"(exp_xmm2),
+                      [in_rcx] "r"(exp_rcx),
+                      [in_r11] "r"(exp_r11),
+                      [fp] "r"(flag_ptr)
+                    : "rcx", "rdx", "r11", "xmm2", "cc", "memory"
+                );
+
+                wait_child_ok(pinger);
+                if (g_sigusr1_seen != 2 ||
+                    loop_xmm2 != exp_xmm2 ||
+                    loop_rcx != exp_rcx ||
+                    loop_r11 != exp_r11) {
+                    ok = 0;
+                }
+            }
+        }
+
+        /* Test sigprocmask blocking, sigpending, SA_NODEFER, and SA_RESETHAND. */
+        if (ok) {
+            sigset_t bset, oldset, pend;
+            sigemptyset(&bset);
+            sigaddset(&bset, SIGUSR1);
+            if (sigprocmask(SIG_BLOCK, &bset, &oldset) != 0)
+                ok = 0;
+            raise(SIGUSR1);
+            if (g_sigusr1_seen != 2)
+                ok = 0;
+            if (sigpending(&pend) != 0 || sigismember(&pend, SIGUSR1) != 1)
+                ok = 0;
+            if (sigprocmask(SIG_UNBLOCK, &bset, NULL) != 0)
+                ok = 0;
+            if (g_sigusr1_seen != 3)
+                ok = 0;
+
+            memset(&act, 0, sizeof(act));
+            act.sa_handler = sig_usr2_handler;
+            act.sa_flags = SA_NODEFER;
+            sigemptyset(&act.sa_mask);
+            if (sigaction(SIGUSR2, &act, NULL) != 0)
+                ok = 0;
+            raise(SIGUSR2);
+            if (g_sigusr2_seen != 2)
+                ok = 0;
+
+            memset(&act, 0, sizeof(act));
+            act.sa_handler = sig_int_handler;
+            act.sa_flags = SA_RESETHAND;
+            sigemptyset(&act.sa_mask);
+            if (sigaction(SIGINT, &act, NULL) != 0)
+                ok = 0;
+            raise(SIGINT);
+            if (g_sigint_seen != 1)
+                ok = 0;
+            if (sigaction(SIGINT, NULL, &oldact) != 0 || oldact.sa_handler != SIG_DFL)
+                ok = 0;
+        }
+
+        /* Negative checks: SIGKILL/SIGSTOP cannot be caught, and bad rt_sigreturn returns EFAULT. */
+        if (ok) {
+            memset(&act, 0, sizeof(act));
+            act.sa_handler = sig_int_handler;
+            errno = 0;
+            if (sigaction(SIGKILL, &act, NULL) != -1 || errno != EINVAL)
+                ok = 0;
+            errno = 0;
+            if (sigaction(SIGSTOP, &act, NULL) != -1 || errno != EINVAL)
+                ok = 0;
+            int64_t bad_null = 0;
+            int64_t bad_kern = 0;
+            __asm__ volatile (
+                "movq %%rsp, %%r12\n\t"
+                "xorq %%rsp, %%rsp\n\t"
+                "movq $15, %%rax\n\t"
+                "syscall\n\t"
+                "movq %%r12, %%rsp\n\t"
+                : "=a"(bad_null)
+                :
+                : "rcx", "r11", "r12", "memory"
+            );
+            __asm__ volatile (
+                "movq %%rsp, %%r12\n\t"
+                "movq $0xFFFFFFFF80000000, %%rsp\n\t"
+                "movq $15, %%rax\n\t"
+                "syscall\n\t"
+                "movq %%r12, %%rsp\n\t"
+                : "=a"(bad_kern)
+                :
+                : "rcx", "r11", "r12", "memory"
+            );
+            if (bad_null != -EFAULT || bad_kern != -EFAULT)
+                ok = 0;
+        }
+
+        signal(SIGUSR1, SIG_DFL);
+        signal(SIGUSR2, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "signal_trampoline_rt_sigreturn", "signal trampoline or state restore failed");
+            return 79;
+        }
+        TSK_TEST_PASS("syscalls", "signal_trampoline_rt_sigreturn");
+        passed++;
+    }
+
+    /* Test 25: SIGCHLD delivery on child exit and unblockable SIGKILL. */
+    {
+        int ok = 1;
+        g_sigchld_seen = 0;
+        struct sigaction act;
+        memset(&act, 0, sizeof(act));
+        act.sa_handler = sig_chld_handler;
+        sigemptyset(&act.sa_mask);
+        if (sigaction(SIGCHLD, &act, NULL) != 0)
+            ok = 0;
+
+        if (ok) {
+            char *wargs[] = { "/bin/TSYSC.ELF", "--worker-exit0", NULL };
+            pid_t cpid = spawn("/bin/TSYSC.ELF", wargs, NULL);
+            if (cpid < 0) {
+                ok = 0;
+            } else {
+                int st = 0;
+                pid_t wr;
+                do {
+                    wr = waitpid(cpid, &st, 0);
+                } while (wr == -1 && errno == EINTR);
+                if (wr != cpid || !WIFEXITED(st) || WEXITSTATUS(st) != 0 || g_sigchld_seen < 1)
+                    ok = 0;
+            }
+        }
+        signal(SIGCHLD, SIG_DFL);
+
+        if (ok) {
+            char *kargs[] = { "/bin/TSYSC.ELF", "--worker-block-sigkill", NULL };
+            pid_t kpid = spawn("/bin/TSYSC.ELF", kargs, NULL);
+            if (kpid < 0) {
+                ok = 0;
+            } else {
+                usleep(20000);
+                if (kill(kpid, SIGKILL) != 0)
+                    ok = 0;
+                int st = 0;
+                pid_t wr = waitpid(kpid, &st, 0);
+                if (wr != kpid || !WIFSIGNALED(st) || WTERMSIG(st) != SIGKILL)
+                    ok = 0;
+            }
+        }
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "sigchld_sigkill_unblockable", "SIGCHLD or SIGKILL check failed");
+            return 80;
+        }
+        TSK_TEST_PASS("syscalls", "sigchld_sigkill_unblockable");
+        passed++;
+    }
+
+    /* Test 26: Blocking pipes, poll wakeup, SIGPIPE + EPIPE. */
+    {
+        int ok = 1;
+        int p_p2c[2];
+        int p_c2p[2];
+        if (pipe(p_p2c) != 0 || pipe(p_c2p) != 0) {
+            ok = 0;
+        } else {
+            struct tsukasa_spawn_request req;
+            req.path = "/bin/TSYSC.ELF";
+            req.args = "/bin/TSYSC.ELF --worker-pipe-echo";
+            req.stdin_fd = p_p2c[0];
+            req.stdout_fd = p_c2p[1];
+            req.stderr_fd = 2;
+            req.tty_id = -1;
+            pid_t cpid = spawn_ex(&req);
+            close(p_p2c[0]);
+            close(p_c2p[1]);
+            if (cpid < 0) {
+                close(p_p2c[1]);
+                close(p_c2p[0]);
+                ok = 0;
+            } else {
+                /* Wait briefly so child genuinely blocks in pipe read(0). */
+                usleep(25000);
+                const char *msg = "BLOCK_PIPE_OK";
+                if (write(p_p2c[1], msg, strlen(msg)) != (ssize_t)strlen(msg))
+                    ok = 0;
+                close(p_p2c[1]);
+
+                struct pollfd pfd;
+                pfd.fd = p_c2p[0];
+                pfd.events = POLLIN;
+                pfd.revents = 0;
+                if (poll(&pfd, 1, 2000) <= 0 || !(pfd.revents & POLLIN))
+                    ok = 0;
+
+                char rbuf[32];
+                memset(rbuf, 0, sizeof(rbuf));
+                ssize_t rn = read(p_c2p[0], rbuf, sizeof(rbuf));
+                ssize_t reof = read(p_c2p[0], rbuf, sizeof(rbuf));
+                close(p_c2p[0]);
+
+                int st = 0;
+                pid_t wr = waitpid(cpid, &st, 0);
+                if (rn != (ssize_t)strlen(msg) || strcmp(rbuf, msg) != 0 ||
+                    reof != 0 || wr != cpid || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+                    ok = 0;
+            }
+        }
+
+        /* Poll wakeup while blocked waiting on pipe writer. */
+        if (ok) {
+            int dp[2];
+            if (pipe(dp) != 0) {
+                ok = 0;
+            } else {
+                struct tsukasa_spawn_request req;
+                req.path = "/bin/TSYSC.ELF";
+                req.args = "/bin/TSYSC.ELF --worker-delayed-write";
+                req.stdin_fd = 0;
+                req.stdout_fd = dp[1];
+                req.stderr_fd = 2;
+                req.tty_id = -1;
+                pid_t cpid = spawn_ex(&req);
+                close(dp[1]);
+                if (cpid < 0) {
+                    close(dp[0]);
+                    ok = 0;
+                } else {
+                    struct pollfd pfd;
+                    pfd.fd = dp[0];
+                    pfd.events = POLLIN;
+                    pfd.revents = 0;
+                    int pr = poll(&pfd, 1, 2000);
+                    char wbuf[8] = {0};
+                    ssize_t n = read(dp[0], wbuf, sizeof(wbuf));
+                    close(dp[0]);
+                    int st = 0;
+                    pid_t wr = waitpid(cpid, &st, 0);
+                    if (pr <= 0 || !(pfd.revents & POLLIN) || n != 4 ||
+                        memcmp(wbuf, "WAKE", 4) != 0 || wr != cpid ||
+                        !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+                        ok = 0;
+                }
+            }
+        }
+
+        /* SIGPIPE raised + EPIPE returned when reader closes, plus SIG_DFL SIGPIPE termination. */
+        if (ok) {
+            int sp[2];
+            g_sigpipe_seen = 0;
+            signal(SIGPIPE, sig_pipe_handler);
+            if (pipe(sp) != 0) {
+                ok = 0;
+            } else {
+                close(sp[0]);
+                errno = 0;
+                ssize_t wrc = write(sp[1], "Z", 1);
+                close(sp[1]);
+                if (wrc != -1 || errno != EPIPE || g_sigpipe_seen != 1)
+                    ok = 0;
+            }
+            signal(SIGPIPE, SIG_DFL);
+
+            char *sargs[] = { "/bin/TSYSC.ELF", "--worker-sigpipe-dfl", NULL };
+            pid_t spid = spawn("/bin/TSYSC.ELF", sargs, NULL);
+            if (spid < 0) {
+                ok = 0;
+            } else {
+                int st = 0;
+                pid_t wr = waitpid(spid, &st, 0);
+                if (wr != spid || !WIFSIGNALED(st) || WTERMSIG(st) != SIGPIPE)
+                    ok = 0;
+            }
+        }
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "blocking_pipes_sigpipe_poll", "blocking pipe/poll/SIGPIPE check failed");
+            return 81;
+        }
+        TSK_TEST_PASS("syscalls", "blocking_pipes_sigpipe_poll");
         passed++;
     }
 

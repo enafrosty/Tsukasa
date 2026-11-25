@@ -66,10 +66,71 @@ typedef int sig_atomic_t;
 #define SIG_UNBLOCK 1
 #define SIG_SETMASK 2
 
+#define SA_NOCLDSTOP 0x00000001u
+#define SA_NOCLDWAIT 0x00000002u
+#define SA_SIGINFO   0x00000004u
+#define SA_RESTORER  0x04000000u
+#define SA_ONSTACK   0x08000000u
+#define SA_RESTART   0x10000000u
+#define SA_NODEFER   0x40000000u
+#define SA_RESETHAND 0x80000000u
+
+typedef struct siginfo {
+    int32_t si_signo;
+    int32_t si_errno;
+    int32_t si_code;
+    int32_t si_pid;
+    uint32_t si_uid;
+    int32_t si_status;
+    void *si_addr;
+    int64_t si_value;
+} siginfo_t;
+
+enum {
+    REG_R8 = 0,
+    REG_R9,
+    REG_R10,
+    REG_R11,
+    REG_R12,
+    REG_R13,
+    REG_R14,
+    REG_R15,
+    REG_RDI,
+    REG_RSI,
+    REG_RBP,
+    REG_RBX,
+    REG_RDX,
+    REG_RAX,
+    REG_RCX,
+    REG_RSP,
+    REG_RIP,
+    REG_EFL,
+    REG_CSGSFS,
+    NGREG
+};
+
+typedef struct mcontext {
+    uint64_t gregs[NGREG];
+    uint64_t fpu_flags;
+    uint8_t fpregs[512] __attribute__((aligned(16)));
+} mcontext_t;
+
+typedef struct ucontext {
+    uint64_t uc_flags;
+    struct ucontext *uc_link;
+    sigset_t uc_sigmask;
+    uint64_t uc_pad;
+    mcontext_t uc_mcontext;
+} ucontext_t;
+
 struct sigaction {
-    sighandler_t sa_handler;
+    union {
+        sighandler_t sa_handler;
+        void (*sa_sigaction)(int, siginfo_t *, void *);
+    };
     sigset_t sa_mask;
     int sa_flags;
+    void (*sa_restorer)(void);
 };
 
 sighandler_t signal(int signum, sighandler_t handler);
@@ -77,6 +138,7 @@ int raise(int sig);
 int kill(pid_t pid, int sig);
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
+int sigpending(sigset_t *set);
 int sigemptyset(sigset_t *set);
 int sigfillset(sigset_t *set);
 int sigaddset(sigset_t *set, int signum);

@@ -120,34 +120,36 @@ int raise(int sig)
     return kill(getpid(), sig);
 }
 
-static sighandler_t g_signal_handlers[32];
+extern void __tsukasa_rt_sigreturn(void);
+
+_Static_assert(sizeof(struct sigaction) == 32,
+               "struct sigaction must match kernel ABI");
 
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 {
-    if (signum <= 0 || signum >= 32) {
+    struct sigaction kact;
+    const struct sigaction *kact_ptr = NULL;
+
+    if (signum <= 0 || signum >= 64) {
         errno = EINVAL;
         return -1;
     }
 
-    sighandler_t prev = g_signal_handlers[signum];
-    int64_t rc = __syscall4(SYS_rt_sigaction,
-                            (int64_t)signum,
-                            (int64_t)(uintptr_t)act,
-                            (int64_t)(uintptr_t)oldact,
-                            (int64_t)sizeof(sigset_t));
-    if (__syscall_check(rc) < 0) {
-        return -1;
+    if (act) {
+        kact = *act;
+        if (!(kact.sa_flags & (int)SA_RESTORER)) {
+            kact.sa_restorer = __tsukasa_rt_sigreturn;
+            kact.sa_flags |= (int)SA_RESTORER;
+        }
+        kact_ptr = &kact;
     }
 
-    if (oldact) {
-        oldact->sa_handler = prev;
-        oldact->sa_mask = 0;
-        oldact->sa_flags = 0;
-    }
-    if (act) {
-        g_signal_handlers[signum] = act->sa_handler;
-    }
-    return 0;
+    int64_t rc = __syscall4(SYS_rt_sigaction,
+                            (int64_t)signum,
+                            (int64_t)(uintptr_t)kact_ptr,
+                            (int64_t)(uintptr_t)oldact,
+                            (int64_t)sizeof(sigset_t));
+    return (int)__syscall_check(rc);
 }
 
 sighandler_t signal(int signum, sighandler_t handler)
@@ -158,6 +160,7 @@ sighandler_t signal(int signum, sighandler_t handler)
     act.sa_handler = handler;
     act.sa_mask = 0;
     act.sa_flags = 0;
+    act.sa_restorer = NULL;
     if (sigaction(signum, &act, &oldact) < 0) {
         return SIG_ERR;
     }
@@ -166,10 +169,24 @@ sighandler_t signal(int signum, sighandler_t handler)
 
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
 {
-    (void)how;
-    (void)set;
-    (void)oldset;
-    return 0;
+    int64_t rc = __syscall4(SYS_rt_sigprocmask,
+                            (int64_t)how,
+                            (int64_t)(uintptr_t)set,
+                            (int64_t)(uintptr_t)oldset,
+                            (int64_t)sizeof(sigset_t));
+    return (int)__syscall_check(rc);
+}
+
+int sigpending(sigset_t *set)
+{
+    if (!set) {
+        errno = EFAULT;
+        return -1;
+    }
+    int64_t rc = __syscall2(SYS_rt_sigpending,
+                            (int64_t)(uintptr_t)set,
+                            (int64_t)sizeof(sigset_t));
+    return (int)__syscall_check(rc);
 }
 
 int sigemptyset(sigset_t *set)
@@ -198,7 +215,7 @@ int sigaddset(sigset_t *set, int signum)
         errno = EINVAL;
         return -1;
     }
-    *set |= (1ULL << (signum - 1));
+    *set |= (1ULL << (uint32_t)signum);
     return 0;
 }
 
@@ -208,7 +225,7 @@ int sigdelset(sigset_t *set, int signum)
         errno = EINVAL;
         return -1;
     }
-    *set &= ~(1ULL << (signum - 1));
+    *set &= ~(1ULL << (uint32_t)signum);
     return 0;
 }
 
@@ -218,7 +235,7 @@ int sigismember(const sigset_t *set, int signum)
         errno = EINVAL;
         return -1;
     }
-    return (*set & (1ULL << (signum - 1))) ? 1 : 0;
+    return (*set & (1ULL << (uint32_t)signum)) ? 1 : 0;
 }
 
 pid_t getpid(void)

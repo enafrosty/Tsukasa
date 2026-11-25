@@ -40,6 +40,7 @@ ASMFLAGS = -f elf64
 CRT_OBJS = crt/crt0.o crt/crt0.s.o
 
 SYSCALL_OBJS = src/syscall/errno.o \
+               src/syscall/sigreturn.o \
                src/syscall/sys_fs.o \
                src/syscall/sys_mem.o \
                src/syscall/sys_proc.o \
@@ -91,6 +92,10 @@ src/setjmp/%.o: src/setjmp/%.s
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(SFLAGS) -c -o $@ $<
 
+src/syscall/%.o: src/syscall/%.s
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(SFLAGS) -c -o $@ $<
+
 src/stdlib/strtod.o: src/stdlib/strtod.c
 	@mkdir -p $(dir $@)
 	$(CC) $(MATH_CFLAGS) -c -o $@ $<
@@ -128,6 +133,10 @@ tests/test_math.o: tests/test_math.c
 	$(CC) $(MATH_CFLAGS) -c -o $@ $<
 
 tests/test_stdio.o: tests/test_stdio.c
+	@mkdir -p $(dir $@)
+	$(CC) $(MATH_CFLAGS) -c -o $@ $<
+
+tests/test_syscalls.o: tests/test_syscalls.c
 	@mkdir -p $(dir $@)
 	$(CC) $(MATH_CFLAGS) -c -o $@ $<
 

@@ -244,6 +244,7 @@ struct tsukasa_sigaction {
     uintptr_t sa_handler;
     uint64_t sa_mask;
     int sa_flags;
+    uintptr_t sa_restorer;
 };
 #define SYSTEM_CMD_TTY_CREATE      9
 #define SYSTEM_CMD_TTY_SET_FG      10
