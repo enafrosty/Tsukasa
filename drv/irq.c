@@ -24,6 +24,7 @@
 #include "pit.h"
 
 #ifdef __x86_64__
+#include "../arch/x86_64/cpu/idt.h"
 #include "../include/kprintf.h"
 #include "../include/lapic.h"
 #include "../include/smp.h"
@@ -76,7 +77,7 @@ static void irq_vec_bit_clear(uint32_t vec)
 static int irq_vec_is_valid_handler_slot(uint8_t vec)
 {
     return (vec >= 48u && vec != 64u && vec != 65u && vec != 66u &&
-            vec != 128u && vec != 255u);
+            vec != 67u && vec != 128u && vec != 255u);
 }
 
 int irq_alloc_vectors(int count)
@@ -251,13 +252,14 @@ uint64_t irq_handler_x64(unsigned int vector, uint64_t context_rsp)
         uint32_t cpu = smp_this_cpu_id();
 
         if (cpu == 0) {
-            pit_irq_tick();
+            if (!lapic_timer_active())
+                pit_irq_tick();
             (void)irq_invoke_hook(0);
             irq_ack(0);
         }
+        if (lapic_timer_active())
+            return context_rsp;
         next_rsp = process_schedule_tick(context_rsp);
-        if (cpu == 0 && smp_cpu_count() > 1)
-            lapic_send_ipi_all();
 
         if (!g_irq32_trace_once) {
             g_irq32_trace_once = 1;
@@ -294,9 +296,18 @@ uint64_t irq_handler_x64(unsigned int vector, uint64_t context_rsp)
     }
 
     if (vector == 65) {
-        /* LAPIC-domain interrupt: EOI goes to the local APIC, not the PIC, and precedes the reschedule to mirror the... */
+        /* LAPIC-domain interrupt: EOI precedes reschedule check. */
         lapic_eoi();
         return process_schedule_ipi(context_rsp);
+    }
+
+    if (vector == IDT_VEC_LAPIC_TIMER) {
+        uint32_t cpu = smp_this_cpu_id();
+        lapic_eoi();
+        lapic_timer_note_tick(cpu);
+        if (cpu == 0)
+            pit_irq_tick();
+        return process_schedule_tick(context_rsp);
     }
 
     if (vector == 33) {

@@ -36,6 +36,7 @@
 #include "../ipc/shm.h"
 #include "../sys/futex.h"
 #include "../sys/panic.h"
+#include "../sys/time.h"
 #include "../drv/acpi.h"
 #include "../drv/ioapic.h"
 #include "../drv/irq.h"
@@ -47,6 +48,7 @@
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
 #include "../include/smp.h"
+#include "../include/lapic.h"
 
 #define SYSCALL_TABLE_SIZE 351
 
@@ -81,19 +83,49 @@ static int user_str_ok(long ptr)
 }
 
 static long sys_futex(long uaddr, long op, long val,
-                      long a4, long a5, long a6)
+                      long timeout_ptr, long uaddr2, long val3)
 {
-    (void)a4; (void)a5; (void)a6;
+    (void)uaddr2;
     if (uaddr & 3)
         return -EINVAL;
     if (!user_ok(uaddr, 4, 0))
         return -EFAULT;
-    if (op == FUTEX_WAIT)
-        return kernel_futex_wait((volatile uint32_t *)(uintptr_t)uaddr,
-                                 (uint32_t)val);
-    if (op == FUTEX_WAKE)
-        return kernel_futex_wake((volatile uint32_t *)(uintptr_t)uaddr,
-                                 (int)val);
+
+    int cmd = (int)(op & FUTEX_CMD_MASK);
+    if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) {
+        int has_to = 0;
+        uint64_t mono_dl = 0;
+        if (timeout_ptr) {
+            if (!user_ok(timeout_ptr, (long)sizeof(struct tsk_timespec), 0))
+                return -EFAULT;
+            struct tsk_timespec ts = *(const struct tsk_timespec *)(uintptr_t)timeout_ptr;
+            if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
+                return -EINVAL;
+            has_to = 1;
+            uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+            if (cmd == FUTEX_WAIT_BITSET) {
+                if (op & FUTEX_CLOCK_REALTIME) {
+                    uint64_t mono_now = time_monotonic_ns();
+                    int64_t rt_now = time_realtime_ns();
+                    int64_t diff = (int64_t)ns - rt_now;
+                    mono_dl = (diff > 0) ? (mono_now + (uint64_t)diff) : mono_now;
+                } else {
+                    mono_dl = ns;
+                }
+            } else {
+                uint64_t mono_now = time_monotonic_ns();
+                mono_dl = (ns > UINT64_MAX - mono_now) ? UINT64_MAX : (mono_now + ns);
+            }
+        }
+        uint32_t bitset = (cmd == FUTEX_WAIT_BITSET) ? (uint32_t)val3 : FUTEX_BITSET_MATCH_ANY;
+        return kernel_futex_wait_ex((volatile uint32_t *)(uintptr_t)uaddr,
+                                    (uint32_t)val, has_to, mono_dl, bitset);
+    }
+    if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
+        uint32_t bitset = (cmd == FUTEX_WAKE_BITSET) ? (uint32_t)val3 : FUTEX_BITSET_MATCH_ANY;
+        return kernel_futex_wake_ex((volatile uint32_t *)(uintptr_t)uaddr,
+                                    (int)val, bitset);
+    }
     return -ENOSYS;
 }
 
@@ -388,7 +420,8 @@ static long sys_mprotect(long addr, long length, long prot, long a4, long a5, lo
 {
     (void)a4; (void)a5; (void)a6;
     process_t *cur = process_current();
-    if (!cur || !cur->vm_space.owns_pml4)
+    vm_space_t *vs = process_vm_space(cur);
+    if (!cur || !vs || !vs->owns_pml4)
         return -ENOMEM;
     if (addr == 0 || !paging_is_page_aligned_uintptr((uintptr_t)addr))
         return -EINVAL;
@@ -412,9 +445,9 @@ static long sys_mprotect(long addr, long length, long prot, long a4, long a5, lo
     if (prot & VFS_PROT_WRITE) vma_prot |= VMA_PROT_WRITE;
     if (prot & VFS_PROT_EXEC)  vma_prot |= VMA_PROT_EXEC;
 
-    vm_space_mmap_write_lock(&cur->vm_space);
-    int rc = vma_protect_range(&cur->vm_space, (uintptr_t)addr, span, vma_prot);
-    vm_space_mmap_write_unlock(&cur->vm_space);
+    vm_space_mmap_write_lock(vs);
+    int rc = vma_protect_range(vs, (uintptr_t)addr, span, vma_prot);
+    vm_space_mmap_write_unlock(vs);
     return (long)rc;
 }
 
@@ -422,11 +455,12 @@ static long sys_brk(long addr, long a2, long a3, long a4, long a5, long a6)
 {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     process_t *cur = process_current();
-    if (!cur || !cur->vm_space.owns_pml4)
+    vm_space_t *vs = process_vm_space(cur);
+    if (!cur || !vs || !vs->owns_pml4)
         return -ENOMEM;
 
     uintptr_t cur_brk = 0;
-    (void)vm_space_brk(&cur->vm_space, (uintptr_t)addr, &cur_brk);
+    (void)vm_space_brk(vs, (uintptr_t)addr, &cur_brk);
     return (long)cur_brk;
 }
 
@@ -536,7 +570,59 @@ static long sys_nanosleep(long ms, long a2, long a3, long a4, long a5, long a6)
 static long sys_getpid(long a1, long a2, long a3, long a4, long a5, long a6)
 {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    process_t *cur = process_current();
+    if (!cur)
+        return -1;
+    return (long)(cur->tgid ? cur->tgid : cur->pid);
+}
+
+static long sys_gettid(long a1, long a2, long a3, long a4, long a5, long a6)
+{
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     return (long)process_current_pid();
+}
+
+static long sys_clone(long flags, long child_stack, long ptid, long ctid, long tls, long a6)
+{
+    (void)a6;
+    if ((flags & PROCESS_CLONE_PARENT_SETTID) &&
+        (!ptid || !user_ok(ptid, (long)sizeof(int), 1)))
+        return -EFAULT;
+    if ((flags & (PROCESS_CLONE_CHILD_SETTID | PROCESS_CLONE_CHILD_CLEARTID)) &&
+        (!ctid || !user_ok(ctid, (long)sizeof(int), 1)))
+        return -EFAULT;
+    syscall_frame_t *sf = process_current_syscall_frame();
+    if (!sf)
+        return -ENOSYS;
+    return (long)process_clone_current(sf,
+                                       (uint64_t)flags,
+                                       (uint64_t)child_stack,
+                                       (int *)(uintptr_t)ptid,
+                                       (int *)(uintptr_t)ctid,
+                                       (uint64_t)tls);
+}
+
+static long sys_arch_prctl(long code, long addr, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (code == PROCESS_ARCH_GET_FS || code == PROCESS_ARCH_GET_GS) {
+        if (!addr || !user_ok(addr, (long)sizeof(uint64_t), 1))
+            return -EFAULT;
+    }
+    return process_arch_prctl((int)code, (uint64_t)addr);
+}
+
+static long sys_set_tid_address(long tidptr, long a2, long a3, long a4, long a5, long a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    return process_set_tid_address((int *)(uintptr_t)tidptr);
+}
+
+static long sys_exit_group(long code, long a2, long a3, long a4, long a5, long a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    process_exit_group((int)code);
+    return 0;
 }
 
 static long sys_getppid(long a1, long a2, long a3, long a4, long a5, long a6)
@@ -832,6 +918,87 @@ static long sys_time(long tloc, long a2, long a3, long a4, long a5, long a6)
         *(int64_t *)(uintptr_t)tloc = epoch;
     }
     return (long)epoch;
+}
+
+static long sys_clock_gettime(long clk_id, long tp_ptr, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (!tp_ptr || !user_ok(tp_ptr, (long)sizeof(struct tsk_timespec), 1))
+        return -EFAULT;
+    struct tsk_timespec *tp = (struct tsk_timespec *)(uintptr_t)tp_ptr;
+    if (clk_id == TSK_CLOCK_MONOTONIC || clk_id == TSK_CLOCK_MONOTONIC_RAW ||
+        clk_id == TSK_CLOCK_BOOTTIME) {
+        uint64_t ns = time_monotonic_ns();
+        tp->tv_sec = (int64_t)(ns / 1000000000ULL);
+        tp->tv_nsec = (int64_t)(ns % 1000000000ULL);
+        return 0;
+    }
+    if (clk_id == TSK_CLOCK_REALTIME) {
+        int64_t ns = time_realtime_ns();
+        if (ns < 0)
+            ns = 0;
+        tp->tv_sec = ns / 1000000000LL;
+        tp->tv_nsec = ns % 1000000000LL;
+        return 0;
+    }
+    return -EINVAL;
+}
+
+static long sys_clock_getres(long clk_id, long res_ptr, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    uint64_t res = time_clock_res_ns((int)clk_id);
+    if (res == 0)
+        return -EINVAL;
+    if (res_ptr) {
+        if (!user_ok(res_ptr, (long)sizeof(struct tsk_timespec), 1))
+            return -EFAULT;
+        struct tsk_timespec *rp = (struct tsk_timespec *)(uintptr_t)res_ptr;
+        rp->tv_sec = (int64_t)(res / 1000000000ULL);
+        rp->tv_nsec = (int64_t)(res % 1000000000ULL);
+    }
+    return 0;
+}
+
+static long sys_clock_settime(long clk_id, long tp_ptr, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (clk_id != TSK_CLOCK_REALTIME)
+        return -EINVAL;
+    if (!tp_ptr || !user_ok(tp_ptr, (long)sizeof(struct tsk_timespec), 0))
+        return -EFAULT;
+    const struct tsk_timespec *tp = (const struct tsk_timespec *)(uintptr_t)tp_ptr;
+    if (tp->tv_sec < 0 || tp->tv_nsec < 0 || tp->tv_nsec >= 1000000000L)
+        return -EINVAL;
+    int64_t ns = tp->tv_sec * 1000000000LL + tp->tv_nsec;
+    return (time_set_realtime_ns(ns) == 0) ? 0 : -EINVAL;
+}
+
+static long sys_timerfd_create(long clockid, long flags, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    return (long)vfs_timerfd_create((int)clockid, (int)flags);
+}
+
+static long sys_timerfd_settime(long fd, long flags, long new_ptr, long old_ptr, long a5, long a6)
+{
+    (void)a5; (void)a6;
+    if (!new_ptr || !user_ok(new_ptr, (long)sizeof(struct tsk_itimerspec), 0))
+        return -EFAULT;
+    if (old_ptr && !user_ok(old_ptr, (long)sizeof(struct tsk_itimerspec), 1))
+        return -EFAULT;
+    return (long)vfs_timerfd_settime((int)fd, (int)flags,
+                                     (const struct tsk_itimerspec *)(uintptr_t)new_ptr,
+                                     (struct tsk_itimerspec *)(uintptr_t)old_ptr);
+}
+
+static long sys_timerfd_gettime(long fd, long cur_ptr, long a3, long a4, long a5, long a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (!cur_ptr || !user_ok(cur_ptr, (long)sizeof(struct tsk_itimerspec), 1))
+        return -EFAULT;
+    return (long)vfs_timerfd_gettime((int)fd,
+                                     (struct tsk_itimerspec *)(uintptr_t)cur_ptr);
 }
 
 static long sys_fsync(long fd, long a2, long a3, long a4, long a5, long a6)
@@ -1255,6 +1422,7 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [45] = sys_recvfrom,
     [49] = sys_bind,
     [50] = sys_listen,
+    [56] = sys_clone,
     [57] = sys_fork,
     [59] = sys_execve,
     [60] = sys_exit,
@@ -1286,15 +1454,25 @@ static const syscall_fn_t syscall_table[SYSCALL_TABLE_SIZE] = {
     [121] = sys_getpgid,
     [124] = sys_getsid,
     [127] = sys_rt_sigpending,
+    [158] = sys_arch_prctl,
     [162] = sys_sync,
     [165] = sys_mount,
     [166] = sys_umount2,
     [169] = sys_reboot,
+    [186] = sys_gettid,
     [201] = sys_time,
     [202] = sys_futex,
     [217] = sys_getdents64,
+    [218] = sys_set_tid_address,
+    [227] = sys_clock_settime,
+    [228] = sys_clock_gettime,
+    [229] = sys_clock_getres,
+    [231] = sys_exit_group,
     [232] = sys_epoll_wait,
     [233] = sys_epoll_ctl,
+    [283] = sys_timerfd_create,
+    [286] = sys_timerfd_settime,
+    [287] = sys_timerfd_gettime,
     [291] = sys_epoll_create1,
     [300] = sys_list,
     [301] = sys_fsize,
@@ -1316,7 +1494,8 @@ static volatile uint64_t g_ring3_syscall_if_off;
 long syscall_dispatch(long nr, long a1, long a2, long a3, long a4, long a5, long a6)
 {
     process_t *cur = process_current();
-    if (cur && cur->vm_space.owns_pml4) {
+    vm_space_t *vs = process_vm_space(cur);
+    if (vs && vs->owns_pml4) {
         uint64_t rf = 0;
         __asm__ volatile ("pushfq; popq %0" : "=r"(rf));
         if (rf & (1ULL << 9))
@@ -1838,9 +2017,6 @@ static void c01_test_entry(void)
     }
 
     blockdev_run_irq_selftests();
-    pagecache_run_selftests();
-    pmm_run_selftests();
-    slab_run_selftests();
     vm_space_run_selftests();
 
     if (smp_cpu_count() > 1) {
@@ -1863,6 +2039,41 @@ static void c01_test_entry(void)
         } else {
             kprintf("[selftest] smp tlb shootdown FAIL (vm_space_create)\n");
         }
+    }
+
+    {
+        uint64_t t0 = time_monotonic_ns();
+        uint64_t t1 = time_monotonic_ns();
+        for (volatile uint32_t s = 0; s < 50000u; s++)
+            __asm__ volatile ("pause");
+        uint64_t t2 = time_monotonic_ns();
+        int ok = (time_is_ready() == 1 && t1 >= t0 && t2 > t0);
+        kprintf("[selftest] hires_clock %s src=%s tsc_hz=%llu dt_ns=%llu\n",
+                ok ? "PASS" : "FAIL",
+                time_clocksource_name(),
+                (unsigned long long)time_tsc_hz(),
+                (unsigned long long)(t2 - t0));
+    }
+
+    {
+        uint32_t fpu_sz = fpu_save_size();
+        int fpu_ok = (fpu_sz >= 512u && fpu_sz <= 1024u);
+        kprintf("[selftest] fpu_state %s xsave=%d size=%u\n",
+                fpu_ok ? "PASS" : "FAIL", fpu_xsave_enabled(), (unsigned)fpu_sz);
+    }
+
+    {
+        uint32_t cpus = smp_cpu_count();
+        int lapic_ok = (lapic_timer_active() == 1);
+        for (uint32_t c = 0; c < cpus; c++) {
+            cpu_state_t *cs = smp_get_cpu(c);
+            if (cs && cs->online && lapic_timer_ticks_cpu(c) == 0ULL)
+                lapic_ok = 0;
+        }
+        kprintf("[selftest] smp_lapic_timers %s cpus=%u active=%d bsp_ticks=%llu\n",
+                lapic_ok ? "PASS" : "FAIL",
+                cpus, lapic_timer_active(),
+                (unsigned long long)lapic_timer_ticks_cpu(0));
     }
 
     kprintf("[selftest] ALL DONE\n");

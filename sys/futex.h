@@ -1,5 +1,5 @@
 /*
- * Project Tsukasa — futex: address-keyed block/wake primitive (guide 10)
+ * Project Tsukasa — futex: physical-address-keyed block/wake primitive
  *
  * Copyright (C) 2025-2026 frosty (@enafrosty) and Project Tsukasa contributors.
  *
@@ -19,14 +19,24 @@
 
 #include <stdint.h>
 
-#define FUTEX_WAIT 0
-#define FUTEX_WAKE 1
+#define FUTEX_WAIT             0
+#define FUTEX_WAKE             1
+#define FUTEX_WAIT_BITSET      9
+#define FUTEX_WAKE_BITSET      10
+#define FUTEX_PRIVATE_FLAG     128
+#define FUTEX_CLOCK_REALTIME   256
+#define FUTEX_CMD_MASK         (~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME))
+#define FUTEX_BITSET_MATCH_ANY 0xFFFFFFFFU
 
-/* Block the calling process while *uaddr == expected. */
 long kernel_futex_wait(volatile uint32_t *uaddr, uint32_t expected);
+long kernel_futex_wait_ex(volatile uint32_t *uaddr,
+                          uint32_t expected,
+                          int has_timeout,
+                          uint64_t mono_deadline_ns,
+                          uint32_t bitset);
 
-/* Wake up to `count` processes blocked on uaddr. */
 long kernel_futex_wake(volatile uint32_t *uaddr, int count);
+long kernel_futex_wake_ex(volatile uint32_t *uaddr, int count, uint32_t bitset);
 
 int futex_pending_waiters(const volatile uint32_t *uaddr);
 

@@ -46,6 +46,10 @@ static int g_iso_count;
 
 static struct acpi_mcfg_entry g_mcfg_entries[ACPI_MAX_MCFG];
 static int g_mcfg_count;
+static uint64_t g_hpet_base;
+static uint8_t  g_hpet_number;
+static uint16_t g_hpet_min_tick;
+static int      g_hpet_found;
 
 /* _S5_ sleep type values, pre-shifted into PM1 SLP_TYP position (bits 10-12). */
 static uint16_t g_slp_typa;
@@ -301,6 +305,19 @@ int acpi_get_mcfg_info(int idx, uint64_t *base, uint16_t *seg,
     return 0;
 }
 
+int acpi_get_hpet_info(uint64_t *base_out, uint8_t *num_out, uint16_t *min_tick_out)
+{
+    if (!g_hpet_found || !g_hpet_base)
+        return -1;
+    if (base_out)
+        *base_out = g_hpet_base;
+    if (num_out)
+        *num_out = g_hpet_number;
+    if (min_tick_out)
+        *min_tick_out = g_hpet_min_tick;
+    return 0;
+}
+
 uint32_t acpi_irq_to_gsi(uint32_t irq)
 {
     for (int i = 0; i < g_iso_count; i++) {
@@ -358,6 +375,10 @@ int acpi_init(const struct tsukasa_boot_info *boot_info)
     g_ioapic_count = 0;
     g_iso_count = 0;
     g_mcfg_count = 0;
+    g_hpet_base = 0;
+    g_hpet_number = 0;
+    g_hpet_min_tick = 0;
+    g_hpet_found = 0;
     g_slp_typa = 0;
     g_slp_typb = 0;
     g_s5_from_dsdt = 0;
@@ -503,6 +524,21 @@ int acpi_init(const struct tsukasa_boot_info *boot_info)
                     e->start_bus, e->end_bus);
             g_mcfg_count++;
         }
+    }
+
+    const struct acpi_hpet *hpet = (const struct acpi_hpet *)acpi_get_sdt("HPET");
+    if (hpet && hpet->header.length >= sizeof(struct acpi_hpet) &&
+        hpet->base_address.address_space_id == 0 && hpet->base_address.address != 0) {
+        g_hpet_base = hpet->base_address.address;
+        g_hpet_number = hpet->hpet_number;
+        g_hpet_min_tick = hpet->min_tick;
+        g_hpet_found = 1;
+        kprintf("[acpi] HPET #%u base=0x%08x%08x min_tick=%u\n",
+                (unsigned)g_hpet_number,
+                (uint32_t)(g_hpet_base >> 32), (uint32_t)g_hpet_base,
+                (unsigned)g_hpet_min_tick);
+    } else {
+        kprintf("[acpi] HPET table unavailable\n");
     }
 
     acpi_parse_s5();

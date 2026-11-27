@@ -176,6 +176,18 @@ struct acpi_mcfg {
     struct acpi_mcfg_entry entries[];
 } __attribute__((packed));
 
+/* High Precision Event Timer (HPET) ACPI table (IA-PC HPET 1.0a §3.2.4). */
+struct acpi_hpet {
+    struct acpi_sdt header;
+    uint32_t event_timer_block_id;
+    acpi_gas_t base_address;
+    uint8_t  hpet_number;
+    uint16_t min_tick;
+    uint8_t  page_protection;
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct acpi_hpet) == 56, "struct acpi_hpet must be 56 bytes");
+
 /* PM1 control register bits (spec §4.8.3.2.1). */
 #define ACPI_PM1_SCI_EN (1u << 0)
 #define ACPI_PM1_SLP_EN (1u << 13)
@@ -202,6 +214,7 @@ int acpi_get_ioapic_info(int idx, uint8_t *id_out, uint32_t *addr_out,
 int acpi_get_mcfg_count(void);
 int acpi_get_mcfg_info(int idx, uint64_t *base, uint16_t *seg,
                        uint8_t *start_bus, uint8_t *end_bus);
+int acpi_get_hpet_info(uint64_t *base_out, uint8_t *num_out, uint16_t *min_tick_out);
 
 /* ISA IRQ -> GSI (identity when no override exists) and its MPS INTI flags. */
 uint32_t acpi_irq_to_gsi(uint32_t irq);

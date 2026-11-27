@@ -28,6 +28,7 @@
 #include <sys/shm.h>
 #include <sys/file.h>
 #include <sys/mount.h>
+#include <sys/timerfd.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -348,6 +349,165 @@ static int run_worker_pty_job(const char *pts_path)
     return 0;
 }
 
+typedef struct t37_tls {
+    void *self;
+    uint64_t magic;
+    int seen_tid;
+    int seen_pid;
+    unsigned long seen_fs;
+    void *seen_fs0;
+    int pipe_wr;
+    int dup_fd;
+    volatile int ok;
+} t37_tls_t;
+
+static int t37_thread_fn(void *arg)
+{
+    t37_tls_t *tls = (t37_tls_t *)arg;
+    void *fs0 = NULL;
+    unsigned long got_fs = 0;
+    int my_tid = (int)gettid();
+    int my_pid = (int)getpid();
+    int ok = 1;
+
+    __asm__ volatile ("movq %%fs:0, %0" : "=r"(fs0));
+    if (arch_prctl(ARCH_GET_FS, (unsigned long)&got_fs) != 0)
+        ok = 0;
+    if (fs0 != (void *)tls || got_fs != (unsigned long)(uintptr_t)tls)
+        ok = 0;
+    if (write(tls->pipe_wr, "OK", 2) != 2)
+        ok = 0;
+    if (close(tls->dup_fd) != 0)
+        ok = 0;
+
+    tls->seen_tid = my_tid;
+    tls->seen_pid = my_pid;
+    tls->seen_fs = got_fs;
+    tls->seen_fs0 = fs0;
+    __atomic_store_n(&tls->ok, ok, __ATOMIC_RELEASE);
+    return 0;
+}
+
+static int t37_exitgrp_worker(void *arg)
+{
+    (void)arg;
+    exit_group(42);
+    return 1;
+}
+
+static volatile uint32_t g_t38_lock;
+static volatile uint64_t g_t38_counter;
+
+static void t38_lock_acquire(volatile uint32_t *lk)
+{
+    uint32_t expected = 0u;
+    if (__atomic_compare_exchange_n(lk, &expected, 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return;
+    for (;;) {
+        uint32_t cur = __atomic_load_n(lk, __ATOMIC_RELAXED);
+        if (cur == 2u ||
+            (cur != 0u && __atomic_compare_exchange_n(lk, &cur, 2u, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))) {
+            (void)tsk_futex(lk, FUTEX_WAIT, 2u, NULL, NULL, 0u);
+        }
+        expected = 0u;
+        if (__atomic_compare_exchange_n(lk, &expected, 2u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return;
+    }
+}
+
+static void t38_lock_release(volatile uint32_t *lk)
+{
+    if (__atomic_exchange_n(lk, 0u, __ATOMIC_RELEASE) == 2u)
+        (void)tsk_futex(lk, FUTEX_WAKE, 1u, NULL, NULL, 0u);
+}
+
+static int t38_worker_fn(void *arg)
+{
+    int iters = (int)(intptr_t)arg;
+    for (int i = 0; i < iters; i++) {
+        t38_lock_acquire(&g_t38_lock);
+        g_t38_counter++;
+        t38_lock_release(&g_t38_lock);
+    }
+    return 0;
+}
+
+typedef struct t39_bitset_ctx {
+    volatile uint32_t word;
+    volatile int started;
+    volatile int wait_rc;
+    volatile int wait_errno;
+} t39_bitset_ctx_t;
+
+static int t39_bitset_worker(void *arg)
+{
+    t39_bitset_ctx_t *ctx = (t39_bitset_ctx_t *)arg;
+    __atomic_store_n(&ctx->started, 1, __ATOMIC_RELEASE);
+    errno = 0;
+    long rc = tsk_futex(&ctx->word, FUTEX_WAIT_BITSET, 0u, NULL, NULL, 0x04u);
+    ctx->wait_errno = errno;
+    __atomic_store_n(&ctx->wait_rc, (int)rc, __ATOMIC_RELEASE);
+    return 0;
+}
+
+typedef struct t41_fpu_ctx {
+    int id;
+    volatile double result;
+    volatile int ok;
+} t41_fpu_ctx_t;
+
+static double t41_calc_ref(int id)
+{
+    double v = (id == 0) ? 1.25 : 3.5;
+    double mul = (id == 0) ? 1.000001 : 0.999997;
+    double add = (id == 0) ? 0.5 : 1.25;
+    for (int i = 0; i < 300; i++) {
+        v = v * mul + add;
+    }
+    return v;
+}
+
+static int t41_fpu_worker(void *arg)
+{
+    t41_fpu_ctx_t *ctx = (t41_fpu_ctx_t *)arg;
+    double v = (ctx->id == 0) ? 1.25 : 3.5;
+    double mul = (ctx->id == 0) ? 1.000001 : 0.999997;
+    double add = (ctx->id == 0) ? 0.5 : 1.25;
+    uint64_t expected_xmm = (ctx->id == 0) ? 0x1122334455667788ULL : 0xCAFEBABEDEADBEEFULL;
+    int ok = 1;
+
+    __asm__ volatile ("movq %0, %%xmm7" : : "r"(expected_xmm) : "memory");
+    for (int i = 0; i < 300; i++) {
+        v = v * mul + add;
+        if ((i % 10) == 0) {
+            uint64_t got_xmm = 0;
+            sched_yield();
+            __asm__ volatile ("movq %%xmm7, %0" : "=r"(got_xmm) : : "memory");
+            if (got_xmm != expected_xmm)
+                ok = 0;
+        }
+    }
+    double ref = t41_calc_ref(ctx->id);
+    double diff = v - ref;
+    if (diff < 0.0)
+        diff = -diff;
+    if (diff > 1e-9)
+        ok = 0;
+    ctx->result = v;
+    __atomic_store_n(&ctx->ok, ok, __ATOMIC_RELEASE);
+    return 0;
+}
+
+static void join_clone_ctid(volatile int *ctid)
+{
+    for (;;) {
+        int val = __atomic_load_n(ctid, __ATOMIC_ACQUIRE);
+        if (val == 0)
+            break;
+        (void)tsk_futex((volatile uint32_t *)ctid, FUTEX_WAIT, (uint32_t)val, NULL, NULL, 0u);
+    }
+}
+
 static int real_main(int argc, char **argv, char **envp)
 {
     (void)envp;
@@ -374,7 +534,7 @@ static int real_main(int argc, char **argv, char **envp)
         return run_worker_pty_job(argv[2]);
 
     int passed = 0;
-    int total = 36;
+    int total = 41;
 
     /* Test 1: Stack frame alignment (rsp % 16 == 8 on function entry). */
     if ((s_entry_rsp & 0xF) != 8) {
@@ -2522,6 +2682,357 @@ static int real_main(int argc, char **argv, char **envp)
             return 82;
         }
         TSK_TEST_PASS("syscalls", "vt_kd_vterm");
+        passed++;
+    }
+
+    /* Test 37: clone threads with TLS (%fs), shared files, clear_child_tid, and exit_group. */
+    {
+        int ok = 1;
+        int pfd[2] = { -1, -1 };
+        int dup_fd = -1;
+        void *stk = mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (stk == MAP_FAILED || pipe(pfd) != 0)
+            ok = 0;
+        if (ok) {
+            dup_fd = dup(pfd[1]);
+            if (dup_fd < 0)
+                ok = 0;
+        }
+
+        if (ok) {
+            t37_tls_t tls;
+            memset(&tls, 0, sizeof(tls));
+            tls.self = &tls;
+            tls.magic = 0x54534B544C530001ULL;
+            tls.pipe_wr = pfd[1];
+            tls.dup_fd = dup_fd;
+
+            int ptid = 0;
+            int ctid = 0;
+            int cflags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+                         CLONE_THREAD | CLONE_SETTLS |
+                         CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+            int tid = tsk_clone(t37_thread_fn, (char *)stk + 16384, cflags,
+                                &tls, &ptid, &tls, &ctid);
+            if (tid <= 0 || ptid != tid) {
+                ok = 0;
+            } else {
+                join_clone_ctid(&ctid);
+                if (!tls.ok || tls.seen_tid != tid || tls.seen_pid != (int)getpid() ||
+                    tls.seen_tid == (int)getpid()) {
+                    ok = 0;
+                }
+                char pbuf[4] = {0};
+                if (read(pfd[0], pbuf, 2) != 2 || memcmp(pbuf, "OK", 2) != 0)
+                    ok = 0;
+                errno = 0;
+                if (write(dup_fd, "X", 1) != -1 || errno != EBADF)
+                    ok = 0;
+            }
+        }
+        if (pfd[0] >= 0) close(pfd[0]);
+        if (pfd[1] >= 0) close(pfd[1]);
+        if (stk != MAP_FAILED) munmap(stk, 16384);
+
+        if (ok) {
+            pid_t cpid = fork();
+            if (cpid == 0) {
+                void *cstk = mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                int pt = 0, ct = 0;
+                int cf = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+                         CLONE_THREAD | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
+                if (cstk != MAP_FAILED &&
+                    tsk_clone(t37_exitgrp_worker, (char *)cstk + 16384, cf, NULL, &pt, NULL, &ct) > 0) {
+                    for (int s = 0; s < 50; s++)
+                        usleep(10000);
+                }
+                _exit(99);
+            } else if (cpid > 0) {
+                int st = 0;
+                pid_t wr = waitpid(cpid, &st, 0);
+                if (wr != cpid || !WIFEXITED(st) || WEXITSTATUS(st) != 42)
+                    ok = 0;
+            } else {
+                ok = 0;
+            }
+        }
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "clone_tls_files_exit_group", "clone/TLS/shared-files/exit_group failed");
+            return 83;
+        }
+        TSK_TEST_PASS("syscalls", "clone_tls_files_exit_group");
+        passed++;
+    }
+
+    /* Test 38: 4-thread SMP futex mutex stress (100,000 non-atomic increments). */
+    {
+        int ok = 1;
+        void *stacks[4];
+        int ctids[4] = { -1, -1, -1, -1 };
+        int ptids[4] = { 0, 0, 0, 0 };
+        g_t38_lock = 0u;
+        g_t38_counter = 0ULL;
+
+        int cflags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+                     CLONE_THREAD | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+
+        for (int i = 0; i < 4; i++) {
+            stacks[i] = mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (stacks[i] == MAP_FAILED) {
+                ok = 0;
+                break;
+            }
+            ctids[i] = 0;
+            int tid = tsk_clone(t38_worker_fn, (char *)stacks[i] + 16384, cflags,
+                                (void *)(intptr_t)25000, &ptids[i], NULL, &ctids[i]);
+            if (tid <= 0) {
+                ctids[i] = 0;
+                ok = 0;
+                break;
+            }
+        }
+
+        for (int i = 0; i < 4; i++) {
+            if (ptids[i] > 0)
+                join_clone_ctid(&ctids[i]);
+            if (stacks[i] != MAP_FAILED)
+                munmap(stacks[i], 16384);
+        }
+
+        if (!ok || g_t38_counter != 100000ULL) {
+            TSK_TEST_FAIL("syscalls", "smp_threads_futex_100k", "counter mismatch under futex contention");
+            return 84;
+        }
+        TSK_TEST_PASS("syscalls", "smp_threads_futex_100k");
+        passed++;
+    }
+
+    /* Test 39: futex relative timeout, bitset matching, and cross-process SHM physical keying. */
+    {
+        int ok = 1;
+
+        /* 1) Relative timeout returns ETIMEDOUT */
+        {
+            volatile uint32_t fw = 7u;
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 15000000L };
+            errno = 0;
+            long rc = tsk_futex(&fw, FUTEX_WAIT, 7u, &ts, NULL, 0u);
+            if (rc != -1 || errno != ETIMEDOUT)
+                ok = 0;
+        }
+
+        /* 2) FUTEX_WAIT_BITSET / FUTEX_WAKE_BITSET selective wake */
+        if (ok) {
+            t39_bitset_ctx_t bctx;
+            memset(&bctx, 0, sizeof(bctx));
+            void *bstk = mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            int pt = 0, ct = 0;
+            int cflags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+                         CLONE_THREAD | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+            if (bstk == MAP_FAILED) {
+                ok = 0;
+            } else {
+                int tid = tsk_clone(t39_bitset_worker, (char *)bstk + 16384, cflags,
+                                    &bctx, &pt, NULL, &ct);
+                if (tid <= 0) {
+                    ok = 0;
+                } else {
+                    while (!__atomic_load_n(&bctx.started, __ATOMIC_ACQUIRE))
+                        sched_yield();
+                    usleep(10000);
+                    long w0 = tsk_futex(&bctx.word, FUTEX_WAKE_BITSET, 1u, NULL, NULL, 0x01u);
+                    long w1 = tsk_futex(&bctx.word, FUTEX_WAKE_BITSET, 1u, NULL, NULL, 0x04u);
+                    join_clone_ctid(&ct);
+                    if (w0 != 0 || w1 != 1 || bctx.wait_rc != 0)
+                        ok = 0;
+                }
+                munmap(bstk, 16384);
+            }
+        }
+
+        /* 3) Cross-process SHM futex at different virtual addresses */
+        if (ok) {
+            int sid_pad = shm_create(4096);
+            int sid = shm_create(4096);
+            if (sid_pad < 0 || sid < 0) {
+                ok = 0;
+            } else {
+                pid_t cpid = fork();
+                if (cpid == 0) {
+                    void *p = shm_attach(sid);
+                    if (!p)
+                        _exit(10);
+                    volatile uint32_t *s32 = (volatile uint32_t *)p;
+                    volatile uint64_t *s64 = (volatile uint64_t *)p;
+                    s64[1] = (uint64_t)(uintptr_t)p;
+                    __atomic_store_n(&s32[1], 1u, __ATOMIC_RELEASE);
+                    long rc = tsk_futex(&s32[0], FUTEX_WAIT, 0u, NULL, NULL, 0u);
+                    uint32_t v = __atomic_load_n(&s32[0], __ATOMIC_ACQUIRE);
+                    (void)shm_detach(p);
+                    _exit((rc == 0 && v == 99u) ? 0 : 11);
+                } else if (cpid > 0) {
+                    /* Attach a dummy SHM segment first so sid lands at a distinct VA from child. */
+                    void *pad = shm_attach(sid_pad);
+                    void *p = shm_attach(sid);
+                    if (!p) {
+                        ok = 0;
+                    } else {
+                        volatile uint32_t *s32 = (volatile uint32_t *)p;
+                        volatile uint64_t *s64 = (volatile uint64_t *)p;
+                        for (int t = 0; t < 500 && __atomic_load_n(&s32[1], __ATOMIC_ACQUIRE) == 0u; t++)
+                            usleep(2000);
+                        uint64_t child_va = s64[1];
+                        if (__atomic_load_n(&s32[1], __ATOMIC_ACQUIRE) != 1u ||
+                            child_va == (uint64_t)(uintptr_t)p) {
+                            ok = 0;
+                        }
+                        usleep(10000);
+                        __atomic_store_n(&s32[0], 99u, __ATOMIC_RELEASE);
+                        long woken = tsk_futex(&s32[0], FUTEX_WAKE, 1u, NULL, NULL, 0u);
+                        if (woken != 1)
+                            ok = 0;
+                        (void)shm_detach(p);
+                    }
+                    if (pad)
+                        (void)shm_detach(pad);
+                    int st = 0;
+                    if (waitpid(cpid, &st, 0) != cpid || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+                        ok = 0;
+                } else {
+                    ok = 0;
+                }
+            }
+            if (sid >= 0) (void)shm_destroy(sid);
+            if (sid_pad >= 0) (void)shm_destroy(sid_pad);
+        }
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "futex_phys_shm_timeout_bitset", "futex physical/timeout/bitset failed");
+            return 85;
+        }
+        TSK_TEST_PASS("syscalls", "futex_phys_shm_timeout_bitset");
+        passed++;
+    }
+
+    /* Test 40: high-resolution clock_getres/clock_gettime and timerfd_create/settime/poll/read. */
+    {
+        int ok = 1;
+        struct timespec res = {0, 0};
+        struct timespec t0 = {0, 0};
+        struct timespec t1 = {0, 0};
+
+        if (clock_getres(CLOCK_MONOTONIC, &res) != 0 ||
+            res.tv_sec != 0 || res.tv_nsec <= 0 || res.tv_nsec >= 1000000L)
+            ok = 0;
+
+        if (ok && clock_gettime(CLOCK_MONOTONIC, &t0) != 0)
+            ok = 0;
+        for (volatile int s = 0; s < 200000; s++) {}
+        if (ok && clock_gettime(CLOCK_MONOTONIC, &t1) != 0)
+            ok = 0;
+        int64_t dt_ns = ((int64_t)t1.tv_sec - (int64_t)t0.tv_sec) * 1000000000LL +
+                        ((int64_t)t1.tv_nsec - (int64_t)t0.tv_nsec);
+        if (dt_ns <= 0)
+            ok = 0;
+
+        int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+        if (tfd < 0)
+            ok = 0;
+        if (ok) {
+            struct itimerspec nv;
+            struct itimerspec cv;
+            memset(&nv, 0, sizeof(nv));
+            memset(&cv, 0, sizeof(cv));
+            nv.it_interval.tv_sec = 0;
+            nv.it_interval.tv_nsec = 10000000L;
+            nv.it_value.tv_sec = 0;
+            nv.it_value.tv_nsec = 10000000L;
+            if (timerfd_settime(tfd, 0, &nv, NULL) != 0)
+                ok = 0;
+            if (ok && timerfd_gettime(tfd, &cv) != 0)
+                ok = 0;
+            if (ok && cv.it_interval.tv_nsec != 10000000L)
+                ok = 0;
+
+            for (int round = 0; round < 2 && ok; round++) {
+                struct pollfd pfd = { .fd = tfd, .events = POLLIN, .revents = 0 };
+                int pr = poll(&pfd, 1, 1000);
+                uint64_t exp = 0;
+                if (pr != 1 || !(pfd.revents & POLLIN) ||
+                    read(tfd, &exp, sizeof(exp)) != (ssize_t)sizeof(exp) || exp == 0ULL)
+                    ok = 0;
+            }
+            close(tfd);
+        }
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "clock_hires_timerfd_poll", "high-res clock or timerfd failed");
+            return 86;
+        }
+        TSK_TEST_PASS("syscalls", "clock_hires_timerfd_poll");
+        passed++;
+    }
+
+    /* Test 41: concurrent FPU/SSE XSAVE isolation + thread/clock/timerfd negative validation. */
+    {
+        int ok = 1;
+        t41_fpu_ctx_t ctx0 = { .id = 0, .result = 0.0, .ok = 0 };
+        t41_fpu_ctx_t ctx1 = { .id = 1, .result = 0.0, .ok = 0 };
+        void *stk0 = mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void *stk1 = mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        int pt0 = 0, pt1 = 0, ct0 = 0, ct1 = 0;
+        int cflags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+                     CLONE_THREAD | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+
+        if (stk0 == MAP_FAILED || stk1 == MAP_FAILED) {
+            ok = 0;
+        } else {
+            int t0 = tsk_clone(t41_fpu_worker, (char *)stk0 + 16384, cflags, &ctx0, &pt0, NULL, &ct0);
+            int t1 = tsk_clone(t41_fpu_worker, (char *)stk1 + 16384, cflags, &ctx1, &pt1, NULL, &ct1);
+            if (t0 <= 0 || t1 <= 0) {
+                ok = 0;
+            } else {
+                join_clone_ctid(&ct0);
+                join_clone_ctid(&ct1);
+                if (!ctx0.ok || !ctx1.ok)
+                    ok = 0;
+            }
+        }
+        if (stk0 != MAP_FAILED) munmap(stk0, 16384);
+        if (stk1 != MAP_FAILED) munmap(stk1, 16384);
+
+        /* Negative syscalls */
+        errno = 0;
+        if (arch_prctl(0x9999, 0) != -1 || errno != EINVAL) ok = 0;
+        errno = 0;
+        if (arch_prctl(ARCH_SET_FS, 0xFFFF800000000000ULL) != -1 || errno != EINVAL) ok = 0;
+        errno = 0;
+        if (arch_prctl(ARCH_GET_FS, 0x1000UL) != -1 || errno != EFAULT) ok = 0;
+        errno = 0;
+        if (tsk_clone(t41_fpu_worker, NULL, CLONE_VM | CLONE_SIGHAND | CLONE_THREAD,
+                      NULL, NULL, NULL, NULL) != -1 || errno != EINVAL) ok = 0;
+        if (__syscall5(SYS_clone, CLONE_THREAD, 0x700000000000LL, 0, 0, 0) != -EINVAL) ok = 0;
+        if (__syscall5(SYS_clone, CLONE_PARENT_SETTID, 0, 0x1000, 0, 0) != -EFAULT) ok = 0;
+        {
+            struct timespec ts;
+            errno = 0;
+            if (clock_gettime(999, &ts) != -1 || errno != EINVAL) ok = 0;
+            errno = 0;
+            if (clock_gettime(CLOCK_MONOTONIC, NULL) != -1 || errno != EFAULT) ok = 0;
+            errno = 0;
+            if (timerfd_create(999, 0) != -1 || errno != EINVAL) ok = 0;
+            errno = 0;
+            if (timerfd_create(CLOCK_MONOTONIC, 0x1234) != -1 || errno != EINVAL) ok = 0;
+            errno = 0;
+            if (timerfd_gettime(999, NULL) != -1 || (errno != EFAULT && errno != EBADF)) ok = 0;
+        }
+
+        if (!ok) {
+            TSK_TEST_FAIL("syscalls", "fpu_xsave_and_thread_negative", "FPU isolation or negative validation failed");
+            return 87;
+        }
+        TSK_TEST_PASS("syscalls", "fpu_xsave_and_thread_negative");
         passed++;
     }
 

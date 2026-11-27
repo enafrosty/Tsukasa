@@ -192,6 +192,28 @@ struct timeval {
 };
 #endif
 
+#ifndef _TSK_TIMESPEC_DEFINED
+#define _TSK_TIMESPEC_DEFINED
+struct tsk_timespec {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+};
+
+struct tsk_itimerspec {
+    struct tsk_timespec it_interval;
+    struct tsk_timespec it_value;
+};
+#endif
+
+#define TSK_CLOCK_REALTIME      0
+#define TSK_CLOCK_MONOTONIC     1
+#define TSK_CLOCK_MONOTONIC_RAW 4
+#define TSK_CLOCK_BOOTTIME      7
+
+#define TSK_TFD_TIMER_ABSTIME (1 << 0)
+#define TSK_TFD_CLOEXEC       0x80000
+#define TSK_TFD_NONBLOCK      0x00800
+
 /* epoll constants and structures */
 #define EPOLLIN      0x0001
 #define EPOLLPRI     0x0002

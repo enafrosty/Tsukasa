@@ -40,6 +40,7 @@ ASMFLAGS = -f elf64
 CRT_OBJS = crt/crt0.o crt/crt0.s.o
 
 SYSCALL_OBJS = src/syscall/errno.o \
+               src/syscall/clone.o \
                src/syscall/sigreturn.o \
                src/syscall/sys_fs.o \
                src/syscall/sys_mem.o \

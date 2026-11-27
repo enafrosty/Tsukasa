@@ -235,10 +235,11 @@ void idt_exception_handler_x64(interrupt_frame_t *frame)
     __asm__ volatile ("mov %%rsp, %0" : "=r"(k_rsp));
     __asm__ volatile ("cli");
 
+    vm_space_t *vs = process_vm_space(cur);
     if ((cs & 3u) == 3u && vector == 14u && cur && !cur->is_idle &&
-        cur->vm_space.owns_pml4) {
+        vs && vs->owns_pml4) {
         __asm__ volatile ("sti");
-        int pf_rc = vm_space_handle_page_fault(&cur->vm_space, (uintptr_t)cr2, error_code);
+        int pf_rc = vm_space_handle_page_fault(vs, (uintptr_t)cr2, error_code);
         __asm__ volatile ("cli");
         if (pf_rc == 0)
             return;
@@ -346,7 +347,8 @@ void idt_init_x64(void)
     set_gate(47, isr_x64_47, 0x8Eu);
     for (uint32_t vec = 48u; vec <= 254u; vec++) {
         if (vec == IDT_VEC_YIELD || vec == 65u ||
-            vec == IDT_VEC_TLB_SHOOTDOWN || vec == 128u)
+            vec == IDT_VEC_TLB_SHOOTDOWN || vec == IDT_VEC_LAPIC_TIMER ||
+            vec == 128u)
             continue;
         if (isr_x64_irq_table[vec - 48u])
             set_gate((uint8_t)vec, isr_x64_irq_table[vec - 48u], 0x8Eu);
@@ -354,6 +356,8 @@ void idt_init_x64(void)
     set_gate(IDT_VEC_YIELD, isr_x64_64, 0x8Eu);
     set_gate(65, isr_x64_65, 0x8Eu);
     set_gate(IDT_VEC_TLB_SHOOTDOWN, isr_x64_66, 0x8Eu);
+    if (isr_x64_irq_table[IDT_VEC_LAPIC_TIMER - 48u])
+        set_gate(IDT_VEC_LAPIC_TIMER, isr_x64_irq_table[IDT_VEC_LAPIC_TIMER - 48u], 0x8Eu);
     set_gate(128, isr_x64_128, 0xEEu);
 
     idtp.limit = (uint16_t)(sizeof(idt) - 1);

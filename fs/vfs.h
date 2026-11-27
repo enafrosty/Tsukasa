@@ -81,7 +81,8 @@ typedef enum vfs_backend {
     VFS_BACKEND_PIPE,
     VFS_BACKEND_UNIXSOCK,
     VFS_BACKEND_EPOLL,
-    VFS_BACKEND_EXT4
+    VFS_BACKEND_EXT4,
+    VFS_BACKEND_TIMERFD
 } vfs_backend_t;
 
 typedef struct epoll_item {
@@ -191,6 +192,13 @@ int vfs_epoll_create1(int flags);
 int vfs_epoll_ctl(int epfd, int op, int fd, uint32_t events, uint64_t data);
 int vfs_epoll_wait(int epfd, epoll_event_t *events, int maxevents, int timeout_ms);
 
+int vfs_timerfd_create(int clockid, int flags);
+int vfs_timerfd_settime(int fd, int flags,
+                        const struct tsk_itimerspec *new_val,
+                        struct tsk_itimerspec *old_val);
+int vfs_timerfd_gettime(int fd, struct tsk_itimerspec *cur_val);
+void vfs_timerfd_tick(uint64_t now_ns);
+
 int vfs_stat(const char *path, vfs_stat_t *out);
 int vfs_lstat(const char *path, vfs_stat_t *out);
 int vfs_fstat(int fd, vfs_stat_t *out);
@@ -223,5 +231,7 @@ int vfs_process_dup2(struct process *dst,
 void vfs_process_close_cloexec(struct process *proc);
 int  vfs_path_nosuid(const char *path);
 void vfs_process_cleanup(struct process *proc);
+struct files_struct;
+void vfs_files_destroy(struct files_struct *fs);
 
 #endif /* VFS_H */

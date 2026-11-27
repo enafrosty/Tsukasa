@@ -295,7 +295,8 @@ void *fb_mmap(void *addr, size_t length, int prot, int flags, size_t offset)
         return (void *)-1;
 
 #ifdef __x86_64__
-    if (proc && proc->vm_space.owns_pml4 && fb_info.phys) {
+    vm_space_t *vs = process_vm_space(proc);
+    if (proc && vs && vs->owns_pml4 && fb_info.phys) {
         uintptr_t target_va;
         if (addr != NULL && paging_is_page_aligned_uintptr((uintptr_t)addr) &&
             paging_range_is_user((uintptr_t)addr, length)) {
@@ -309,14 +310,14 @@ void *fb_mmap(void *addr, size_t length, int prot, int flags, size_t offset)
         uint64_t q_phys = 0;
         uint64_t q_flags = 0;
 
-        if (vmm_query_page(proc->vm_space.pml4_phys, target_va, &q_phys, &q_flags) == 0 &&
+        if (vmm_query_page(vs->pml4_phys, target_va, &q_phys, &q_flags) == 0 &&
             (q_flags & VMM_X64_PTE_PRESENT)) {
             g_fb_user_mmap_pte_flags = q_flags;
             return (void *)(target_va + (offset & page_mask));
         }
 
         uint64_t phys_start = fb_info.phys + (offset & ~page_mask);
-        if (vm_space_map_user_pages(&proc->vm_space,
+        if (vm_space_map_user_pages(vs,
                                     target_va,
                                     phys_start,
                                     page_count,
@@ -324,7 +325,7 @@ void *fb_mmap(void *addr, size_t length, int prot, int flags, size_t offset)
                                     PAGING_MAP_USER | PAGING_MAP_WC) != 0) {
             return (void *)-1;
         }
-        if (vmm_query_page(proc->vm_space.pml4_phys, target_va, &q_phys, &q_flags) == 0) {
+        if (vmm_query_page(vs->pml4_phys, target_va, &q_phys, &q_flags) == 0) {
             g_fb_user_mmap_pte_flags = q_flags;
             if (!g_fb_user_mmap_logged) {
                 g_fb_user_mmap_logged = 1;
@@ -349,12 +350,13 @@ int fb_munmap(void *addr, size_t length)
 
 #ifdef __x86_64__
     process_t *proc = process_current();
-    if (proc && proc->vm_space.owns_pml4 &&
+    vm_space_t *vs = process_vm_space(proc);
+    if (proc && vs && vs->owns_pml4 &&
         ((p == (uintptr_t)VFS_FB_USER_BASE && length <= size) ||
          paging_range_is_user(p, length))) {
         uintptr_t page_mask = (uintptr_t)PAGE_SIZE - 1;
         size_t page_count = (size_t)((length + page_mask) / PAGE_SIZE);
-        return vm_space_unmap_user_pages(&proc->vm_space, p & ~page_mask, page_count);
+        return vm_space_unmap_user_pages(vs, p & ~page_mask, page_count);
     }
 #endif
     return 0;

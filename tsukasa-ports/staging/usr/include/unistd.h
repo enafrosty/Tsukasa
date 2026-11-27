@@ -72,8 +72,41 @@ pid_t spawn(const char *path, char *const argv[], char *const envp[]);
 int spawn_ex(const struct tsukasa_spawn_request *req);
 int execve(const char *pathname, char *const argv[], char *const envp[]);
 int execvp(const char *file, char *const argv[]);
+#define CLONE_VM             0x00000100
+#define CLONE_FS             0x00000200
+#define CLONE_FILES          0x00000400
+#define CLONE_SIGHAND        0x00000800
+#define CLONE_THREAD         0x00010000
+#define CLONE_SYSVSEM        0x00040000
+#define CLONE_SETTLS         0x00080000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_CHILD_SETTID   0x01000000
+
+#define ARCH_SET_GS          0x1001
+#define ARCH_SET_FS          0x1002
+#define ARCH_GET_FS          0x1003
+#define ARCH_GET_GS          0x1004
+
+#define FUTEX_WAIT           0
+#define FUTEX_WAKE           1
+#define FUTEX_WAIT_BITSET    9
+#define FUTEX_WAKE_BITSET    10
+#define FUTEX_PRIVATE_FLAG   128
+#define FUTEX_CLOCK_REALTIME 256
+#define FUTEX_BITSET_MATCH_ANY 0xFFFFFFFFU
+
+struct timespec;
+
 pid_t getpid(void);
 pid_t getppid(void);
+pid_t gettid(void);
+int tsk_clone(int (*fn)(void *), void *child_stack_top, int flags,
+              void *arg, int *ptid, void *tls, int *ctid);
+int arch_prctl(int code, unsigned long addr);
+pid_t set_tid_address(int *tidptr);
+long tsk_futex(volatile uint32_t *uaddr, int op, uint32_t val,
+               const struct timespec *timeout, volatile uint32_t *uaddr2, uint32_t val3);
 pid_t setsid(void);
 pid_t getsid(pid_t pid);
 int setpgid(pid_t pid, pid_t pgid);
@@ -91,6 +124,7 @@ unsigned int sleep(unsigned int seconds);
 int usleep(useconds_t usec);
 
 void _exit(int status);
+void exit_group(int status);
 void exit(int status);
 
 #endif /* _TSUKASA_UNISTD_H */

@@ -17,6 +17,7 @@
 #include "syscall_internal.h"
 #include <time.h>
 #include <sys/time.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
 int nanosleep(const struct timespec *req, struct timespec *rem)
@@ -118,21 +119,52 @@ int clock_gettime(int clk_id, struct timespec *tp)
         errno = EFAULT;
         return -1;
     }
-    if (clk_id == CLOCK_MONOTONIC) {
-        int64_t ticks = __syscall0(SYS_ticks);
-        if (ticks < 0)
-            ticks = 0;
-        tp->tv_sec = (time_t)(ticks / 100);
-        tp->tv_nsec = (long)((ticks % 100) * 10000000L);
-        return 0;
-    } else if (clk_id == CLOCK_REALTIME) {
-        time_t t = time(NULL);
-        tp->tv_sec = t;
-        tp->tv_nsec = 0;
-        return 0;
+    return (int)__syscall_check(__syscall2(SYS_clock_gettime,
+                                           (int64_t)clk_id,
+                                           (int64_t)(uintptr_t)tp));
+}
+
+int clock_getres(int clk_id, struct timespec *res)
+{
+    return (int)__syscall_check(__syscall2(SYS_clock_getres,
+                                           (int64_t)clk_id,
+                                           (int64_t)(uintptr_t)res));
+}
+
+int clock_settime(int clk_id, const struct timespec *tp)
+{
+    if (!tp) {
+        errno = EFAULT;
+        return -1;
     }
-    errno = EINVAL;
-    return -1;
+    return (int)__syscall_check(__syscall2(SYS_clock_settime,
+                                           (int64_t)clk_id,
+                                           (int64_t)(uintptr_t)tp));
+}
+
+int timerfd_create(int clockid, int flags)
+{
+    return (int)__syscall_check(__syscall2(SYS_timerfd_create,
+                                           (int64_t)clockid,
+                                           (int64_t)flags));
+}
+
+int timerfd_settime(int fd, int flags,
+                    const struct itimerspec *new_value,
+                    struct itimerspec *old_value)
+{
+    return (int)__syscall_check(__syscall4(SYS_timerfd_settime,
+                                           (int64_t)fd,
+                                           (int64_t)flags,
+                                           (int64_t)(uintptr_t)new_value,
+                                           (int64_t)(uintptr_t)old_value));
+}
+
+int timerfd_gettime(int fd, struct itimerspec *curr_value)
+{
+    return (int)__syscall_check(__syscall2(SYS_timerfd_gettime,
+                                           (int64_t)fd,
+                                           (int64_t)(uintptr_t)curr_value));
 }
 
 int gettimeofday(struct timeval *tv, void *tz)
@@ -141,6 +173,12 @@ int gettimeofday(struct timeval *tv, void *tz)
     if (!tv) {
         errno = EFAULT;
         return -1;
+    }
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+        tv->tv_sec = ts.tv_sec;
+        tv->tv_usec = (suseconds_t)(ts.tv_nsec / 1000L);
+        return 0;
     }
     int64_t ticks = __syscall0(SYS_ticks);
     if (ticks < 0)
